@@ -1,0 +1,90 @@
+import { test } from 'node:test';
+import assert from 'node:assert';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Registry } from '../src/sessions.ts';
+
+function make(): { reg: Registry; id: string } {
+  const reg = new Registry('/dev/null');
+  const s = reg.create({
+    provider: 'claude', account: 'main', repo: '/r',
+    cwd: '/r/.claude/worktrees/x', branch: 'x', title: 'x',
+  });
+  return { reg, id: s.id };
+}
+
+test('a new session starts working with an empty transcript', () => {
+  const { reg, id } = make();
+  const s = reg.get(id)!;
+  assert.equal(s.status, 'working');
+  assert.deepEqual(s.transcript, []);
+  assert.equal(s.pending, null);
+});
+
+test('an approval event sets needs-you and stores the request', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'approval', request: { id: 'a1', tool: 'Bash', summary: 'rm -rf dist' } });
+  const s = reg.get(id)!;
+  assert.equal(s.status, 'needs-you');
+  assert.deepEqual(s.pending, { id: 'a1', tool: 'Bash', summary: 'rm -rf dist' });
+});
+
+test('resolving an approval clears pending and returns to working', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'approval', request: { id: 'a1', tool: 'Bash', summary: 'x' } });
+  reg.apply(id, { type: 'approval-resolved' });
+  const s = reg.get(id)!;
+  assert.equal(s.status, 'working');
+  assert.equal(s.pending, null);
+});
+
+test('a stopped event records the reason and never reverts', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'stopped', reason: 'exit 1' });
+  reg.apply(id, { type: 'status', status: 'working' });
+  const s = reg.get(id)!;
+  assert.equal(s.status, 'stopped');
+  assert.equal(s.stoppedReason, 'exit 1');
+});
+
+test('statusSince advances only when the status actually changes', () => {
+  const { reg, id } = make();
+  const first = reg.get(id)!.statusSince;
+  reg.apply(id, { type: 'status', status: 'working' });
+  assert.equal(reg.get(id)!.statusSince, first);
+  reg.apply(id, { type: 'status', status: 'done' });
+  assert.ok(reg.get(id)!.statusSince >= first);
+});
+
+test('subscribers are notified on every apply', () => {
+  const { reg, id } = make();
+  let calls = 0;
+  const unsub = reg.subscribe(() => { calls++; });
+  reg.apply(id, { type: 'msg', msg: { kind: 'text', text: 'hi' } });
+  assert.equal(calls, 1);
+  unsub();
+  reg.apply(id, { type: 'msg', msg: { kind: 'text', text: 'again' } });
+  assert.equal(calls, 1);
+});
+
+test('a saved registry reloads with sessions marked stopped', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const reg = new Registry(path);
+  const s = reg.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'title',
+  });
+  reg.apply(s.id, { type: 'msg', msg: { kind: 'text', text: 'hello' } });
+  await reg.save();
+
+  const back = await Registry.load(path);
+  const loaded = back.get(s.id)!;
+  assert.equal(loaded.title, 'title');
+  assert.equal(loaded.status, 'stopped');
+  assert.equal(loaded.stoppedReason, 'switchboard restarted');
+  assert.deepEqual(loaded.transcript, [{ kind: 'text', text: 'hello' }]);
+});
