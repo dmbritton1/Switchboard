@@ -77,13 +77,21 @@ test('item.started is ignored so items are only rendered once', () => {
   );
 });
 
+// Pins the decision this task exists to get right: cached_input_tokens,
+// cache_write_input_tokens, and reasoning_output_tokens are subsets of
+// input_tokens/output_tokens under the Responses API convention, not additions to
+// them (unlike Anthropic's cache fields, which the Claude adapter correctly sums).
+// Every cache field below is nonzero and distinct so any wrong summation — folding
+// in one field, two, or all three — produces a total other than 10 or 5 and fails
+// this assertion. Do not "fix" a failure here by summing the fields in; that is
+// the regression this test exists to catch.
 test('turn.completed reports usage and sets done', () => {
   assert.deepEqual(
     normalizeCodex({
       type: 'turn.completed',
       usage: {
-        input_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0,
-        output_tokens: 5, reasoning_output_tokens: 0,
+        input_tokens: 10, cached_input_tokens: 3, cache_write_input_tokens: 7,
+        output_tokens: 5, reasoning_output_tokens: 2,
       },
     } as never),
     [

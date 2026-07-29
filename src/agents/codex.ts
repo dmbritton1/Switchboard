@@ -92,6 +92,10 @@ export const codexAdapter: Adapter = {
       : codex.startThread(threadOptions);
 
     const queue: string[] = [];
+    // Cancels the in-flight Codex turn on stop(); see TurnOptions.signal in the SDK's
+    // .d.ts. One controller for the adapter's lifetime — stop() is terminal, like the
+    // Claude adapter's q.interrupt().
+    const abortController = new AbortController();
     let running = false;
     let stopped = false;
 
@@ -101,13 +105,18 @@ export const codexAdapter: Adapter = {
       try {
         while (queue.length && !stopped) {
           const text = queue.shift()!;
-          const { events } = await thread.runStreamed(text);
+          const { events } = await thread.runStreamed(text, { signal: abortController.signal });
           for await (const e of events) {
             if (stopped) break;
             for (const ev of normalizeCodex(e)) emit(ev);
           }
         }
       } catch (err) {
+        // stop() sets `stopped` before calling abort(), so if we land here with
+        // `stopped` already true, this throw is the abort unwinding — stop() already
+        // emitted its own 'stopped' event and this is not a session failure to report.
+        if (stopped) return;
+        stopped = true;
         emit({ type: 'stopped', reason: String((err as Error).message ?? err) });
       } finally {
         running = false;
@@ -128,6 +137,7 @@ export const codexAdapter: Adapter = {
       stop() {
         stopped = true;
         queue.length = 0;
+        abortController.abort();
         emit({ type: 'stopped', reason: 'stopped from switchboard' });
       },
     };
