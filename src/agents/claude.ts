@@ -142,13 +142,28 @@ function inputQueue() {
  * one and hands back the next request so the caller can re-surface it.
  * Exported so it can be tested directly — `claudeAdapter.start` stays untested
  * plumbing, but the FIFO logic itself is pure and worth covering.
+ *
+ * Round-2-of-2 fix: `wait()` used to only enqueue; the caller emitted `approval`
+ * for every request regardless of queue position. `Session.pending` is a single
+ * slot, so a second concurrent request overwrote it before the first was
+ * resolved — the UI card showed request 2's summary while `decide()` still
+ * resolved request 1. `wait()` now reports `isHead` (true only when this
+ * request was pushed into an empty queue) so the caller emits `approval` only
+ * for the request that will actually be decided next; a queued request stays
+ * invisible until `resolve()` promotes it to head.
  */
 export function approvalQueue() {
   const pending: { request: ApprovalRequest; resolve: (r: PermissionResult) => void }[] = [];
 
   return {
-    wait(request: ApprovalRequest): Promise<PermissionResult> {
-      return new Promise((resolve) => { pending.push({ request, resolve }); });
+    /** Enqueue a request. `isHead` is true only when the queue was empty
+     *  beforehand — the caller should emit `approval` for it only then. */
+    wait(request: ApprovalRequest): { promise: Promise<PermissionResult>; isHead: boolean } {
+      const isHead = pending.length === 0;
+      const promise = new Promise<PermissionResult>((resolve) => {
+        pending.push({ request, resolve });
+      });
+      return { promise, isHead };
     },
     /** Resolves the oldest pending request. Returns null if nothing was pending,
      *  otherwise the next pending request (or null if the queue is now empty). */
@@ -172,8 +187,9 @@ export const claudeAdapter: Adapter = {
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
       const request = { id: `a${++approvalSeq}`, tool: toolName, summary: summarize(toolName, toolInput) };
-      emit({ type: 'approval', request });
-      return approvals.wait(request);
+      const { promise, isHead } = approvals.wait(request);
+      if (isHead) emit({ type: 'approval', request });
+      return promise;
     };
 
     const options: Options = {

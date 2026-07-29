@@ -103,8 +103,8 @@ test('approvalQueue resolves the oldest pending request first, not a concurrent 
   const q = approvalQueue();
   const req1 = { id: 'a1', tool: 'Bash', summary: 'ls' };
   const req2 = { id: 'a2', tool: 'Bash', summary: 'pwd' };
-  const p1 = q.wait(req1);
-  const p2 = q.wait(req2);
+  const { promise: p1 } = q.wait(req1);
+  const { promise: p2 } = q.wait(req2);
 
   const outcome1 = q.resolve({ behavior: 'allow', updatedInput: {} });
   assert.deepEqual(outcome1, { next: req2 }, 'resolving should surface the next pending request');
@@ -116,4 +116,27 @@ test('approvalQueue resolves the oldest pending request first, not a concurrent 
 
   assert.equal(q.resolve({ behavior: 'allow', updatedInput: {} }), null,
     'resolving an empty queue should be a no-op, not throw');
+});
+
+test('approvalQueue signals emission only for the request that is actually decided next', () => {
+  // Round-2-of-2 fix: canUseTool used to emit `approval` for every request the
+  // instant it arrived. Session.pending is a single slot, so a second
+  // concurrent request overwrote the card with its own summary before the
+  // first request was resolved -- the user could authorize a different tool
+  // call than the one displayed. Only the request that just became the head
+  // of the queue (isHead) should ever be surfaced.
+  const q = approvalQueue();
+  const req1 = { id: 'a1', tool: 'Read', summary: 'package.json' };
+  const req2 = { id: 'a2', tool: 'Bash', summary: 'rm -rf dist' };
+
+  const w1 = q.wait(req1);
+  assert.equal(w1.isHead, true, 'the first request enqueued must become the head and be surfaced');
+
+  const w2 = q.wait(req2);
+  assert.equal(w2.isHead, false,
+    'a second request queued behind an unresolved one must stay hidden from the UI');
+
+  const outcome = q.resolve({ behavior: 'allow', updatedInput: {} });
+  assert.deepEqual(outcome, { next: req2 },
+    'once request 1 is decided, request 2 becomes head and should now be surfaced');
 });
