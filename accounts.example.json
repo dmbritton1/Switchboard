@@ -1,0 +1,6 @@
+[
+  { "name": "claude-main", "provider": "claude", "budget": 2000000, "env": {} },
+  { "name": "claude-alt", "provider": "claude", "budget": 2000000,
+    "env": { "CLAUDE_CONFIG_DIR": "/Users/dwightbritton/.claude-alt" } },
+  { "name": "codex", "provider": "codex", "budget": 2000000, "env": {} }
+]
