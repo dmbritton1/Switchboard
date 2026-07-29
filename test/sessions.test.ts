@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Registry } from '../src/sessions.ts';
@@ -53,8 +53,11 @@ test('statusSince advances only when the status actually changes', () => {
   const first = reg.get(id)!.statusSince;
   reg.apply(id, { type: 'status', status: 'working' });
   assert.equal(reg.get(id)!.statusSince, first);
+  // Busy-wait to ensure next Date.now() returns a different millisecond
+  const target = Date.now();
+  while (Date.now() === target) {}
   reg.apply(id, { type: 'status', status: 'done' });
-  assert.ok(reg.get(id)!.statusSince >= first);
+  assert.notEqual(reg.get(id)!.statusSince, first);
 });
 
 test('subscribers are notified on every apply', () => {
@@ -87,4 +90,40 @@ test('a saved registry reloads with sessions marked stopped', async (t) => {
   assert.equal(loaded.status, 'stopped');
   assert.equal(loaded.stoppedReason, 'switchboard restarted');
   assert.deepEqual(loaded.transcript, [{ kind: 'text', text: 'hello' }]);
+});
+
+test('a reloaded session updates statusSince to restart time', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const reg = new Registry(path);
+  const s = reg.create({
+    provider: 'claude', account: 'main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'title',
+  });
+  const originalStatusSince = s.statusSince;
+  await reg.save();
+
+  // Busy-wait to ensure next Date.now() returns a different millisecond
+  const target = Date.now();
+  while (Date.now() === target) {}
+
+  const before = Date.now();
+  const back = await Registry.load(path);
+  const after = Date.now();
+  const loaded = back.get(s.id)!;
+  assert.ok(loaded.statusSince >= before, 'statusSince should be at or after reload time');
+  assert.notEqual(loaded.statusSince, originalStatusSince, 'statusSince should have changed');
+});
+
+test('a corrupted state.json returns an empty registry instead of crashing', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  await writeFile(path, '{invalid json');
+
+  const reg = await Registry.load(path);
+  assert.deepEqual(reg.all(), [], 'should return empty registry for corrupted file');
 });

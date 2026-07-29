@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, rename } from 'node:fs/promises';
 import type { AdapterEvent, Session } from './types.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
@@ -96,7 +96,9 @@ export class Registry {
 
   async save(): Promise<void> {
     if (this.#path === '/dev/null') return;
-    await writeFile(this.#path, JSON.stringify(this.all(), null, 2));
+    const tmpPath = this.#path + '.tmp';
+    await writeFile(tmpPath, JSON.stringify(this.all(), null, 2));
+    await rename(tmpPath, this.#path);
   }
 
   static async load(path: string): Promise<Registry> {
@@ -104,17 +106,18 @@ export class Registry {
     let raw: string;
     try {
       raw = await readFile(path, 'utf8');
+      for (const s of JSON.parse(raw) as Session[]) {
+        // Agents are children of this process; nothing survived the restart.
+        reg.#sessions.set(s.id, {
+          ...s,
+          status: 'stopped',
+          statusSince: Date.now(),
+          stoppedReason: s.stoppedReason ?? 'switchboard restarted',
+          pending: null,
+        });
+      }
     } catch {
       return reg;
-    }
-    for (const s of JSON.parse(raw) as Session[]) {
-      // Agents are children of this process; nothing survived the restart.
-      reg.#sessions.set(s.id, {
-        ...s,
-        status: 'stopped',
-        stoppedReason: s.stoppedReason ?? 'switchboard restarted',
-        pending: null,
-      });
     }
     return reg;
   }
