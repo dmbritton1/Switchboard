@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Registry } from '../src/sessions.ts';
@@ -133,6 +133,46 @@ test('a tool-result event updates the matching tool message and ignores unknown 
   assert.deepEqual(reg.get(id)!.transcript[0], {
     kind: 'tool', name: 'Bash', summary: 'ls', status: 'error', id: 't1',
   });
+});
+
+test('concurrent saves all resolve and leave valid, parseable state', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const reg = new Registry(path);
+  const s = reg.create({
+    provider: 'claude', account: 'main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'title',
+  });
+
+  const results = await Promise.allSettled([reg.save(), reg.save(), reg.save(), reg.save()]);
+  assert.ok(
+    results.every((r) => r.status === 'fulfilled'),
+    `every concurrent save should resolve, got: ${JSON.stringify(results)}`,
+  );
+
+  const parsed = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].id, s.id);
+  assert.equal(parsed[0].title, 'title');
+});
+
+test('revive clears stopped state and notifies subscribers', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'stopped', reason: 'exit 1' });
+  assert.equal(reg.get(id)!.status, 'stopped');
+
+  let calls = 0;
+  const unsub = reg.subscribe(() => { calls++; });
+  reg.revive(id);
+  unsub();
+
+  const s = reg.get(id)!;
+  assert.equal(s.status, 'working');
+  assert.equal(s.stoppedReason, null);
+  assert.equal(s.pending, null);
+  assert.equal(calls, 1, 'revive should notify subscribers');
 });
 
 test('a corrupted state.json returns an empty registry instead of crashing', async (t) => {

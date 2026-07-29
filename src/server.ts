@@ -29,6 +29,24 @@ const MIME: Record<string, string> = {
 };
 
 /**
+ * DNS-rebinding guard: the `Origin`-vs-`Host` check below only blocks a plain
+ * cross-origin POST, where the two strings differ. In a rebinding attack the
+ * victim's browser resolves an attacker-owned hostname to 127.0.0.1, so both
+ * `Origin` and `Host` say `attacker-host:<port>` and agree with each other —
+ * the same-string check passes while the request is in fact hitting this
+ * server. The standard fix for a loopback server is to allowlist `Host`
+ * itself: a rebound request can never present a `Host` of `127.0.0.1` or
+ * `localhost`, because that string comes from the URL the browser actually
+ * navigated to, not from DNS. Missing or unparseable `Host` fails closed.
+ */
+function hostOk(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  if (!host) return false;
+  const hostname = host.split(':')[0];
+  return hostname === '127.0.0.1' || hostname === 'localhost';
+}
+
+/**
  * Directory names under ~/.claude/projects are meant to decode back to repo
  * paths, but the encoding Claude Code uses is lossy: '/', '-', and ' ' in the
  * original cwd all collapse to '-' in the directory name (confirmed against
@@ -148,8 +166,11 @@ export function createServer(opts: {
         if (!session) return { status: 404, json: { error: 'no such session' } };
         const account = accounts.find((a) => a.name === session.account);
         if (!account) return { status: 400, json: { error: 'account no longer configured' } };
-        session.status = 'working';
-        session.stoppedReason = null;
+        // registry.revive() (not a direct mutation) so subscribers get #notify()'d
+        // immediately; neither adapter emits a synchronous status event at start(),
+        // so without this an SSE client would keep showing 'stopped' until the
+        // resumed agent's first async event arrived.
+        registry.revive(session.id);
         launch(
           session.id, account, session.cwd, String(body.prompt ?? 'continue'),
           session.vendorSessionId ?? undefined,
@@ -175,87 +196,123 @@ export function createServer(opts: {
   }
 
   const server = httpServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    // Every fallible await for this request happens inside this try. Node treats
+    // an unhandled rejection as a fatal, process-wide error — one bad request
+    // (a missing static file, a Registry#save() hiccup, anything future) would
+    // otherwise kill every live agent session on the whole process, not just
+    // this request. A single top-level catch covers every current and future
+    // await in the handler, instead of relying on every branch to remember its
+    // own try/catch.
+    try {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 
-    if (url.pathname === '/events') {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-      });
-      const push = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
-      push();
-      const unsub = registry.subscribe(push);
-      // Keeps proxies and sleeping laptops from dropping an idle stream.
-      const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
-      req.on('close', () => { unsub(); clearInterval(ping); });
-      return;
-    }
+      if (url.pathname === '/events') {
+        // See hostOk() above: /events is a read, but the snapshot it streams
+        // carries repo paths, branch names, and full session transcripts, so it
+        // gets the same DNS-rebinding guard as the write side.
+        if (!hostOk(req)) { res.writeHead(403).end('forbidden'); return; }
 
-    if (url.pathname === '/repos') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(await recentRepos()));
-      return;
-    }
-
-    if (url.pathname === '/status') {
-      const id = url.searchParams.get('id') ?? '';
-      const session = registry.get(id);
-      if (!session) { res.writeHead(404).end('{}'); return; }
-      const status = await worktreeStatus(session.cwd).catch(() => null);
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(status));
-      return;
-    }
-
-    if (url.pathname === '/command' && req.method === 'POST') {
-      // Origin guard: the server binds loopback only, but loopback binding does not
-      // stop CSRF. Any page open in the user's browser — including a malicious one
-      // on the open internet — can issue a same-network POST to 127.0.0.1:4711;
-      // browsers don't preflight a simple POST like the ones this UI sends, so the
-      // request reaches us and its side effects (worktree creation, process launch,
-      // directory deletion) run before any CORS check would block the attacker from
-      // reading the response. The attacker doesn't need to read the response to do
-      // damage. Browsers attach `Origin` on cross-origin requests; our own same-origin
-      // page also sends it. Non-browser clients (curl, scripts, this file's own tests)
-      // typically send no Origin header at all, so we only reject a *mismatched* one —
-      // this blocks the drive-by case without breaking local tooling.
-      const origin = req.headers.origin;
-      if (origin && origin !== `http://${req.headers.host}`) {
-        res.writeHead(403, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'cross-origin request blocked' }));
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        const push = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
+        push();
+        const unsub = registry.subscribe(push);
+        // Keeps proxies and sleeping laptops from dropping an idle stream.
+        const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
+        req.on('close', () => { unsub(); clearInterval(ping); });
         return;
       }
 
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      let result: { status: number; json: unknown };
-      try {
-        result = await command(JSON.parse(Buffer.concat(chunks).toString() || '{}'));
-      } catch (err) {
-        result = { status: 400, json: { error: (err as Error).message } };
+      if (url.pathname === '/repos') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(await recentRepos()));
+        return;
       }
-      // Persist before responding, not after: the brief's original order sent the
-      // response first and awaited save() afterward. The client sees the response
-      // complete as soon as res.end() flushes, regardless of that trailing await —
-      // so a test's cleanup (rm the temp state dir) could run concurrently with the
-      // still-in-flight write-tmp-then-rename in Registry#save, intermittently
-      // failing with ENOTEMPTY. Saving first makes "response received" imply "state
-      // durable," which is also the more correct guarantee to offer callers.
-      await registry.save();
-      res.writeHead(result.status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(result.json));
-      return;
-    }
 
-    const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-    // Serve only the three known assets; never join user-controlled path segments.
-    if (!['index.html', 'app.js', 'style.css'].includes(file)) {
-      res.writeHead(404).end('not found');
-      return;
+      if (url.pathname === '/status') {
+        const id = url.searchParams.get('id') ?? '';
+        const session = registry.get(id);
+        if (!session) { res.writeHead(404).end('{}'); return; }
+        const status = await worktreeStatus(session.cwd).catch(() => null);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(status));
+        return;
+      }
+
+      if (url.pathname === '/command' && req.method === 'POST') {
+        if (!hostOk(req)) { res.writeHead(403).end('forbidden'); return; }
+
+        // Origin guard: blocks plain cross-origin POST (Origin disagrees with
+        // Host), which the hostOk() check above does not — that check only
+        // catches a spoofed Host. Any page open in the user's browser can issue
+        // a same-network POST to 127.0.0.1:4711; browsers don't preflight a
+        // simple POST like the ones this UI sends, so the request reaches us
+        // and its side effects (worktree creation, process launch, directory
+        // deletion) run before any CORS check would block the attacker from
+        // reading the response — and the attacker doesn't need to read the
+        // response to do damage. Non-browser clients (curl, scripts, this
+        // file's own tests) typically send no Origin header at all, so we only
+        // reject a *mismatched* one — this blocks the drive-by case without
+        // breaking local tooling.
+        const origin = req.headers.origin;
+        if (origin && origin !== `http://${req.headers.host}`) {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'cross-origin request blocked' }));
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        let result: { status: number; json: unknown };
+        try {
+          result = await command(JSON.parse(Buffer.concat(chunks).toString() || '{}'));
+        } catch (err) {
+          result = { status: 400, json: { error: (err as Error).message } };
+        }
+        // Persist before responding, not after: the brief's original order sent the
+        // response first and awaited save() afterward. The client sees the response
+        // complete as soon as res.end() flushes, regardless of that trailing await —
+        // so a test's cleanup (rm the temp state dir) could run concurrently with the
+        // still-in-flight write-tmp-then-rename in Registry#save, intermittently
+        // failing with ENOTEMPTY. Saving first makes "response received" imply "state
+        // durable," which is also the more correct guarantee to offer callers.
+        await registry.save();
+        res.writeHead(result.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(result.json));
+        return;
+      }
+
+      const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+      // Serve only the three known assets; never join user-controlled path segments.
+      if (!['index.html', 'app.js', 'style.css'].includes(file)) {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      // web/app.js and web/style.css legitimately don't exist until Task 7 lands —
+      // that's a 404, not a server error, so it's handled here rather than falling
+      // through to the catch-all 500 below.
+      let body: Buffer;
+      try {
+        body = await readFile(join(WEB, file));
+      } catch {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      res.writeHead(200, { 'content-type': MIME[extname(file)] });
+      res.end(body);
+    } catch {
+      // A rejected await anywhere above lands here instead of escaping as an
+      // unhandled rejection. Never write a second set of headers onto a response
+      // that already started one — destroy the socket instead.
+      if (res.headersSent) res.destroy();
+      else {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal server error' }));
+      }
     }
-    res.writeHead(200, { 'content-type': MIME[extname(file)] });
-    res.end(await readFile(join(WEB, file)));
   });
 
   return server;

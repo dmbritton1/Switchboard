@@ -3,9 +3,32 @@ import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { createServer } from '../src/server.ts';
+
+// `fetch` implements the Fetch spec's forbidden-header-name list, which includes
+// `Host` — there is no way to send a spoofed Host header through fetch(). node:http's
+// request() has no such restriction, so the Host-guard tests below use it directly.
+function rawRequest(
+  url: URL,
+  opts: { method: string; headers: Record<string, string>; body?: string },
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { hostname: url.hostname, port: url.port, path: url.pathname, method: opts.method, headers: opts.headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+      },
+    );
+    req.on('error', reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
 
 const accounts = [
   { name: 'claude-main', provider: 'claude' as const, budget: 1000, env: {} },
@@ -72,6 +95,45 @@ test('POST /command create rejects a repo that is not a git repo', async (t) => 
   assert.equal(res.status, 400);
   assert.match((await res.json()).error, /not a git repository/i);
   assert.equal(registry.all().length, 0, 'no orphan session may be created');
+});
+
+test('POST /command with a mismatched Origin is rejected and has no effect', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    headers: { origin: 'https://evil.example' },
+    body: JSON.stringify({ cmd: 'delete', id: s.id, removeWorktree: false }),
+  });
+  assert.equal(res.status, 403);
+  assert.equal(registry.all().length, 1, 'a rejected request must not have deleted the session');
+});
+
+test('POST /command with a foreign Host is rejected and has no effect', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  const res = await rawRequest(new URL(`${base}/command`), {
+    method: 'POST',
+    headers: { host: 'evil.example:9999', 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'delete', id: s.id, removeWorktree: false }),
+  });
+  assert.equal(res.status, 403);
+  assert.equal(registry.all().length, 1, 'a rejected request must not have deleted the session');
+});
+
+test('GET /events with a foreign Host is rejected', async (t) => {
+  const { base } = await boot(t);
+  const res = await rawRequest(new URL(`${base}/events`), {
+    method: 'GET',
+    headers: { host: 'evil.example:9999' },
+  });
+  assert.equal(res.status, 403);
 });
 
 test('POST /command delete removes the session', async (t) => {

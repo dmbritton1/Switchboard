@@ -8,6 +8,9 @@ export class Registry {
   #sessions = new Map<string, Session>();
   #subs = new Set<() => void>();
   #path: string;
+  // Chains every save() behind the previous one so concurrent callers never
+  // run writeFile/rename on the same temp path at once. See save() below.
+  #saveChain: Promise<void> = Promise.resolve();
 
   constructor(path: string) {
     this.#path = path;
@@ -90,6 +93,23 @@ export class Registry {
     s.statusSince = Date.now();
   }
 
+  /**
+   * Explicitly revives a stopped session (used by `resume`). `apply()`
+   * deliberately treats `stopped` as terminal — see its guard above — so
+   * reviving can't go through it; this is a separate, deliberate transition
+   * with its own notifying method instead of a caller reaching in and
+   * mutating the session object directly (which would skip #notify() and
+   * leave SSE subscribers showing a stale `stopped` card).
+   */
+  revive(id: string): void {
+    const s = this.#sessions.get(id);
+    if (!s) return;
+    s.pending = null;
+    s.stoppedReason = null;
+    this.#setStatus(s, 'working');
+    this.#notify();
+  }
+
   subscribe(fn: () => void): () => void {
     this.#subs.add(fn);
     return () => this.#subs.delete(fn);
@@ -99,8 +119,27 @@ export class Registry {
     for (const fn of this.#subs) fn();
   }
 
+  /**
+   * Writes are serialized behind #saveChain rather than given unique temp
+   * filenames: two concurrent save() calls used to both write `path + '.tmp'`
+   * and race each other's rename, so up to 3 of 4 concurrent saves could
+   * reject with ENOENT. Chaining is the smaller fix — no extra filenames to
+   * clean up on failure, and it also collapses redundant back-to-back writes
+   * of identical state into the same queue position. The temp file still
+   * lives next to the destination and is only renamed in after a full write,
+   * so a crash mid-write still leaves the previous good state.json intact.
+   * The chain link itself always resolves (errors are swallowed there) so a
+   * failed save doesn't wedge every save after it; the rejection still
+   * propagates to the caller that triggered it, via the returned promise.
+   */
   async save(): Promise<void> {
     if (this.#path === '/dev/null') return;
+    const next = this.#saveChain.then(() => this.#writeNow());
+    this.#saveChain = next.catch(() => {});
+    return next;
+  }
+
+  async #writeNow(): Promise<void> {
     const tmpPath = this.#path + '.tmp';
     await writeFile(tmpPath, JSON.stringify(this.all(), null, 2));
     await rename(tmpPath, this.#path);
