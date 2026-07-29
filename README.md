@@ -86,7 +86,21 @@ npm test
   approval callback, only a start-of-thread `approvalPolicy`. Codex sessions run
   with `approvalPolicy: 'never'` and are sandboxed to their own worktree
   (`sandboxMode: 'workspace-write'`) instead; `decide()` on a Codex session is a
-  no-op.
+  no-op. The Codex binary path (`CODEX_BIN` in `src/agents/codex.ts`) is also
+  hardcoded to ChatGPT.app with no override env var or existence check, so a
+  missing or relocated install fails with the SDK's own error, not an
+  actionable one.
 - Transport is SSE (`GET /events`) + `POST /command`, not WebSocket — the
   traffic is one-directional in each channel (server pushes state, browser
   posts commands), and `EventSource` reconnects on its own with no extra code.
+- Tool-call outcomes are tracked but not shown: `src/sessions.ts` correlates
+  each `tool-result` event and sets `ok`/`error` on the transcript entry, but
+  the chat view renders every tool message as `name: summary` regardless of
+  that status — a failed edit and a successful one look identical.
+- Command failures are mostly silent in the UI: only the create-session dialog
+  checks `/command`'s response and shows the error; send, decide, resume, and
+  delete all fire-and-forget. Delete is the sharp edge — the server removes
+  the session from the registry unconditionally, even when `removeWorktree`'s
+  `git worktree remove`/`rm -rf` failed, so a failed delete can look identical
+  to a successful one (the card just disappears) while the worktree is still
+  on disk. If a delete looks suspicious, check `git worktree list` in the repo.
