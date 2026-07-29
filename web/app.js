@@ -61,11 +61,22 @@ function renderGrid() {
     const pct = Math.round(a.pace * 100);
     const el = document.createElement('div');
     el.className = 'card';
-    // a.name/a.provider come from the local accounts.json config file, not from
-    // any browser input, so innerHTML here doesn't cross a trust boundary.
-    el.innerHTML = `<div class="status">${a.name}</div>
-      <div class="bar ${a.pace > 1 ? 'over' : ''}"><i style="width:${Math.min(pct, 100)}%"></i></div>
-      <div class="meta">~${pct}% of 5h budget · estimate</div>`;
+
+    const status = document.createElement('div');
+    status.className = 'status';
+    status.textContent = a.name;
+
+    const bar = document.createElement('div');
+    bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
+    const i = document.createElement('i');
+    i.style.width = `${Math.min(pct, 100)}%`;
+    bar.append(i);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = `~${pct}% of 5h budget · estimate`;
+
+    el.append(status, bar, meta);
     accounts.append(el);
   }
   grid.append(accounts);
@@ -89,6 +100,7 @@ function renderGrid() {
 function card(s, fetchStatus) {
   const el = document.createElement('div');
   el.className = `card ${s.status}`;
+  el.dataset.id = s.id;
 
   // s.branch is whatever the user typed into the create-session form (and it
   // survives into the session basically unsanitized on the server side), so it
@@ -111,16 +123,51 @@ function card(s, fetchStatus) {
   el.append(status, branch, meta, wt);
   el.onclick = () => { openId = s.id; render(); };
 
+  // renderGrid() replaceChildren()s the whole grid on every render, so the `wt`
+  // node captured by this closure is very likely detached by the time the fetch
+  // resolves (a fresh SSE snapshot mid-burst rebuilds it before the network
+  // round trip finishes). Look the node up fresh by session id at write time —
+  // `.card[data-id] > .wt` picks the direct-child stats div, not the unrelated
+  // `.wt`-classed line inside an approval box — and skip silently if the card
+  // is gone (session deleted or scrolled off in a future render).
   if (fetchStatus) {
     fetch(`/status?id=${s.id}`).then((r) => r.json()).then((data) => {
       if (!data) return;
-      wt.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`;
+      const live = document.querySelector(`.card[data-id="${s.id}"] > .wt`);
+      if (live) live.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`;
     }).catch(() => {});
   }
 
   if (s.pending) el.append(approval(s));
   if (s.status === 'stopped') el.append(resumeButton(s));
+  el.append(deleteControl(s));
   return el;
+}
+
+function deleteControl(s) {
+  const box = document.createElement('div');
+  box.className = 'delete';
+
+  const label = document.createElement('label');
+  label.onclick = (e) => e.stopPropagation();
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  label.append(checkbox, ' remove worktree');
+
+  const b = document.createElement('button');
+  b.textContent = 'Delete';
+  b.onclick = (e) => {
+    e.stopPropagation();
+    const removeWorktree = checkbox.checked;
+    const msg = removeWorktree
+      ? `Delete "${s.branch}" and remove its git worktree? Uncommitted changes in it will be lost.`
+      : `Delete "${s.branch}" from Switchboard? Its git worktree will be left on disk, untouched.`;
+    if (!window.confirm(msg)) return;
+    send({ cmd: 'delete', id: s.id, removeWorktree });
+  };
+
+  box.append(label, b);
+  return box;
 }
 
 function approval(s) {

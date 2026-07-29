@@ -23,6 +23,8 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .bar.over > i { background: var(--needs); }
 .approval { margin-top: .6rem; }
 .approval button { margin-right: .4rem; }
+.delete { margin-top: .6rem; display: flex; align-items: center; gap: .5rem; }
+.delete label { color: var(--dim); font-size: .9em; }
 #new-card { display: grid; place-content: center; color: var(--dim); min-height: 120px; }
 #transcript { max-width: 60rem; }
 .msg { padding: .5rem 0; border-bottom: 1px solid #222; white-space: pre-wrap; }
