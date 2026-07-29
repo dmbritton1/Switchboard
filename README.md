@@ -99,8 +99,10 @@ npm test
   that status — a failed edit and a successful one look identical.
 - Command failures are mostly silent in the UI: only the create-session dialog
   checks `/command`'s response and shows the error; send, decide, resume, and
-  delete all fire-and-forget. Delete is the sharp edge — the server removes
-  the session from the registry unconditionally, even when `removeWorktree`'s
-  `git worktree remove`/`rm -rf` failed, so a failed delete can look identical
-  to a successful one (the card just disappears) while the worktree is still
-  on disk. If a delete looks suspicious, check `git worktree list` in the repo.
+  delete all fire-and-forget. Delete's actual risk is stale bookkeeping, not
+  lost work: if `git worktree remove --force` fails, the fallback already
+  `rm -rf`s the directory before the session is removed from the registry
+  unconditionally — so a vanished card means git's own worktree registration
+  for that path is now orphaned, not that data survived. `git worktree list`
+  shows the stale entry; `git worktree prune` clears it. (The one case a
+  delete leaves the card in place is when that `rm -rf` fallback fails too.)
