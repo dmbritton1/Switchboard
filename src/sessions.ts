@@ -68,6 +68,11 @@ export class Registry {
       case 'vendor-session-id':
         s.vendorSessionId = e.id;
         break;
+      case 'tool-result': {
+        const msg = s.transcript.find((m) => m.kind === 'tool' && m.id === e.id);
+        if (msg && msg.kind === 'tool') msg.status = e.ok ? 'ok' : 'error';
+        break;
+      }
       case 'stopped':
         s.pending = null;
         s.stoppedReason = e.reason;

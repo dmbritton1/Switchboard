@@ -3,7 +3,10 @@ export type Status = 'working' | 'needs-you' | 'done' | 'stopped';
 export type Msg =
   | { kind: 'user'; text: string }
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error' }
+  // id is optional: it correlates a tool call to its later result so the registry
+  // can flip status running -> ok/error. The Codex adapter (Task 5) emits tool
+  // messages already resolved and has no equivalent id.
+  | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error'; id?: string }
   | { kind: 'error'; text: string };
 
 export type ApprovalRequest = { id: string; tool: string; summary: string };
@@ -32,6 +35,7 @@ export type AdapterEvent =
   | { type: 'approval-resolved' }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   | { type: 'vendor-session-id'; id: string }
+  | { type: 'tool-result'; id: string; ok: boolean }
   | { type: 'stopped'; reason: string };
 
 export type StartOpts = {

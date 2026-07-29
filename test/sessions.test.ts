@@ -117,6 +117,24 @@ test('a reloaded session updates statusSince to restart time', async (t) => {
   assert.notEqual(loaded.statusSince, originalStatusSince, 'statusSince should have changed');
 });
 
+test('a tool-result event updates the matching tool message and ignores unknown ids', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'Bash', summary: 'ls', status: 'running', id: 't1' },
+  });
+
+  reg.apply(id, { type: 'tool-result', id: 'nope', ok: true });
+  assert.deepEqual(reg.get(id)!.transcript[0], {
+    kind: 'tool', name: 'Bash', summary: 'ls', status: 'running', id: 't1',
+  });
+
+  reg.apply(id, { type: 'tool-result', id: 't1', ok: false });
+  assert.deepEqual(reg.get(id)!.transcript[0], {
+    kind: 'tool', name: 'Bash', summary: 'ls', status: 'error', id: 't1',
+  });
+});
+
 test('a corrupted state.json returns an empty registry instead of crashing', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
