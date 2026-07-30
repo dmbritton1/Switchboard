@@ -140,3 +140,48 @@ test('approvalQueue signals emission only for the request that is actually decid
   assert.deepEqual(outcome, { next: req2 },
     'once request 1 is decided, request 2 becomes head and should now be surfaced');
 });
+
+test('a failed slash-command expansion surfaces as an error, not silence', () => {
+  // Real shape observed from a /security-review run in a repo with no remote:
+  // the command aborted before the model ran, so the only signal was this
+  // user-role stderr message. Dropping it made the session look like it did
+  // nothing at all — empty transcript, status done.
+  const events = normalizeClaude({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: '<local-command-stderr>Error: Shell command failed for pattern '
+        + '"!`git diff origin/HEAD...`": [stderr]\nfatal: ambiguous argument '
+        + "'origin/HEAD...': unknown revision or path not in the working tree."
+        + '</local-command-stderr>',
+    },
+  } as never);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'msg');
+  assert.ok(events[0].type === 'msg' && events[0].msg.kind === 'error');
+  assert.match(
+    events[0].type === 'msg' && events[0].msg.kind === 'error' ? events[0].msg.text : '',
+    /git diff origin\/HEAD/,
+  );
+});
+
+test('ordinary user text is not mistaken for a command error', () => {
+  assert.deepEqual(
+    normalizeClaude({
+      type: 'user',
+      message: { role: 'user', content: 'just a normal prompt' },
+    } as never),
+    [],
+  );
+});
+
+test('a tool_result still correlates when content is an array', () => {
+  assert.deepEqual(
+    normalizeClaude({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't9', is_error: true }] },
+    } as never),
+    [{ type: 'tool-result', id: 't9', ok: false }],
+  );
+});

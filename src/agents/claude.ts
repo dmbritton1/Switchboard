@@ -64,6 +64,18 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
           out.push({ type: 'tool-result', id: block.tool_use_id, ok: !block.is_error });
         }
       }
+      return out;
+    }
+    // A slash command whose expansion shells out reports failure here, as a
+    // user-role message — not as a `result` error. Dropping it made an aborted
+    // command look identical to an agent that ran and said nothing: observed
+    // with /security-review in a repo with no remote, where `git diff
+    // origin/HEAD...` cannot resolve, so the turn ended with an empty transcript
+    // and a `done` status. Surface it instead.
+    if (typeof content === 'string') {
+      const stderr = content.match(/<local-command-stderr>([\s\S]*?)(?:<\/local-command-stderr>|$)/);
+      const text = stderr?.[1].trim();
+      if (text) out.push({ type: 'msg', msg: { kind: 'error', text } });
     }
     return out;
   }
