@@ -11,13 +11,36 @@
 </section>
 <dialog id="new">
   <form method="dialog">
-    <label>Repo <input name="repo" list="repos" required></label>
-    <datalist id="repos"></datalist>
-    <label>Branch <input name="branch" required placeholder="feat/thing"></label>
-    <label>Account <select name="account"></select></label>
-    <label>First prompt <textarea name="prompt" required rows="3"></textarea></label>
+    <h2>New worktree</h2>
+    <!-- A native <datalist> is an OS widget: unstylable, and it clips long
+         absolute paths to the input's width, which is exactly the information
+         you need to pick a repo. Replaced with a real combobox. -->
+    <div class="field">
+      <label for="repo-input">Repo</label>
+      <div class="combo">
+        <input id="repo-input" name="repo" required autocomplete="off" spellcheck="false"
+               placeholder="/path/to/repo" role="combobox" aria-expanded="false"
+               aria-controls="repo-list" aria-autocomplete="list">
+        <ul class="combo-list" id="repo-list" role="listbox" aria-label="Recent repos" hidden></ul>
+      </div>
+      <p class="hint">Paths Claude Code has opened before. Type any other path.</p>
+    </div>
+    <div class="field">
+      <label for="branch-input">Branch</label>
+      <input id="branch-input" name="branch" required placeholder="feat/thing"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="account-select">Account</label>
+      <div class="select-wrap"><select id="account-select" name="account"></select></div>
+    </div>
+    <div class="field">
+      <label for="prompt-input">First prompt</label>
+      <textarea id="prompt-input" name="prompt" required rows="3"
+                placeholder="What should the agent do?"></textarea>
+    </div>
     <p id="new-error"></p>
-    <menu><button value="cancel">Cancel</button><button id="create" value="create">Create</button></menu>
+    <menu><button value="cancel">Cancel</button><button id="create" value="create">Create worktree</button></menu>
   </form>
 </dialog>
 <script type="module" src="/app.js"></script>

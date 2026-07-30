@@ -257,6 +257,118 @@ $('#composer').onsubmit = (e) => {
   send({ cmd: 'send', id: openId, text });
 };
 
+// A styled combobox standing in for the native <datalist>, which is an OS widget:
+// unstylable, and it clipped long absolute paths to the input's width. Rows show the
+// repo name (what identifies it) above the full path (context), so the useful half is
+// never the half that gets truncated.
+const repoCombo = (() => {
+  const input = $('#repo-input');
+  const list = $('#repo-list');
+  let all = [];
+  let active = -1;
+
+  const rows = () => [...list.querySelectorAll('li')];
+
+  function close() {
+    list.hidden = true;
+    list.replaceChildren();
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    active = -1;
+  }
+
+  /** Paths come from disk, so build with textContent — never innerHTML. */
+  function withMatch(text, q) {
+    const frag = document.createDocumentFragment();
+    const at = q ? text.toLowerCase().indexOf(q.toLowerCase()) : -1;
+    if (at < 0) { frag.append(text); return frag; }
+    const mark = document.createElement('mark');
+    mark.textContent = text.slice(at, at + q.length);
+    frag.append(text.slice(0, at), mark, text.slice(at + q.length));
+    return frag;
+  }
+
+  function setActive(i) {
+    const items = rows();
+    if (!items.length) return;
+    active = (i + items.length) % items.length;
+    items.forEach((li, n) => li.setAttribute('aria-selected', String(n === active)));
+    const li = items[active];
+    input.setAttribute('aria-activedescendant', li.id);
+    li.scrollIntoView({ block: 'nearest' });
+  }
+
+  function open(q = '') {
+    const matches = all.filter((p) => p.toLowerCase().includes(q.toLowerCase()));
+    list.replaceChildren();
+
+    if (!all.length || !matches.length) {
+      const p = document.createElement('p');
+      p.className = 'combo-empty';
+      p.textContent = all.length
+        ? 'No recent repo matches. Type a full path.'
+        : 'No recent repos found. Type a full path.';
+      list.append(p);
+      list.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      active = -1;
+      return;
+    }
+
+    matches.forEach((path, n) => {
+      const li = document.createElement('li');
+      li.id = `repo-opt-${n}`;
+      li.role = 'option';
+      li.setAttribute('aria-selected', 'false');
+
+      const name = document.createElement('span');
+      name.className = 'repo-name';
+      name.append(withMatch(path.split('/').filter(Boolean).pop() ?? path, q));
+
+      const full = document.createElement('span');
+      full.className = 'repo-path';
+      full.append(withMatch(path, q));
+
+      li.append(name, full);
+      // mousedown, not click: click fires after blur would have closed the list.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); choose(path); });
+      list.append(li);
+    });
+
+    list.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    active = -1;
+  }
+
+  function choose(path) {
+    input.value = path;
+    close();
+    input.focus();
+  }
+
+  input.addEventListener('input', () => open(input.value));
+  input.addEventListener('focus', () => open(input.value));
+  input.addEventListener('blur', close);
+
+  input.addEventListener('keydown', (e) => {
+    const isOpen = !list.hidden;
+    if (e.key === 'ArrowDown') { e.preventDefault(); isOpen ? setActive(active + 1) : open(input.value); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); if (isOpen) setActive(active - 1); }
+    else if (e.key === 'Enter' && isOpen && active >= 0) {
+      // Selecting from the list must not also submit the form.
+      e.preventDefault();
+      choose(rows()[active].querySelector('.repo-path').textContent);
+    } else if (e.key === 'Escape' && isOpen) {
+      // Close the list, not the dialog.
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+
+  return { setOptions(list_) { all = list_; close(); } };
+})();
+
 async function openNew() {
   // reset() before the option lists are rebuilt below, so it can't clobber them:
   // a re-opened dialog otherwise still holds the previous session's repo, branch
@@ -265,12 +377,7 @@ async function openNew() {
   const dialog = $('#new');
   dialog.querySelector('form').reset();
 
-  const repos = await fetch('/repos').then((r) => r.json());
-  $('#repos').replaceChildren(...repos.map((r) => {
-    const o = document.createElement('option');
-    o.value = r;
-    return o;
-  }));
+  repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
   const sel = document.querySelector('select[name=account]');
   const freest = [...state.accounts].sort((a, b) => a.pace - b.pace)[0];
