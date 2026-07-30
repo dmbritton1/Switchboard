@@ -134,7 +134,11 @@ export const codexAdapter: Adapter = {
       },
       // Codex approvals are policy, not interactive. Nothing to decide.
       decide() {},
+      // Idempotent, and load-bearing so: the server calls stop() from its own
+      // `stopped` handler, and this stop() emits `stopped` — without the early
+      // return a UI double-click, or drain()'s failure path, would re-enter.
       stop() {
+        if (stopped) return;
         stopped = true;
         queue.length = 0;
         abortController.abort();

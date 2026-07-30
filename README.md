@@ -31,8 +31,13 @@ Codex uses the binary inside ChatGPT.app (`/Applications/ChatGPT.app/Contents/Re
 hardcoded in `src/agents/codex.ts`) and the existing `~/.codex/auth.json` — no separate
 login step.
 
-`accounts.json` and `state.json` are both gitignored; the app writes session
-state to `state.json` next to the server on every command.
+`accounts.json` and `state.json` are both gitignored. The app writes to
+`state.json` next to the server on every command and, coalesced to at most one
+write every two seconds, on any other state change — so a session that runs to
+completion unattended is still on disk. Usage samples are saved alongside the
+sessions, which is why account pace survives a restart. `state.json` is
+`{ sessions, usage }`; a file from an older build (a bare session array) still
+loads, minus usage history.
 
 ## What it does
 
@@ -43,7 +48,11 @@ view. Codex runs sandboxed to its worktree with `approvalPolicy: 'never'` and
 never enters `needs-you` — see Limits below.
 
 Opening a card shows its transcript and a message box to keep steering the
-agent. Each card also has a delete control with a "remove worktree" checkbox;
+agent. Tool calls show their outcome (`ok`/`error`) once it is known. A running
+card (`working` or `needs-you`) has a Stop button, which halts the agent and
+leaves the card in `stopped` with a Resume button — nothing is deleted.
+
+Each card also has a delete control with a "remove worktree" checkbox;
 deleting always forgets the session, and checking the box additionally runs
 `git worktree remove` (falling back to deleting the directory) on confirmation
 — which **discards any uncommitted work in that worktree**.
@@ -71,7 +80,9 @@ npm test
 - Only sessions started here are shown. Sessions from the Claude desktop app or
   ChatGPT.app are invisible to it.
 - The server only answers requests whose `Host` header is `127.0.0.1` or
-  `localhost` (`/command` also checks `Origin`), to close a DNS-rebinding hole:
+  `localhost` — every route, with no exemptions, since even the read-only ones
+  return local repo paths and transcripts (`/command` also checks `Origin`), to
+  close a DNS-rebinding hole:
   it runs unauthenticated and a POST can create worktrees, launch processes, and
   delete directories. Practically, this means the app is not reachable from a
   LAN IP, a custom hostname, or another device — only from a browser on the same
@@ -93,14 +104,14 @@ npm test
 - Transport is SSE (`GET /events`) + `POST /command`, not WebSocket — the
   traffic is one-directional in each channel (server pushes state, browser
   posts commands), and `EventSource` reconnects on its own with no extra code.
-- Tool-call outcomes are tracked but not shown: `src/sessions.ts` correlates
-  each `tool-result` event and sets `ok`/`error` on the transcript entry, but
-  the chat view renders every tool message as `name: summary` regardless of
-  that status — a failed edit and a successful one look identical.
 - Command failures are mostly silent in the UI: only the create-session dialog
-  checks `/command`'s response and shows the error; send, decide, resume, and
-  delete all fire-and-forget. Delete's actual risk is stale bookkeeping, not
-  lost work: if `git worktree remove --force` fails, the fallback already
+  checks `/command`'s response and shows the error; send, decide, resume, stop,
+  and delete all fire-and-forget. The server does reject the dangerous cases
+  rather than pretending — a `send` to a session with no live agent is a 404,
+  not a 200 with the prompt dropped, and a `resume` on a session that is not
+  `stopped` is a 409 rather than a second agent launched into the same worktree
+  — but the browser shows nothing either way. Delete's actual risk is stale
+  bookkeeping, not lost work: if `git worktree remove --force` fails, the fallback already
   `rm -rf`s the directory before the session is removed from the registry
   unconditionally — so a vanished card means git's own worktree registration
   for that path is now orphaned, not that data survived. `git worktree list`

@@ -2,6 +2,8 @@ const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
 let state = { sessions: [], accounts: [] };
 let openId = null;
 let seenNeedsYou = new Set();
+// Session whose chat view has already been auto-scrolled once; see renderChat().
+let scrolledFor = null;
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -50,6 +52,7 @@ let lastStatusFetch = 0;
 const STATUS_THROTTLE_MS = 4000;
 
 function renderGrid() {
+  scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#chat').hidden = true;
   const grid = $('#grid');
   grid.hidden = false;
@@ -140,8 +143,20 @@ function card(s, fetchStatus) {
 
   if (s.pending) el.append(approval(s));
   if (s.status === 'stopped') el.append(resumeButton(s));
+  // Only where there is something to stop: a `done` session has finished its turn
+  // and a `stopped` one is already terminal, so Stop on either is a no-op button.
+  // Without this, Delete was the only way to halt a runaway write-capable agent.
+  if (s.status === 'working' || s.status === 'needs-you') el.append(stopButton(s));
   el.append(deleteControl(s));
   return el;
+}
+
+function stopButton(s) {
+  const b = document.createElement('button');
+  b.textContent = 'Stop';
+  // Stopping is not destructive — no confirm. The card stays, with a Resume button.
+  b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'stop', id: s.id }); };
+  return b;
 }
 
 function deleteControl(s) {
@@ -205,16 +220,31 @@ function renderChat() {
   $('#chat').hidden = false;
   $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
 
+  // Measured before the rebuild, because replaceChildren() changes the height:
+  // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
+  // unconditionally yanked the view out from under anyone reading scrollback.
+  // The first render after opening a card always scrolls — that one is the user
+  // asking to see the latest, not reading back.
+  const firstOpen = scrolledFor !== openId;
+  scrolledFor = openId;
+  const nearBottom = firstOpen
+    || window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 120;
+
   const t = $('#transcript');
   t.replaceChildren();
   for (const m of s.transcript) {
     const el = document.createElement('div');
-    el.className = `msg ${m.kind}`;
-    el.textContent = m.kind === 'tool' ? `${m.name}: ${m.summary}` : m.text;
+    // The status class doubles as the styling hook: a tool message with status
+    // 'error' picks up the existing .msg.error colour.
+    el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
+    el.textContent = m.kind === 'tool'
+      // A denied `rm -rf` and a successful one used to be pixel-identical.
+      ? `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`
+      : m.text;
     t.append(el);
   }
   if (s.pending) t.append(approval(s));
-  t.scrollIntoView({ block: 'end' });
+  if (nearBottom) t.scrollIntoView({ block: 'end' });
 }
 
 $('#back').onclick = () => { openId = null; render(); };
@@ -228,6 +258,13 @@ $('#composer').onsubmit = (e) => {
 };
 
 async function openNew() {
+  // reset() before the option lists are rebuilt below, so it can't clobber them:
+  // a re-opened dialog otherwise still holds the previous session's repo, branch
+  // and prompt. (returnValue is cleared by the close handler, which is the only
+  // place it is ever set — see there.)
+  const dialog = $('#new');
+  dialog.querySelector('form').reset();
+
   const repos = await fetch('/repos').then((r) => r.json());
   $('#repos').replaceChildren(...repos.map((r) => {
     const o = document.createElement('option');
@@ -246,12 +283,20 @@ async function openNew() {
   }));
 
   $('#new-error').textContent = '';
-  $('#new').showModal();
+  dialog.showModal();
 }
 
 $('#new').addEventListener('close', async (e) => {
   const dialog = e.target;
-  if (dialog.returnValue !== 'create') return;
+  // Consume returnValue: a close request (Escape) closes a dialog *without*
+  // setting one, so an unconsumed 'create' made the next Escape re-POST the still
+  // populated form — an unintended worktree and a paid agent launch from a
+  // keypress that means "cancel". Cleared here rather than only in openNew()
+  // because the error-retry path below re-opens the dialog without going through
+  // openNew(), and would keep the stale 'create' otherwise.
+  const create = dialog.returnValue === 'create';
+  dialog.returnValue = '';
+  if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
   const { ok, data } = await send({
     cmd: 'create',

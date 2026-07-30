@@ -61,3 +61,21 @@ test('worktreeStatus reports clean, then dirty with line counts', async (t) => {
   assert.equal(dirty.added, 1);
   assert.equal(dirty.removed, 0);
 });
+
+test('worktreeStatus counts untracked files, which git diff cannot see', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/new');
+
+  // Most first prompts tell the agent to *create* files. `git diff HEAD --numstat`
+  // ignores untracked ones, so the card used to read `+0 −0 · dirty`.
+  await writeFile(join(wt, 'new.txt'), 'a\nb\nc\n');
+  await writeFile(join(wt, 'no-newline.txt'), 'x\ny');   // trailing line still counts
+  await writeFile(join(wt, 'bin.dat'), Buffer.from([1, 0, 2, 0]));  // binary: skipped
+  await writeFile(join(wt, 'empty.txt'), '');
+
+  const s = await worktreeStatus(wt);
+  assert.equal(s.dirty, true);
+  assert.equal(s.added, 5, '3 lines + 2 lines, binary and empty files contribute none');
+  assert.equal(s.removed, 0);
+});

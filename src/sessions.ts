@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import type { AdapterEvent, Session } from './types.ts';
+import type { Usage } from './usage.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
 
@@ -8,12 +9,17 @@ export class Registry {
   #sessions = new Map<string, Session>();
   #subs = new Set<() => void>();
   #path: string;
+  // Optional so tests (and anything that only cares about sessions) can skip it.
+  // The Registry owns the one save/load path, so persisting usage means handing
+  // the Usage instance to it rather than inventing a second state file.
+  #usage: Usage | undefined;
   // Chains every save() behind the previous one so concurrent callers never
   // run writeFile/rename on the same temp path at once. See save() below.
   #saveChain: Promise<void> = Promise.resolve();
 
-  constructor(path: string) {
+  constructor(path: string, usage?: Usage) {
     this.#path = path;
+    this.#usage = usage;
   }
 
   create(init: Init): Session {
@@ -55,7 +61,16 @@ export class Registry {
 
     switch (e.type) {
       case 'status':
-        this.#setStatus(s, e.status);
+        // A pending approval outranks any status an adapter reports. The Claude
+        // adapter emits `working` on every SDK message and on every send(), both
+        // of which run concurrently with a blocked canUseTool() — so an unguarded
+        // apply moved a session with a populated `pending` off `needs-you`,
+        // losing its sort-first position, its browser notification and its title
+        // counter while the Allow/Deny buttons still showed. Guarding here rather
+        // than in the adapter covers both adapters and any future one. Safe
+        // because `pending` is only ever cleared by `approval-resolved`,
+        // `stopped` and revive(), each of which sets the status itself.
+        if (!s.pending) this.#setStatus(s, e.status);
         break;
       case 'msg':
         s.transcript.push(e.msg);
@@ -141,16 +156,27 @@ export class Registry {
 
   async #writeNow(): Promise<void> {
     const tmpPath = this.#path + '.tmp';
-    await writeFile(tmpPath, JSON.stringify(this.all(), null, 2));
+    const state = { sessions: this.all(), usage: this.#usage?.toJSON() ?? {} };
+    await writeFile(tmpPath, JSON.stringify(state, null, 2));
     await rename(tmpPath, this.#path);
   }
 
-  static async load(path: string): Promise<Registry> {
-    const reg = new Registry(path);
-    let raw: string;
+  static async load(path: string, usage?: Usage): Promise<Registry> {
+    const reg = new Registry(path, usage);
     try {
-      raw = await readFile(path, 'utf8');
-      for (const s of JSON.parse(raw) as Session[]) {
+      const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+      // state.json used to be a bare array of sessions; it is now
+      // { sessions, usage }. Read both shapes so an existing file keeps its
+      // sessions across the upgrade (it just has no usage history to restore) —
+      // a shape change must not be worse than the corrupt-JSON path below.
+      const isNew = !Array.isArray(parsed);
+      const raw = isNew ? (parsed as { sessions?: unknown }).sessions : parsed;
+      if (isNew) usage?.restore((parsed as { usage?: unknown }).usage);
+      // state.json is hand-editable, so treat it as untrusted: a `sessions` value
+      // that is a string would otherwise be iterated character by character into
+      // garbage sessions keyed on `undefined`.
+      for (const s of (Array.isArray(raw) ? raw : []) as Session[]) {
+        if (!s || typeof s.id !== 'string') continue;
         // Agents are children of this process; nothing survived the restart.
         reg.#sessions.set(s.id, {
           ...s,

@@ -90,7 +90,6 @@ export function createServer(opts: {
   registry: Registry;
   usage: Usage;
   accounts: Account[];
-  statePath: string;
 }): Server {
   const { registry, usage, accounts } = opts;
   const handles = new Map<string, AgentHandle>();
@@ -110,7 +109,21 @@ export function createServer(opts: {
     const adapter = account.provider === 'claude' ? claudeAdapter : codexAdapter;
     const handle = adapter.start({ cwd, prompt, env: account.env, resumeId }, (e) => {
       if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
+      if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
+      // A `stopped` session is terminal in the registry, so a handle left in the map
+      // is a lie: `send` returned 200, the still-running subprocess burned tokens on
+      // the prompt, and every event it produced was dropped by the terminal guard.
+      // Drop the handle and shut the agent down for real.
+      //
+      // Ordering is load-bearing, because the Codex adapter's stop() emits its own
+      // `stopped` and so re-enters this callback: delete first, so the re-entrant
+      // pass finds no handle and cannot recurse; apply before stop(), so the real
+      // reason is recorded and the re-entrant "stopped from switchboard" is the one
+      // the terminal guard drops, not the other way round.
+      const dead = handles.get(sessionId);
+      handles.delete(sessionId);
       registry.apply(sessionId, e);
+      dead?.stop();
     });
     handles.set(sessionId, handle);
   }
@@ -156,14 +169,23 @@ export function createServer(opts: {
       }
 
       case 'stop': {
-        handles.get(String(body.id))?.stop();
+        // Delete first, then stop — see the emit callback in launch().
+        const handle = handles.get(String(body.id));
         handles.delete(String(body.id));
+        handle?.stop();
         return { status: 200, json: { ok: true } };
       }
 
       case 'resume': {
         const session = registry.get(String(body.id));
         if (!session) return { status: 404, json: { error: 'no such session' } };
+        // Without this, resume on a live session (or a double-click on Resume)
+        // calls launch(), whose handles.set() overwrites the live handle —
+        // orphaning an agent that no stop() can reach while it still holds write
+        // access to the worktree a second agent is now editing.
+        if (session.status !== 'stopped') {
+          return { status: 409, json: { error: 'session is not stopped' } };
+        }
         const account = accounts.find((a) => a.name === session.account);
         if (!account) return { status: 400, json: { error: 'account no longer configured' } };
         // registry.revive() (not a direct mutation) so subscribers get #notify()'d
@@ -180,8 +202,9 @@ export function createServer(opts: {
 
       case 'delete': {
         const session = registry.get(String(body.id));
-        handles.get(String(body.id))?.stop();
+        const handle = handles.get(String(body.id));
         handles.delete(String(body.id));
+        handle?.stop();
         if (session && body.removeWorktree) {
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
             .catch(() => rm(session.cwd, { recursive: true, force: true }));
@@ -206,12 +229,14 @@ export function createServer(opts: {
     try {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
 
-      if (url.pathname === '/events') {
-        // See hostOk() above: /events is a read, but the snapshot it streams
-        // carries repo paths, branch names, and full session transcripts, so it
-        // gets the same DNS-rebinding guard as the write side.
-        if (!hostOk(req)) { res.writeHead(403).end('forbidden'); return; }
+      // Applied above the route dispatch, with no per-route exemptions: /repos
+      // used to be reachable without it and leaked the decoded path of every
+      // project the user has opened in Claude Code to a rebound attacker page.
+      // Every route here either mutates the machine or returns local paths,
+      // transcripts and repo names, so none of them wants an exemption.
+      if (!hostOk(req)) { res.writeHead(403).end('forbidden'); return; }
 
+      if (url.pathname === '/events') {
         res.writeHead(200, {
           'content-type': 'text/event-stream',
           'cache-control': 'no-cache',
@@ -243,8 +268,6 @@ export function createServer(opts: {
       }
 
       if (url.pathname === '/command' && req.method === 'POST') {
-        if (!hostOk(req)) { res.writeHead(403).end('forbidden'); return; }
-
         // Origin guard: blocks plain cross-origin POST (Origin disagrees with
         // Host), which the hostOk() check above does not — that check only
         // catches a spoofed Host. Any page open in the user's browser can issue
@@ -315,6 +338,34 @@ export function createServer(opts: {
     }
   });
 
+  // Persist on any state change, not just on a command. save()'s only other call
+  // site is the /command handler, so a session that ran to completion unattended
+  // never got past its `create` snapshot: state.json held status "working" with an
+  // empty transcript, and a restart brought back an empty card — exactly the case
+  // restart survival exists for. Coalesced because #notify() fires per SDK
+  // message. The .catch is load-bearing: this runs outside the request handler's
+  // try/catch, where an unguarded rejection is fatal to the whole process and
+  // would take every live agent with it.
+  //
+  // unref()'d rather than flushed on close: the timer must never be the reason
+  // the process stays alive (it would also hold test runs open for 2s each, and
+  // fire a write into an already-deleted temp dir), while the server handle keeps
+  // the loop alive for as long as saving actually matters. Cleared on 'close' too
+  // so a closed server can't write after its state dir is gone.
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  const unsubSave = registry.subscribe(() => {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      void registry.save().catch(() => {});
+    }, 2000).unref();
+  });
+  server.on('close', () => {
+    unsubSave();
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+  });
+
   return server;
 }
 
@@ -324,8 +375,8 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   const accounts = JSON.parse(
     await readFile(new URL('../accounts.json', import.meta.url), 'utf8'),
   ) as Account[];
-  const registry = await Registry.load(statePath);
   const usage = new Usage();
-  createServer({ registry, usage, accounts, statePath })
+  const registry = await Registry.load(statePath, usage);
+  createServer({ registry, usage, accounts })
     .listen(4711, '127.0.0.1', () => console.log('switchboard on http://127.0.0.1:4711'));
 }

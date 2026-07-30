@@ -6,9 +6,31 @@ export class Usage {
   #samples = new Map<string, Sample[]>();
 
   record(account: string, inputTokens: number, outputTokens: number, now = Date.now()): void {
-    const list = this.#samples.get(account) ?? [];
+    // Prune on write: samples outside the trailing window can never affect pace()
+    // again, and this list is now persisted to state.json — unpruned it would be a
+    // file that only grows for the lifetime of the install.
+    const list = (this.#samples.get(account) ?? []).filter((s) => s.t > now - WINDOW_MS);
     list.push({ t: now, tokens: inputTokens + outputTokens });
     this.#samples.set(account, list);
+  }
+
+  /** Serialized into state.json alongside sessions so pace survives a restart. */
+  toJSON(): Record<string, Sample[]> {
+    return Object.fromEntries(this.#samples);
+  }
+
+  /** Inverse of toJSON(). Tolerates anything: state.json is user-editable and may
+   *  predate usage persistence entirely, so bad input is dropped, not thrown on. */
+  restore(data: unknown, now = Date.now()): void {
+    if (!data || typeof data !== 'object') return;
+    const cutoff = now - WINDOW_MS;
+    for (const [account, list] of Object.entries(data as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue;
+      const kept = (list as Sample[]).filter(
+        (s) => s && typeof s.t === 'number' && typeof s.tokens === 'number' && s.t > cutoff,
+      );
+      if (kept.length) this.#samples.set(account, kept);
+    }
   }
 
   /** Fraction of `budget` spent in the trailing five hours. Can exceed 1. */

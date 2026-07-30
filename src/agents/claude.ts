@@ -181,6 +181,7 @@ export const claudeAdapter: Adapter = {
     const input = inputQueue();
     const approvals = approvalQueue();
     let approvalSeq = 0;
+    let stopped = false;
 
     const canUseTool = (
       toolName: string,
@@ -227,7 +228,12 @@ export const claudeAdapter: Adapter = {
         emit({ type: 'approval-resolved' });
         if (outcome.next) emit({ type: 'approval', request: outcome.next });
       },
+      // Idempotent: the server now calls stop() from its own `stopped` handler as
+      // well as from the stop/delete commands, so this runs more than once per
+      // session by design.
       stop() {
+        if (stopped) return;
+        stopped = true;
         input.close();
         void q.interrupt().catch(() => {});
       },

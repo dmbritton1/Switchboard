@@ -17,6 +17,20 @@ test('pace ignores samples older than five hours', () => {
   assert.equal(u.pace('main', 1000, 6 * HOUR), 0);
 });
 
+test('record prunes samples that have fallen out of the window', () => {
+  const u = new Usage();
+  u.record('main', 500, 500, 0);
+  u.record('main', 50, 50, 2 * HOUR);
+  assert.equal(u.toJSON().main.length, 2);
+
+  u.record('main', 100, 100, 6 * HOUR);
+  assert.deepEqual(
+    u.toJSON().main,
+    [{ t: 2 * HOUR, tokens: 100 }, { t: 6 * HOUR, tokens: 200 }],
+    'the 0h sample is outside the 5h window and must not be kept (it is now persisted)',
+  );
+});
+
 test('pace of an account with no samples is zero', () => {
   const u = new Usage();
   assert.equal(u.pace('never-used', 1000, 0), 0);

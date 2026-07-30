@@ -39,7 +39,7 @@ async function boot(t: { after: (fn: () => void) => void }) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'));
   const usage = new Usage();
-  const server = createServer({ registry, usage, accounts, statePath: join(dir, 'state.json') });
+  const server = createServer({ registry, usage, accounts });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
@@ -134,6 +134,47 @@ test('GET /events with a foreign Host is rejected', async (t) => {
     headers: { host: 'evil.example:9999' },
   });
   assert.equal(res.status, 403);
+});
+
+test('GET /repos with a foreign Host is rejected', async (t) => {
+  const { base } = await boot(t);
+  const res = await rawRequest(new URL(`${base}/repos`), {
+    method: 'GET',
+    headers: { host: 'evil.example:9999' },
+  });
+  assert.equal(res.status, 403, '/repos returns decoded local repo paths; it needs the guard too');
+});
+
+test('POST /command send to a session with no live agent is not a 200', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'exit 1' });
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'send', id: s.id, text: 'hi' }),
+  });
+  assert.equal(res.status, 404, 'a 200 here means the prompt was silently dropped');
+  assert.deepEqual(registry.get(s.id)!.transcript, [], 'and nothing was appended');
+});
+
+test('POST /command resume is rejected unless the session is stopped', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  assert.equal(registry.get(s.id)!.status, 'working');
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'resume', id: s.id }),
+  });
+  assert.equal(res.status, 409, 'resume must not launch a second agent into a live worktree');
+  assert.equal(registry.get(s.id)!.status, 'working', 'and must not have revived anything');
 });
 
 test('POST /command delete removes the session', async (t) => {
