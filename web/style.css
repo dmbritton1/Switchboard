@@ -45,6 +45,10 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    padding (which would indent the account cards too, for no reason). */
 .card-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
 .card-head .select { cursor: pointer; line-height: 0; }
+.tree-btn { margin-left: auto; padding: .15rem .5rem; border-radius: 6px;
+  border: 1px solid var(--line); background: #232323; color: var(--dim);
+  font: inherit; font-size: .75rem; cursor: pointer; }
+.tree-btn:hover { color: var(--fg); border-color: var(--done); }
 #selection-bar { grid-column: 1 / -1; position: sticky; top: 0; z-index: 2;
   display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
@@ -74,6 +78,44 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #chat.dropping { outline: 2px dashed var(--working); outline-offset: 6px; border-radius: 8px; }
 #upload-error { margin: .5rem 0 0; color: #e05555; font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
+
+/* ---- Commit graph ------------------------------------------------------ */
+/* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
+   interchange where two lines join. Lane colours reuse the status palette —
+   there are no status chips in this view, so nothing collides, and the app
+   keeps one set of colours instead of two. */
+#graph { --row: 34px; --lane: 24px; }
+#graph header { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
+#graph h2 { margin: 0; font-size: 1.05rem; font-weight: 700; }
+#graph-back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--line);
+  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#graph-map { position: relative; }
+#graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
+.lane0 { color: #e0574a; } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
+.lane3 { color: #22b3a4; } .lane4 { color: #9d7bff; } .lane5 { color: var(--working); }
+#graph-svg path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
+#graph-svg circle { stroke: currentColor; fill: currentColor; stroke-width: 2.5; }
+/* Hollow stop = a merge: two lines arriving, the way an interchange is drawn. */
+#graph-svg circle.merge { fill: var(--bg); }
+#graph-svg circle.head { stroke-width: 3; }
+.commit { height: var(--row); display: flex; align-items: center; gap: .7rem;
+  padding: 0 .6rem; border-radius: 6px; white-space: nowrap; }
+.commit:hover { background: var(--card); }
+.commit .hash { color: var(--dim); font-family: var(--mono); font-size: .78rem; flex: none; }
+.commit .subject { overflow: hidden; text-overflow: ellipsis; font-size: .9em; }
+.commit .when { margin-left: auto; padding-left: 1rem; color: var(--dim);
+  font-size: .8rem; flex: none; }
+/* Branches move, tags don't — so branch pills are rounded and tag pills are cut
+   square. HEAD gets the double ring an interchange station gets on a real map. */
+.ref { flex: none; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; padding: .2rem .45rem; border-radius: 999px;
+  background: currentColor; }
+.ref > span { color: #111; }
+.ref.tag { border-radius: 4px; }
+.ref.head { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px currentColor; }
+.ref.remote { background: none; box-shadow: inset 0 0 0 1px var(--line); }
+.ref.remote > span { color: var(--dim); }
+#graph-empty { color: var(--dim); }
 
 /* ---- New worktree dialog ---------------------------------------------- */
 /* Wide enough that an absolute repo path fits on one line: the whole point of

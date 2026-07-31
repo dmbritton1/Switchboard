@@ -45,7 +45,15 @@ function elapsed(since) {
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
 }
 
+// Session whose commit graph is open, and the commits last fetched for it.
+// Graph data is not in the SSE snapshot: commits change when the agent commits
+// or the user merges, neither of which is a session-state event, so this view
+// polls instead of riding render().
+let graphId = null;
+let graphCommits = [];
+
 function render() {
+  if (graphId) return renderGraph();
   openId ? renderChat() : renderGrid();
 }
 
@@ -62,6 +70,7 @@ const STATUS_THROTTLE_MS = 4000;
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#chat').hidden = true;
+  $('#graph').hidden = true;
   const grid = $('#grid');
   grid.hidden = false;
   grid.replaceChildren();
@@ -214,9 +223,17 @@ function card(s, fetchStatus) {
   status.className = `status ${s.status}`;
   status.textContent = `${s.status} · ${elapsed(s.statusSince)}`;
 
+  // The card itself opens the chat, so this has to stop the click from bubbling.
+  const tree = document.createElement('button');
+  tree.className = 'tree-btn';
+  tree.type = 'button';
+  tree.title = 'Commit graph';
+  tree.textContent = 'graph';
+  tree.onclick = (e) => { e.stopPropagation(); openGraph(s.id); };
+
   const head = document.createElement('div');
   head.className = 'card-head';
-  head.append(select, status);
+  head.append(select, status, tree);
 
   const branch = document.createElement('div');
   branch.className = 'branch';
@@ -323,6 +340,7 @@ function renderChat() {
   const s = state.sessions.find((x) => x.id === openId);
   if (!s) { openId = null; return renderGrid(); }
   $('#grid').hidden = true;
+  $('#graph').hidden = true;
   $('#chat').hidden = false;
   $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
 
@@ -358,6 +376,121 @@ function renderChat() {
   if (nearBottom) t.scrollIntoView({ block: 'end' });
 }
 
+// ---- Commit graph -------------------------------------------------------
+const ROW = 34, LANE = 24, PAD = 14, DOT = 5;
+const svgEl = (tag, attrs) => {
+  const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+};
+
+function drawGraph(commits) {
+  const at = new Map(commits.map((c) => [c.h, c]));
+  const svg = $('#graph-svg');
+  const width = PAD * 2 + Math.max(0, ...commits.map((c) => c.lane)) * LANE;
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', commits.length * ROW);
+  svg.replaceChildren();
+  const x = (c) => PAD + c.lane * LANE;
+  const y = (c) => ROW / 2 + c.row * ROW;
+
+  for (const c of commits) {
+    for (const [i, ph] of c.p.entries()) {
+      const p = at.get(ph);
+      // Parent outside the fetched window: its line simply ends at the bottom.
+      if (!p) continue;
+      const [x1, y1, x2, y2] = [x(c), y(c), x(p), y(p)];
+      // The line holds its own lane and only swings across near the parent, so a
+      // merge reads as an interchange instead of a diagonal cutting the map.
+      const bend = Math.max(y1, y2 - ROW);
+      const d = x1 === x2
+        ? `M${x1},${y1}V${y2}`
+        : `M${x1},${y1}V${bend}C${x1},${y2} ${x2},${bend} ${x2},${y2}`;
+      // A merge's second parent is drawn in the parent's colour, not the child's:
+      // that line belongs to the branch being merged in.
+      svg.append(svgEl('path', { d, class: `lane${(i ? p.lane : c.lane) % 6}` }));
+    }
+  }
+  for (const c of commits) {
+    const head = c.refs.some((r) => r.startsWith('HEAD'));
+    svg.append(svgEl('circle', {
+      cx: x(c), cy: y(c), r: head ? DOT + 1.5 : DOT,
+      class: `lane${c.lane % 6}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+    }));
+  }
+  return width;
+}
+
+function refPill(raw, lane) {
+  const tag = raw.startsWith('tag: ');
+  const name = raw.replace(/^tag: /, '').replace(/^HEAD -> /, '');
+  const pill = document.createElement('span');
+  pill.className = `ref lane${lane % 6}${tag ? ' tag' : ''}`
+    + (!tag && name.includes('/') ? ' remote' : '') + (raw.startsWith('HEAD') ? ' head' : '');
+  // Branch and tag names come from the repo, so they go in as text, never markup.
+  const label = document.createElement('span');
+  label.textContent = name;
+  pill.append(label);
+  return pill;
+}
+
+function renderGraph() {
+  const s = state.sessions.find((x) => x.id === graphId);
+  if (!s) { graphId = null; return renderGrid(); }
+  $('#grid').hidden = true;
+  $('#chat').hidden = true;
+  $('#graph').hidden = false;
+  $('#graph-title').textContent = `${s.branch} · commit graph`;
+
+  const rows = $('#graph-rows');
+  if (!graphCommits.length) {
+    rows.replaceChildren(Object.assign(document.createElement('p'), {
+      id: 'graph-empty', textContent: 'No commits yet.',
+    }));
+    $('#graph-svg').replaceChildren();
+    return;
+  }
+  const width = drawGraph(graphCommits);
+  rows.replaceChildren(...graphCommits.map((c) => {
+    const row = document.createElement('div');
+    row.className = 'commit';
+    row.style.marginLeft = `${width + 14}px`;
+    const hash = document.createElement('span');
+    hash.className = 'hash';
+    hash.textContent = c.h.slice(0, 7);
+    row.append(hash);
+    for (const r of c.refs) row.append(refPill(r, c.lane));
+    const subject = document.createElement('span');
+    subject.className = 'subject';
+    subject.textContent = c.subject;
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = `${c.author} · ${c.when}`;
+    row.append(subject, when);
+    return row;
+  }));
+}
+
+async function loadGraph() {
+  if (!graphId) return;
+  const id = graphId;
+  const commits = await fetch(`/graph?id=${id}`).then((r) => r.json()).catch(() => null);
+  // The view can close or switch sessions while this is in flight; dropping a
+  // stale response keeps one session's commits from landing under another's.
+  if (!commits || graphId !== id) return;
+  graphCommits = commits;
+  renderGraph();
+}
+setInterval(loadGraph, 2000);
+
+function openGraph(id) {
+  graphId = id;
+  graphCommits = [];
+  render();
+  loadGraph();
+}
+
+$('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
 
 $('#composer').onsubmit = (e) => {
