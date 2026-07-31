@@ -433,3 +433,24 @@ test('GET /graph is behind the Host guard like every other route', async (t) => 
   });
   assert.equal(res.status, 403);
 });
+
+test('POST /command resume on a session whose worktree is gone reports that, not an SDK error', async (t) => {
+  const { base, registry } = await boot(t);
+  const gone = join(tmpdir(), `sb-not-here-${Date.now()}`);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: gone, branch: 'b', title: 't',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'done' });
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'resume', id: s.id }),
+  });
+
+  assert.equal(res.status, 409);
+  // Spawning into a missing cwd surfaces as a bogus "native binary does not
+  // match this platform" from the SDK, which sends you debugging the wrong thing.
+  assert.match((await res.json()).error, /worktree is gone/);
+  assert.equal(registry.get(s.id)!.status, 'stopped', 'and the session must not have been revived');
+});

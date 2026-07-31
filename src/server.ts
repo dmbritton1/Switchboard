@@ -246,6 +246,14 @@ export function createServer(opts: {
         }
         const account = accounts.find((a) => a.name === session.account);
         if (!account) return { status: 400, json: { error: 'account no longer configured' } };
+        // A worktree can be removed (merged and cleaned up, or deleted by hand)
+        // while its session card lives on. Spawning into a missing cwd makes the
+        // Claude SDK report a native-binary/platform mismatch — the binary is
+        // fine, the directory is gone — so check here and say what actually
+        // happened rather than passing that error on.
+        if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
+          return { status: 409, json: { error: `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree` } };
+        }
         // registry.revive() (not a direct mutation) so subscribers get #notify()'d
         // immediately; neither adapter emits a synchronous status event at start(),
         // so without this an SSE client would keep showing 'stopped' until the
