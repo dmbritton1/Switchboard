@@ -28,6 +28,61 @@ export async function createWorktree(repo: string, branch: string): Promise<stri
   return path;
 }
 
+export type GraphCommit = {
+  h: string; p: string[]; subject: string; author: string; when: string;
+  refs: string[]; lane: number; row: number;
+};
+
+/** Index of a reusable lane, appending one if all are busy. */
+function freeLane(lanes: (string | null)[]): number {
+  const i = lanes.indexOf(null);
+  if (i !== -1) return i;
+  lanes.push(null);
+  return lanes.length - 1;
+}
+
+/**
+ * Assign each commit a lane (column). `commits` must be in topo order.
+ *
+ * A lane is reserved by a child for its parent, so a commit inherits whichever
+ * lane claimed it first and every other lane pointing at it is released — that
+ * release is what closes a branch's line after a merge instead of leaving a
+ * dead column running down the rest of the graph.
+ */
+export function assignLanes<T extends { h: string; p: string[] }>(
+  commits: T[],
+): (T & { lane: number; row: number })[] {
+  const lanes: (string | null)[] = [];
+  return commits.map((c, row) => {
+    const lane = lanes.includes(c.h) ? lanes.indexOf(c.h) : freeLane(lanes);
+    for (let i = 0; i < lanes.length; i++) if (i !== lane && lanes[i] === c.h) lanes[i] = null;
+    lanes[lane] = c.p[0] ?? null;
+    for (const extra of c.p.slice(1)) if (!lanes.includes(extra)) lanes[freeLane(lanes)] = extra;
+    return Object.assign(c, { lane, row });
+  });
+}
+
+/**
+ * Commits across every branch, laid out for drawing. `--all` reads the whole
+ * repo, so any one worktree's cwd shows the same full picture.
+ */
+export async function commitGraph(cwd: string, limit = 400): Promise<GraphCommit[]> {
+  const { stdout } = await run(
+    'git',
+    ['log', '--all', '--topo-order', `-${limit}`, '--format=%H%x00%P%x00%s%x00%an%x00%ar%x00%D'],
+    { cwd },
+  );
+  const commits = stdout.split('\n').filter(Boolean).map((line) => {
+    const [h, p, subject, author, when, refs] = line.split('\0');
+    return {
+      h, subject, author, when,
+      p: p ? p.split(' ') : [],
+      refs: refs.split(',').map((r) => r.trim()).filter(Boolean),
+    };
+  });
+  return assignLanes(commits);
+}
+
 export async function worktreeStatus(cwd: string): Promise<{
   branch: string; added: number; removed: number; dirty: boolean;
 }> {

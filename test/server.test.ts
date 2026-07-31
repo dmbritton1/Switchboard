@@ -394,3 +394,42 @@ test('POST /command auto sets the flag on a stopped session, which has no live h
   // still has to stick so the next resume() launches with auto already on.
   assert.equal(registry.get(s.id)!.auto, true);
 });
+
+test('GET /graph returns the laid-out commits for a session', async (t) => {
+  const { base, registry } = await boot(t);
+  const dir = await mkdtemp(join(tmpdir(), 'sb-repo-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await run('git', ['init', '-b', 'main'], { cwd: dir });
+  await run('git', ['config', 'user.email', 't@t.t'], { cwd: dir });
+  await run('git', ['config', 'user.name', 'T'], { cwd: dir });
+  await writeFile(join(dir, 'a.txt'), 'one\n');
+  await run('git', ['add', '.'], { cwd: dir });
+  await run('git', ['commit', '-m', 'init'], { cwd: dir });
+
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: dir,
+    cwd: dir, branch: 'main', title: 't',
+  });
+
+  const res = await fetch(`${base}/graph?id=${s.id}`);
+  assert.equal(res.status, 200);
+  const commits = await res.json();
+  assert.equal(commits.length, 1);
+  assert.equal(commits[0].subject, 'init');
+  assert.equal(commits[0].lane, 0);
+  assert.ok(commits[0].refs.includes('HEAD -> main'));
+});
+
+test('GET /graph for an unknown session is a 404, not a crash', async (t) => {
+  const { base } = await boot(t);
+  const res = await fetch(`${base}/graph?id=nope`);
+  assert.equal(res.status, 404);
+});
+
+test('GET /graph is behind the Host guard like every other route', async (t) => {
+  const { base } = await boot(t);
+  const res = await rawRequest(new URL(`${base}/graph?id=nope`), {
+    method: 'GET', headers: { Host: 'evil.example' },
+  });
+  assert.equal(res.status, 403);
+});
