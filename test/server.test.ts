@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
@@ -189,4 +189,46 @@ test('POST /command delete removes the session', async (t) => {
   });
   assert.equal(res.status, 200);
   assert.equal(registry.all().length, 0);
+});
+
+test('POST /upload writes the file into the session worktree', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const res = await fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST',
+    body: 'hello file',
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { path: 'uploads/notes.txt' });
+  assert.equal(await readFile(join(wt, 'uploads', 'notes.txt'), 'utf8'), 'hello file');
+});
+
+test('POST /upload rejects a filename that escapes the worktree', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+  // Unique so a leftover file from an earlier run can never make this pass.
+  const escapee = `escaped-${s.id}.txt`;
+
+  const res = await fetch(
+    `${base}/upload?id=${s.id}&name=${encodeURIComponent(`../${escapee}`)}`,
+    { method: 'POST', body: 'pwned' },
+  );
+
+  assert.equal(res.status, 400);
+  await assert.rejects(
+    stat(join(dirname(wt), escapee)),
+    'a rejected name must not have written anything outside the worktree',
+  );
 });
