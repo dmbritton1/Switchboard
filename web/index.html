@@ -52,7 +52,12 @@
                 placeholder="What should the agent do?"></textarea>
     </div>
     <p id="new-error"></p>
-    <menu><button value="cancel">Cancel</button><button id="create" value="create">Create worktree</button></menu>
+    <!-- formnovalidate: without it, Cancel is still a type=submit button inside
+         a form with required fields, so clicking it while any of them are
+         empty runs the browser's native constraint validation and blocks the
+         dialog's method="dialog" close entirely — Cancel silently does
+         nothing on the form's default (empty) state. -->
+    <menu><button value="cancel" formnovalidate>Cancel</button><button id="create" value="create">Create worktree</button></menu>
   </form>
 </dialog>
 <script type="module" src="/app.js"></script>
