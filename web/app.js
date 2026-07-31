@@ -576,5 +576,33 @@ $('#new').addEventListener('close', async (e) => {
   }
 });
 
-if (Notification.permission === 'default') Notification.requestPermission();
+// Chrome and Safari largely ignore (or silently fall back to a "quiet",
+// easy-to-miss UI for) a requestPermission() call that isn't the direct result
+// of a user click — a call fired from page load routinely shows the user
+// nothing, and they're never notified with no way to tell why. A persistent
+// banner tied to a real button click is the reliable way to get the actual
+// native prompt, and it also surfaces the 'denied' case up front, which no
+// amount of re-requesting can recover from — only the browser's own
+// site-settings UI can undo that, so we just point the user at it.
+function updateNotifBar() {
+  const bar = $('#notif-bar');
+  if (!('Notification' in window)) { bar.hidden = true; return; }
+  const btn = $('#notif-btn');
+  if (Notification.permission === 'granted') { bar.hidden = true; return; }
+  bar.hidden = false;
+  if (Notification.permission === 'denied') {
+    $('#notif-msg').textContent =
+      "Notifications are blocked for this page — enable them in your browser's site settings to hear about sessions that need you.";
+    btn.hidden = true;
+  } else {
+    $('#notif-msg').textContent =
+      "Turn on notifications so you know when a session needs you, even when this tab isn't in front.";
+    btn.hidden = false;
+  }
+}
+$('#notif-btn').onclick = async () => {
+  await Notification.requestPermission();
+  updateNotifBar();
+};
+updateNotifBar();
 setInterval(render, 30_000); // keeps the elapsed times honest
