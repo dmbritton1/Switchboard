@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { request as httpRequest } from 'node:http';
@@ -230,5 +230,31 @@ test('POST /upload rejects a filename that escapes the worktree', async (t) => {
   await assert.rejects(
     stat(join(dirname(wt), escapee)),
     'a rejected name must not have written anything outside the worktree',
+  );
+});
+
+test('POST /upload refuses to follow a symlinked uploads directory', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const outside = await mkdtemp(join(tmpdir(), 'sb-outside-'));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  // Simulates a tracked symlink materialized by `git worktree add` from an
+  // untrusted branch: uploads/ points somewhere outside the worktree entirely.
+  await symlink(outside, join(wt, 'uploads'));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const res = await fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST',
+    body: 'pwned',
+  });
+
+  assert.equal(res.status, 400);
+  await assert.rejects(
+    stat(join(outside, 'notes.txt')),
+    'a refused upload must not have written anything into the symlink target',
   );
 });

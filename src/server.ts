@@ -1,6 +1,6 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Server } from 'node:http';
-import { readFile, readdir, rm, stat, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rm, stat, lstat, mkdir, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
@@ -356,8 +356,25 @@ export function createServer(opts: {
           }
           chunks.push(c as Buffer);
         }
-        await mkdir(join(session.cwd, 'uploads'), { recursive: true });
-        await writeFile(join(session.cwd, 'uploads', name), Buffer.concat(chunks));
+        // mkdir({recursive:true}) is a no-op if uploads already exists, and
+        // writeFile follows symlinks — so a tracked symlink named uploads/ (or
+        // uploads/<name>) checked out by an untrusted branch could redirect this
+        // write outside the worktree. lstat (unlike stat) doesn't follow
+        // symlinks, so it tells us the truth about what's actually there. A
+        // missing path is fine — that's the normal new-file case — only an
+        // existing symlink is refused.
+        const uploadsDir = join(session.cwd, 'uploads');
+        const target = join(uploadsDir, name);
+        for (const p of [uploadsDir, target]) {
+          const st = await lstat(p).catch(() => null);
+          if (st?.isSymbolicLink()) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
+            return;
+          }
+        }
+        await mkdir(uploadsDir, { recursive: true });
+        await writeFile(target, Buffer.concat(chunks));
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ path: `uploads/${name}` }));
         return;

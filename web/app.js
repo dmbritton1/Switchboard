@@ -219,8 +219,6 @@ function renderChat() {
   $('#grid').hidden = true;
   $('#chat').hidden = false;
   $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
-  // Clear any upload error from a previous session, since errors belong to the session they occurred in.
-  $('#upload-error').textContent = '';
 
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
@@ -228,6 +226,11 @@ function renderChat() {
   // The first render after opening a card always scrolls — that one is the user
   // asking to see the latest, not reading back.
   const firstOpen = scrolledFor !== openId;
+  // Clear any upload error from a previous session, but only on an actual
+  // session switch: renderChat() re-runs on every SSE snapshot and on a 30s
+  // interval while the agent works, so an unconditional clear here erased the
+  // error before the user had a chance to read it.
+  if (firstOpen) $('#upload-error').textContent = '';
   scrolledFor = openId;
   const nearBottom = firstOpen
     || window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 120;
