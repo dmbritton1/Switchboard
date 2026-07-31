@@ -29,6 +29,7 @@ export class Registry {
       id: randomUUID(),
       vendorSessionId: null,
       status: 'working',
+      auto: false,
       transcript: [],
       pending: null,
       stoppedReason: null,
@@ -125,6 +126,16 @@ export class Registry {
     this.#notify();
   }
 
+  /** Sets the auto-approve flag. Separate from apply() because this is a user
+   *  decision, not an adapter event — and it must work on a `stopped` session,
+   *  which apply()'s terminal guard would drop. */
+  setAuto(id: string, on: boolean): void {
+    const s = this.#sessions.get(id);
+    if (!s || s.auto === on) return;
+    s.auto = on;
+    this.#notify();
+  }
+
   subscribe(fn: () => void): () => void {
     this.#subs.add(fn);
     return () => this.#subs.delete(fn);
@@ -184,6 +195,9 @@ export class Registry {
           statusSince: Date.now(),
           stoppedReason: s.stoppedReason ?? 'switchboard restarted',
           pending: null,
+          // Predates the auto toggle in any state.json written before it existed,
+          // and `undefined` would render as an indeterminate checkbox.
+          auto: s.auto ?? false,
         });
       }
     } catch {

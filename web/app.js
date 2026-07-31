@@ -216,7 +216,7 @@ function card(s, fetchStatus) {
 
   const head = document.createElement('div');
   head.className = 'card-head';
-  head.append(select, status);
+  head.append(select, status, autoToggle(s));
 
   const branch = document.createElement('div');
   branch.className = 'branch';
@@ -255,6 +255,27 @@ function card(s, fetchStatus) {
   if (s.status === 'working' || s.status === 'needs-you') el.append(stopButton(s));
   el.append(deleteControl(s));
   return el;
+}
+
+/**
+ * Auto-approve toggle. Codex sessions never prompt in the first place
+ * (approvalPolicy 'never'), so the checkbox would be a lie there — show it
+ * disabled and explain, rather than offering a switch that changes nothing.
+ */
+function autoToggle(s) {
+  const label = document.createElement('label');
+  label.className = 'auto';
+  label.onclick = (e) => e.stopPropagation();
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = s.auto;
+  box.disabled = s.provider === 'codex';
+  label.title = s.provider === 'codex'
+    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
+    : 'Approve every tool call automatically, without asking';
+  box.onchange = () => send({ cmd: 'auto', id: s.id, auto: box.checked });
+  label.append(box, ' auto');
+  return label;
 }
 
 function stopButton(s) {
@@ -325,6 +346,9 @@ function renderChat() {
   $('#grid').hidden = true;
   $('#chat').hidden = false;
   $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
+  // Rebuilt rather than mutated: renderChat() runs on every SSE snapshot, so the
+  // checkbox has to re-read s.auto to stay honest if another tab flips it.
+  $('#chat-auto').replaceChildren(autoToggle(s));
 
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling

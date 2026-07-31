@@ -185,3 +185,23 @@ test('a tool_result still correlates when content is an array', () => {
     [{ type: 'tool-result', id: 't9', ok: false }],
   );
 });
+
+test('draining the approval queue settles every queued request, not just the head', async () => {
+  // Mirrors what setAuto(true) does: loop resolve() until it reports nothing
+  // left. resolve() returns a truthy {next} even when next is null, so the loop
+  // must key on the null return, not on `next` — getting that backwards would
+  // strand every request after the first with the agent still awaiting it.
+  const q = approvalQueue();
+  const settled: string[] = [];
+  for (const id of ['a1', 'a2', 'a3']) {
+    const { promise } = q.wait({ id, tool: 'Bash', summary: id });
+    void promise.then((r) => settled.push(`${id}:${r.behavior}`));
+  }
+
+  let passes = 0;
+  while (q.resolve({ behavior: 'allow', updatedInput: {} })) passes++;
+
+  await Promise.resolve();
+  assert.equal(passes, 3, 'all three must be resolved, and the loop must then stop');
+  assert.deepEqual(settled, ['a1:allow', 'a2:allow', 'a3:allow']);
+});

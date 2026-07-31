@@ -374,3 +374,23 @@ test('POST /upload refuses to follow a symlinked uploads directory', async (t) =
     'a refused upload must not have written anything into the symlink target',
   );
 });
+
+test('POST /command auto sets the flag on a stopped session, which has no live handle', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'done' });
+  assert.equal(registry.get(s.id)!.auto, false, 'sessions start off, not on');
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'auto', id: s.id, auto: true }),
+  });
+
+  assert.equal(res.status, 200);
+  // The point of setting it registry-side: no handle exists here, and the flag
+  // still has to stick so the next resume() launches with auto already on.
+  assert.equal(registry.get(s.id)!.auto, true);
+});

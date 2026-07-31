@@ -134,6 +134,9 @@ export const codexAdapter: Adapter = {
       },
       // Codex approvals are policy, not interactive. Nothing to decide.
       decide() {},
+      // Already effectively auto — approvalPolicy 'never' above. The toggle has
+      // nothing to switch, but the handle must satisfy AgentHandle.
+      setAuto() {},
       // Idempotent, and load-bearing so: the server calls stop() from its own
       // `stopped` handler, and this stop() emits `stopped` — without the early
       // return a UI double-click, or drain()'s failure path, would re-enter.

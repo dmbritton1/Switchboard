@@ -194,11 +194,15 @@ export const claudeAdapter: Adapter = {
     const approvals = approvalQueue();
     let approvalSeq = 0;
     let stopped = false;
+    let auto = opts.auto ?? false;
 
     const canUseTool = (
       toolName: string,
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
+      // Read at call time, not captured: setAuto() can flip this mid-session and
+      // every later tool call must see the new value.
+      if (auto) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
       const request = { id: `a${++approvalSeq}`, tool: toolName, summary: summarize(toolName, toolInput) };
       const { promise, isHead } = approvals.wait(request);
       if (isHead) emit({ type: 'approval', request });
@@ -207,6 +211,9 @@ export const claudeAdapter: Adapter = {
 
     const options: Options = {
       cwd: opts.cwd,
+      // canUseTool stays wired even when `auto` starts true: the flag is checked
+      // inside it, so turning auto back off restores prompting on a session whose
+      // callback was never removed.
       env: { ...process.env, ...opts.env } as Options['env'],
       canUseTool,
       ...(opts.resumeId ? { resume: opts.resumeId } : {}),
@@ -239,6 +246,17 @@ export const claudeAdapter: Adapter = {
         if (!outcome) return;
         emit({ type: 'approval-resolved' });
         if (outcome.next) emit({ type: 'approval', request: outcome.next });
+      },
+      // Turning auto on has to clear what is already queued, not just future
+      // calls: the tool call blocking right now is the reason the user reached
+      // for the toggle, and leaving it pending would strand the agent waiting on
+      // an Allow button the card no longer shows.
+      setAuto(on: boolean) {
+        auto = on;
+        if (!on) return;
+        let drained = false;
+        while (approvals.resolve({ behavior: 'allow', updatedInput: {} })) drained = true;
+        if (drained) emit({ type: 'approval-resolved' });
       },
       // Idempotent: the server now calls stop() from its own `stopped` handler as
       // well as from the stop/delete commands, so this runs more than once per

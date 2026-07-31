@@ -21,6 +21,9 @@ export type Session = {
   branch: string;
   title: string;
   status: Status;
+  /** Auto-approve every tool call instead of asking. Codex sessions ignore it —
+   *  their SDK has no interactive approval to skip (see codex.ts approvalPolicy). */
+  auto: boolean;
   transcript: Msg[];
   pending: ApprovalRequest | null;
   stoppedReason: string | null;
@@ -43,11 +46,15 @@ export type StartOpts = {
   prompt: string;
   env: Record<string, string>;
   resumeId?: string;
+  /** Start with auto-approval already on, so a resumed session keeps the toggle
+   *  it had before the restart rather than silently reverting to prompting. */
+  auto?: boolean;
 };
 
 export type AgentHandle = {
   send(text: string): void;
   decide(allow: boolean): void;
+  setAuto(on: boolean): void;
   stop(): void;
 };
 

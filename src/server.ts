@@ -153,7 +153,8 @@ export function createServer(opts: {
 
   function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
     const adapter = account.provider === 'claude' ? claudeAdapter : codexAdapter;
-    const handle = adapter.start({ cwd, prompt, env: account.env, resumeId }, (e) => {
+    const auto = registry.get(sessionId)?.auto ?? false;
+    const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
       if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
       if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
@@ -212,6 +213,17 @@ export function createServer(opts: {
         if (!handle) return { status: 404, json: { error: 'no live session' } };
         handle.decide(Boolean(body.allow));
         return { status: 200, json: { ok: true } };
+      }
+
+      case 'auto': {
+        const session = registry.get(String(body.id));
+        if (!session) return { status: 404, json: { error: 'no such session' } };
+        const on = Boolean(body.auto);
+        // Registry first, so the flag sticks (and survives a restart) even for a
+        // stopped session with no live handle to tell.
+        registry.setAuto(session.id, on);
+        handles.get(session.id)?.setAuto(on);
+        return { status: 200, json: { ok: true, auto: on } };
       }
 
       case 'stop': {
