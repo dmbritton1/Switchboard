@@ -7,7 +7,11 @@
 <section id="chat" hidden>
   <header><button id="back">← grid</button><h2 id="chat-title"></h2></header>
   <div id="transcript"></div>
-  <form id="composer"><input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button></form>
+  <form id="composer">
+    <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
+    <input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button>
+  </form>
+  <p id="upload-error"></p>
 </section>
 <dialog id="new">
   <form method="dialog">

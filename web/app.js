@@ -257,6 +257,51 @@ $('#composer').onsubmit = (e) => {
   send({ cmd: 'send', id: openId, text });
 };
 
+// Uploads go straight to disk in the session's worktree and come back as a
+// relative path, which is appended to the prompt box. The agent then opens it
+// like any other file in the repo — no adapter or transcript change needed.
+async function upload(files) {
+  if (!openId || !files.length) return;
+  $('#upload-error').textContent = '';
+  for (const file of files) {
+    let path;
+    try {
+      const res = await fetch(`/upload?id=${openId}&name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: file,
+      });
+      if (!res.ok) throw new Error((await res.json()).error ?? res.status);
+      ({ path } = await res.json());
+    } catch (err) {
+      // Surfaced, not swallowed: a silently dropped upload turns into the user
+      // sending a path that does not exist and the agent reporting confusion.
+      $('#upload-error').textContent = `could not attach ${file.name}: ${err.message}`;
+      return;
+    }
+    const box = $('#prompt');
+    box.value = box.value ? `${box.value} ${path}` : path;
+  }
+  $('#prompt').focus();
+}
+
+$('#attach input').onchange = (e) => {
+  upload(e.target.files);
+  // Cleared so picking the same file twice in a row still fires `change`.
+  e.target.value = '';
+};
+
+const chat = $('#chat');
+chat.addEventListener('dragover', (e) => {
+  e.preventDefault(); // Without this the browser navigates to the dropped file.
+  chat.classList.add('dropping');
+});
+chat.addEventListener('dragleave', () => chat.classList.remove('dropping'));
+chat.addEventListener('drop', (e) => {
+  e.preventDefault();
+  chat.classList.remove('dropping');
+  upload(e.dataTransfer.files);
+});
+
 // A styled combobox standing in for the native <datalist>, which is an OS widget:
 // unstylable, and it clipped long absolute paths to the input's width. Rows show the
 // repo name (what identifies it) above the full path (context), so the useful half is
