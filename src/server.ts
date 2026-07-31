@@ -49,10 +49,18 @@ function hostOk(req: IncomingMessage): boolean {
 const MAX_UPLOAD = 25 * 1024 * 1024;
 
 /**
- * Blocks a plain cross-origin POST, where Origin disagrees with Host — the
- * hostOk() check above only catches a spoofed Host. Non-browser clients (curl,
- * this file's own tests) send no Origin at all, so only a *mismatched* one is
- * rejected. Every route with side effects calls this.
+ * Origin guard: blocks plain cross-origin POST (Origin disagrees with
+ * Host), which the hostOk() check above does not — that check only
+ * catches a spoofed Host. Any page open in the user's browser can issue
+ * a same-network POST to 127.0.0.1:4711; browsers don't preflight a
+ * simple POST like the ones this UI sends, so the request reaches us
+ * and its side effects (worktree creation, process launch, directory
+ * deletion) run before any CORS check would block the attacker from
+ * reading the response — and the attacker doesn't need to read the
+ * response to do damage. Non-browser clients (curl, scripts, this
+ * file's own tests) typically send no Origin header at all, so we only
+ * reject a *mismatched* one — this blocks the drive-by case without
+ * breaking local tooling.
  */
 function originOk(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
