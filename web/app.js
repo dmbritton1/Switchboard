@@ -4,6 +4,14 @@ let openId = null;
 let seenNeedsYou = new Set();
 // Session whose chat view has already been auto-scrolled once; see renderChat().
 let scrolledFor = null;
+// Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
+// as openId — render() reads it, checkbox/button handlers mutate it and re-render.
+let selected = new Set();
+// Result text from the last merge/push, shown in the toolbar until the next
+// selection change or action. Not part of `state`: it doesn't come from the
+// server's SSE snapshot, it's local UI feedback for a fire-and-forget-style
+// command that, unlike most of this app's commands, we do want to surface.
+let selectionMessage = '';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -58,6 +66,13 @@ function renderGrid() {
   grid.hidden = false;
   grid.replaceChildren();
 
+  // A selected session can vanish (deleted, or gone after a restart's reload)
+  // without ever passing back through a checkbox handler, so prune here rather
+  // than trust the Set to stay in sync with `state` on its own.
+  const live = new Set(state.sessions.map((s) => s.id));
+  for (const id of selected) if (!live.has(id)) selected.delete(id);
+  if (selected.size) grid.append(selectionBar());
+
   const accounts = document.createElement('div');
   accounts.className = 'accounts';
   for (const a of state.accounts) {
@@ -100,10 +115,97 @@ function renderGrid() {
   grid.append(add);
 }
 
+/**
+ * The toolbar that appears once at least one worktree is checked. Merge and
+ * Push both act on the whole selection, and both require it to be a single
+ * repo — a "folder" in the sense the feature was asked for — because a merge
+ * or push runs once, in one repo's working directory; there is no such thing
+ * as merging worktree A's branch into worktree B's unrelated repo. The button
+ * disables itself rather than erroring after the click, but /command runs the
+ * identical same-repo check server-side (see selectedRepo() in server.ts) —
+ * this is a courtesy, not the guard.
+ */
+function selectionBar() {
+  const ids = [...selected];
+  const sessions = state.sessions.filter((s) => ids.includes(s.id));
+  const repos = new Set(sessions.map((s) => s.repo));
+  const busy = sessions.find((s) => s.status === 'working' || s.status === 'needs-you');
+
+  const bar = document.createElement('div');
+  bar.id = 'selection-bar';
+  bar.onclick = (e) => e.stopPropagation();
+
+  const label = document.createElement('span');
+  label.className = 'selection-label';
+  label.textContent = repos.size > 1
+    ? `${sessions.length} selected across ${repos.size} repos`
+    : `${sessions.length} selected · ${sessions[0].repo.split('/').filter(Boolean).pop() ?? sessions[0].repo}`;
+  bar.append(label);
+
+  const mergeBtn = document.createElement('button');
+  mergeBtn.textContent = 'Merge selected';
+  mergeBtn.disabled = repos.size !== 1 || Boolean(busy);
+  mergeBtn.title = repos.size > 1
+    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
+    : busy ? `"${busy.branch}" is still running — stop it or wait` : '';
+  mergeBtn.onclick = () => doMerge(ids);
+
+  const pushBtn = document.createElement('button');
+  pushBtn.textContent = 'Push';
+  pushBtn.disabled = repos.size !== 1;
+  pushBtn.title = repos.size > 1
+    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
+    : '';
+  pushBtn.onclick = () => doPush(ids);
+
+  const clearBtn = document.createElement('button');
+  clearBtn.textContent = 'Clear';
+  clearBtn.className = 'ghost';
+  clearBtn.onclick = () => { selected.clear(); selectionMessage = ''; render(); };
+
+  bar.append(mergeBtn, pushBtn, clearBtn);
+
+  if (selectionMessage) {
+    const msg = document.createElement('p');
+    msg.id = 'selection-status';
+    msg.textContent = selectionMessage;
+    bar.append(msg);
+  }
+  return bar;
+}
+
+async function doMerge(ids) {
+  const branches = state.sessions.filter((s) => ids.includes(s.id)).map((s) => s.branch);
+  if (!window.confirm(`Commit outstanding changes and merge ${branches.join(', ')} into the repo's checked-out branch?`)) return;
+  const { ok, data } = await send({ cmd: 'merge', ids });
+  selectionMessage = ok ? `Merged ${data.merged.join(', ')} into ${data.target}.` : data.error;
+  if (ok) selected.clear();
+  render();
+}
+
+async function doPush(ids) {
+  const { ok, data } = await send({ cmd: 'push', ids });
+  selectionMessage = ok ? (data.output ? `Pushed: ${data.output}` : 'Pushed — already up to date.') : data.error;
+  render();
+}
+
 function card(s, fetchStatus) {
   const el = document.createElement('div');
   el.className = `card ${s.status}`;
   el.dataset.id = s.id;
+
+  const select = document.createElement('label');
+  select.className = 'select';
+  select.onclick = (e) => e.stopPropagation();
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = selected.has(s.id);
+  checkbox.onchange = () => {
+    if (checkbox.checked) selected.add(s.id); else selected.delete(s.id);
+    selectionMessage = '';
+    render();
+  };
+  select.append(checkbox);
 
   // s.branch is whatever the user typed into the create-session form (and it
   // survives into the session basically unsanitized on the server side), so it
@@ -111,6 +213,10 @@ function card(s, fetchStatus) {
   const status = document.createElement('div');
   status.className = `status ${s.status}`;
   status.textContent = `${s.status} · ${elapsed(s.statusSince)}`;
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  head.append(select, status);
 
   const branch = document.createElement('div');
   branch.className = 'branch';
@@ -123,7 +229,7 @@ function card(s, fetchStatus) {
   const wt = document.createElement('div');
   wt.className = 'wt';
 
-  el.append(status, branch, meta, wt);
+  el.append(head, branch, meta, wt);
   el.onclick = () => { openId = s.id; render(); };
 
   // renderGrid() replaceChildren()s the whole grid on every render, so the `wt`

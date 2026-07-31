@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { createServer } from '../src/server.ts';
+import { createWorktree } from '../src/worktree.ts';
+
+const run = promisify(execFile);
 
 // `fetch` implements the Fetch spec's forbidden-header-name list, which includes
 // `Host` — there is no way to send a spoofed Host header through fetch(). node:http's
@@ -189,4 +194,115 @@ test('POST /command delete removes the session', async (t) => {
   });
   assert.equal(res.status, 200);
   assert.equal(registry.all().length, 0);
+});
+
+// ---- merge / push --------------------------------------------------------
+
+async function makeRepo(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  await run('git', ['init', '-b', 'main'], { cwd: dir });
+  await run('git', ['config', 'user.email', 't@t.t'], { cwd: dir });
+  await run('git', ['config', 'user.name', 'T'], { cwd: dir });
+  await writeFile(join(dir, 'a.txt'), 'one\n');
+  await run('git', ['add', '.'], { cwd: dir });
+  await run('git', ['commit', '-m', 'init'], { cwd: dir });
+  return dir;
+}
+
+test('POST /command merge rejects worktrees selected from two different repos', async (t) => {
+  const { base, registry } = await boot(t);
+  const a = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/repo-a',
+    cwd: '/repo-a/wt', branch: 'x', title: 'x',
+  });
+  const b = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/repo-b',
+    cwd: '/repo-b/wt', branch: 'y', title: 'y',
+  });
+  registry.apply(a.id, { type: 'stopped', reason: 'done' });
+  registry.apply(b.id, { type: 'stopped', reason: 'done' });
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'merge', ids: [a.id, b.id] }),
+  });
+
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /different repos/i);
+});
+
+test('POST /command merge rejects a session that is still working', async (t) => {
+  const { base, registry } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+  assert.equal(registry.get(s.id)!.status, 'working');
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'merge', ids: [s.id] }),
+  });
+
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /still running/i);
+});
+
+test('POST /command push rejects worktrees selected from two different repos', async (t) => {
+  const { base, registry } = await boot(t);
+  const a = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/repo-a',
+    cwd: '/repo-a/wt', branch: 'x', title: 'x',
+  });
+  const b = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/repo-b',
+    cwd: '/repo-b/wt', branch: 'y', title: 'y',
+  });
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'push', ids: [a.id, b.id] }),
+  });
+
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /different repos/i);
+});
+
+test('POST /command merge then push: end to end against a real repo and remote', async (t) => {
+  const { base, registry } = await boot(t);
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const remote = await mkdtemp(join(tmpdir(), 'sb-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true }));
+  await run('git', ['init', '--bare', '-b', 'main'], { cwd: remote });
+  await run('git', ['remote', 'add', 'origin', remote], { cwd: repo });
+
+  const cwd = await createWorktree(repo, 'feat/ship');
+  await writeFile(join(cwd, 'ship.txt'), 'payload\n');
+  // Left uncommitted on purpose: merge is supposed to pick up outstanding work.
+
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo, cwd, branch: 'feat/ship', title: 'feat/ship',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'done' });
+
+  const mergeRes = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'merge', ids: [s.id] }),
+  });
+  assert.equal(mergeRes.status, 200);
+  const mergeBody = await mergeRes.json();
+  assert.deepEqual(mergeBody.merged, ['feat/ship']);
+  assert.equal(mergeBody.target, 'main');
+
+  const pushRes = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'push', ids: [s.id] }),
+  });
+  assert.equal(pushRes.status, 200);
+
+  // `cwd: remote` would fail here: git refuses to run inside a bare repo via
+  // plain cwd discovery (safe.bareRepository) unless told explicitly.
+  const { stdout } = await run('git', ['--git-dir=' + remote, 'show', 'main:ship.txt']);
+  assert.equal(stdout, 'payload\n', 'the merged file should have reached the remote');
 });

@@ -8,9 +8,10 @@ import { join, extname } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createWorktree, worktreeStatus } from './worktree.ts';
+import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { codexAdapter } from './agents/codex.ts';
-import type { AgentHandle } from './types.ts';
+import type { AgentHandle, Session } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -103,6 +104,30 @@ export function createServer(opts: {
         pace: usage.pace(a.name, a.budget),
       })),
     };
+  }
+
+  /**
+   * Resolves `body.ids` to sessions and enforces the one rule that keeps a
+   * merge or push from ever touching more than one base repo at once: every
+   * selected worktree must share the same `repo`. This is the authoritative
+   * check — the UI disables the buttons for a mixed selection too, but that's
+   * a courtesy, not the guard; this is what a `/command` sent from anywhere
+   * else (curl, a stale tab, a future client) actually has to pass.
+   */
+  function selectedRepo(body: Record<string, unknown>): { repo: string; sessions: Session[] } | { error: string } {
+    const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+    if (ids.length === 0) return { error: 'select at least one worktree' };
+    const sessions: Session[] = [];
+    for (const id of ids) {
+      const s = registry.get(id);
+      if (!s) return { error: `no such session: ${id}` };
+      sessions.push(s);
+    }
+    const repos = new Set(sessions.map((s) => s.repo));
+    if (repos.size > 1) {
+      return { error: `selected worktrees belong to different repos, not one folder: ${[...repos].join(', ')}` };
+    }
+    return { repo: sessions[0].repo, sessions };
   }
 
   function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
@@ -198,6 +223,30 @@ export function createServer(opts: {
           session.vendorSessionId ?? undefined,
         );
         return { status: 200, json: { ok: true } };
+      }
+
+      case 'merge': {
+        const sel = selectedRepo(body);
+        if ('error' in sel) return { status: 400, json: { error: sel.error } };
+        // A `working`/`needs-you` session has an agent actively writing to its
+        // worktree; committing out from under it would race the agent's own
+        // writes and could snapshot a half-written state. `done` and `stopped`
+        // are both quiescent — nothing is touching the files right now.
+        const busy = sel.sessions.find((s) => s.status === 'working' || s.status === 'needs-you');
+        if (busy) {
+          return { status: 409, json: { error: `"${busy.branch}" is still running — stop it or wait before merging` } };
+        }
+        const result = await mergeWorktrees(sel.repo, sel.sessions.map((s) => ({ cwd: s.cwd, branch: s.branch })));
+        if (!result.ok) return { status: 409, json: { error: result.error, merged: result.merged } };
+        return { status: 200, json: result };
+      }
+
+      case 'push': {
+        const sel = selectedRepo(body);
+        if ('error' in sel) return { status: 400, json: { error: sel.error } };
+        const result = await pushRepo(sel.repo);
+        if (!result.ok) return { status: 400, json: { error: result.error } };
+        return { status: 200, json: result };
       }
 
       case 'delete': {

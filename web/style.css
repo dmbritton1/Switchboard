@@ -29,6 +29,27 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .delete { margin-top: .6rem; display: flex; align-items: center; gap: .5rem; }
 .delete label { color: var(--dim); font-size: .9em; }
 #new-card { display: grid; place-content: center; color: var(--dim); min-height: 120px; }
+
+/* ---- Selection / merge / push ------------------------------------------ */
+/* A session card's checkbox sits in its own row above .status: the accounts
+   row above it reuses the bare .card class with none of this markup, so the
+   checkbox is scoped to .card-head rather than repurposing .card's own
+   padding (which would indent the account cards too, for no reason). */
+.card-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
+.card-head .select { cursor: pointer; line-height: 0; }
+#selection-bar { grid-column: 1 / -1; position: sticky; top: 0; z-index: 2;
+  display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: .7rem 1rem; cursor: default; }
+.selection-label { color: var(--dim); font-size: .9em; margin-right: .2rem; }
+#selection-bar button { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--working); border-color: var(--working); color: #08210f;
+  font: inherit; font-weight: 650; cursor: pointer; }
+#selection-bar button:disabled { background: #2a2a2a; border-color: var(--line); color: var(--dim);
+  cursor: not-allowed; }
+#selection-bar button.ghost { background: #232323; border-color: var(--line); color: var(--fg);
+  font-weight: 500; }
+#selection-status { flex-basis: 100%; margin: 0; color: var(--dim); font-size: .85em; }
 #transcript { max-width: 60rem; }
 .msg { padding: .5rem 0; border-bottom: 1px solid #222; white-space: pre-wrap; }
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
