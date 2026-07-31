@@ -219,6 +219,8 @@ function renderChat() {
   $('#grid').hidden = true;
   $('#chat').hidden = false;
   $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
+  // Clear any upload error from a previous session, since errors belong to the session they occurred in.
+  $('#upload-error').textContent = '';
 
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
@@ -295,7 +297,11 @@ chat.addEventListener('dragover', (e) => {
   e.preventDefault(); // Without this the browser navigates to the dropped file.
   chat.classList.add('dropping');
 });
-chat.addEventListener('dragleave', () => chat.classList.remove('dropping'));
+chat.addEventListener('dragleave', (e) => {
+  // Dragleave fires when crossing child element boundaries, so check that the
+  // pointer actually left the chat container entirely (relatedTarget is outside).
+  if (!chat.contains(e.relatedTarget)) chat.classList.remove('dropping');
+});
 chat.addEventListener('drop', (e) => {
   e.preventDefault();
   chat.classList.remove('dropping');
