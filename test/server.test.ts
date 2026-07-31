@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readFile, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
@@ -305,4 +305,72 @@ test('POST /command merge then push: end to end against a real repo and remote',
   // plain cwd discovery (safe.bareRepository) unless told explicitly.
   const { stdout } = await run('git', ['--git-dir=' + remote, 'show', 'main:ship.txt']);
   assert.equal(stdout, 'payload\n', 'the merged file should have reached the remote');
+});
+
+test('POST /upload writes the file into the session worktree', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const res = await fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST',
+    body: 'hello file',
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { path: 'uploads/notes.txt' });
+  assert.equal(await readFile(join(wt, 'uploads', 'notes.txt'), 'utf8'), 'hello file');
+});
+
+test('POST /upload rejects a filename that escapes the worktree', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+  // Unique so a leftover file from an earlier run can never make this pass.
+  const escapee = `escaped-${s.id}.txt`;
+
+  const res = await fetch(
+    `${base}/upload?id=${s.id}&name=${encodeURIComponent(`../${escapee}`)}`,
+    { method: 'POST', body: 'pwned' },
+  );
+
+  assert.equal(res.status, 400);
+  await assert.rejects(
+    stat(join(dirname(wt), escapee)),
+    'a rejected name must not have written anything outside the worktree',
+  );
+});
+
+test('POST /upload refuses to follow a symlinked uploads directory', async (t) => {
+  const { base, registry } = await boot(t);
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  const outside = await mkdtemp(join(tmpdir(), 'sb-outside-'));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  // Simulates a tracked symlink materialized by `git worktree add` from an
+  // untrusted branch: uploads/ points somewhere outside the worktree entirely.
+  await symlink(outside, join(wt, 'uploads'));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const res = await fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST',
+    body: 'pwned',
+  });
+
+  assert.equal(res.status, 400);
+  await assert.rejects(
+    stat(join(outside, 'notes.txt')),
+    'a refused upload must not have written anything into the symlink target',
+  );
 });

@@ -1,10 +1,10 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Server } from 'node:http';
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { readFile, readdir, rm, stat, lstat, mkdir, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
-import { join, extname } from 'node:path';
+import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createWorktree, worktreeStatus } from './worktree.ts';
@@ -45,6 +45,27 @@ function hostOk(req: IncomingMessage): boolean {
   if (!host) return false;
   const hostname = host.split(':')[0];
   return hostname === '127.0.0.1' || hostname === 'localhost';
+}
+
+const MAX_UPLOAD = 25 * 1024 * 1024;
+
+/**
+ * Origin guard: blocks plain cross-origin POST (Origin disagrees with
+ * Host), which the hostOk() check above does not — that check only
+ * catches a spoofed Host. Any page open in the user's browser can issue
+ * a same-network POST to 127.0.0.1:4711; browsers don't preflight a
+ * simple POST like the ones this UI sends, so the request reaches us
+ * and its side effects (worktree creation, process launch, directory
+ * deletion) run before any CORS check would block the attacker from
+ * reading the response — and the attacker doesn't need to read the
+ * response to do damage. Non-browser clients (curl, scripts, this
+ * file's own tests) typically send no Origin header at all, so we only
+ * reject a *mismatched* one — this blocks the drive-by case without
+ * breaking local tooling.
+ */
+function originOk(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  return !origin || origin === `http://${req.headers.host}`;
 }
 
 /**
@@ -317,20 +338,7 @@ export function createServer(opts: {
       }
 
       if (url.pathname === '/command' && req.method === 'POST') {
-        // Origin guard: blocks plain cross-origin POST (Origin disagrees with
-        // Host), which the hostOk() check above does not — that check only
-        // catches a spoofed Host. Any page open in the user's browser can issue
-        // a same-network POST to 127.0.0.1:4711; browsers don't preflight a
-        // simple POST like the ones this UI sends, so the request reaches us
-        // and its side effects (worktree creation, process launch, directory
-        // deletion) run before any CORS check would block the attacker from
-        // reading the response — and the attacker doesn't need to read the
-        // response to do damage. Non-browser clients (curl, scripts, this
-        // file's own tests) typically send no Origin header at all, so we only
-        // reject a *mismatched* one — this blocks the drive-by case without
-        // breaking local tooling.
-        const origin = req.headers.origin;
-        if (origin && origin !== `http://${req.headers.host}`) {
+        if (!originOk(req)) {
           res.writeHead(403, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'cross-origin request blocked' }));
           return;
@@ -354,6 +362,70 @@ export function createServer(opts: {
         await registry.save();
         res.writeHead(result.status, { 'content-type': 'application/json' });
         res.end(JSON.stringify(result.json));
+        return;
+      }
+
+      if (url.pathname === '/upload' && req.method === 'POST') {
+        if (!originOk(req)) {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'cross-origin request blocked' }));
+          return;
+        }
+        const session = registry.get(url.searchParams.get('id') ?? '');
+        // No session means no worktree to write into — there is no sane default
+        // target for the bytes, so this is a 404 rather than a guess.
+        if (!session) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'no such session' }));
+          return;
+        }
+        // Trust boundary: the name comes from the browser and is used to build a
+        // filesystem path. Reject anything basename() had to change rather than
+        // silently rewriting it — a caller asking for ../../.ssh/authorized_keys
+        // should get an error, not a surprise file in uploads/.
+        const raw = url.searchParams.get('name') ?? '';
+        const name = basename(raw);
+        if (!name || name === '.' || name === '..' || name !== raw) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'bad filename' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const c of req) {
+          size += (c as Buffer).length;
+          // Counted as it streams, not after: buffering first would mean a
+          // mistaken drop of a video file allocates the whole thing before we
+          // decide to refuse it.
+          if (size > MAX_UPLOAD) {
+            res.writeHead(413, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'file too large' }));
+            req.destroy();
+            return;
+          }
+          chunks.push(c as Buffer);
+        }
+        // mkdir({recursive:true}) is a no-op if uploads already exists, and
+        // writeFile follows symlinks — so a tracked symlink named uploads/ (or
+        // uploads/<name>) checked out by an untrusted branch could redirect this
+        // write outside the worktree. lstat (unlike stat) doesn't follow
+        // symlinks, so it tells us the truth about what's actually there. A
+        // missing path is fine — that's the normal new-file case — only an
+        // existing symlink is refused.
+        const uploadsDir = join(session.cwd, 'uploads');
+        const target = join(uploadsDir, name);
+        for (const p of [uploadsDir, target]) {
+          const st = await lstat(p).catch(() => null);
+          if (st?.isSymbolicLink()) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
+            return;
+          }
+        }
+        await mkdir(uploadsDir, { recursive: true });
+        await writeFile(target, Buffer.concat(chunks));
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ path: `uploads/${name}` }));
         return;
       }
 

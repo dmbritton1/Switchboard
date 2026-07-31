@@ -58,6 +58,14 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #composer { display: flex; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
 #prompt { flex: 1; padding: .6rem; background: var(--card); color: var(--fg);
   border: 1px solid #333; border-radius: 8px; }
+#attach { display: grid; place-content: center; padding: 0 .7rem; cursor: pointer;
+  background: var(--card); border: 1px solid #333; border-radius: 8px; }
+#attach:hover { border-color: var(--working); }
+/* Drop target feedback: without it, a drag over the transcript looks inert and
+   the user cannot tell whether releasing will do anything. */
+#chat.dropping { outline: 2px dashed var(--working); outline-offset: 6px; border-radius: 8px; }
+#upload-error { margin: .5rem 0 0; color: #e05555; font-size: .85rem; max-width: 60rem; }
+#upload-error:empty { display: none; }
 
 /* ---- New worktree dialog ---------------------------------------------- */
 /* Wide enough that an absolute repo path fits on one line: the whole point of

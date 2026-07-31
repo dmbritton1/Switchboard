@@ -332,6 +332,11 @@ function renderChat() {
   // The first render after opening a card always scrolls — that one is the user
   // asking to see the latest, not reading back.
   const firstOpen = scrolledFor !== openId;
+  // Clear any upload error from a previous session, but only on an actual
+  // session switch: renderChat() re-runs on every SSE snapshot and on a 30s
+  // interval while the agent works, so an unconditional clear here erased the
+  // error before the user had a chance to read it.
+  if (firstOpen) $('#upload-error').textContent = '';
   scrolledFor = openId;
   const nearBottom = firstOpen
     || window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 120;
@@ -362,6 +367,55 @@ $('#composer').onsubmit = (e) => {
   $('#prompt').value = '';
   send({ cmd: 'send', id: openId, text });
 };
+
+// Uploads go straight to disk in the session's worktree and come back as a
+// relative path, which is appended to the prompt box. The agent then opens it
+// like any other file in the repo — no adapter or transcript change needed.
+async function upload(files) {
+  if (!openId || !files.length) return;
+  $('#upload-error').textContent = '';
+  for (const file of files) {
+    let path;
+    try {
+      const res = await fetch(`/upload?id=${openId}&name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: file,
+      });
+      if (!res.ok) throw new Error((await res.json()).error ?? res.status);
+      ({ path } = await res.json());
+    } catch (err) {
+      // Surfaced, not swallowed: a silently dropped upload turns into the user
+      // sending a path that does not exist and the agent reporting confusion.
+      $('#upload-error').textContent = `could not attach ${file.name}: ${err.message}`;
+      return;
+    }
+    const box = $('#prompt');
+    box.value = box.value ? `${box.value} ${path}` : path;
+  }
+  $('#prompt').focus();
+}
+
+$('#attach input').onchange = (e) => {
+  upload(e.target.files);
+  // Cleared so picking the same file twice in a row still fires `change`.
+  e.target.value = '';
+};
+
+const chat = $('#chat');
+chat.addEventListener('dragover', (e) => {
+  e.preventDefault(); // Without this the browser navigates to the dropped file.
+  chat.classList.add('dropping');
+});
+chat.addEventListener('dragleave', (e) => {
+  // Dragleave fires when crossing child element boundaries, so check that the
+  // pointer actually left the chat container entirely (relatedTarget is outside).
+  if (!chat.contains(e.relatedTarget)) chat.classList.remove('dropping');
+});
+chat.addEventListener('drop', (e) => {
+  e.preventDefault();
+  chat.classList.remove('dropping');
+  upload(e.dataTransfer.files);
+});
 
 // A styled combobox standing in for the native <datalist>, which is an OS widget:
 // unstylable, and it clipped long absolute paths to the input's width. Rows show the
