@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
+import { Scheduler } from '../src/schedule.ts';
 import { createServer } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
 
@@ -44,11 +45,12 @@ async function boot(t: { after: (fn: () => void) => void }) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'));
   const usage = new Usage();
-  const server = createServer({ registry, usage, accounts });
+  const scheduler = new Scheduler();
+  const server = createServer({ registry, usage, scheduler, accounts });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
-  return { base: `http://127.0.0.1:${port}`, registry };
+  return { base: `http://127.0.0.1:${port}`, registry, usage, scheduler, server };
 }
 
 test('GET / serves the app shell', async (t) => {

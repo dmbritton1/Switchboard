@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import type { AdapterEvent, Session } from './types.ts';
 import type { Usage } from './usage.ts';
+import type { Scheduler } from './schedule.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
 
@@ -13,13 +14,19 @@ export class Registry {
   // The Registry owns the one save/load path, so persisting usage means handing
   // the Usage instance to it rather than inventing a second state file.
   #usage: Usage | undefined;
+  // Optional for the same reason #usage is: tests that only care about sessions
+  // shouldn't have to build one. The Registry owns the single save/load path, so
+  // persisting the queue means handing it the Scheduler rather than inventing a
+  // second state file.
+  #scheduler: Scheduler | undefined;
   // Chains every save() behind the previous one so concurrent callers never
   // run writeFile/rename on the same temp path at once. See save() below.
   #saveChain: Promise<void> = Promise.resolve();
 
-  constructor(path: string, usage?: Usage) {
+  constructor(path: string, usage?: Usage, scheduler?: Scheduler) {
     this.#path = path;
     this.#usage = usage;
+    this.#scheduler = scheduler;
   }
 
   create(init: Init): Session {
@@ -169,13 +176,17 @@ export class Registry {
 
   async #writeNow(): Promise<void> {
     const tmpPath = this.#path + '.tmp';
-    const state = { sessions: this.all(), usage: this.#usage?.toJSON() ?? {} };
+    const state = {
+      sessions: this.all(),
+      usage: this.#usage?.toJSON() ?? {},
+      queue: this.#scheduler?.toJSON() ?? [],
+    };
     await writeFile(tmpPath, JSON.stringify(state, null, 2));
     await rename(tmpPath, this.#path);
   }
 
-  static async load(path: string, usage?: Usage): Promise<Registry> {
-    const reg = new Registry(path, usage);
+  static async load(path: string, usage?: Usage, scheduler?: Scheduler): Promise<Registry> {
+    const reg = new Registry(path, usage, scheduler);
     try {
       const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
       // state.json used to be a bare array of sessions; it is now
@@ -184,7 +195,12 @@ export class Registry {
       // a shape change must not be worse than the corrupt-JSON path below.
       const isNew = !Array.isArray(parsed);
       const raw = isNew ? (parsed as { sessions?: unknown }).sessions : parsed;
-      if (isNew) usage?.restore((parsed as { usage?: unknown }).usage);
+      if (isNew) {
+        usage?.restore((parsed as { usage?: unknown }).usage);
+        // Absent in any state.json written before scheduling existed; restore()
+        // drops a non-array, so the missing key needs no special case here.
+        scheduler?.restore((parsed as { queue?: unknown }).queue);
+      }
       // state.json is hand-editable, so treat it as untrusted: a `sessions` value
       // that is a string would otherwise be iterated character by character into
       // garbage sessions keyed on `undefined`.

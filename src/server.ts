@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
+import { Scheduler } from './schedule.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
@@ -111,9 +112,10 @@ export async function recentRepos(): Promise<string[]> {
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
+  scheduler: Scheduler;
   accounts: Account[];
 }): Server {
-  const { registry, usage, accounts } = opts;
+  const { registry, usage, scheduler, accounts } = opts;
   const handles = new Map<string, AgentHandle>();
 
   function snapshot() {
@@ -531,7 +533,8 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
     await readFile(new URL('../accounts.json', import.meta.url), 'utf8'),
   ) as Account[];
   const usage = new Usage();
-  const registry = await Registry.load(statePath, usage);
-  createServer({ registry, usage, accounts })
+  const scheduler = new Scheduler();
+  const registry = await Registry.load(statePath, usage, scheduler);
+  createServer({ registry, usage, scheduler, accounts })
     .listen(4711, '127.0.0.1', () => console.log('switchboard on http://127.0.0.1:4711'));
 }
