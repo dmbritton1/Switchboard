@@ -186,6 +186,40 @@ test('a tool_result still correlates when content is an array', () => {
   );
 });
 
+test('a rate_limit_event becomes a rate-limit adapter event', () => {
+  const events = replay([{
+    type: 'rate_limit_event',
+    rate_limit_info: { status: 'rejected', resetsAt: 1_800_000_000, rateLimitType: 'five_hour' },
+    uuid: 'u1',
+    session_id: 's1',
+  }]);
+  assert.deepEqual(events, [
+    { type: 'rate-limit', status: 'rejected', resetsAt: 1_800_000_000 },
+  ]);
+});
+
+test('a rate_limit_event with no resetsAt reports null rather than undefined', () => {
+  const events = replay([{
+    type: 'rate_limit_event',
+    rate_limit_info: { status: 'allowed' },
+    uuid: 'u1',
+    session_id: 's1',
+  }]);
+  assert.deepEqual(events, [{ type: 'rate-limit', status: 'allowed', resetsAt: null }]);
+});
+
+test('a rate_limit_event does not report a vendor session id', () => {
+  // It carries session_id like almost every SDK message. Only subtype:'init'
+  // system messages are meant to report session identity — see normalizeClaude.
+  const events = replay([{
+    type: 'rate_limit_event',
+    rate_limit_info: { status: 'allowed' },
+    uuid: 'u1',
+    session_id: 's1',
+  }]);
+  assert.ok(!events.some((e) => e.type === 'vendor-session-id'));
+});
+
 test('draining the approval queue settles every queued request, not just the head', async () => {
   // Mirrors what setAuto(true) does: loop resolve() until it reports nothing
   // left. resolve() returns a truthy {next} even when next is null, so the loop

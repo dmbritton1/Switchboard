@@ -99,6 +99,8 @@ export class Registry {
         break;
       case 'usage':
         break; // handled by the caller, which owns the Usage instance
+      case 'rate-limit':
+        break; // per-account, not per-session — handled by the caller, which owns Usage
     }
     this.#notify();
   }

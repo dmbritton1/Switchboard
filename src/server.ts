@@ -156,6 +156,7 @@ export function createServer(opts: {
     const auto = registry.get(sessionId)?.auto ?? false;
     const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
       if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
+      if (e.type === 'rate-limit') usage.noteLimit(account.name, e.status, e.resetsAt);
       if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on

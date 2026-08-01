@@ -37,6 +37,9 @@ export type AdapterEvent =
   | { type: 'approval'; request: ApprovalRequest }
   | { type: 'approval-resolved' }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
+  // Claude only. The Codex SDK has no rate-limit concept anywhere in its types,
+  // so a Codex account never produces this and falls back to the pace estimate.
+  | { type: 'rate-limit'; status: 'allowed' | 'allowed_warning' | 'rejected'; resetsAt: number | null }
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
   | { type: 'stopped'; reason: string };
