@@ -12,7 +12,7 @@ import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { codexAdapter } from './agents/codex.ts';
-import type { AgentHandle, Session } from './types.ts';
+import type { Action, AgentHandle, Session, Trigger } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -121,6 +121,7 @@ export function createServer(opts: {
   function snapshot() {
     return {
       sessions: registry.all(),
+      queue: scheduler.all(),
       accounts: accounts.map((a) => ({
         name: a.name,
         provider: a.provider,
@@ -176,6 +177,63 @@ export function createServer(opts: {
       dead?.stop();
     });
     handles.set(sessionId, handle);
+  }
+
+  /**
+   * Validates a `schedule` body into a (trigger, action) pair.
+   *
+   * The action is parsed first so a `reset` trigger can take its account from
+   * it rather than from the client — the account whose window we wait on is by
+   * definition the account the work runs on, and deriving it makes the two
+   * impossible to get out of step.
+   *
+   * Everything here is checked at schedule time so a typo surfaces now rather
+   * than at 3am. Fire-time validation is `command()`'s own and is unchanged.
+   */
+  async function parseSchedule(
+    body: Record<string, unknown>,
+  ): Promise<{ trigger: Trigger; action: Action } | { error: string }> {
+    const t = body.trigger as Record<string, unknown> | undefined;
+    const a = body.action as Record<string, unknown> | undefined;
+    if (!t || !a) return { error: 'schedule needs a trigger and an action' };
+
+    let action: Action;
+    let account: string;
+
+    if (a.kind === 'create') {
+      const found = accounts.find((x) => x.name === a.account);
+      if (!found) return { error: `unknown account: ${String(a.account)}` };
+      const repo = String(a.repo ?? '');
+      if (!(await stat(repo).then((s) => s.isDirectory(), () => false))) {
+        return { error: `not a directory: ${repo}` };
+      }
+      const branch = String(a.branch ?? '').trim();
+      if (!branch) return { error: 'branch is required' };
+      const prompt = String(a.prompt ?? '').trim();
+      if (!prompt) return { error: 'prompt is required' };
+      action = { kind: 'create', repo, branch, account: found.name, prompt };
+      account = found.name;
+    } else if (a.kind === 'send' || a.kind === 'resume') {
+      const sessionId = String(a.sessionId ?? '');
+      const session = registry.get(sessionId);
+      if (!session) return { error: `no such session: ${sessionId}` };
+      const text = String((a.kind === 'send' ? a.text : a.prompt) ?? '').trim();
+      if (!text) return { error: 'message is required' };
+      action = a.kind === 'send'
+        ? { kind: 'send', sessionId, text }
+        : { kind: 'resume', sessionId, prompt: text };
+      account = session.account;
+    } else {
+      return { error: `unknown action: ${String(a.kind)}` };
+    }
+
+    if (t.kind === 'at') {
+      const time = Number(t.time);
+      if (!Number.isFinite(time)) return { error: 'trigger.time must be a timestamp' };
+      return { trigger: { kind: 'at', time }, action };
+    }
+    if (t.kind === 'reset') return { trigger: { kind: 'reset', account }, action };
+    return { error: `unknown trigger: ${String(t.kind)}` };
   }
 
   async function command(body: Record<string, unknown>): Promise<{ status: number; json: unknown }> {
@@ -303,6 +361,18 @@ export function createServer(opts: {
             .catch(() => rm(session.cwd, { recursive: true, force: true }));
         }
         registry.remove(String(body.id));
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'schedule': {
+        const parsed = await parseSchedule(body);
+        if ('error' in parsed) return { status: 400, json: { error: parsed.error } };
+        const item = scheduler.add(parsed.trigger, parsed.action);
+        return { status: 200, json: { id: item.id } };
+      }
+
+      case 'unschedule': {
+        scheduler.remove(String(body.itemId));
         return { status: 200, json: { ok: true } };
       }
 

@@ -436,6 +436,121 @@ test('GET /graph is behind the Host guard like every other route', async (t) => 
   assert.equal(res.status, 403);
 });
 
+// ---- schedule / unschedule ------------------------------------------------
+
+function post(base: string, body: unknown) {
+  return fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
+}
+
+test('scheduling a create returns an id and puts it in the queue', async (t) => {
+  const { base, scheduler } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3600_000 },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 200);
+  assert.ok((await res.json()).id);
+  assert.equal(scheduler.all().length, 1);
+});
+
+test('a reset trigger takes its account from the action, not the client', async (t) => {
+  const { base, scheduler } = await boot(t);
+  await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'reset', account: 'attacker-supplied' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'codex', prompt: 'go' },
+  });
+  assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+});
+
+test('scheduling rejects an unknown account', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'nope', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /unknown account/);
+});
+
+test('scheduling rejects a repo that is not a directory', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'create', repo: '/no/such/place', branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /not a directory/);
+});
+
+test('scheduling rejects a non-numeric time', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: 'tomorrow' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /timestamp/);
+});
+
+test('scheduling rejects an empty prompt and a missing branch', async (t) => {
+  const { base } = await boot(t);
+  const at = { kind: 'at', time: Date.now() };
+  const base_ = { repo: process.cwd(), account: 'claude-main' };
+
+  const noPrompt = await post(base, {
+    cmd: 'schedule', trigger: at, action: { kind: 'create', ...base_, branch: 'b', prompt: '  ' },
+  });
+  assert.equal(noPrompt.status, 400);
+
+  const noBranch = await post(base, {
+    cmd: 'schedule', trigger: at, action: { kind: 'create', ...base_, branch: '', prompt: 'go' },
+  });
+  assert.equal(noBranch.status, 400);
+});
+
+test('scheduling a send rejects an unknown session', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'send', sessionId: 'nope', text: 'hi' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /no such session/);
+});
+
+test('unschedule removes the item', async (t) => {
+  const { base, scheduler } = await boot(t);
+  const { id } = await (await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3600_000 },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  })).json();
+
+  const res = await post(base, { cmd: 'unschedule', itemId: id });
+  assert.equal(res.status, 200);
+  assert.equal(scheduler.all().length, 0);
+});
+
+test('the SSE snapshot carries the queue', async (t) => {
+  const { base, scheduler } = await boot(t);
+  scheduler.add({ kind: 'at', time: 1 }, {
+    kind: 'create', repo: '/r', branch: 'b', account: 'claude-main', prompt: 'go',
+  });
+
+  const res = await fetch(`${base}/events`);
+  const reader = res.body!.getReader();
+  const chunk = new TextDecoder().decode((await reader.read()).value);
+  const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+  assert.equal(payload.queue.length, 1);
+  await reader.cancel();
+});
+
 test('POST /command resume on a session whose worktree is gone reports that, not an SDK error', async (t) => {
   const { base, registry } = await boot(t);
   const gone = join(tmpdir(), `sb-not-here-${Date.now()}`);
