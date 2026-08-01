@@ -201,23 +201,37 @@ export function createServer(opts: {
     let account: string;
 
     if (a.kind === 'create') {
+      // typeof-guarded, not coerced: String()/Number() turn a wrong-shaped
+      // field (an array, an object, null) into a plausible-looking value
+      // instead of rejecting it — e.g. String({}) is the non-empty, non-blank
+      // string '[object Object]', which would sail past a truthiness check
+      // and get scheduled as a real branch name. A bad request must 400 here,
+      // not become a queue item that misbehaves later at fire time.
+      if (typeof a.account !== 'string') return { error: 'account must be a string' };
       const found = accounts.find((x) => x.name === a.account);
-      if (!found) return { error: `unknown account: ${String(a.account)}` };
-      const repo = String(a.repo ?? '');
+      if (!found) return { error: `unknown account: ${a.account}` };
+      if (typeof a.repo !== 'string') return { error: 'repo must be a string' };
+      const repo = a.repo;
       if (!(await stat(repo).then((s) => s.isDirectory(), () => false))) {
         return { error: `not a directory: ${repo}` };
       }
-      const branch = String(a.branch ?? '').trim();
+      if (typeof a.branch !== 'string') return { error: 'branch must be a string' };
+      const branch = a.branch.trim();
       if (!branch) return { error: 'branch is required' };
-      const prompt = String(a.prompt ?? '').trim();
+      if (typeof a.prompt !== 'string') return { error: 'prompt must be a string' };
+      const prompt = a.prompt.trim();
       if (!prompt) return { error: 'prompt is required' };
       action = { kind: 'create', repo, branch, account: found.name, prompt };
       account = found.name;
     } else if (a.kind === 'send' || a.kind === 'resume') {
-      const sessionId = String(a.sessionId ?? '');
+      if (typeof a.sessionId !== 'string') return { error: 'sessionId must be a string' };
+      const sessionId = a.sessionId;
       const session = registry.get(sessionId);
       if (!session) return { error: `no such session: ${sessionId}` };
-      const text = String((a.kind === 'send' ? a.text : a.prompt) ?? '').trim();
+      const field = a.kind === 'send' ? 'text' : 'prompt';
+      const raw = a.kind === 'send' ? a.text : a.prompt;
+      if (typeof raw !== 'string') return { error: `${field} must be a string` };
+      const text = raw.trim();
       if (!text) return { error: 'message is required' };
       action = a.kind === 'send'
         ? { kind: 'send', sessionId, text }
@@ -228,9 +242,10 @@ export function createServer(opts: {
     }
 
     if (t.kind === 'at') {
-      const time = Number(t.time);
-      if (!Number.isFinite(time)) return { error: 'trigger.time must be a timestamp' };
-      return { trigger: { kind: 'at', time }, action };
+      if (typeof t.time !== 'number' || !Number.isFinite(t.time)) {
+        return { error: 'trigger.time must be a timestamp' };
+      }
+      return { trigger: { kind: 'at', time: t.time }, action };
     }
     if (t.kind === 'reset') return { trigger: { kind: 'reset', account }, action };
     return { error: `unknown trigger: ${String(t.kind)}` };

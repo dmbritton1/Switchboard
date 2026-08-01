@@ -497,6 +497,45 @@ test('scheduling rejects a non-numeric time', async (t) => {
   assert.match((await res.json()).error, /timestamp/);
 });
 
+// Number(t.time) would happily coerce [] -> 0 and null -> 0 into a "valid"
+// finite timestamp, scheduling a nonsense-time item instead of rejecting the
+// request. A typeof guard is the only thing standing between this and a
+// silently-accepted garbage trigger.
+test('scheduling rejects a time that is coercible to a number but is not one', async (t) => {
+  const { base } = await boot(t);
+  for (const time of [[], null, [5000]]) {
+    const res = await post(base, {
+      cmd: 'schedule',
+      trigger: { kind: 'at', time },
+      action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+    });
+    assert.equal(res.status, 400, `time=${JSON.stringify(time)} must be rejected`);
+    assert.match((await res.json()).error, /timestamp/);
+  }
+});
+
+// String({}) is the non-empty, non-blank string '[object Object]' — it would
+// sail past a truthiness check and get scheduled as a real branch name or
+// prompt body. A typeof guard rejects the wrong-shaped field outright.
+test('scheduling rejects an object-valued branch or prompt', async (t) => {
+  const { base } = await boot(t);
+  const at = { kind: 'at', time: Date.now() };
+
+  const badBranch = await post(base, {
+    cmd: 'schedule', trigger: at,
+    action: { kind: 'create', repo: process.cwd(), branch: {}, account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(badBranch.status, 400);
+  assert.match((await badBranch.json()).error, /branch/);
+
+  const badPrompt = await post(base, {
+    cmd: 'schedule', trigger: at,
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: {} },
+  });
+  assert.equal(badPrompt.status, 400);
+  assert.match((await badPrompt.json()).error, /prompt/);
+});
+
 test('scheduling rejects an empty prompt and a missing branch', async (t) => {
   const { base } = await boot(t);
   const at = { kind: 'at', time: Date.now() };
@@ -524,6 +563,25 @@ test('scheduling a send rejects an unknown session', async (t) => {
   assert.match((await res.json()).error, /no such session/);
 });
 
+// The other half of the design guarantee: a reset trigger on a send/resume
+// action takes its account from the target session, not from the client —
+// same rule as the create case, covered here so it isn't only proven for one
+// of the two action shapes that can carry a reset trigger.
+test('a reset trigger on a send takes its account from the target session, not the client', async (t) => {
+  const { base, registry, scheduler } = await boot(t);
+  const s = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+
+  await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'reset', account: 'attacker-supplied' },
+    action: { kind: 'send', sessionId: s.id, text: 'hi' },
+  });
+  assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+});
+
 test('unschedule removes the item', async (t) => {
   const { base, scheduler } = await boot(t);
   const { id } = await (await post(base, {
@@ -545,10 +603,20 @@ test('the SSE snapshot carries the queue', async (t) => {
 
   const res = await fetch(`${base}/events`);
   const reader = res.body!.getReader();
-  const chunk = new TextDecoder().decode((await reader.read()).value);
-  const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
-  assert.equal(payload.queue.length, 1);
-  await reader.cancel();
+  // try/finally, not a bare await at the end: if the assertion throws, an
+  // uncancelled reader leaves the SSE fetch open, and boot()'s t.after
+  // (server.close()) waits for that connection to end before it resolves —
+  // node:test's after-hooks run in registration order (FIFO), so a t.after
+  // registered here would run after boot()'s and still hang. finally runs
+  // synchronously as the test unwinds, before any after-hook, so the
+  // connection is always closed and a failure reports instead of hanging.
+  try {
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.queue.length, 1);
+  } finally {
+    await reader.cancel();
+  }
 });
 
 test('POST /command resume on a session whose worktree is gone reports that, not an SDK error', async (t) => {
