@@ -64,3 +64,26 @@ export type AgentHandle = {
 export type Adapter = {
   start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle;
 };
+
+export type Trigger =
+  /** Fire at this wall-clock moment (epoch ms). */
+  | { kind: 'at'; time: number }
+  /** Fire once this account's usage window has room again. */
+  | { kind: 'reset'; account: string };
+
+export type Action =
+  | { kind: 'create'; repo: string; branch: string; account: string; prompt: string }
+  | { kind: 'send'; sessionId: string; text: string }
+  | { kind: 'resume'; sessionId: string; prompt: string };
+
+/** A one-shot queued chat. There is no `fired` state: an item that fires is
+ *  removed. `missed` and `failed` stick around so the user can see what happened
+ *  and re-arm or delete them. */
+export type Queued = {
+  id: string;
+  trigger: Trigger;
+  action: Action;
+  createdAt: number;
+  state: 'waiting' | 'missed' | 'failed';
+  error: string | null;
+};
