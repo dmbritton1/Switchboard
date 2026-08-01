@@ -98,14 +98,26 @@ export class Scheduler {
   }
 
   /** Inverse of toJSON(). state.json is hand-editable, so anything that isn't a
-   *  usable item is dropped rather than thrown on — the same tolerance
-   *  Registry.load already applies to `sessions`. */
+   *  usable item is dropped rather than thrown on. Validates shape and domain
+   *  constraints (state, trigger kind, trigger fields) to prevent silent failures
+   *  or eager fires from corrupted input. */
   restore(data: unknown): void {
     if (!Array.isArray(data)) return;
     for (const raw of data as Queued[]) {
       if (!raw || typeof raw.id !== 'string') continue;
       if (!raw.trigger || typeof raw.trigger !== 'object') continue;
       if (!raw.action || typeof raw.action !== 'object') continue;
+      // Validate state to prevent items stuck waiting forever on an unrecognized state.
+      if (raw.state !== 'waiting' && raw.state !== 'missed' && raw.state !== 'failed') continue;
+      // Validate trigger kind and its fields.
+      if (raw.trigger.kind === 'at') {
+        if (!Number.isFinite(raw.trigger.time)) continue;
+      } else if (raw.trigger.kind === 'reset') {
+        if (typeof raw.trigger.account !== 'string') continue;
+      } else {
+        // Unrecognized trigger kind; drop it.
+        continue;
+      }
       this.#items.set(raw.id, raw);
     }
   }

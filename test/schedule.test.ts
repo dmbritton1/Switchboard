@@ -125,3 +125,29 @@ test('restore drops malformed items rather than throwing', () => {
   s.restore([null, {}, { id: 7 }, { id: 'ok', trigger: { kind: 'at', time: 0 } }]);
   assert.equal(s.all().length, 0, 'an item with no action is not usable');
 });
+
+test('restore drops items with corrupted state, invalid at.time, and unrecognized trigger.kind', () => {
+  // These are the exact inputs that caused the two failure modes: silent non-firing
+  // (bad state) and eager fire bypassing grace window (non-numeric time or bad kind).
+  const s = new Scheduler();
+  s.restore([
+    // Good at-item: should load.
+    { id: 'ok1', trigger: { kind: 'at', time: 0 }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+    // Good reset-item: should load.
+    { id: 'ok2', trigger: { kind: 'reset', account: 'a' }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+    // Bad state: dropped.
+    { id: 'bad-state', trigger: { kind: 'at', time: 0 }, action: CREATE, createdAt: 0, state: 'unknown', error: null },
+    // At-item with non-numeric time (string): dropped, prevents eager fire.
+    { id: 'bad-time-string', trigger: { kind: 'at', time: 'not a number' }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+    // At-item with NaN time: dropped.
+    { id: 'bad-time-nan', trigger: { kind: 'at', time: NaN }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+    // Unrecognized trigger.kind: dropped, prevents treatment as reset for undefined account.
+    { id: 'bad-kind', trigger: { kind: 'unknown' }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+    // Reset item with missing account: dropped.
+    { id: 'bad-reset-account', trigger: { kind: 'reset', account: null }, action: CREATE, createdAt: 0, state: 'waiting', error: null },
+  ]);
+
+  assert.equal(s.all().length, 2, 'only the two valid items load');
+  assert.equal(s.all()[0].id, 'ok1');
+  assert.equal(s.all()[1].id, 'ok2');
+});
