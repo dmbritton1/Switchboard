@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
-import { Scheduler } from './schedule.ts';
+import { Scheduler, type Ctx } from './schedule.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
@@ -49,6 +49,10 @@ function hostOk(req: IncomingMessage): boolean {
 }
 
 const MAX_UPLOAD = 25 * 1024 * 1024;
+
+/** How often the scheduler is checked. Coarse on purpose: the UI picker is
+ *  minute-resolution, so a finer tick would buy nothing. */
+const TICK_MS = 30_000;
 
 /**
  * Origin guard: blocks plain cross-origin POST (Origin disagrees with
@@ -109,12 +113,21 @@ export async function recentRepos(): Promise<string[]> {
   return [...repos].sort();
 }
 
+/** A queued action as the `command()` body that performs it. */
+function toCommand(a: Action): Record<string, unknown> {
+  if (a.kind === 'create') {
+    return { cmd: 'create', repo: a.repo, branch: a.branch, account: a.account, prompt: a.prompt };
+  }
+  if (a.kind === 'send') return { cmd: 'send', id: a.sessionId, text: a.text };
+  return { cmd: 'resume', id: a.sessionId, prompt: a.prompt };
+}
+
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
   scheduler: Scheduler;
   accounts: Account[];
-}): Server {
+}): Server & { tick: () => Promise<void> } {
   const { registry, usage, scheduler, accounts } = opts;
   const handles = new Map<string, AgentHandle>();
 
@@ -396,6 +409,43 @@ export function createServer(opts: {
     }
   }
 
+  /**
+   * One scheduler pass. Every due item is routed back through `command()` — a
+   * scheduled create is literally the same code path as a create from the
+   * dialog, so there is no second launch path to keep in sync, and scheduled
+   * actions inherit `command()`'s validation and 404/409 handling for free.
+   *
+   * Saves unconditionally at the end, not only when something fired: `due()`
+   * marks overdue items `missed`, and that transition has to survive a restart.
+   * The registry's coalesced save subscribes to registry changes only, and a
+   * scheduler-only change is not one.
+   */
+  async function tick(): Promise<void> {
+    const ctx: Ctx = {
+      free: (name) => {
+        const a = accounts.find((x) => x.name === name);
+        // An account dropped from accounts.json can never be free — its work
+        // cannot run at all, and command() will say so if the item ever fires.
+        return a ? usage.free(a.name, a.budget) : false;
+      },
+      busy: (name) => registry.all().some(
+        (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+      ),
+    };
+
+    for (const item of scheduler.due(Date.now(), ctx)) {
+      let result: { status: number; json: unknown };
+      try {
+        result = await command(toCommand(item.action));
+      } catch (err) {
+        result = { status: 500, json: { error: String((err as Error).message ?? err) } };
+      }
+      if (result.status === 200) scheduler.remove(item.id);
+      else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
+    }
+    await registry.save().catch(() => {});
+  }
+
   const server = httpServer(async (req: IncomingMessage, res: ServerResponse) => {
     // Every fallible await for this request happens inside this try. Node treats
     // an unhandled rejection as a fatal, process-wide error — one bad request
@@ -608,7 +658,16 @@ export function createServer(opts: {
     saveTimer = null;
   });
 
-  return server;
+  // unref()'d and cleared on close for the same reasons as the save timer above:
+  // it must never be the reason the process stays alive, and a closed server
+  // must not fire a create into an already-deleted state directory.
+  const tickTimer = setInterval(() => { void tick().catch(() => {}); }, TICK_MS).unref();
+  server.on('close', () => clearInterval(tickTimer));
+
+  // Exposed so tests can drive exactly one pass instead of racing a 30s timer.
+  (server as Server & { tick: () => Promise<void> }).tick = tick;
+
+  return server as Server & { tick: () => Promise<void> };
 }
 
 // Entry point: only when run directly, so tests can import createServer freely.

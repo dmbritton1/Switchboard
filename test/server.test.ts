@@ -639,3 +639,86 @@ test('POST /command resume on a session whose worktree is gone reports that, not
   assert.match((await res.json()).error, /worktree is gone/);
   assert.equal(registry.get(s.id)!.status, 'stopped', 'and the session must not have been revived');
 });
+
+test('a due item fires through command() and leaves the queue', async (t) => {
+  const { base, registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  // A `send` to a session with no live agent is a 404 from command(), which is
+  // exactly the failure path we want to observe — no agent is spawned in tests.
+  const item = scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed');
+  assert.match(scheduler.all()[0].error ?? '', /no live session/);
+  assert.equal(scheduler.all()[0].id, item.id, 'a failed item stays visible, it is not dropped');
+});
+
+test('an item whose time has not come is left alone', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  scheduler.add({ kind: 'at', time: Date.now() + 3600_000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+});
+
+test('a reset item does not fire while its account is rate limited', async (t) => {
+  const { registry, scheduler, server, usage } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  // registry.create() starts a session `working`, which would make the account
+  // busy() and block the item for the wrong reason. Park it first so the only
+  // thing under test is the rate limit.
+  registry.apply(s.id, { type: 'stopped', reason: 'parked for the test' });
+  usage.noteLimit('claude-main', 'rejected', Date.now() + 3600_000);
+  scheduler.add({ kind: 'reset', account: 'claude-main' }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+
+  usage.noteLimit('claude-main', 'allowed', null);
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed', 'it fired once the limit cleared');
+});
+
+test('a reset item waits while its account has a working session', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const busy = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'busy', title: 'busy',
+  });
+  assert.equal(busy.status, 'working', 'created sessions start working');
+
+  const target = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt2', branch: 'b', title: 'b',
+  });
+  // Park the target, so `busy` is true because of the *other* session and the
+  // test can't pass for the wrong reason.
+  registry.apply(target.id, { type: 'stopped', reason: 'parked for the test' });
+  scheduler.add({ kind: 'reset', account: 'claude-main' }, {
+    kind: 'send', sessionId: target.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+
+  // Retire the busy session and it goes through.
+  registry.apply(busy.id, { type: 'stopped', reason: 'done' });
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed', 'fired once the account went idle');
+});
