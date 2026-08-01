@@ -409,6 +409,17 @@ export function createServer(opts: {
     }
   }
 
+  // True while a tick's `command()` calls are in flight. An item stays
+  // `waiting` until its own call resolves, so if one pass runs past TICK_MS
+  // (a realistic case: due() deliberately lets a backlog build up while
+  // Switchboard is down, and each `create` in that backlog awaits a real git
+  // checkout), the next interval firing would call due() again and see the
+  // same still-waiting items — dispatching a `create` a second time and
+  // spawning two live agents for one scheduled task. Skipping the overlapping
+  // pass is correct, not just convenient: it has nothing unique to do, and
+  // the next interval will pick up whatever is still due 30s later.
+  let ticking = false;
+
   /**
    * One scheduler pass. Every due item is routed back through `command()` — a
    * scheduled create is literally the same code path as a create from the
@@ -421,29 +432,35 @@ export function createServer(opts: {
    * scheduler-only change is not one.
    */
   async function tick(): Promise<void> {
-    const ctx: Ctx = {
-      free: (name) => {
-        const a = accounts.find((x) => x.name === name);
-        // An account dropped from accounts.json can never be free — its work
-        // cannot run at all, and command() will say so if the item ever fires.
-        return a ? usage.free(a.name, a.budget) : false;
-      },
-      busy: (name) => registry.all().some(
-        (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
-      ),
-    };
+    if (ticking) return;
+    ticking = true;
+    try {
+      const ctx: Ctx = {
+        free: (name) => {
+          const a = accounts.find((x) => x.name === name);
+          // An account dropped from accounts.json can never be free — its work
+          // cannot run at all, and command() will say so if the item ever fires.
+          return a ? usage.free(a.name, a.budget) : false;
+        },
+        busy: (name) => registry.all().some(
+          (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+        ),
+      };
 
-    for (const item of scheduler.due(Date.now(), ctx)) {
-      let result: { status: number; json: unknown };
-      try {
-        result = await command(toCommand(item.action));
-      } catch (err) {
-        result = { status: 500, json: { error: String((err as Error).message ?? err) } };
+      for (const item of scheduler.due(Date.now(), ctx)) {
+        let result: { status: number; json: unknown };
+        try {
+          result = await command(toCommand(item.action));
+        } catch (err) {
+          result = { status: 500, json: { error: String((err as Error).message ?? err) } };
+        }
+        if (result.status === 200) scheduler.remove(item.id);
+        else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
       }
-      if (result.status === 200) scheduler.remove(item.id);
-      else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
+      await registry.save().catch(() => {});
+    } finally {
+      ticking = false;
     }
-    await registry.save().catch(() => {});
   }
 
   const server = httpServer(async (req: IncomingMessage, res: ServerResponse) => {

@@ -722,3 +722,33 @@ test('a reset item waits while its account has a working session', async (t) => 
   await server.tick();
   assert.equal(scheduler.all()[0].state, 'failed', 'fired once the account went idle');
 });
+
+test('overlapping ticks consult the scheduler once, not twice', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  // Count calls to due() rather than inspect end state: a doubled `send` to a
+  // dead session ends up looking the same either way, so the thing worth
+  // proving is that the scheduler is only consulted once per overlap.
+  let calls = 0;
+  const realDue = scheduler.due.bind(scheduler);
+  scheduler.due = (now, ctx) => { calls++; return realDue(now, ctx); };
+
+  // tick() yields at its first await (inside the loop's `command()` call, or
+  // at the trailing save if nothing is due), so calling it twice back to back
+  // without awaiting the first genuinely overlaps them — this is deterministic,
+  // not a race to hope for: the first call's synchronous prefix (which sets the
+  // in-flight guard and calls due()) always finishes before the second call's
+  // synchronous prefix begins.
+  const first = server.tick();
+  const second = server.tick();
+  await Promise.all([first, second]);
+
+  assert.equal(calls, 1, 'the second, overlapping tick must skip rather than re-dispatch the same item');
+});
