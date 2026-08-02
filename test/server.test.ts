@@ -167,6 +167,86 @@ test('a successful Codex create finishes with the fake executable', async (t) =>
   assert.equal(fixture.registry.get(created.id)!.vendorSessionId, 'fake-thread');
 });
 
+test('Codex send validates attachments, persists only names, and resumes without replaying them', async (t) => {
+  const fixture = await bootCodex(t);
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  const session = fixture.registry.get(created.id)!;
+  await mkdir(join(session.cwd, 'uploads'));
+  const imagePath = join(session.cwd, 'uploads', 'screen.png');
+  const filePath = join(session.cwd, 'uploads', 'notes.txt');
+  await Promise.all([
+    writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+    writeFile(filePath, 'server notes'),
+  ]);
+
+  const sent = await fixture.command({
+    cmd: 'send', id: created.id, text: 'Review these',
+    attachments: ['uploads/screen.png', 'uploads/notes.txt'],
+  });
+  assert.equal(sent.status, 200);
+  await waitFor(async () => (await fixture.invocations()).length === 2);
+
+  const attachmentMessage = session.transcript.find(
+    (message) => message.kind === 'user' && message.text === 'Review these',
+  );
+  assert.ok(attachmentMessage?.kind === 'user');
+  assert.deepEqual(attachmentMessage.attachments, ['screen.png', 'notes.txt']);
+  const persisted = await readFile(fixture.statePath, 'utf8');
+  const persistedState = JSON.parse(persisted) as { sessions: Array<{ transcript: unknown[] }> };
+  assert.ok(JSON.stringify(persistedState.sessions[0].transcript).includes(
+    '"attachments":["screen.png","notes.txt"]',
+  ));
+  assert.ok(!persisted.includes(imagePath));
+  assert.ok(!persisted.includes(filePath));
+
+  const eventsResponse = await fetch(`${fixture.base}/events`);
+  const reader = eventsResponse.body!.getReader();
+  const firstEvent = new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  assert.match(firstEvent, /"attachments":\["screen\.png","notes\.txt"\]/);
+  assert.ok(!firstEvent.includes(imagePath));
+  assert.ok(!firstEvent.includes(filePath));
+
+  const [, attachmentInvocation] = await fixture.invocations();
+  assert.equal(attachmentInvocation.prompt, 'Review these\nAttached file: uploads/notes.txt');
+  assert.deepEqual(attachmentInvocation.argv.flatMap((arg, index, argv) =>
+    arg === '--image' ? [argv[index + 1]] : []), [imagePath]);
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
+  const resumed = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'Continue cleanly' });
+  assert.equal(resumed.status, 200);
+  await waitFor(async () => (await fixture.invocations()).length === 3);
+  const resumeInvocation = (await fixture.invocations())[2];
+  assert.equal(resumeInvocation.prompt, 'Continue cleanly');
+  assert.ok(!resumeInvocation.argv.includes('--image'), 'resume must not replay prior image attachments');
+});
+
+test('invalid attachment paths neither append a prompt nor call the live handle', async (t) => {
+  const fixture = await bootCodex(t);
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  const session = fixture.registry.get(created.id)!;
+  await writeFile(join(session.cwd, 'real.txt'), 'real');
+  await symlink('real.txt', join(session.cwd, 'link.txt'));
+  const transcriptLength = session.transcript.length;
+
+  for (const attachments of [
+    ['missing.txt'],
+    ['../outside.txt'],
+    ['link.txt'],
+  ]) {
+    const response = await fixture.command({
+      cmd: 'send', id: created.id, text: 'must not be accepted', attachments,
+    });
+    assert.equal(response.status, 400, attachments[0]);
+    assert.equal(session.transcript.length, transcriptLength, attachments[0]);
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal((await fixture.invocations()).length, 1, 'validation failures never call handle.send');
+});
+
 test('Codex create persists its written initial prompt as queued before the response', async (t) => {
   const fixture = await bootCodex(t);
   const deliveries: string[] = [];

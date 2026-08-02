@@ -2,7 +2,16 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { Adapter, AdapterEvent, AgentHandle, ApprovalRequest, StartOpts } from '../types.ts';
+import type {
+  Adapter, AdapterEvent, AgentHandle, AgentPrompt, ApprovalRequest, StartOpts,
+} from '../types.ts';
+
+export function renderClaudePrompt(prompt: AgentPrompt): string {
+  return [
+    prompt.text,
+    ...prompt.attachments.map((attachment) => `Attached file: ${attachment.relativePath}`),
+  ].filter(Boolean).join('\n');
+}
 
 /** One line describing a tool call, for the transcript. */
 function summarize(name: string, input: Record<string, unknown>): string {
@@ -220,7 +229,7 @@ export const claudeAdapter: Adapter = {
     };
 
     const q = query({ prompt: input.stream(), options });
-    input.push(opts.prompt);
+    input.push(renderClaudePrompt(opts.prompt));
 
     (async () => {
       try {
@@ -235,9 +244,9 @@ export const claudeAdapter: Adapter = {
     })();
 
     return {
-      send(text: string) {
+      send(prompt: AgentPrompt) {
         emit({ type: 'status', status: 'working' });
-        input.push(text);
+        input.push(renderClaudePrompt(prompt));
       },
       decide(allow: boolean) {
         const outcome = approvals.resolve(allow

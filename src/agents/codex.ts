@@ -1,11 +1,26 @@
 import { Codex } from '@openai/codex-sdk';
-import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
+import type { Input, ThreadEvent, ThreadItem } from '@openai/codex-sdk';
 import { safeCodexDetail } from './codex-detail.ts';
 import { redactCodexText } from './codex-runtime.ts';
 import type { PreparedCodexRuntime } from './codex-runtime.ts';
 import type {
-  Adapter, AdapterEvent, AgentHandle, CodexFailureCode, StartOpts, ToolMsg,
+  Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, StartOpts, ToolMsg,
 } from '../types.ts';
+
+export function codexPromptInput(prompt: AgentPrompt): Input {
+  const files = prompt.attachments.filter((attachment) => attachment.kind === 'file');
+  const images = prompt.attachments.filter((attachment) => attachment.kind === 'image');
+  const text = [
+    prompt.text,
+    ...files.map((attachment) => `Attached file: ${attachment.relativePath}`),
+  ].filter(Boolean).join('\n');
+  return images.length
+    ? [
+      { type: 'text', text },
+      ...images.map((attachment) => ({ type: 'local_image' as const, path: attachment.absolutePath })),
+    ]
+    : text;
+}
 
 type ItemPhase = 'started' | 'updated' | 'completed';
 
@@ -161,7 +176,7 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       ? codex.resumeThread(opts.resumeId, threadOptions)
       : codex.startThread(threadOptions);
 
-    const queue: { text: string; promptId?: string }[] = [];
+    const queue: { prompt: AgentPrompt; promptId?: string }[] = [];
     // Cancels the in-flight Codex turn on stop(); see TurnOptions.signal in the SDK's
     // .d.ts. One controller for the adapter's lifetime — stop() is terminal, like the
     // Claude adapter's q.interrupt().
@@ -208,7 +223,9 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
         while (queue.length && !stopped) {
           const prompt = queue.shift()!;
           if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'sent' });
-          const { events } = await thread.runStreamed(prompt.text, { signal: abortController.signal });
+          const { events } = await thread.runStreamed(codexPromptInput(prompt.prompt), {
+            signal: abortController.signal,
+          });
           for await (const e of events) {
             if (stopped) break;
             if (e.type === 'turn.started') turnStarted = true;
@@ -236,13 +253,13 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       }
     }
 
-    queue.push({ text: opts.prompt, promptId: opts.promptId });
+    queue.push({ prompt: opts.prompt, promptId: opts.promptId });
     void drain();
 
     return {
-      send(text: string, promptId?: string) {
+      send(prompt: AgentPrompt, promptId?: string) {
         emit({ type: 'status', status: 'working' });
-        queue.push({ text, promptId });
+        queue.push({ prompt, promptId });
         void drain();
       },
       // Codex approvals are policy, not interactive. Nothing to decide.

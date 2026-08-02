@@ -15,6 +15,18 @@ export type CodexFailureCode =
 
 export type PromptDelivery = 'queued' | 'sent' | 'unsent';
 
+export type PromptAttachment = {
+  name: string;
+  relativePath: string;
+  absolutePath: string;
+  kind: 'image' | 'file';
+};
+
+export type AgentPrompt = {
+  text: string;
+  attachments: PromptAttachment[];
+};
+
 export type ToolMsg = {
   kind: 'tool';
   id?: string;
@@ -34,8 +46,16 @@ export type TodoMsg = {
   items: { text: string; completed: boolean }[];
 };
 
+export type UserMsg = {
+  kind: 'user';
+  id: string;
+  text: string;
+  delivery: PromptDelivery;
+  attachments?: string[];
+};
+
 export type Msg =
-  | { kind: 'user'; id: string; text: string; delivery: PromptDelivery }
+  | UserMsg
   | { kind: 'text'; text: string }
   | ToolMsg
   | ReasoningMsg
@@ -106,7 +126,7 @@ export type AdapterEvent =
 
 export type StartOpts = {
   cwd: string;
-  prompt: string;
+  prompt: AgentPrompt;
   promptId?: string;
   env: Record<string, string>;
   resumeId?: string;
@@ -116,7 +136,7 @@ export type StartOpts = {
 };
 
 export type AgentHandle = {
-  send(text: string, promptId?: string): void;
+  send(prompt: AgentPrompt, promptId?: string): void;
   decide(allow: boolean): void;
   setAuto(on: boolean): void;
   stop(): void;

@@ -11,10 +11,13 @@ import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
+import { resolveAgentPrompt } from './prompt-input.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
-import type { Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session } from './types.ts';
+import type {
+  Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, Session,
+} from './types.ts';
 
 const run = promisify(execFile);
 
@@ -206,7 +209,7 @@ export function createServer(opts: {
   }
 
   function launch(
-    sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: string, resumeId?: string,
+    sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: AgentPrompt, resumeId?: string,
     promptId?: string,
   ): { error: string; code?: CodexFailureCode } | null {
     const auto = registry.get(sessionId)?.auto ?? false;
@@ -282,7 +285,9 @@ export function createServer(opts: {
         const promptId = registry.appendPrompt(
           session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
         );
-        const launchError = launch(session.id, account, prepared.adapter, cwd, prompt, undefined, promptId);
+        const launchError = launch(
+          session.id, account, prepared.adapter, cwd, { text: prompt, attachments: [] }, undefined, promptId,
+        );
         if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
       }
@@ -292,10 +297,17 @@ export function createServer(opts: {
         const handle = handles.get(String(body.id));
         if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
         const text = String(body.text);
+        let prompt: AgentPrompt;
+        try {
+          prompt = await resolveAgentPrompt(session.cwd, text, body.attachments);
+        } catch (error) {
+          return { status: 400, json: { error: String((error as Error).message ?? error) } };
+        }
         const promptId = registry.appendPrompt(
           session.id, text, session.provider === 'codex' ? 'queued' : 'sent',
+          prompt.attachments.map((attachment) => attachment.name),
         );
-        handle.send(text, promptId);
+        handle.send(prompt, promptId);
         return { status: 200, json: { ok: true } };
       }
 
@@ -372,7 +384,7 @@ export function createServer(opts: {
           ? registry.appendPrompt(session.id, prompt, 'queued')
           : undefined;
         const launchError = launch(
-          session.id, account, prepared.adapter, session.cwd, prompt,
+          session.id, account, prepared.adapter, session.cwd, { text: prompt, attachments: [] },
           session.vendorSessionId ?? undefined, promptId,
         );
         if (launchError) return { status: 500, json: launchError };

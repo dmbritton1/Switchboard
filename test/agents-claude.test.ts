@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
-import { normalizeClaude, approvalQueue } from '../src/agents/claude.ts';
+import { normalizeClaude, approvalQueue, renderClaudePrompt } from '../src/agents/claude.ts';
 import type { AdapterEvent } from '../src/types.ts';
 
 const fixture = JSON.parse(
@@ -11,6 +11,26 @@ const fixture = JSON.parse(
 function replay(messages: unknown[]): AdapterEvent[] {
   return messages.flatMap((m) => normalizeClaude(m as never));
 }
+
+test('Claude receives every attachment as a relative text reference', () => {
+  const rendered = renderClaudePrompt({
+    text: 'Review these',
+    attachments: [
+      {
+        name: 'screen.png', relativePath: 'uploads/screen.png',
+        absolutePath: '/private/secret/worktree/uploads/screen.png', kind: 'image',
+      },
+      {
+        name: 'notes.txt', relativePath: 'docs/notes.txt',
+        absolutePath: '/private/secret/worktree/docs/notes.txt', kind: 'file',
+      },
+    ],
+  });
+
+  assert.equal(rendered,
+    'Review these\nAttached file: uploads/screen.png\nAttached file: docs/notes.txt');
+  assert.doesNotMatch(rendered, /\/private\/secret/);
+});
 
 test('a recorded session yields text, a tool call, and a final done status', () => {
   const events = replay(fixture);

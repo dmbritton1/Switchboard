@@ -79,7 +79,7 @@ async function collect(
 ): Promise<{ events: AdapterEvent[]; handle: ReturnType<Adapter['start']> }> {
   const events: AdapterEvent[] = [];
   const handle = adapter.start(
-    { cwd: fixture.cwd, prompt, env: {}, ...(resumeId ? { resumeId } : {}) },
+    { cwd: fixture.cwd, prompt: { text: prompt, attachments: [] }, env: {}, ...(resumeId ? { resumeId } : {}) },
     (event) => events.push(event),
   );
   await waitFor(() => predicate(events));
@@ -119,6 +119,44 @@ test('a resume id is passed to the SDK CLI', async (t) => {
   assert.deepEqual(invocation.argv.slice(-2), ['resume', 'fake-thread']);
 });
 
+test('PNG, JPEG, and WebP attachments reach the real SDK as native image arguments', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const paths = {
+    png: join(fixture.cwd, 'screen.png'),
+    jpeg: join(fixture.cwd, 'photo.jpeg'),
+    webp: join(fixture.cwd, 'diagram.webp'),
+    file: join(fixture.cwd, 'notes.txt'),
+  };
+  await Promise.all([
+    writeFile(paths.png, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+    writeFile(paths.jpeg, Buffer.from([0xff, 0xd8, 0xff])),
+    writeFile(paths.webp, Buffer.from('RIFF0000WEBP')),
+    writeFile(paths.file, 'notes'),
+  ]);
+  const events: AdapterEvent[] = [];
+
+  createCodexAdapter(fixture.runtime).start({
+    cwd: fixture.cwd,
+    env: {},
+    prompt: {
+      text: 'Inspect the attachments',
+      attachments: [
+        { name: 'screen.png', relativePath: 'screen.png', absolutePath: paths.png, kind: 'image' },
+        { name: 'photo.jpeg', relativePath: 'photo.jpeg', absolutePath: paths.jpeg, kind: 'image' },
+        { name: 'diagram.webp', relativePath: 'diagram.webp', absolutePath: paths.webp, kind: 'image' },
+        { name: 'notes.txt', relativePath: 'notes.txt', absolutePath: paths.file, kind: 'file' },
+      ],
+    },
+  }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'done'));
+
+  const [invocation] = await fixture.readInvocations();
+  assert.equal(invocation.prompt, 'Inspect the attachments\nAttached file: notes.txt');
+  assert.deepEqual(invocation.argv.flatMap((arg, index, argv) =>
+    arg === '--image' ? [argv[index + 1]] : []), [paths.png, paths.jpeg, paths.webp]);
+  assert.ok(!invocation.argv.includes(paths.file), 'ordinary files belong in prompt text, not --image');
+});
+
 test('completed SDK JSONL items normalize into append-only text and tool upserts', async (t) => {
   const fixture = await makeProcessFixture(t);
   const { events } = await collect(createCodexAdapter(fixture.runtime), fixture, 'basic', (all) =>
@@ -147,7 +185,7 @@ test('rich SDK lifecycles update one Registry row per item with safe bounded det
   });
   const events: AdapterEvent[] = [];
   createCodexAdapter(fixture.runtime).start(
-    { cwd: fixture.cwd, prompt: 'rich-lifecycle', env: {} },
+    { cwd: fixture.cwd, prompt: { text: 'rich-lifecycle', attachments: [] }, env: {} },
     (event) => {
       events.push(event);
       registry.apply(session.id, event);
@@ -212,8 +250,11 @@ test('follow-up prompts execute in FIFO order', async (t) => {
   const fixture = await makeProcessFixture(t);
   const adapter = createCodexAdapter(fixture.runtime);
   const events: AdapterEvent[] = [];
-  const handle = adapter.start({ cwd: fixture.cwd, prompt: 'first', env: {} }, (event) => events.push(event));
-  handle.send('second');
+  const handle = adapter.start(
+    { cwd: fixture.cwd, prompt: { text: 'first', attachments: [] }, env: {} },
+    (event) => events.push(event),
+  );
+  handle.send({ text: 'second', attachments: [] });
 
   await waitFor(async () => (await fixture.readInvocations()).length === 2);
   const invocations = await fixture.readInvocations();
@@ -309,12 +350,12 @@ test('stop marks queued FIFO prompts unsent before the terminal Codex event', as
   const adapter = createCodexAdapter(fixture.runtime);
   const events: AdapterEvent[] = [];
   const handle = adapter.start(
-    { cwd: fixture.cwd, prompt: 'hold', promptId: 'initial', env: {} },
+    { cwd: fixture.cwd, prompt: { text: 'hold', attachments: [] }, promptId: 'initial', env: {} },
     (event) => events.push(event),
   );
   await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'working'));
-  handle.send('follow one', 'follow-1');
-  handle.send('follow two', 'follow-2');
+  handle.send({ text: 'follow one', attachments: [] }, 'follow-1');
+  handle.send({ text: 'follow two', attachments: [] }, 'follow-2');
   handle.stop();
   await waitFor(() => events.some((event) => event.type === 'stopped'));
 

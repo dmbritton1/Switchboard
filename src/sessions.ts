@@ -118,11 +118,14 @@ export class Registry {
     this.#notify();
   }
 
-  appendPrompt(id: string, text: string, delivery: PromptDelivery): string {
+  appendPrompt(id: string, text: string, delivery: PromptDelivery, attachments: string[] = []): string {
     const s = this.#sessions.get(id);
     const promptId = randomUUID();
     if (!s) return promptId;
-    s.transcript.push({ kind: 'user', id: promptId, text, delivery });
+    s.transcript.push({
+      kind: 'user', id: promptId, text, delivery,
+      ...(attachments.length ? { attachments: [...attachments] } : {}),
+    });
     this.#notify();
     return promptId;
   }
