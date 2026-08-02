@@ -196,10 +196,11 @@ export function createServer(opts: {
 
   function launch(
     sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: string, resumeId?: string,
+    promptId?: string,
   ): { error: string; code?: CodexFailureCode } | null {
     const auto = registry.get(sessionId)?.auto ?? false;
     try {
-      const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
+      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
         if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
@@ -227,6 +228,9 @@ export function createServer(opts: {
       const code = account.provider === 'codex'
         ? (resumeId ? 'codex_resume_failed' : 'codex_start_failed')
         : undefined;
+      if (account.provider === 'codex' && promptId) {
+        registry.apply(sessionId, { type: 'prompt-delivery', id: promptId, delivery: 'unsent' });
+      }
       registry.apply(sessionId, { type: 'stopped', reason, ...(code ? { code } : {}) });
       return { error: reason, ...(code ? { code } : {}) };
     }
@@ -263,18 +267,24 @@ export function createServer(opts: {
           branch: String(body.branch),
           title: String(body.branch),
         });
-        const launchError = launch(session.id, account, prepared.adapter, cwd, String(body.prompt));
+        const prompt = String(body.prompt);
+        const promptId = registry.appendPrompt(
+          session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
+        );
+        const launchError = launch(session.id, account, prepared.adapter, cwd, prompt, undefined, promptId);
         if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
       }
 
       case 'send': {
+        const session = registry.get(String(body.id));
         const handle = handles.get(String(body.id));
-        if (!handle) return { status: 404, json: { error: 'no live session' } };
-        registry.apply(String(body.id), {
-          type: 'msg', msg: { kind: 'user', text: String(body.text) },
-        });
-        handle.send(String(body.text));
+        if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
+        const text = String(body.text);
+        const promptId = registry.appendPrompt(
+          session.id, text, session.provider === 'codex' ? 'queued' : 'sent',
+        );
+        handle.send(text, promptId);
         return { status: 200, json: { ok: true } };
       }
 
@@ -340,9 +350,13 @@ export function createServer(opts: {
         // so without this an SSE client would keep showing 'stopped' until the
         // resumed agent's first async event arrived.
         registry.revive(session.id);
+        const prompt = typeof body.prompt === 'string' ? body.prompt : 'continue';
+        const promptId = account.provider === 'codex' && typeof body.prompt === 'string'
+          ? registry.appendPrompt(session.id, prompt, 'queued')
+          : undefined;
         const launchError = launch(
-          session.id, account, prepared.adapter, session.cwd, String(body.prompt ?? 'continue'),
-          session.vendorSessionId ?? undefined,
+          session.id, account, prepared.adapter, session.cwd, prompt,
+          session.vendorSessionId ?? undefined, promptId,
         );
         if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { ok: true } };

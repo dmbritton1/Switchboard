@@ -112,7 +112,7 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       ? codex.resumeThread(opts.resumeId, threadOptions)
       : codex.startThread(threadOptions);
 
-    const queue: string[] = [];
+    const queue: { text: string; promptId?: string }[] = [];
     // Cancels the in-flight Codex turn on stop(); see TurnOptions.signal in the SDK's
     // .d.ts. One controller for the adapter's lifetime — stop() is terminal, like the
     // Claude adapter's q.interrupt().
@@ -125,7 +125,20 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
     function finish(reason: string, code: CodexFailureCode, abort = true): void {
       if (stopped) return;
       stopped = true;
-      queue.length = 0;
+      const unsent = queue.splice(0);
+      for (const prompt of unsent) {
+        if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'unsent' });
+      }
+      if (unsent.length) {
+        const noun = unsent.length === 1 ? 'prompt was' : 'prompts were';
+        emit({
+          type: 'msg',
+          msg: {
+            kind: 'error',
+            text: `${unsent.length} queued ${noun} not sent. Resend ${unsent.length === 1 ? 'it' : 'them'} manually if still needed.`,
+          },
+        });
+      }
       if (abort && !aborted) {
         aborted = true;
         abortController.abort();
@@ -144,8 +157,9 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       running = true;
       try {
         while (queue.length && !stopped) {
-          const text = queue.shift()!;
-          const { events } = await thread.runStreamed(text, { signal: abortController.signal });
+          const prompt = queue.shift()!;
+          if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'sent' });
+          const { events } = await thread.runStreamed(prompt.text, { signal: abortController.signal });
           for await (const e of events) {
             if (stopped) break;
             if (e.type === 'turn.started') turnStarted = true;
@@ -173,13 +187,13 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       }
     }
 
-    queue.push(opts.prompt);
+    queue.push({ text: opts.prompt, promptId: opts.promptId });
     void drain();
 
     return {
-      send(text: string) {
+      send(text: string, promptId?: string) {
         emit({ type: 'status', status: 'working' });
-        queue.push(text);
+        queue.push({ text, promptId });
         void drain();
       },
       // Codex approvals are policy, not interactive. Nothing to decide.
@@ -191,7 +205,7 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       // `stopped` handler, and this stop() emits `stopped` — without the early
       // return a UI double-click, or drain()'s failure path, would re-enter.
       stop() {
-        finish('stopped from switchboard', 'codex_user_stopped');
+        finish('Stopped by user.', 'codex_user_stopped');
       },
     };
     },

@@ -231,9 +231,35 @@ test('stop aborts a holding SDK turn exactly once with the user-stopped code', a
   await waitFor(async () => (await fixture.readHoldLifecycle()).includes('aborted'));
 
   assert.deepEqual(events.filter((event) => event.type === 'stopped'), [{
-    type: 'stopped', reason: 'stopped from switchboard', code: 'codex_user_stopped',
+    type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped',
   }]);
   assert.deepEqual(await fixture.readHoldLifecycle(), ['started', 'alive', 'aborted']);
+});
+
+test('stop marks queued FIFO prompts unsent before the terminal Codex event', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const adapter = createCodexAdapter(fixture.runtime);
+  const events: AdapterEvent[] = [];
+  const handle = adapter.start(
+    { cwd: fixture.cwd, prompt: 'hold', promptId: 'initial', env: {} },
+    (event) => events.push(event),
+  );
+  await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'working'));
+  handle.send('follow one', 'follow-1');
+  handle.send('follow two', 'follow-2');
+  handle.stop();
+  await waitFor(() => events.some((event) => event.type === 'stopped'));
+
+  assert.deepEqual(events.filter((event) => event.type !== 'status' && event.type !== 'vendor-session-id'), [
+    { type: 'prompt-delivery', id: 'initial', delivery: 'sent' },
+    { type: 'prompt-delivery', id: 'follow-1', delivery: 'unsent' },
+    { type: 'prompt-delivery', id: 'follow-2', delivery: 'unsent' },
+    {
+      type: 'msg',
+      msg: { kind: 'error', text: '2 queued prompts were not sent. Resend them manually if still needed.' },
+    },
+    { type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped' },
+  ]);
 });
 
 test('public Codex failure classification prefers auth and sandbox over fallback', () => {

@@ -15,12 +15,83 @@ function make(): { reg: Registry; id: string } {
   return { reg, id: s.id };
 }
 
+async function writePromptMigrationState(
+  t: { after(fn: () => unknown): void },
+  transcript: unknown[],
+): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-prompt-migration-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [{
+    id: 'prompt-migration', provider: 'codex', account: 'codex', vendorSessionId: null,
+    repo: '/r', cwd: '/r/wt', branch: 'b', title: 'prompt migration', status: 'working',
+    transcript, pending: null, stoppedReason: null, startedAt: 1, statusSince: 1,
+  }] }));
+  return path;
+}
+
 test('a new session starts working with an empty transcript', () => {
   const { reg, id } = make();
   const s = reg.get(id)!;
   assert.equal(s.status, 'working');
   assert.deepEqual(s.transcript, []);
   assert.equal(s.pending, null);
+});
+
+test('prompt delivery moves queued to sent by stable id', () => {
+  const { reg, id } = make();
+  const promptId = reg.appendPrompt(id, 'run the tests', 'queued');
+  reg.apply(id, { type: 'prompt-delivery', id: promptId, delivery: 'sent' });
+
+  assert.deepEqual(reg.get(id)!.transcript.at(-1), {
+    kind: 'user', id: promptId, text: 'run the tests', delivery: 'sent',
+  });
+});
+
+test('unknown prompt delivery ids leave accepted prompts unchanged', () => {
+  const { reg, id } = make();
+  const promptId = reg.appendPrompt(id, 'keep this delivery', 'queued');
+  reg.apply(id, { type: 'prompt-delivery', id: 'not-a-prompt', delivery: 'sent' });
+
+  assert.deepEqual(reg.get(id)!.transcript.at(-1), {
+    kind: 'user', id: promptId, text: 'keep this delivery', delivery: 'queued',
+  });
+});
+
+test('load migrates legacy and interrupted prompts without replaying them', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    { kind: 'user', text: 'legacy' },
+    { kind: 'user', id: 'queued-1', text: 'interrupted', delivery: 'queued' },
+  ]);
+
+  const loaded = (await Registry.load(path)).all()[0];
+  const legacy = loaded.transcript[0];
+  assert.equal(legacy.kind, 'user');
+  assert.ok(legacy.kind === 'user');
+  assert.equal(legacy.delivery, 'sent');
+  assert.ok(legacy.id, 'legacy prompts receive a durable ID');
+  assert.deepEqual(loaded.transcript[1], {
+    kind: 'user', id: 'queued-1', text: 'interrupted', delivery: 'unsent',
+  });
+  assert.match((loaded.transcript.at(-1) as { text: string }).text, /1 queued prompt was not sent/);
+});
+
+test('load converts every queued prompt to unsent and preserves sent prompts', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    { kind: 'user', id: 'sent-1', text: 'already delivered', delivery: 'sent' },
+    { kind: 'user', id: 'queued-1', text: 'first interrupted', delivery: 'queued' },
+    { kind: 'user', id: 'queued-2', text: 'second interrupted', delivery: 'queued' },
+  ]);
+
+  const loaded = (await Registry.load(path)).all()[0];
+  assert.deepEqual(loaded.transcript.slice(0, 3), [
+    { kind: 'user', id: 'sent-1', text: 'already delivered', delivery: 'sent' },
+    { kind: 'user', id: 'queued-1', text: 'first interrupted', delivery: 'unsent' },
+    { kind: 'user', id: 'queued-2', text: 'second interrupted', delivery: 'unsent' },
+  ]);
+  assert.deepEqual(loaded.transcript.at(-1), {
+    kind: 'error', text: '2 queued prompts were not sent. Resend them manually if still needed.',
+  });
 });
 
 test('an approval event sets needs-you and stores the request', () => {

@@ -13,8 +13,10 @@ export type CodexFailureCode =
   | 'codex_sandbox_denied'
   | 'codex_user_stopped';
 
+export type PromptDelivery = 'queued' | 'sent' | 'unsent';
+
 export type Msg =
-  | { kind: 'user'; text: string }
+  | { kind: 'user'; id: string; text: string; delivery: PromptDelivery }
   | { kind: 'text'; text: string }
   // id is optional: it correlates a tool call to its later result so the registry
   // can flip status running -> ok/error. The Codex adapter (Task 5) emits tool
@@ -53,11 +55,13 @@ export type AdapterEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
+  | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
   | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 
 export type StartOpts = {
   cwd: string;
   prompt: string;
+  promptId?: string;
   env: Record<string, string>;
   resumeId?: string;
   /** Start with auto-approval already on, so a resumed session keeps the toggle
@@ -66,7 +70,7 @@ export type StartOpts = {
 };
 
 export type AgentHandle = {
-  send(text: string): void;
+  send(text: string, promptId?: string): void;
   decide(allow: boolean): void;
   setAuto(on: boolean): void;
   stop(): void;

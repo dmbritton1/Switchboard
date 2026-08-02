@@ -165,6 +165,106 @@ test('a successful Codex create finishes with the fake executable', async (t) =>
   assert.equal(fixture.registry.get(created.id)!.vendorSessionId, 'fake-thread');
 });
 
+test('Codex create persists its written initial prompt as queued before the response', async (t) => {
+  const fixture = await bootCodex(t);
+  const deliveries: string[] = [];
+  const unsubscribe = fixture.registry.subscribe(() => {
+    const prompt = fixture.registry.all()[0]?.transcript.find((msg) => msg.kind === 'user');
+    if (prompt?.kind === 'user') deliveries.push(prompt.delivery);
+  });
+  const response = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'codex-hold', prompt: 'hold',
+  });
+  unsubscribe();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(deliveries.slice(0, 2), ['queued', 'sent']);
+});
+
+test('Codex follow-ups persist queued then become sent in FIFO order', async (t) => {
+  const fixture = await bootCodex(t);
+  const created = await fixture.create('hold');
+  await fixture.waitForSession(created.id, (session) => session.status === 'working');
+  const first = await fixture.command({ cmd: 'send', id: created.id, text: 'first follow-up' });
+  const second = await fixture.command({ cmd: 'send', id: created.id, text: 'second follow-up' });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.deepEqual(fixture.registry.get(created.id)!.transcript.slice(-2).map((msg) =>
+    msg.kind === 'user' && ({ text: msg.text, delivery: msg.delivery })), [
+    { text: 'first follow-up', delivery: 'queued' },
+    { text: 'second follow-up', delivery: 'queued' },
+  ]);
+
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  assert.deepEqual(fixture.registry.get(created.id)!.transcript
+    .filter((msg) => msg.kind === 'user')
+    .map((msg) => ({ text: msg.text, delivery: msg.delivery })), [
+    { text: 'hold', delivery: 'sent' },
+    { text: 'first follow-up', delivery: 'unsent' },
+    { text: 'second follow-up', delivery: 'unsent' },
+  ]);
+});
+
+test('a failed active Codex turn leaves queued follow-ups unsent and resume does not replay them', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-codex-delivery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = join(dir, 'slow-failing-codex');
+  await writeFile(bin, `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('--version')) { process.stdout.write('codex-cli 0.145.0\\n'); process.exit(0); }
+if (args[0] === 'login' && args[1] === 'status') { process.stdout.write('Logged in using ChatGPT\\n'); process.exit(0); }
+let prompt = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { prompt += chunk; });
+process.stdin.on('end', () => {
+  appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ argv: args, prompt, cwd: args[args.indexOf('--cd') + 1], codexHome: process.env.CODEX_HOME ?? null }) + '\\n');
+  const emit = (event) => process.stdout.write(JSON.stringify(event) + '\\n');
+  emit({ type: 'thread.started', thread_id: 'fake-thread' });
+  emit({ type: 'turn.started' });
+  if (prompt === 'fail after delay') {
+    setTimeout(() => emit({ type: 'turn.failed', error: { message: 'delayed failure' } }), 200);
+    return;
+  }
+  emit({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+});
+`);
+  await chmod(bin, 0o755);
+
+  const fixture = await bootCodex(t, { bin });
+  const create = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'codex-delayed-failure', prompt: 'fail after delay',
+  });
+  assert.equal(create.status, 200, JSON.stringify(create.data));
+  const created = create.data as { id: string };
+  await fixture.waitForSession(created.id, (session) => session.status === 'working');
+  await fixture.command({ cmd: 'send', id: created.id, text: 'queued one' });
+  await fixture.command({ cmd: 'send', id: created.id, text: 'queued two' });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+
+  assert.deepEqual(fixture.registry.get(created.id)!.transcript
+    .filter((msg) => msg.kind === 'user')
+    .map((msg) => ({ text: msg.text, delivery: msg.delivery })), [
+    { text: 'fail after delay', delivery: 'sent' },
+    { text: 'queued one', delivery: 'unsent' },
+    { text: 'queued two', delivery: 'unsent' },
+  ]);
+
+  const resumed = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'resume once' });
+  assert.equal(resumed.status, 200);
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'send', id: created.id, text: 'delivered one' });
+  await fixture.command({ cmd: 'send', id: created.id, text: 'delivered two' });
+  await waitFor(async () => (await fixture.invocations()).length === 4);
+  await fixture.waitForSession(created.id, (session) => session.transcript
+    .filter((msg) => msg.kind === 'user' && msg.text.startsWith('delivered'))
+    .every((msg) => msg.kind === 'user' && msg.delivery === 'sent'));
+  assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), [
+    'fail after delay', 'resume once', 'delivered one', 'delivered two',
+  ]);
+});
+
 test('a first-turn Codex launch failure keeps its stopped session and worktree', async (t) => {
   const fixture = await bootCodex(t, { env: { FAKE_CODEX_SECRET: 'launch-secret' } });
   const response = await fixture.command({
