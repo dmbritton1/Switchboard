@@ -5,10 +5,17 @@
   /* Fields read as wells recessed into the card, so they sit darker than it. */
   --field: #141414; --line: #2e2e2e;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* #bar's real rendered height (measured, not assumed) — anything else that
+     sticks below it (#selection-bar, the session view's sticky chrome) reads
+     this instead of hard-coding a number that would drift the moment #bar's
+     padding or content does. */
+  --bar-h: 3.476rem;
 }
 body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   font: 15px/1.4 ui-sans-serif, system-ui, sans-serif; }
-#notif-bar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center;
+/* Not sticky: it renders directly under #bar in document order and has nothing
+   to stick to a second time. */
+#notif-bar { display: flex; align-items: center;
   flex-wrap: wrap; gap: .8rem; background: #2a1f0f; border: 1px solid #4a3316;
   color: #e8c48a; border-radius: 10px; padding: .6rem 1rem; margin-bottom: 1rem;
   font-size: .9em; }
@@ -18,11 +25,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 /* The `hidden` attribute only sets `display: none` from the UA sheet, so any
    author rule with a `display` beats it — `#grid { display: grid }` below kept
    the grid laid out at full height while the code believed it was hidden,
-   pushing #chat and #graph down the page behind a wall of blank space. One
-   defensive rule rather than a `[hidden]` variant per view, which is the same
-   bug waiting on whichever view gets a `display` next. */
+   pushing the session view down the page behind a wall of blank space. One
+   defensive rule rather than a `[hidden]` variant per view (`#grid`, the
+   `#pane-*` panes), which is the same bug waiting on whichever one gets a
+   `display` next. */
 [hidden] { display: none !important; }
-#notif-bar button[hidden] { display: none; }
 #grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
 .card { background: var(--card); border-radius: 14px; padding: 1rem; cursor: pointer;
   border: 1px solid transparent; }
@@ -41,13 +48,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .approval button { margin-right: .4rem; }
 
 /* ---- Selection / merge / push ------------------------------------------ */
-/* A session card's checkbox sits in its own row above .status: the accounts
-   row above it reuses the bare .card class with none of this markup, so the
-   checkbox is scoped to .card-head rather than repurposing .card's own
-   padding (which would indent the account cards too, for no reason). */
+/* The top row of a card: selection checkbox, status, and the ⋯ overflow menu
+   pushed to the far right, all on one line above the branch name. */
 .card-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
 .card-head .select { cursor: pointer; line-height: 0; }
-#selection-bar { grid-column: 1 / -1; position: sticky; top: 0; z-index: 2;
+#selection-bar { grid-column: 1 / -1; position: sticky; top: var(--bar-h); z-index: 2;
   display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
   padding: .7rem 1rem; cursor: default; }
@@ -78,6 +83,19 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #upload-error:empty { display: none; }
 
 /* ---- Session view ------------------------------------------------------ */
+/* Only the cross-session interrupt band and the one action slot (Allow/Deny,
+   Stop, Resume) stick below #bar — not the title bar and tabs above them. Those
+   two are what a long, auto-scrolled-to-bottom transcript would otherwise bury
+   several screens up; the title and tabs are not needed while reading the
+   bottom of a transcript you already opened, and sticking the whole stack ate
+   most of a short (~400px-tall) viewport in testing. They're grouped in one
+   #session-sticky wrapper, rather than each sticking independently, because
+   sibling sticky elements pinned to the same `top` stack on top of each other
+   instead of below one another. Opaque background and a z-index below #bar's
+   (4) but above the transcript's static content, so a long scroll shows
+   transcript text sliding *under* this, not through it. */
+#session-sticky { position: sticky; top: var(--bar-h); z-index: 1;
+  background: var(--bg); }
 #session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
 #session h2 { margin: 0; font-size: 1.05rem; font-weight: 700; word-break: break-word; }
 #session-menu { margin-left: auto; position: relative; }
@@ -99,7 +117,7 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    interchange where two lines join. Lane colours reuse the status palette —
    there are no status chips in this view, so nothing collides, and the app
    keeps one set of colours instead of two. */
-#pane-graph { --row: 34px; --lane: 24px; }
+#pane-graph { --row: 34px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
 .lane0 { color: #e0574a; } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
@@ -230,7 +248,7 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .menu-btn { padding: .1rem .45rem; border: 1px solid transparent; border-radius: 6px;
   background: none; color: var(--dim); font: inherit; line-height: 1; cursor: pointer; }
 .menu-btn:hover, .menu-btn.open { color: var(--fg); border-color: var(--line); }
-.menu { position: absolute; z-index: 3; top: 1.9rem; right: 0; min-width: 13rem;
+.menu { position: absolute; z-index: 5; top: 1.9rem; right: 0; min-width: 13rem;
   display: grid; padding: .25rem; background: #1f1f1f; border: 1px solid var(--line);
   border-radius: 10px; box-shadow: 0 12px 28px #000a; }
 .menu button, .menu label { display: flex; align-items: center; gap: .5rem; width: 100%;

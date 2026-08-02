@@ -2,7 +2,7 @@
 // Everything else in app.js is DOM assembly, verified by using it — this file
 // is the part with branches worth locking down.
 
-export const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
+const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
 
 const MIXED = 'Selected worktrees belong to different repos — pick worktrees from one repo';
 const basename = (p) => p.split('/').filter(Boolean).pop() ?? p;
@@ -32,6 +32,25 @@ export function cardAction(session, queue = []) {
     return held ? { kind: 'waiting', account: held.trigger.account } : { kind: 'resume' };
   }
   return { kind: 'none' };
+}
+
+/** A queue item's trigger, rendered for the queue strip. */
+export function triggerLabel(t) {
+  if (t.kind === 'at') return new Date(t.time).toLocaleString();
+  return `when ${t.account} resets`;
+}
+
+/**
+ * A queue item's target, rendered for the queue strip. `sessions` is passed in
+ * rather than read from a module global, the way `selectionState` already
+ * takes `sessions` and `selected` as arguments — that's what keeps this DOM-free
+ * and testable.
+ */
+export function targetLabel(action, sessions) {
+  if (action.kind === 'create') return `${action.branch} · new worktree`;
+  const s = sessions.find((x) => x.id === action.sessionId);
+  const branch = s ? s.branch : 'deleted session';
+  return action.kind === 'resume' ? `${branch} · resume` : `${branch} · message`;
 }
 
 /**

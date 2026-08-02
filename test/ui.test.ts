@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { sortSessions, cardAction, selectionState } from '../web/lib.js';
+import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from '../web/lib.js';
 
 const session = (over = {}) => ({
   id: 'a', repo: '/r/one', branch: 'feat/a', account: 'claude-main',
@@ -112,4 +112,35 @@ test('selectionState survives an empty selection', () => {
   assert.equal(out.count, 0);
   assert.equal(out.merge.enabled, false);
   assert.equal(out.push.enabled, false);
+});
+
+test('triggerLabel formats an at trigger as a local date/time', () => {
+  const time = Date.parse('2026-08-01T15:00:00Z');
+  assert.equal(triggerLabel({ kind: 'at', time }), new Date(time).toLocaleString());
+});
+
+test('triggerLabel names the account for a reset trigger', () => {
+  assert.equal(triggerLabel({ kind: 'reset', account: 'claude-main' }), 'when claude-main resets');
+});
+
+test('targetLabel names the new branch for a create action', () => {
+  const action = { kind: 'create', repo: '/r/one', branch: 'feat/new', account: 'claude-main', prompt: 'go' };
+  assert.equal(targetLabel(action, []), 'feat/new · new worktree');
+});
+
+test('targetLabel names the branch and kind for a send action on a live session', () => {
+  const sessions = [session({ id: 'a', branch: 'feat/a' })];
+  const action = { kind: 'send', sessionId: 'a', text: 'keep going' };
+  assert.equal(targetLabel(action, sessions), 'feat/a · message');
+});
+
+test('targetLabel names the branch and kind for a resume action on a live session', () => {
+  const sessions = [session({ id: 'a', branch: 'feat/a' })];
+  const action = { kind: 'resume', sessionId: 'a', prompt: 'continue' };
+  assert.equal(targetLabel(action, sessions), 'feat/a · resume');
+});
+
+test('targetLabel falls back to "deleted session" for a session id no longer in the list', () => {
+  const action = { kind: 'resume', sessionId: 'gone', prompt: 'continue' };
+  assert.equal(targetLabel(action, []), 'deleted session · resume');
 });

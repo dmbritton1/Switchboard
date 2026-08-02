@@ -1,4 +1,4 @@
-import { sortSessions, cardAction, selectionState } from './lib.js';
+import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
 let openId = null;
@@ -129,18 +129,6 @@ function accountPanel(a) {
 // rather than guarded at each call site.
 const queueItems = () => state.queue ?? [];
 
-function triggerLabel(t) {
-  if (t.kind === 'at') return new Date(t.time).toLocaleString();
-  return `when ${t.account} resets`;
-}
-
-function targetLabel(action) {
-  if (action.kind === 'create') return `${action.branch} · new worktree`;
-  const s = state.sessions.find((x) => x.id === action.sessionId);
-  const branch = s ? s.branch : 'deleted session';
-  return action.kind === 'resume' ? `${branch} · resume` : `${branch} · message`;
-}
-
 function queueRow(q) {
   const row = document.createElement('div');
   row.className = 'queue-row';
@@ -151,7 +139,7 @@ function queueRow(q) {
 
   const what = document.createElement('span');
   what.className = 'queue-what';
-  what.textContent = targetLabel(q.action);
+  what.textContent = targetLabel(q.action, state.sessions);
 
   const del = document.createElement('button');
   del.type = 'button';
@@ -183,7 +171,7 @@ function queuePanel() {
   return box;
 }
 
-/** The open panel's contents, or null. Task 3 adds the 'queue' branch. */
+/** The open panel's contents, or null. */
 function panelBody() {
   if (!panel) return null;
   if (panel === 'queue') return queueItems().length ? queuePanel() : null;
@@ -219,8 +207,15 @@ function render() {
 // per-session cache of results — cards are torn down and rebuilt every render
 // regardless, so a result cache would need its own invalidation story for no
 // real benefit here.
+//
+// renderDiffPane() shares this same timestamp rather than keeping a second timer:
+// renderGrid() only runs while openId is null and renderDiffPane() only while it
+// isn't, so the two never race for the throttle window.
 let lastStatusFetch = 0;
 const STATUS_THROTTLE_MS = 4000;
+// Set by openTab() on a fresh switch onto Diff; consumed by the next
+// renderDiffPane() to bypass the throttle just this once. See openTab().
+let forceDiffFetch = false;
 
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
@@ -413,12 +408,24 @@ function confirmDelete(s) {
   const dialog = $('#del');
   $('#del-branch').textContent = s.branch;
   $('#del-wt').checked = false;
-  $('#del-hint').textContent =
-    'Without the checkbox, the worktree is left on disk untouched — only Switchboard forgets the session.';
+  setDelHint(false);
   dialog.returnValue = '';
   dialog.dataset.id = s.id;
   dialog.showModal();
 }
+
+const DEL_HINT = {
+  false: 'Without the checkbox, the worktree is left on disk untouched — only Switchboard forgets the session.',
+  true: 'Uncommitted changes in this worktree will be lost.',
+};
+
+function setDelHint(removeWorktree) {
+  $('#del-hint').textContent = DEL_HINT[removeWorktree];
+}
+
+// Registered once at module level, not inside confirmDelete() (which runs per
+// open): the checkbox element itself never changes, only its checked state.
+$('#del-wt').addEventListener('change', (e) => setDelHint(e.target.checked));
 
 $('#del').addEventListener('close', (e) => {
   const dialog = e.target;
@@ -590,6 +597,11 @@ function resumeButton(s) {
 let tab = 'chat';
 
 function openTab(id, which) {
+  // A genuine switch onto Diff (new session, or arriving from another tab) must
+  // show fresh data immediately rather than wait out the throttle below — this
+  // is the one case where the pane would otherwise sit empty for up to
+  // STATUS_THROTTLE_MS with nothing on screen yet.
+  if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
   openId = id;
   tab = which;
   if (which === 'graph') { graphCommits = []; loadGraph(); }
@@ -649,6 +661,7 @@ function renderChatPane(s) {
     // The status class doubles as the styling hook: a tool message with status
     // 'error' picks up the existing .msg.error colour.
     el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
+    // A denied `rm -rf` and a successful one used to be pixel-identical.
     el.textContent = m.kind === 'tool'
       ? `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`
       : m.text;
@@ -661,6 +674,10 @@ function renderChatPane(s) {
 // that is what this shows — a real file-by-file diff needs a server route and
 // is spec'd separately.
 function renderDiffPane(s) {
+  const due = forceDiffFetch || Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
+  forceDiffFetch = false;
+  if (!due) return;
+  lastStatusFetch = Date.now();
   const pane = $('#pane-diff');
   fetch(`/status?id=${s.id}`).then((r) => r.json()).then((d) => {
     if (openId !== s.id || tab !== 'diff') return;
@@ -789,6 +806,7 @@ $('#queue-badge').onclick = () => setPanel('queue');
 // a keydown on document while the dialog is modal.
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && panel) { panel = null; render(); }
+  else if (e.key === 'Escape' && menuFor) { menuFor = null; render(); }
 });
 
 $('#composer').onsubmit = (e) => {
