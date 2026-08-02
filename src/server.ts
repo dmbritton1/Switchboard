@@ -20,6 +20,7 @@ export type Account = {
   provider: 'claude' | 'codex';
   budget: number;
   env: Record<string, string>;
+  bin?: string;
 };
 
 const WEB = new URL('../web/', import.meta.url).pathname;

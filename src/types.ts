@@ -1,5 +1,18 @@
 export type Status = 'working' | 'needs-you' | 'done' | 'stopped';
 
+export type CodexFailureCode =
+  | 'codex_platform_unsupported'
+  | 'codex_binary_missing'
+  | 'codex_binary_not_executable'
+  | 'codex_version_unreadable'
+  | 'codex_version_mismatch'
+  | 'codex_auth_unavailable'
+  | 'codex_start_failed'
+  | 'codex_resume_failed'
+  | 'codex_stream_failed'
+  | 'codex_sandbox_denied'
+  | 'codex_user_stopped';
+
 export type Msg =
   | { kind: 'user'; text: string }
   | { kind: 'text'; text: string }
