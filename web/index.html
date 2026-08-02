@@ -68,4 +68,18 @@
     <menu><button value="cancel" formnovalidate>Cancel</button><button id="create" value="create">Create worktree</button></menu>
   </form>
 </dialog>
+<dialog id="del">
+  <form method="dialog">
+    <h2>Delete session</h2>
+    <p id="del-branch"></p>
+    <!-- The checkbox lives inside the confirmation it modifies. On the card
+         face it was one misclick from discarding uncommitted work. -->
+    <label class="del-wt"><input type="checkbox" id="del-wt"> Also remove the git worktree</label>
+    <p class="hint" id="del-hint"></p>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button id="del-go" value="delete">Delete</button>
+    </menu>
+  </form>
+</dialog>
 <script type="module" src="/app.js"></script>

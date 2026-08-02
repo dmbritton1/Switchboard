@@ -1,4 +1,5 @@
-const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
+import { sortSessions, cardAction, selectionState } from './lib.js';
+
 let state = { sessions: [], accounts: [] };
 let openId = null;
 // Which header panel is open: null, 'queue', or an account name. Mutually
@@ -220,9 +221,7 @@ function renderGrid() {
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
-  const sorted = [...state.sessions].sort(
-    (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince,
-  );
+  const sorted = sortSessions(state.sessions);
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
   if (!state.sessions.length) {
@@ -249,9 +248,7 @@ function renderGrid() {
  */
 function selectionBar() {
   const ids = [...selected];
-  const sessions = state.sessions.filter((s) => ids.includes(s.id));
-  const repos = new Set(sessions.map((s) => s.repo));
-  const busy = sessions.find((s) => s.status === 'working' || s.status === 'needs-you');
+  const st = selectionState(state.sessions, selected);
 
   const bar = document.createElement('div');
   bar.id = 'selection-bar';
@@ -259,25 +256,19 @@ function selectionBar() {
 
   const label = document.createElement('span');
   label.className = 'selection-label';
-  label.textContent = repos.size > 1
-    ? `${sessions.length} selected across ${repos.size} repos`
-    : `${sessions.length} selected · ${sessions[0].repo.split('/').filter(Boolean).pop() ?? sessions[0].repo}`;
+  label.textContent = st.label;
   bar.append(label);
 
   const mergeBtn = document.createElement('button');
   mergeBtn.textContent = 'Merge selected';
-  mergeBtn.disabled = repos.size !== 1 || Boolean(busy);
-  mergeBtn.title = repos.size > 1
-    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
-    : busy ? `"${busy.branch}" is still running — stop it or wait` : '';
+  mergeBtn.disabled = !st.merge.enabled;
+  mergeBtn.title = st.merge.reason;
   mergeBtn.onclick = () => doMerge(ids);
 
   const pushBtn = document.createElement('button');
   pushBtn.textContent = 'Push';
-  pushBtn.disabled = repos.size !== 1;
-  pushBtn.title = repos.size > 1
-    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
-    : '';
+  pushBtn.disabled = !st.push.enabled;
+  pushBtn.title = st.push.reason;
   pushBtn.onclick = () => doPush(ids);
 
   const clearBtn = document.createElement('button');
@@ -311,6 +302,114 @@ async function doPush(ids) {
   render();
 }
 
+/** The single contextual control a session's state calls for. */
+function actionSlot(s) {
+  const act = cardAction(s, queueItems());
+  if (act.kind === 'approve') return approval(s);
+  if (act.kind === 'stop') return stopButton(s);
+  if (act.kind === 'resume') return resumeButton(s);
+  if (act.kind === 'waiting') {
+    const p = document.createElement('p');
+    p.className = 'waiting';
+    p.textContent = `⏱ waiting for ${act.account} to reset`;
+    return p;
+  }
+  return null;
+}
+
+// The session whose ⋯ menu is open, or null. Same pattern as openId: render()
+// reads it, handlers mutate it and re-render.
+let menuFor = null;
+
+function menuItem(label, onclick, extra = '') {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = extra;
+  b.textContent = label;
+  b.onclick = (e) => { e.stopPropagation(); menuFor = null; onclick(); };
+  return b;
+}
+
+/**
+ * Every per-session control that is not the one contextual action. New
+ * per-session features go here, so the card face never grows again.
+ */
+function overflowMenu(s) {
+  const wrap = document.createElement('div');
+  wrap.className = 'menu-wrap';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `menu-btn${menuFor === s.id ? ' open' : ''}`;
+  btn.title = 'More';
+  btn.textContent = '⋯';
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menuFor = menuFor === s.id ? null : s.id;
+    render();
+  };
+  wrap.append(btn);
+  if (menuFor !== s.id) return wrap;
+
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  menu.onclick = (e) => e.stopPropagation();
+
+  // Codex sessions never prompt (approvalPolicy 'never'), so the toggle would
+  // be a lie there — shown disabled with the reason, not hidden.
+  const auto = document.createElement('label');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = s.auto;
+  box.disabled = s.provider === 'codex';
+  auto.title = s.provider === 'codex'
+    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
+    : 'Approve every tool call automatically, without asking';
+  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
+  box.onchange = () => { menuFor = null; send({ cmd: 'auto', id: s.id, auto: box.checked }); };
+  auto.append(box, ' Auto-approve');
+
+  menu.append(
+    auto,
+    // `openTab()` does not exist until Task 5 — use `openGraph()` here and swap it there.
+    menuItem('Graph', () => openGraph(s.id)),
+    menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
+    menuItem('Delete…', () => confirmDelete(s), 'danger'),
+  );
+  wrap.append(menu);
+  return wrap;
+}
+
+function confirmDelete(s) {
+  const dialog = $('#del');
+  $('#del-branch').textContent = s.branch;
+  $('#del-wt').checked = false;
+  $('#del-hint').textContent =
+    'Without the checkbox, the worktree is left on disk untouched — only Switchboard forgets the session.';
+  dialog.returnValue = '';
+  dialog.dataset.id = s.id;
+  dialog.showModal();
+}
+
+$('#del').addEventListener('close', (e) => {
+  const dialog = e.target;
+  // Consumed for the same reason the create dialog consumes it: Escape closes
+  // without setting returnValue, so a stale 'delete' would make the next
+  // Escape destroy a worktree.
+  const go = dialog.returnValue === 'delete';
+  dialog.returnValue = '';
+  if (!go) return;
+  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
+  send({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
+});
+
+// Any click that is not on a menu closes the open one. Registered once, in the
+// capture phase so a card's own onclick (which opens the chat) does not fire
+// first and navigate away while a menu is open.
+document.addEventListener('click', (e) => {
+  if (menuFor && !e.target.closest('.menu-wrap')) { menuFor = null; render(); }
+}, true);
+
 function card(s, fetchStatus) {
   const el = document.createElement('div');
   el.className = `card ${s.status}`;
@@ -329,24 +428,15 @@ function card(s, fetchStatus) {
   };
   select.append(checkbox);
 
-  // s.branch is whatever the user typed into the create-session form (and it
-  // survives into the session basically unsanitized on the server side), so it
-  // is untrusted text and must go through textContent, not innerHTML.
+  // s.branch is whatever the user typed into the create form and reaches the
+  // session essentially unsanitized, so it is untrusted text — textContent only.
   const status = document.createElement('div');
   status.className = `status ${s.status}`;
   status.textContent = `${s.status} · ${elapsed(s.statusSince)}`;
 
-  // The card itself opens the chat, so this has to stop the click from bubbling.
-  const tree = document.createElement('button');
-  tree.className = 'tree-btn';
-  tree.type = 'button';
-  tree.title = 'Commit graph';
-  tree.textContent = 'graph';
-  tree.onclick = (e) => { e.stopPropagation(); openGraph(s.id); };
-
   const head = document.createElement('div');
   head.className = 'card-head';
-  head.append(select, status, autoToggle(s), tree);
+  head.append(select, status, overflowMenu(s));
 
   const branch = document.createElement('div');
   branch.className = 'branch';
@@ -354,21 +444,18 @@ function card(s, fetchStatus) {
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = s.account;
+  meta.textContent = `${s.repo.split('/').filter(Boolean).pop() ?? s.repo} · ${s.account}`;
 
   const wt = document.createElement('div');
   wt.className = 'wt';
 
   el.append(head, branch, meta, wt);
+  // `tab` does not exist until Task 5 — until then this just opens the chat view.
   el.onclick = () => { openId = s.id; render(); };
 
-  // renderGrid() replaceChildren()s the whole grid on every render, so the `wt`
-  // node captured by this closure is very likely detached by the time the fetch
-  // resolves (a fresh SSE snapshot mid-burst rebuilds it before the network
-  // round trip finishes). Look the node up fresh by session id at write time —
-  // `.card[data-id] > .wt` picks the direct-child stats div, not the unrelated
-  // `.wt`-classed line inside an approval box — and skip silently if the card
-  // is gone (session deleted or scrolled off in a future render).
+  // renderGrid() replaceChildren()s the whole grid on every render, so this
+  // node is very likely detached by the time the fetch resolves. Look the card
+  // up fresh by id at write time and skip silently if it is gone.
   if (fetchStatus) {
     fetch(`/status?id=${s.id}`).then((r) => r.json()).then((data) => {
       if (!data) return;
@@ -377,13 +464,8 @@ function card(s, fetchStatus) {
     }).catch(() => {});
   }
 
-  if (s.pending) el.append(approval(s));
-  if (s.status === 'stopped') el.append(resumeButton(s));
-  // Only where there is something to stop: a `done` session has finished its turn
-  // and a `stopped` one is already terminal, so Stop on either is a no-op button.
-  // Without this, Delete was the only way to halt a runaway write-capable agent.
-  if (s.status === 'working' || s.status === 'needs-you') el.append(stopButton(s));
-  el.append(deleteControl(s));
+  const slot = actionSlot(s);
+  if (slot) el.append(slot);
   return el;
 }
 
@@ -414,32 +496,6 @@ function stopButton(s) {
   // Stopping is not destructive — no confirm. The card stays, with a Resume button.
   b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'stop', id: s.id }); };
   return b;
-}
-
-function deleteControl(s) {
-  const box = document.createElement('div');
-  box.className = 'delete';
-
-  const label = document.createElement('label');
-  label.onclick = (e) => e.stopPropagation();
-  const checkbox = document.createElement('input');
-  checkbox.type = 'checkbox';
-  label.append(checkbox, ' remove worktree');
-
-  const b = document.createElement('button');
-  b.textContent = 'Delete';
-  b.onclick = (e) => {
-    e.stopPropagation();
-    const removeWorktree = checkbox.checked;
-    const msg = removeWorktree
-      ? `Delete "${s.branch}" and remove its git worktree? Uncommitted changes in it will be lost.`
-      : `Delete "${s.branch}" from Switchboard? Its git worktree will be left on disk, untouched.`;
-    if (!window.confirm(msg)) return;
-    send({ cmd: 'delete', id: s.id, removeWorktree });
-  };
-
-  box.append(label, b);
-  return box;
 }
 
 function approval(s) {
