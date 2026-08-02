@@ -6,7 +6,7 @@ let openId = null;
 // exclusive by construction — one variable, not one flag per panel.
 let panel = null;
 let seenNeedsYou = new Set();
-// Session whose chat view has already been auto-scrolled once; see renderChat().
+// Session whose chat view has already been auto-scrolled once; see renderChatPane().
 let scrolledFor = null;
 // Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
 // as openId — render() reads it, checkbox/button handlers mutate it and re-render.
@@ -52,11 +52,10 @@ function elapsed(since) {
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
 }
 
-// Session whose commit graph is open, and the commits last fetched for it.
-// Graph data is not in the SSE snapshot: commits change when the agent commits
-// or the user merges, neither of which is a session-state event, so this view
-// polls instead of riding render().
-let graphId = null;
+// Commits last fetched for the open session's Graph tab. Graph data is not in
+// the SSE snapshot: commits change when the agent commits or the user merges,
+// neither of which is a session-state event, so this view polls instead of
+// riding render().
 let graphCommits = [];
 
 function setPanel(next) {
@@ -189,8 +188,7 @@ function renderHeader() {
 
 function render() {
   renderHeader();
-  if (graphId) return renderGraph();
-  openId ? renderChat() : renderGrid();
+  openId ? renderSession() : renderGrid();
 }
 
 // ponytail: renderGrid() rebuilds every card on every render, and render() runs on
@@ -205,8 +203,7 @@ const STATUS_THROTTLE_MS = 4000;
 
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
-  $('#chat').hidden = true;
-  $('#graph').hidden = true;
+  $('#session').hidden = true;
   const grid = $('#grid');
   grid.hidden = false;
   grid.replaceChildren();
@@ -375,8 +372,7 @@ function overflowMenu(s) {
 
   menu.append(
     auto,
-    // `openTab()` does not exist until Task 5 — use `openGraph()` here and swap it there.
-    menuItem('Graph', () => openGraph(s.id)),
+    menuItem('Graph', () => openTab(s.id, 'graph')),
     menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
     menuItem('Delete…', () => confirmDelete(s), 'danger'),
   );
@@ -460,8 +456,7 @@ function card(s, fetchStatus) {
   wt.className = 'wt';
 
   el.append(head, branch, meta, wt);
-  // `tab` does not exist until Task 5 — until then this just opens the chat view.
-  el.onclick = () => { openId = s.id; render(); };
+  el.onclick = () => openTab(s.id, 'chat');
 
   // renderGrid() replaceChildren()s the whole grid on every render, so this
   // node is very likely detached by the time the fetch resolves. Look the card
@@ -477,27 +472,6 @@ function card(s, fetchStatus) {
   const slot = actionSlot(s);
   if (slot) el.append(slot);
   return el;
-}
-
-/**
- * Auto-approve toggle. Codex sessions never prompt in the first place
- * (approvalPolicy 'never'), so the checkbox would be a lie there — show it
- * disabled and explain, rather than offering a switch that changes nothing.
- */
-function autoToggle(s) {
-  const label = document.createElement('label');
-  label.className = 'auto';
-  label.onclick = (e) => e.stopPropagation();
-  const box = document.createElement('input');
-  box.type = 'checkbox';
-  box.checked = s.auto;
-  box.disabled = s.provider === 'codex';
-  label.title = s.provider === 'codex'
-    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
-    : 'Approve every tool call automatically, without asking';
-  box.onchange = () => send({ cmd: 'auto', id: s.id, auto: box.checked });
-  label.append(box, ' auto');
-  return label;
 }
 
 function stopButton(s) {
@@ -536,27 +510,58 @@ function resumeButton(s) {
   return b;
 }
 
-function renderChat() {
+// Which facet of the open session is showing. Resets to 'chat' on open — you
+// open a session to read what it said, not to land on the tab you last used
+// somewhere else.
+let tab = 'chat';
+
+function openTab(id, which) {
+  openId = id;
+  tab = which;
+  if (which === 'graph') { graphCommits = []; loadGraph(); }
+  render();
+}
+
+const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
+
+function renderSession() {
   const s = state.sessions.find((x) => x.id === openId);
   if (!s) { openId = null; return renderGrid(); }
   $('#grid').hidden = true;
-  $('#graph').hidden = true;
-  $('#chat').hidden = false;
-  $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
-  // Rebuilt rather than mutated: renderChat() runs on every SSE snapshot, so the
-  // checkbox has to re-read s.auto to stay honest if another tab flips it.
-  $('#chat-auto').replaceChildren(autoToggle(s));
+  $('#session').hidden = false;
+  $('#session-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
+  $('#session-menu').replaceChildren(overflowMenu(s));
 
+  const slot = actionSlot(s);
+  $('#session-action').replaceChildren(...(slot ? [slot] : []));
+
+  $('#tabs').replaceChildren(...TABS.map(([key, label]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.role = 'tab';
+    b.textContent = label;
+    b.setAttribute('aria-selected', String(tab === key));
+    b.onclick = () => openTab(s.id, key);
+    return b;
+  }));
+
+  for (const [key] of TABS) $(`#pane-${key}`).hidden = tab !== key;
+
+  if (tab === 'chat') renderChatPane(s);
+  if (tab === 'diff') renderDiffPane(s);
+  if (tab === 'graph') renderGraphPane(s);
+}
+
+function renderChatPane(s) {
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
   // unconditionally yanked the view out from under anyone reading scrollback.
-  // The first render after opening a card always scrolls — that one is the user
-  // asking to see the latest, not reading back.
+  // The first render after opening a session always scrolls — that one is the
+  // user asking to see the latest, not reading back.
   const firstOpen = scrolledFor !== openId;
-  // Clear any upload error from a previous session, but only on an actual
-  // session switch: renderChat() re-runs on every SSE snapshot and on a 30s
-  // interval while the agent works, so an unconditional clear here erased the
-  // error before the user had a chance to read it.
+  // Only cleared on an actual session switch: this re-runs on every snapshot
+  // and on the 30s timer, and an unconditional clear erased upload errors
+  // before they could be read.
   if (firstOpen) $('#upload-error').textContent = '';
   scrolledFor = openId;
   const nearBottom = firstOpen
@@ -570,13 +575,60 @@ function renderChat() {
     // 'error' picks up the existing .msg.error colour.
     el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
     el.textContent = m.kind === 'tool'
-      // A denied `rm -rf` and a successful one used to be pixel-identical.
       ? `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`
       : m.text;
     t.append(el);
   }
-  if (s.pending) t.append(approval(s));
   if (nearBottom) t.scrollIntoView({ block: 'end' });
+}
+
+// The named slot for the diff spec. /status returns only the totals today, so
+// that is what this shows — a real file-by-file diff needs a server route and
+// is spec'd separately.
+function renderDiffPane(s) {
+  const pane = $('#pane-diff');
+  fetch(`/status?id=${s.id}`).then((r) => r.json()).then((d) => {
+    if (openId !== s.id || tab !== 'diff') return;
+    const p = document.createElement('p');
+    p.className = 'meta';
+    p.textContent = d
+      ? `${d.branch} · +${d.added} −${d.removed} · ${d.dirty ? 'uncommitted changes' : 'clean'}`
+      : 'No worktree status available.';
+    const note = document.createElement('p');
+    note.className = 'meta';
+    note.textContent = 'File-by-file diff is not implemented yet.';
+    pane.replaceChildren(p, note);
+  }).catch(() => {});
+}
+
+function renderGraphPane(s) {
+  const rows = $('#graph-rows');
+  if (!graphCommits.length) {
+    rows.replaceChildren(Object.assign(document.createElement('p'), {
+      id: 'graph-empty', textContent: 'No commits yet.',
+    }));
+    $('#graph-svg').replaceChildren();
+    return;
+  }
+  const width = drawGraph(graphCommits);
+  rows.replaceChildren(...graphCommits.map((c) => {
+    const row = document.createElement('div');
+    row.className = 'commit';
+    row.style.marginLeft = `${width + 14}px`;
+    const hash = document.createElement('span');
+    hash.className = 'hash';
+    hash.textContent = c.h.slice(0, 7);
+    row.append(hash);
+    for (const r of c.refs) row.append(refPill(r, c.lane));
+    const subject = document.createElement('span');
+    subject.className = 'subject';
+    subject.textContent = c.subject;
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = `${c.author} · ${c.when}`;
+    row.append(subject, when);
+    return row;
+  }));
 }
 
 // ---- Commit graph -------------------------------------------------------
@@ -637,63 +689,21 @@ function refPill(raw, lane) {
   return pill;
 }
 
-function renderGraph() {
-  const s = state.sessions.find((x) => x.id === graphId);
-  if (!s) { graphId = null; return renderGrid(); }
-  $('#grid').hidden = true;
-  $('#chat').hidden = true;
-  $('#graph').hidden = false;
-  $('#graph-title').textContent = `${s.branch} · commit graph`;
-
-  const rows = $('#graph-rows');
-  if (!graphCommits.length) {
-    rows.replaceChildren(Object.assign(document.createElement('p'), {
-      id: 'graph-empty', textContent: 'No commits yet.',
-    }));
-    $('#graph-svg').replaceChildren();
-    return;
-  }
-  const width = drawGraph(graphCommits);
-  rows.replaceChildren(...graphCommits.map((c) => {
-    const row = document.createElement('div');
-    row.className = 'commit';
-    row.style.marginLeft = `${width + 14}px`;
-    const hash = document.createElement('span');
-    hash.className = 'hash';
-    hash.textContent = c.h.slice(0, 7);
-    row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.lane));
-    const subject = document.createElement('span');
-    subject.className = 'subject';
-    subject.textContent = c.subject;
-    const when = document.createElement('span');
-    when.className = 'when';
-    when.textContent = `${c.author} · ${c.when}`;
-    row.append(subject, when);
-    return row;
-  }));
-}
-
 async function loadGraph() {
-  if (!graphId) return;
-  const id = graphId;
+  if (!openId || tab !== 'graph') return;
+  const id = openId;
   const commits = await fetch(`/graph?id=${id}`).then((r) => r.json()).catch(() => null);
   // The view can close or switch sessions while this is in flight; dropping a
   // stale response keeps one session's commits from landing under another's.
-  if (!commits || graphId !== id) return;
+  if (!commits || openId !== id || tab !== 'graph') return;
   graphCommits = commits;
-  renderGraph();
+  renderSession();
 }
+// The 2s interval stays, but the guard above makes it a no-op unless the
+// Graph tab is showing — before this task it polled whether or not the view
+// was even open.
 setInterval(loadGraph, 2000);
 
-function openGraph(id) {
-  graphId = id;
-  graphCommits = [];
-  render();
-  loadGraph();
-}
-
-$('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
 $('#new-btn').onclick = openNew;
 $('#queue-badge').onclick = () => setPanel('queue');
@@ -747,7 +757,9 @@ $('#attach input').onchange = (e) => {
   e.target.value = '';
 };
 
-const chat = $('#chat');
+// Bound to the chat pane, not the whole session view: a file dropped on the
+// commit graph is not an upload.
+const chat = $('#pane-chat');
 chat.addEventListener('dragover', (e) => {
   e.preventDefault(); // Without this the browser navigates to the dropped file.
   chat.classList.add('dropping');

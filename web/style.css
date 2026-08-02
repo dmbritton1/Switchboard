@@ -47,13 +47,6 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    padding (which would indent the account cards too, for no reason). */
 .card-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
 .card-head .select { cursor: pointer; line-height: 0; }
-/* Pushed to the far end of .card-head so it reads as a per-session mode, not as
-   a second selection checkbox next to .select. */
-.auto { margin-left: auto; display: flex; align-items: center; gap: .3rem;
-  color: var(--dim); font-size: .9em; cursor: pointer; white-space: nowrap; }
-.auto:has(:checked) { color: var(--working); }
-.auto:has(:disabled) { opacity: .45; cursor: not-allowed; }
-#chat-auto { margin-left: auto; }
 #selection-bar { grid-column: 1 / -1; position: sticky; top: 0; z-index: 2;
   display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
@@ -80,20 +73,33 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #attach:hover { border-color: var(--working); }
 /* Drop target feedback: without it, a drag over the transcript looks inert and
    the user cannot tell whether releasing will do anything. */
-#chat.dropping { outline: 2px dashed var(--working); outline-offset: 6px; border-radius: 8px; }
+#pane-chat.dropping { outline: 2px dashed var(--working); outline-offset: 6px; border-radius: 8px; }
 #upload-error { margin: .5rem 0 0; color: #e05555; font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
+
+/* ---- Session view ------------------------------------------------------ */
+#session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
+#session h2 { margin: 0; font-size: 1.05rem; font-weight: 700; word-break: break-word; }
+#session-menu { margin-left: auto; position: relative; }
+#session-menu .menu-wrap { margin-left: 0; }
+#back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--line);
+  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#tabs { display: flex; gap: .2rem; margin: .9rem 0 1rem;
+  border-bottom: 1px solid var(--line); }
+#tabs button { padding: .45rem .9rem; border: 0; border-bottom: 2px solid transparent;
+  background: none; color: var(--dim); font: inherit; cursor: pointer; }
+#tabs button:hover { color: var(--fg); }
+#tabs button[aria-selected=true] { color: var(--fg); border-bottom-color: var(--working); }
+#session-action:empty { display: none; }
+#session-action { max-width: 60rem; margin-bottom: 1rem; }
+#pane-diff { max-width: 60rem; }
 
 /* ---- Commit graph ------------------------------------------------------ */
 /* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
    interchange where two lines join. Lane colours reuse the status palette —
    there are no status chips in this view, so nothing collides, and the app
    keeps one set of colours instead of two. */
-#graph { --row: 34px; --lane: 24px; }
-#graph header { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
-#graph h2 { margin: 0; font-size: 1.05rem; font-weight: 700; }
-#graph-back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--line);
-  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#pane-graph { --row: 34px; --lane: 24px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
 .lane0 { color: #e0574a; } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
