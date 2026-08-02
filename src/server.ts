@@ -11,7 +11,9 @@ import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
-import { CodexRuntimeError, prepareCodexRuntime, redactCodexText } from './agents/codex-runtime.ts';
+import {
+  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
+} from './agents/codex-runtime.ts';
 import type { Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session } from './types.ts';
 
 const run = promisify(execFile);
@@ -34,10 +36,16 @@ async function prepareProvider(account: Account): Promise<PreparedProvider> {
   return { adapter: createCodexAdapter(runtime) };
 }
 
+/**
+ * Account values are launch-only configuration, so any of them — not just the
+ * credential-shaped keys redactCodexText() knows about — is removed from text
+ * the browser will see. Short values are left alone: see MIN_REDACTABLE, a
+ * substring search for "1" redacts arithmetic, not a secret.
+ */
 function redactAccountValue(text: string, account: Account): string {
   let safe = redactCodexText(text, account.env);
   for (const value of Object.values(account.env)) {
-    if (value) safe = safe.replaceAll(value, '[REDACTED]');
+    if (redactable(value)) safe = safe.replaceAll(value, '[REDACTED]');
   }
   return safe;
 }
@@ -57,8 +65,11 @@ function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent
     }
     case 'stopped':
       return { ...event, reason: redactAccountValue(event.reason, account) };
-    case 'vendor-session-id':
-      return { ...event, id: redactAccountValue(event.id, account) };
+    // vendor-session-id is deliberately not redacted: it is an identifier the
+    // server hands straight back to resumeThread(), never rendered as prose. A
+    // value that happened to contain an account value would come back rewritten
+    // to [REDACTED] and resume the wrong thread — or no thread at all — with
+    // nothing on screen to explain it.
     default:
       return event;
   }

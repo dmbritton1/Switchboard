@@ -6,6 +6,19 @@ import type { CodexFailureCode } from '../types.ts';
 
 const VERSION = /\bcodex(?:-cli)?\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)/i;
 const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
+/**
+ * Shortest account environment value worth substituting out of public text. A
+ * value is redacted by searching for it in unrelated output, so a short one is
+ * a shredder rather than a guard: `RUST_LOG=info` or `CODEX_DEBUG=1` would turn
+ * `--grep info 1 file changed` into `--grep [REDACTED] [REDACTED] file changed`.
+ * Nothing a credential store issues is this short, so the floor costs no real
+ * protection.
+ */
+const MIN_REDACTABLE = 6;
+
+export function redactable(value: string): boolean {
+  return typeof value === 'string' && value.length >= MIN_REDACTABLE;
+}
 const CHATGPT_PATH = '/Applications/ChatGPT.app/Contents/Resources/codex';
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 10_000;
 const require = createRequire(import.meta.url);
@@ -64,7 +77,7 @@ function parseVersion(output: string): string | null {
 export function redactCodexText(text: string, env: Record<string, string>): string {
   let safe = text.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
   for (const [key, value] of Object.entries(env)) {
-    if (value && CREDENTIAL_KEY.test(key)) safe = safe.replaceAll(value, '[REDACTED]');
+    if (redactable(value) && CREDENTIAL_KEY.test(key)) safe = safe.replaceAll(value, '[REDACTED]');
   }
   return safe;
 }
@@ -98,6 +111,20 @@ async function defaultSdkVersion(): Promise<string> {
 
 function defaultBundledPath(): string {
   return require.resolve('@openai/codex/bin/codex.js');
+}
+
+/**
+ * The redacted tail of whatever the candidate actually said, appended to a
+ * public message. Without it, every unreadable-version cause — a wrapper that
+ * prints nothing, a first-run OS verification that kills the process, a fork
+ * that fails under load — arrives as the same "Reinstall or update Codex" for
+ * a CLI that may run fine on the next attempt, and there is nowhere else to
+ * look: this output is never persisted.
+ */
+function detailSuffix(raw: string, env: Record<string, string>): string {
+  const safe = redactCodexText(raw, env).replace(/\s+/g, ' ').trim();
+  if (!safe) return '';
+  return ` It reported: ${safe.length > 200 ? `${safe.slice(0, 200)}…` : safe}`;
 }
 
 function outputFrom(error: unknown): CommandOutput {
@@ -182,19 +209,19 @@ async function readCompatibleVersion(
         `Codex version check timed out at ${path}. Check that the executable starts normally and try again.`,
       );
     }
-    // The combined output is deliberately redacted before considering it. It is
-    // not exposed, but treating it as safe here keeps future diagnostics safe.
-    redactCodexText(`${outputFrom(error).stdout}\n${outputFrom(error).stderr}`, env);
+    const output = outputFrom(error);
     throw new CodexRuntimeError(
       'codex_version_unreadable',
-      `Codex version could not be read from ${path}. Reinstall or update Codex.`,
+      `Codex version could not be read from ${path}. Reinstall or update Codex.${
+        detailSuffix(`${(error as Error)?.message ?? ''}\n${output.stdout}\n${output.stderr}`, env)}`,
     );
   }
-  const version = parseVersion(redactCodexText(`${result.stdout}\n${result.stderr}`, env));
+  const combined = redactCodexText(`${result.stdout}\n${result.stderr}`, env);
+  const version = parseVersion(combined);
   if (!version) {
     throw new CodexRuntimeError(
       'codex_version_unreadable',
-      `Codex version could not be read from ${path}. Reinstall or update Codex.`,
+      `Codex version could not be read from ${path}. Reinstall or update Codex.${detailSuffix(combined, env)}`,
     );
   }
   if (publishedVersion(version) !== publishedVersion(sdkVersion)) {

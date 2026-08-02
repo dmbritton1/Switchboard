@@ -115,6 +115,46 @@ test('an explicit binary with an unreadable version fails closed', async (t) => 
   );
 });
 
+test('an unreadable version reports what the candidate said, redacted', async (t) => {
+  const dir = await fixture(t);
+  const bin = await writeFakeCodex(dir);
+
+  await assert.rejects(
+    prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'version-secret' } }, {
+      platform: 'darwin', sdkVersion: '0.145.0',
+      runFile: async () => {
+        throw Object.assign(new Error('spawn EAGAIN'), {
+          stdout: '', stderr: 'refusing to start for version-secret\n',
+        });
+      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof CodexRuntimeError);
+      assert.equal(error.code, 'codex_version_unreadable');
+      assert.match(error.message, /It reported: spawn EAGAIN refusing to start for \[REDACTED\]$/);
+      assert.doesNotMatch(error.message, /version-secret/);
+      return true;
+    },
+  );
+});
+
+test('an unparseable version reports the output rather than a bare reinstall', async (t) => {
+  const dir = await fixture(t);
+  const bin = await writeFakeCodex(dir);
+
+  await assert.rejects(
+    prepareCodexRuntime({ bin, env: {} }, {
+      platform: 'darwin', sdkVersion: '0.145.0',
+      runFile: async () => ({ stdout: 'not a Codex version', stderr: '' }),
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof CodexRuntimeError);
+      assert.match(error.message, /It reported: not a Codex version$/);
+      return true;
+    },
+  );
+});
+
 test('a wedged version preflight times out with the version readiness code', async (t) => {
   const dir = await fixture(t);
   const bin = await writeFakeCodex(dir);
@@ -272,5 +312,12 @@ test('redaction removes bearer tokens and credential-shaped environment values',
   assert.equal(
     redactCodexText('Bearer abc123 failed with super-secret', { CODEX_TOKEN: 'abc123', CUSTOM_SECRET: 'super-secret' }),
     'Bearer [REDACTED] failed with [REDACTED]',
+  );
+});
+
+test('redaction leaves values too short to be a credential alone', () => {
+  assert.equal(
+    redactCodexText('--grep info found 1 match', { LOG_KEY: 'info', DEBUG_TOKEN: '1' }),
+    '--grep info found 1 match',
   );
 });

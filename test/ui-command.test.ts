@@ -1,8 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  CODEX_FAILURE_LABEL, commandFailure, postCommand, retainedSessionError,
-  sessionCommandErrorForView,
+  CODEX_FAILURE_LABEL, commandErrorText, commandFailure, postCommand, retainedSessionError,
 } from '../web/lib.js';
 
 test('every stable Codex failure has a user-facing label', () => {
@@ -37,11 +36,20 @@ test('network failures become visible command errors', async () => {
   assert.equal(commandFailure(result), 'Switchboard request failed: connection closed');
 });
 
-test('a cross-session approval error stays visible while another session is open', () => {
+test('a cross-session error stays visible and names the session it came from', () => {
+  const sessions = [
+    { id: 'blocked', branch: 'feat/blocked' },
+    { id: 'current', branch: 'feat/current' },
+  ];
   const error = { sessionId: 'blocked', message: 'approval decision refused' };
-  assert.deepEqual(sessionCommandErrorForView(error, null), error, 'grid render');
-  assert.deepEqual(sessionCommandErrorForView(error, null), error, 'SSE grid rerender');
-  assert.deepEqual(sessionCommandErrorForView(error, 'blocked'), error, 'affected session opens');
-  assert.deepEqual(sessionCommandErrorForView(error, 'current'), error, 'different session stays open');
-  assert.equal(sessionCommandErrorForView(null, 'current'), null, 'dismissal');
+
+  assert.equal(commandErrorText(error, sessions, 'blocked'), 'approval decision refused',
+    'unlabelled while its own session is open');
+  assert.equal(commandErrorText(error, sessions, 'current'), 'feat/blocked: approval decision refused',
+    'labelled while a different session is open');
+  assert.equal(commandErrorText(error, sessions, null), 'feat/blocked: approval decision refused',
+    'labelled in the grid');
+  assert.equal(commandErrorText(error, [], null), 'approval decision refused',
+    'a deleted session leaves the message rather than dropping it');
+  assert.equal(commandErrorText(null, sessions, 'current'), '', 'dismissal');
 });

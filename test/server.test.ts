@@ -375,6 +375,31 @@ test('Codex item errors redact every account environment value before persistenc
   assert.ok(!payload.includes('customer-internal-42'));
 });
 
+test('a short account environment value does not redact ordinary transcript text', async (t) => {
+  const fixture = await bootCodex(t, { env: { WORKSPACE_LABEL: 'info' } });
+  const created = await fixture.create('non-credential-env-echo');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+
+  assert.deepEqual(fixture.registry.get(created.id)!.transcript.find((msg) => msg.kind === 'error'),
+    { kind: 'error', text: 'fake backend error for workspace info' });
+});
+
+test('a vendor session id that matches an account value is still resumable', async (t) => {
+  const fixture = await bootCodex(t, { env: { THREAD_LABEL: 'fake-thread' } });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  assert.equal(fixture.registry.get(created.id)!.vendorSessionId, 'fake-thread');
+
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  assert.equal((await fixture.command({ cmd: 'resume', id: created.id })).status, 200);
+  await waitFor(async () => (await fixture.invocations()).length === 2);
+
+  const resumed = (await fixture.invocations())[1].argv;
+  assert.deepEqual(resumed.slice(resumed.indexOf('resume'), resumed.indexOf('resume') + 2),
+    ['resume', 'fake-thread']);
+});
+
 test('Codex preserves repository instructions and leaves non-safety configuration to the repo', async (t) => {
   const fixture = await bootCodex(t);
   const agents = join(fixture.repo, 'AGENTS.md');

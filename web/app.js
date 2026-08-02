@@ -1,6 +1,6 @@
 import {
   sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
-  postCommand, commandFailure, retainedSessionError, sessionCommandErrorForView, CODEX_FAILURE_LABEL,
+  postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -212,9 +212,9 @@ function render() {
 function renderCommandError() {
   const error = $('#command-error');
   error.replaceChildren();
-  const visible = sessionCommandErrorForView(sessionCommandError, openId);
-  if (!visible) return;
-  error.append(visible.message, ' ');
+  const text = commandErrorText(sessionCommandError, state.sessions, openId);
+  if (!text) return;
+  error.append(text, ' ');
   const dismiss = document.createElement('button');
   dismiss.type = 'button';
   dismiss.textContent = 'Dismiss';
@@ -642,7 +642,6 @@ function openTab(id, which) {
   // is the one case where the pane would otherwise sit empty for up to
   // STATUS_THROTTLE_MS with nothing on screen yet.
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
-  sessionCommandError = sessionCommandErrorForView(sessionCommandError, id);
   openId = id;
   tab = which;
   if (which === 'graph') { graphCommits = []; loadGraph(); }

@@ -121,7 +121,19 @@ export function retainedSessionError(sessionId, result) {
   return message ? { sessionId, message } : null;
 }
 
-/** Keeps the last session command error visible regardless of the open view. */
-export function sessionCommandErrorForView(error, _openId) {
-  return error ?? null;
+/**
+ * The text for the retained session error, or '' when there is none.
+ *
+ * Deviation from the plan, which said to clear this region whenever `openId`
+ * changes: the grid's Allow/Deny and Stop buttons act on a session other than
+ * the open one, so clearing on navigation drops exactly the failure the user
+ * needs. It is retained instead — and because it can therefore belong to a
+ * session that is nowhere on screen, it is named. `sessions` is passed in
+ * rather than read from a module global, like selectionState() above.
+ */
+export function commandErrorText(error, sessions, openId) {
+  if (!error) return '';
+  if (error.sessionId === openId) return error.message;
+  const session = sessions.find((s) => s.id === error.sessionId);
+  return session ? `${session.branch}: ${error.message}` : error.message;
 }
