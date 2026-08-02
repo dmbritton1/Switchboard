@@ -214,3 +214,14 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #panel .meta { margin: .2rem 0; }
 #grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
   padding: 4rem 1rem; color: var(--dim); text-align: center; }
+
+/* ---- Scheduling queue --------------------------------------------------- */
+.queue-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+  gap: .7rem; padding: .4rem 0; border-top: 1px solid var(--line); }
+.queue-row:first-of-type { border-top: 0; }
+.queue-when { color: var(--dim); font-size: .85em; white-space: nowrap; }
+.queue-what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-del { padding: .1rem .4rem; border: 0; border-radius: 6px; background: none;
+  color: var(--dim); font: inherit; cursor: pointer; }
+.queue-del:hover { color: #e05555; }
+.queue-why { grid-column: 1 / -1; margin: 0 0 .2rem; color: var(--needs); font-size: .8rem; }

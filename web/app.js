@@ -102,15 +102,82 @@ function accountPanel(a) {
   return box;
 }
 
+// The scheduling queue rides the SSE snapshot (see the scheduling design), which
+// does not carry it yet — so this is written to render nothing until it does,
+// rather than guarded at each call site.
+const queueItems = () => state.queue ?? [];
+
+function triggerLabel(t) {
+  if (t.kind === 'at') return new Date(t.time).toLocaleString();
+  return `when ${t.account} resets`;
+}
+
+function targetLabel(action) {
+  if (action.kind === 'create') return `${action.branch} · new worktree`;
+  const s = state.sessions.find((x) => x.id === action.sessionId);
+  const branch = s ? s.branch : 'deleted session';
+  return action.kind === 'resume' ? `${branch} · resume` : `${branch} · message`;
+}
+
+function queueRow(q) {
+  const row = document.createElement('div');
+  row.className = 'queue-row';
+
+  const when = document.createElement('span');
+  when.className = 'queue-when';
+  when.textContent = triggerLabel(q.trigger);
+
+  const what = document.createElement('span');
+  what.className = 'queue-what';
+  what.textContent = targetLabel(q.action);
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'queue-del';
+  del.title = 'Remove from queue';
+  del.textContent = '✕';
+  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
+  del.onclick = () => send({ cmd: 'unschedule', itemId: q.id });
+
+  row.append(when, what, del);
+
+  // missed and failed items stay in the queue on purpose, so their reason has
+  // to be readable here — this is the only place they are ever shown.
+  if (q.state !== 'waiting') {
+    const why = document.createElement('p');
+    why.className = 'queue-why';
+    why.textContent = q.state === 'missed'
+      ? 'missed — its time passed while Switchboard was not running'
+      : `failed — ${q.error ?? 'unknown error'}`;
+    row.append(why);
+  }
+  return row;
+}
+
+function queuePanel() {
+  const box = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = 'Scheduled';
+  box.append(h, ...queueItems().map(queueRow));
+  return box;
+}
+
 /** The open panel's contents, or null. Task 3 adds the 'queue' branch. */
 function panelBody() {
   if (!panel) return null;
+  if (panel === 'queue') return queueItems().length ? queuePanel() : null;
   const account = state.accounts.find((a) => a.name === panel);
   return account ? accountPanel(account) : null;
 }
 
 function renderHeader() {
   $('#meters').replaceChildren(...state.accounts.map(accountMeter));
+  const badge = $('#queue-badge');
+  const n = queueItems().length;
+  badge.hidden = n === 0;
+  badge.textContent = `⏱ ${n}`;
+  badge.className = panel === 'queue' ? 'open' : '';
+  badge.title = `${n} scheduled item${n === 1 ? '' : 's'}`;
   const body = panelBody();
   // A panel whose subject vanished (account renamed out of accounts.json)
   // closes itself rather than leaving an empty box open.
@@ -563,6 +630,7 @@ function openGraph(id) {
 $('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
 $('#new-btn').onclick = openNew;
+$('#queue-badge').onclick = () => setPanel('queue');
 
 // Escape closes the panel. Registered on document rather than on the panel so
 // it works with focus anywhere; dialogs handle their own Escape natively and
