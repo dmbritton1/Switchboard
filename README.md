@@ -27,9 +27,34 @@ at it with an absolute path:
   "env": { "CLAUDE_CONFIG_DIR": "/absolute/path/to/.claude-alt" } }
 ```
 
-Codex uses the binary inside ChatGPT.app (`/Applications/ChatGPT.app/Contents/Resources/codex`,
-hardcoded in `src/agents/codex.ts`) and the existing `~/.codex/auth.json` — no separate
-login step.
+Codex selects its runtime deterministically: an explicit account `bin`, then a
+compatible standard ChatGPT.app binary, then the SDK-bundled CLI fallback. An
+explicit path is authoritative and must be an executable whose exact published
+version matches the installed SDK (apart from build metadata); otherwise
+preflight fails before a worktree or session is created with an actionable
+error. A mismatched ChatGPT.app binary is skipped in favor of the SDK fallback.
+Switchboard is intentionally macOS-only.
+
+The usual account uses automatic selection:
+
+```json
+{ "name": "codex", "provider": "codex", "budget": 2000000, "env": {} }
+```
+
+An optional explicit binary is documentation for a local account, not a
+portable default:
+
+```json
+{ "name": "codex", "provider": "codex", "budget": 2000000,
+  "bin": "/absolute/path/to/codex", "env": {} }
+```
+
+Run `codex login status` to check the selected account. Account `env` may set
+`CODEX_HOME` (or another supported credential source); preflight runs login
+status with that same launch environment. Switchboard preserves user and target
+repository Codex configuration, applying only its fixed worktree safety
+overrides: `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'`.
+There are no interactive Codex approvals.
 
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one
@@ -82,6 +107,10 @@ per account.
 npm test
 ```
 
+The normal suite is hermetic: it uses a fake Codex process, a temporary
+`CODEX_HOME`, and the real SDK process boundary. It does not contact OpenAI,
+spend a model turn, or read a real Codex account.
+
 ## Limits
 
 - Only sessions started here are shown. Sessions from the Claude desktop app or
@@ -104,26 +133,34 @@ npm test
   approval callback, only a start-of-thread `approvalPolicy`. Codex sessions run
   with `approvalPolicy: 'never'` and are sandboxed to their own worktree
   (`sandboxMode: 'workspace-write'`) instead; `decide()` on a Codex session is a
-  no-op. The Codex binary path (`CODEX_BIN` in `src/agents/codex.ts`) is also
-  hardcoded to ChatGPT.app with no override env var or existence check, so a
-  missing or relocated install fails with the SDK's own error, not an
-  actionable one.
+  no-op. Runtime preflight validates a selected macOS binary, compatibility, and
+  recognizable login state before creating a worktree. Launch, resume, stream,
+  sandbox, authentication, and user-stop failures use persistent session errors
+  with stable codes and actionable remediation rather than a transient toast.
+- Every written initial prompt is displayed for both Claude and Codex. Codex
+  prompts are marked `queued`, then `sent` immediately before delivery; queued
+  prompts left by a failure, stop, or restart become `unsent` and remain visible.
+  They are never replayed automatically: copy or resend them after resume if
+  still needed.
 - Transport is SSE (`GET /events`) + `POST /command`, not WebSocket — the
   traffic is one-directional in each channel (server pushes state, browser
   posts commands), and `EventSource` reconnects on its own with no extra code.
-- Command failures now surface as a toast: `send`, `decide`, `resume`, `stop`,
-  `delete`, `auto` and `unschedule` all go through a `fire()` wrapper that reads
-  `/command`'s response and, on failure, shows the server's error text (falling
-  back to a generic message) for six seconds. Merge, push and the
-  create-session dialog still call `/command` directly and render their errors
-  in place instead, as they did before. The server does reject the dangerous
-  cases rather than pretending — a `send` to a session with no live agent is a
-  404, not a 200 with the prompt dropped, and a `resume` on a session that is
-  not `stopped` is a 409 rather than a second agent launched into the same
-  worktree. Delete's actual risk is stale
+- All browser commands await `/command` and retain non-2xx responses in their
+  relevant persistent surface (session, queue, dialog, or selection toolbar).
+  This replaces the old transient session-error toast. The server rejects the
+  dangerous cases rather than pretending — a `send` to a session with no live
+  agent is a 404, not a 200 with the prompt dropped, and a `resume` on a session
+  that is not `stopped` is a 409 rather than a second agent launched into the
+  same worktree. Delete's actual risk is stale
   bookkeeping, not lost work: if `git worktree remove --force` fails, the fallback already
   `rm -rf`s the directory before the session is removed from the registry
   unconditionally — so a vanished card means git's own worktree registration
   for that path is now orphaned, not that data survived. `git worktree list`
   shows the stale entry; `git worktree prune` clears it. (The one case a
   delete leaves the card in place is when that `rm -rf` fallback fails too.)
+
+Phase 2 remains intentionally out of scope: live item lifecycle rendering,
+bounded/redacted tool details, reasoning and todo presentation, structured
+local-image input, inherited-by-default per-session settings, improved usage
+reporting where supported, and the SDK-versus-app-server interactive-approval
+evaluation.
