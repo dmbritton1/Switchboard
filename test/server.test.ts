@@ -619,6 +619,36 @@ test('the SSE snapshot carries the queue', async (t) => {
   }
 });
 
+// The test above only proves the *first* frame (sent on connect) carries the
+// queue — it would pass even if scheduling never pushed again. This is the
+// live-update case: an already-open tab must see a `schedule` command without
+// reloading, which needs the Scheduler to notify its own subscribers the way
+// Registry does, not just get read by the next unrelated push.
+test('scheduling an item pushes a second SSE frame carrying it, without a reload', async (t) => {
+  const { base } = await boot(t);
+
+  const res = await fetch(`${base}/events`);
+  const reader = res.body!.getReader();
+  // Same try/finally discipline as the test above: an uncancelled reader on a
+  // thrown assertion hangs node --test instead of failing it (bit us in Task 5).
+  try {
+    await reader.read(); // the initial snapshot; queue is empty, not asserted here
+
+    const posted = post(base, {
+      cmd: 'schedule',
+      trigger: { kind: 'at', time: Date.now() + 3600_000 },
+      action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+    });
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    await posted;
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.queue.length, 1);
+    assert.equal(payload.queue[0].action.branch, 'b');
+  } finally {
+    await reader.cancel();
+  }
+});
+
 test('POST /command resume on a session whose worktree is gone reports that, not an SDK error', async (t) => {
   const { base, registry } = await boot(t);
   const gone = join(tmpdir(), `sb-not-here-${Date.now()}`);

@@ -31,17 +31,22 @@ export type Ctx = {
  */
 export class Scheduler {
   #items = new Map<string, Queued>();
+  // Mirrors Registry's #subs/#notify (src/sessions.ts) exactly: same shape, so
+  // the /events route can treat both sources the same way.
+  #subs = new Set<() => void>();
 
   add(trigger: Trigger, action: Action, now = Date.now()): Queued {
     const item: Queued = {
       id: randomUUID(), trigger, action, createdAt: now, state: 'waiting', error: null,
     };
     this.#items.set(item.id, item);
+    this.#notify();
     return item;
   }
 
   remove(id: string): void {
     this.#items.delete(id);
+    this.#notify();
   }
 
   fail(id: string, error: string): void {
@@ -49,6 +54,7 @@ export class Scheduler {
     if (!item) return;
     item.state = 'failed';
     item.error = error;
+    this.#notify();
   }
 
   all(): Queued[] {
@@ -68,6 +74,13 @@ export class Scheduler {
     // one account both fire before either has had a chance to reach `working`,
     // and a freshly reset window is spent in seconds.
     const claimed = new Set<string>();
+    // due() runs once per 30s tick regardless of whether anything happened, so
+    // notifying unconditionally would push a full snapshot to every connected
+    // client every 30 seconds forever. Only a missed-item transition changes
+    // anything an SSE client can't already tell from the items it gets back in
+    // `out` (the caller's own command() calls notify the normal way via
+    // Registry), so that's the only case worth a push from in here.
+    let missed = false;
 
     for (const item of this.#items.values()) {
       if (item.state !== 'waiting') continue;
@@ -77,6 +90,7 @@ export class Scheduler {
         if (now - item.trigger.time > GRACE_MS) {
           item.state = 'missed';
           item.error = `overdue by more than ${GRACE_MS / 3600_000}h`;
+          missed = true;
           continue;
         }
         // Deliberately no free/busy check: the user named a time.
@@ -90,7 +104,17 @@ export class Scheduler {
       claimed.add(account);
       out.push(item);
     }
+    if (missed) this.#notify();
     return out;
+  }
+
+  subscribe(fn: () => void): () => void {
+    this.#subs.add(fn);
+    return () => this.#subs.delete(fn);
+  }
+
+  #notify(): void {
+    for (const fn of this.#subs) fn();
   }
 
   toJSON(): Queued[] {

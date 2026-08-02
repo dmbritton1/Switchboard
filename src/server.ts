@@ -514,10 +514,15 @@ export function createServer(opts: {
         });
         const push = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
         push();
-        const unsub = registry.subscribe(push);
+        const unsubRegistry = registry.subscribe(push);
+        const unsubScheduler = scheduler.subscribe(push);
         // Keeps proxies and sleeping laptops from dropping an idle stream.
         const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
-        req.on('close', () => { unsub(); clearInterval(ping); });
+        req.on('close', () => {
+          unsubRegistry();
+          unsubScheduler();
+          clearInterval(ping);
+        });
         return;
       }
 
