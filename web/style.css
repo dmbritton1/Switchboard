@@ -78,6 +78,18 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #selection-bar button.ghost { background: #232323; border-color: var(--line); color: var(--fg);
   font-weight: 500; }
 #selection-status { flex-basis: 100%; margin: 0; color: var(--dim); font-size: .85em; }
+#queue-strip { grid-column: 1 / -1; background: var(--card); border-radius: 14px;
+  padding: .8rem 1rem; display: grid; gap: .4rem; }
+.queue-head { color: var(--dim); font-size: .85em; }
+.queue-row { display: flex; align-items: center; gap: .5rem; font-size: .9em; }
+.queue-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.queue-row.missed, .queue-row.failed { color: var(--needs); }
+.queue-row button { padding: .1rem .45rem; border-radius: 6px; border: 1px solid var(--line);
+  background: #232323; color: var(--dim); font: inherit; cursor: pointer; }
+.queue-row button:hover { color: var(--fg); border-color: var(--needs); }
+#schedule-btn { padding: .4rem .6rem; border-radius: 8px; border: 1px solid var(--line);
+  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#when-dialog input[type=datetime-local] { width: 100%; }
 #transcript { max-width: 60rem; }
 .msg { padding: .5rem 0; border-bottom: 1px solid #222; white-space: pre-wrap; }
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }

@@ -1,5 +1,5 @@
 const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
-let state = { sessions: [], accounts: [] };
+let state = { sessions: [], accounts: [], queue: [] };
 let openId = null;
 let seenNeedsYou = new Set();
 // Session whose chat view has already been auto-scrolled once; see renderChat().
@@ -67,6 +67,53 @@ function render() {
 let lastStatusFetch = 0;
 const STATUS_THROTTLE_MS = 4000;
 
+function whenLabel(t) {
+  return t.kind === 'reset'
+    ? `when ${t.account} resets`
+    : new Date(t.time).toLocaleString([], {
+        weekday: 'short', hour: 'numeric', minute: '2-digit',
+      });
+}
+
+function whatLabel(a, sessions) {
+  if (a.kind === 'create') return `new worktree ${a.branch}`;
+  const branch = sessions.find((s) => s.id === a.sessionId)?.branch ?? 'a session';
+  return a.kind === 'send' ? `message ${branch}` : `resume ${branch}`;
+}
+
+/** The strip above the grid listing everything queued. Rendered from the SSE
+ *  snapshot's `queue`, so it stays live with no extra request. */
+function queueStrip() {
+  const el = document.createElement('div');
+  el.id = 'queue-strip';
+
+  const head = document.createElement('div');
+  head.className = 'queue-head';
+  head.textContent = `${state.queue.length} scheduled`;
+  el.append(head);
+
+  for (const q of state.queue) {
+    const row = document.createElement('div');
+    row.className = `queue-row ${q.state}`;
+
+    const label = document.createElement('span');
+    label.textContent = q.state === 'waiting'
+      ? `${whenLabel(q.trigger)} · ${whatLabel(q.action, state.sessions)}`
+      : `${q.state}: ${whatLabel(q.action, state.sessions)} — ${q.error ?? ''}`;
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'ghost';
+    del.textContent = '✕';
+    del.title = 'Remove';
+    del.onclick = () => send({ cmd: 'unschedule', itemId: q.id });
+
+    row.append(label, del);
+    el.append(row);
+  }
+  return el;
+}
+
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#chat').hidden = true;
@@ -81,6 +128,7 @@ function renderGrid() {
   const live = new Set(state.sessions.map((s) => s.id));
   for (const id of selected) if (!live.has(id)) selected.delete(id);
   if (selected.size) grid.append(selectionBar());
+  if (state.queue.length) grid.append(queueStrip());
 
   const accounts = document.createElement('div');
   accounts.className = 'accounts';
@@ -247,6 +295,20 @@ function card(s, fetchStatus) {
   wt.className = 'wt';
 
   el.append(head, branch, meta, wt);
+
+  // A session whose resume is queued reads as plain `stopped` otherwise, which
+  // looks like something the user has to act on. It doesn't.
+  const queued = state.queue.some(
+    (q) => q.state === 'waiting' && q.trigger.kind === 'reset'
+      && q.action.kind !== 'create' && q.action.sessionId === s.id,
+  );
+  if (queued) {
+    const wait = document.createElement('div');
+    wait.className = 'meta';
+    wait.textContent = '⏱ waiting for reset';
+    el.append(wait);
+  }
+
   el.onclick = () => { openId = s.id; render(); };
 
   // renderGrid() replaceChildren()s the whole grid on every render, so the `wt`
@@ -517,6 +579,22 @@ function openGraph(id) {
 $('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
 
+// The datetime input is only meaningful for the "at" choice; `required` is set
+// with it so an empty value can't be submitted, and cleared with it so the
+// other two choices don't trip the form's own validation.
+function bindWhen(selectSel, inputSel) {
+  const sel = $(selectSel);
+  const at = $(inputSel);
+  const sync = () => {
+    at.hidden = sel.value !== 'at';
+    at.required = sel.value === 'at';
+  };
+  sel.onchange = sync;
+  sync();
+}
+bindWhen('#when-select', '#when-at');
+bindWhen('#when2-select', '#when2-at');
+
 $('#composer').onsubmit = (e) => {
   e.preventDefault();
   const text = $('#prompt').value.trim();
@@ -524,6 +602,36 @@ $('#composer').onsubmit = (e) => {
   $('#prompt').value = '';
   send({ cmd: 'send', id: openId, text });
 };
+
+$('#schedule-btn').onclick = () => {
+  const text = $('#prompt').value.trim();
+  if (!text) return;
+  $('#when-dialog').showModal();
+};
+
+$('#when-dialog').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Same returnValue discipline as the #new dialog: Escape closes without
+  // setting one, and an unconsumed 'ok' would re-fire on the next Escape.
+  const ok = dialog.returnValue === 'ok';
+  dialog.returnValue = '';
+  if (!ok || !openId) return;
+
+  const text = $('#prompt').value.trim();
+  if (!text) return;
+  const session = state.sessions.find((s) => s.id === openId);
+  // A stopped session has no live agent for a `send` to reach, so schedule the
+  // resume that will bring it back instead.
+  const action = session?.status === 'stopped'
+    ? { kind: 'resume', sessionId: openId, prompt: text }
+    : { kind: 'send', sessionId: openId, text };
+
+  const f = new FormData(dialog.querySelector('form'));
+  const { ok: sent } = await send({
+    cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
+  });
+  if (sent) $('#prompt').value = '';
+});
 
 // Uploads go straight to disk in the session's worktree and come back as a
 // relative path, which is appended to the prompt box. The agent then opens it
@@ -710,6 +818,15 @@ async function openNew() {
   dialog.showModal();
 }
 
+// The server derives a reset trigger's account from the action, so the client
+// never sends one. An invalid or empty datetime yields NaN, which the server
+// rejects with a message the dialog already knows how to show.
+function triggerFor(when, at) {
+  return when === 'reset'
+    ? { kind: 'reset' }
+    : { kind: 'at', time: new Date(at).getTime() };
+}
+
 $('#new').addEventListener('close', async (e) => {
   const dialog = e.target;
   // Consume returnValue: a close request (Escape) closes a dialog *without*
@@ -722,11 +839,17 @@ $('#new').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
-  const { ok, data } = await send({
-    cmd: 'create',
+  const action = {
+    kind: 'create',
     repo: f.get('repo'), branch: f.get('branch'),
     account: f.get('account'), prompt: f.get('prompt'),
-  });
+  };
+  const when = f.get('when');
+  const body = when === 'now'
+    ? { cmd: 'create', ...action }
+    : { cmd: 'schedule', trigger: triggerFor(when, f.get('at')), action };
+
+  const { ok, data } = await send(body);
   if (!ok) {
     $('#new-error').textContent = data.error;
     dialog.showModal();
