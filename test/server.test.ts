@@ -9,7 +9,7 @@ import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
-import { createServer } from '../src/server.ts';
+import { createServer, shouldRequeue } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
 
 const run = promisify(execFile);
@@ -751,4 +751,26 @@ test('overlapping ticks consult the scheduler once, not twice', async (t) => {
   await Promise.all([first, second]);
 
   assert.equal(calls, 1, 'the second, overlapping tick must skip rather than re-dispatch the same item');
+});
+
+test('a self-inflicted stop during a limit window is requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, now + 3600_000, now), true);
+});
+
+test('a stop we caused is never requeued', () => {
+  // Stop and Delete both drop the handle before calling stop(), so `dead` is
+  // falsy on the resulting event. Pressing Stop must not resurrect the session.
+  const now = 1000;
+  assert.equal(shouldRequeue(false, now + 3600_000, now), false);
+});
+
+test('a stop with no known limit is not requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, null, now), false);
+});
+
+test('a stop after the window already rolled is not requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, now - 1, now), false);
 });

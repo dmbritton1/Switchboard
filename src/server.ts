@@ -122,6 +122,25 @@ function toCommand(a: Action): Record<string, unknown> {
   return { cmd: 'resume', id: a.sessionId, prompt: a.prompt };
 }
 
+/**
+ * Should a `stopped` session be auto-queued for a resume once its account's
+ * window rolls?
+ *
+ * `agentDied` is the `dead` local from launch()'s emit callback: truthy only
+ * when the agent ended on its own, because both the stop and delete commands
+ * remove the handle before calling stop(). `resetAt` is Usage's stored reset
+ * time; a non-null value in the future is exactly "this account is past its
+ * limit right now".
+ *
+ * ponytail: this will occasionally requeue a session that died of something
+ * unrelated during a limit window. Accepted on purpose — the item is visible in
+ * the queue strip and one click deletes it, whereas every tighter test means
+ * matching on provider error text, which is the brittleness this avoids.
+ */
+export function shouldRequeue(agentDied: boolean, resetAt: number | null, now: number): boolean {
+  return agentDied && resetAt !== null && resetAt > now;
+}
+
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
@@ -187,6 +206,12 @@ export function createServer(opts: {
       const dead = handles.get(sessionId);
       handles.delete(sessionId);
       registry.apply(sessionId, e);
+      if (shouldRequeue(Boolean(dead), usage.resetAt(account.name), Date.now())) {
+        scheduler.add(
+          { kind: 'reset', account: account.name },
+          { kind: 'resume', sessionId, prompt: 'continue' },
+        );
+      }
       dead?.stop();
     });
     handles.set(sessionId, handle);
