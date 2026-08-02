@@ -254,3 +254,14 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
 #del menu button#del-go { background: #7a2626; border-color: #a33; color: #ffdede;
   font-weight: 650; }
+
+/* ---- Inline interrupt -------------------------------------------------- */
+#interrupt { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  max-width: 60rem; margin-bottom: 1rem; padding: .6rem 1rem; border-radius: 10px;
+  background: #2a1f0f; border: 1px solid #4a3316; color: #e8c48a; font-size: .9em; }
+#interrupt span { flex: 1 1 20rem; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+#interrupt button { padding: .3rem .7rem; border-radius: 7px; border: 1px solid var(--needs);
+  background: none; color: var(--needs); font: inherit; cursor: pointer; white-space: nowrap; }
+#interrupt button:hover { background: var(--needs); color: #1a1000; }
+#interrupt button.more { border-color: transparent; color: var(--dim); }

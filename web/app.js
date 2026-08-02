@@ -204,6 +204,7 @@ const STATUS_THROTTLE_MS = 4000;
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#session').hidden = true;
+  $('#interrupt').hidden = true;
   const grid = $('#grid');
   grid.hidden = false;
   grid.replaceChildren();
@@ -482,6 +483,53 @@ function stopButton(s) {
   return b;
 }
 
+/**
+ * The only cross-session element in the session view: another session blocking
+ * on an approval while you are reading this one. Answerable in place, because
+ * walking back to the grid to click Allow is the whole friction this removes.
+ */
+function renderInterrupt(current) {
+  const blocked = state.sessions
+    .filter((s) => s.id !== current.id && s.pending)
+    .sort((a, b) => a.statusSince - b.statusSince);
+  const box = $('#interrupt');
+  box.hidden = !blocked.length;
+  if (!blocked.length) return;
+
+  const [first, ...rest] = blocked;
+  box.replaceChildren();
+
+  // Branch name and tool summary are both untrusted — the summary is chosen by
+  // the agent, transitively by whatever it read while working.
+  const line = document.createElement('span');
+  line.textContent = `${first.branch} needs you — ${first.pending.tool}: ${first.pending.summary}`;
+  box.append(line);
+
+  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
+    b.onclick = () => send({ cmd: 'decide', id: first.id, allow });
+    box.append(b);
+  }
+
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.textContent = 'Open';
+  open.onclick = () => openTab(first.id, 'chat');
+  box.append(open);
+
+  if (rest.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'more';
+    more.textContent = `+${rest.length} more`;
+    more.onclick = () => { openId = null; render(); };
+    box.append(more);
+  }
+}
+
 function approval(s) {
   const box = document.createElement('div');
   box.className = 'approval';
@@ -534,6 +582,7 @@ function renderSession() {
 
   const slot = actionSlot(s);
   $('#session-action').replaceChildren(...(slot ? [slot] : []));
+  renderInterrupt(s);
 
   $('#tabs').replaceChildren(...TABS.map(([key, label]) => {
     const b = document.createElement('button');
