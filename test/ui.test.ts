@@ -5,6 +5,7 @@ import {
   transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
   fetchToolDetail, createDetailController, changeDetailSession, setDetailExpanded,
   detailControllerView, storeToolDetail, storeToolDetailError, invalidateToolDetail,
+  addAttachment, removeAttachment, sendPayload, settleSendState,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -241,6 +242,42 @@ test('transcriptView preserves assistant, error, and user text without exposing 
     kind: 'user', id: '/private/prompt-id', text: 'Please continue.', delivery: 'queued',
   }), {
     kind: 'text', className: 'msg user', summary: 'Please continue.',
+  });
+});
+
+test('transcriptView exposes attachment filenames without exposing stored paths', () => {
+  assert.deepEqual(transcriptView({
+    kind: 'user', text: 'Inspect these.', delivery: 'sent',
+    attachments: ['uploads/screen.png', '/private/customer/notes.txt', 'nested\\photo.webp'],
+  }), {
+    kind: 'text', className: 'msg user', summary: 'Inspect these.',
+    attachments: ['screen.png', 'notes.txt', 'photo.webp'],
+  });
+});
+
+test('attachment helpers deduplicate, remove, and build a path-only request', () => {
+  const first = addAttachment([], { name: 'screen.png', path: 'uploads/screen.png' });
+  const duplicate = addAttachment(first, { name: 'screen.png', path: 'uploads/screen.png' });
+  const second = addAttachment(duplicate, { name: 'notes.txt', path: 'uploads/notes.txt' });
+  assert.strictEqual(duplicate, first, 'a duplicate does not churn composer state');
+  assert.deepEqual(second.map((item) => item.name), ['screen.png', 'notes.txt']);
+  assert.deepEqual(sendPayload('s1', 'inspect it', second), {
+    cmd: 'send', id: 's1', text: 'inspect it',
+    attachments: ['uploads/screen.png', 'uploads/notes.txt'],
+  });
+  assert.deepEqual(removeAttachment(second, 'uploads/screen.png'), [
+    { name: 'notes.txt', path: 'uploads/notes.txt' },
+  ]);
+});
+
+test('settleSendState retains the retry draft after failure and clears it after acceptance', () => {
+  const attachments = [{ name: 'screen.png', path: 'uploads/screen.png' }];
+  const failure = settleSendState('inspect it', attachments, { ok: false });
+  assert.equal(failure.text, 'inspect it');
+  assert.strictEqual(failure.attachments, attachments);
+
+  assert.deepEqual(settleSendState('inspect it', attachments, { ok: true }), {
+    text: '', attachments: [],
   });
 });
 

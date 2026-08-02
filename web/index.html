@@ -32,9 +32,10 @@
 
   <div id="pane-chat">
     <div id="transcript"></div>
+    <div id="attachments" aria-live="polite"></div>
     <form id="composer">
       <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
-      <input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button>
+      <input id="prompt" placeholder="Message…" autocomplete="off"><button type="submit">Send</button>
     </form>
     <p id="upload-error"></p>
   </div>

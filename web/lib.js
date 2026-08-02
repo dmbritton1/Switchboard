@@ -121,6 +121,29 @@ export function retainedSessionError(sessionId, result) {
   return message ? { sessionId, message } : null;
 }
 
+/** Keep upload metadata in the browser while sending only server-issued paths. */
+export function addAttachment(list, attachment) {
+  return list.some((item) => item.path === attachment.path)
+    ? list
+    : [...list, attachment];
+}
+
+export function removeAttachment(list, path) {
+  return list.filter((item) => item.path !== path);
+}
+
+export function sendPayload(sessionId, text, attachments) {
+  return {
+    cmd: 'send', id: sessionId, text,
+    attachments: attachments.map((item) => item.path),
+  };
+}
+
+/** Transactional composer state: a rejected command remains retryable. */
+export function settleSendState(text, attachments, result) {
+  return result.ok ? { text: '', attachments: [] } : { text, attachments };
+}
+
 /**
  * The text for the retained session error, or '' when there is none.
  *
@@ -167,7 +190,16 @@ export function transcriptView(message) {
       items: message.items.map(({ text, completed }) => ({ text, completed })),
     };
   }
-  return { kind: 'text', className: `msg ${message.kind}`, summary: message.text };
+  const attachments = message.kind === 'user' && Array.isArray(message.attachments)
+    ? message.attachments
+      .filter((name) => typeof name === 'string')
+      .map((name) => name.split(/[\\/]/).filter(Boolean).pop() ?? '')
+      .filter((name) => name && name !== '.' && name !== '..')
+    : [];
+  return {
+    kind: 'text', className: `msg ${message.kind}`, summary: message.text,
+    ...(attachments.length ? { attachments } : {}),
+  };
 }
 
 /** Collision-free key for browser-local detail state. */
