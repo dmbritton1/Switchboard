@@ -165,6 +165,8 @@ test('rich SDK lifecycles update one Registry row per item with safe bounded det
   }
 
   const transcript = registry.get(session.id)!.transcript;
+  assert.doesNotMatch(JSON.stringify(transcript), /never-expose-me/);
+  assert.doesNotMatch(JSON.stringify(registry.publicSessions()), /never-expose-me/);
   for (const id of ['rich-command', 'rich-mcp', 'rich-file', 'rich-search', 'rich-reasoning', 'rich-todo']) {
     assert.equal(transcript.filter((message) => 'id' in message && message.id === id).length, 1, id);
   }
@@ -172,7 +174,8 @@ test('rich SDK lifecycles update one Registry row per item with safe bounded det
   const command = transcript.find((message) => message.kind === 'tool' && message.id === 'rich-command');
   assert.ok(command?.kind === 'tool');
   assert.equal(command.status, 'ok');
-  assert.equal(command.detail, 'all command output');
+  assert.equal(command.summary, 'npm test [REDACTED]');
+  assert.equal(command.detail, 'all command output [REDACTED]');
 
   const mcp = transcript.find((message) => message.kind === 'tool' && message.id === 'rich-mcp');
   assert.ok(mcp?.kind === 'tool');
@@ -183,12 +186,12 @@ test('rich SDK lifecycles update one Registry row per item with safe bounded det
   assert.doesNotMatch(mcp.detail ?? '', /never-expose-me/);
 
   assert.deepEqual(transcript.find((message) => message.kind === 'reasoning'), {
-    kind: 'reasoning', id: 'rich-reasoning', text: 'Verified the lifecycle',
+    kind: 'reasoning', id: 'rich-reasoning', text: 'Verified the lifecycle [REDACTED]',
   });
   assert.deepEqual(transcript.find((message) => message.kind === 'todo'), {
     kind: 'todo', id: 'rich-todo', items: [
-      { text: 'Inspect events', completed: true },
-      { text: 'Run tests', completed: true },
+      { text: 'Inspect events [REDACTED]', completed: true },
+      { text: 'Run tests [REDACTED]', completed: true },
     ],
   });
   assert.deepEqual(transcript.filter((message) => message.kind === 'text'), [

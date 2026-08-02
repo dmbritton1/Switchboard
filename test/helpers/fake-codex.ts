@@ -118,65 +118,69 @@ process.stdin.on('end', () => {
     return;
   }
   if (prompt === 'rich-lifecycle') {
+    const lifecycleSecret = process.env.FAKE_CODEX_SECRET ?? '';
     emit({ type: 'item.started', item: {
-      id: 'rich-command', type: 'command_execution', command: 'npm test',
+      id: 'rich-command', type: 'command_execution', command: 'npm test ' + lifecycleSecret,
       aggregated_output: '', status: 'in_progress',
     }});
     emit({ type: 'item.updated', item: {
-      id: 'rich-command', type: 'command_execution', command: 'npm test',
-      aggregated_output: 'running command output', status: 'in_progress',
+      id: 'rich-command', type: 'command_execution', command: 'npm test ' + lifecycleSecret,
+      aggregated_output: 'running command output ' + lifecycleSecret, status: 'in_progress',
     }});
     emit({ type: 'item.completed', item: {
-      id: 'rich-command', type: 'command_execution', command: 'npm test',
-      aggregated_output: 'all command output', exit_code: 0, status: 'completed',
+      id: 'rich-command', type: 'command_execution', command: 'npm test ' + lifecycleSecret,
+      aggregated_output: 'all command output ' + lifecycleSecret, exit_code: 0, status: 'completed',
     }});
     emit({ type: 'item.started', item: {
-      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
-      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' }, status: 'in_progress',
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-' + lifecycleSecret,
+      tool: 'rich-' + lifecycleSecret,
+      arguments: { note: lifecycleSecret }, status: 'in_progress',
     }});
     emit({ type: 'item.updated', item: {
-      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
-      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' },
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-' + lifecycleSecret,
+      tool: 'rich-' + lifecycleSecret,
+      arguments: { note: lifecycleSecret },
       result: { content: [], structured_content: { progress: 'working' } }, status: 'in_progress',
     }});
     emit({ type: 'item.completed', item: {
-      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
-      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' },
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-' + lifecycleSecret,
+      tool: 'rich-' + lifecycleSecret,
+      arguments: { note: lifecycleSecret },
       result: { content: [], structured_content: { output: 'x'.repeat(40 * 1024) } }, status: 'completed',
     }});
     emit({ type: 'item.started', item: {
       id: 'rich-file', type: 'file_change', status: 'completed',
-      changes: [{ path: 'rich.ts', kind: 'update' }],
+      changes: [{ path: 'rich-' + lifecycleSecret + '.ts', kind: 'update' }],
     }});
     emit({ type: 'item.completed', item: {
       id: 'rich-file', type: 'file_change', status: 'completed',
-      changes: [{ path: 'rich.ts', kind: 'update' }],
+      changes: [{ path: 'rich-' + lifecycleSecret + '.ts', kind: 'update' }],
     }});
     emit({ type: 'item.started', item: {
-      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle ' + lifecycleSecret,
     }});
     emit({ type: 'item.updated', item: {
-      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle ' + lifecycleSecret,
     }});
     emit({ type: 'item.completed', item: {
-      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle ' + lifecycleSecret,
     }});
     emit({ type: 'item.started', item: {
-      id: 'rich-reasoning', type: 'reasoning', text: 'Checking the lifecycle',
+      id: 'rich-reasoning', type: 'reasoning', text: 'Checking the lifecycle ' + lifecycleSecret,
     }});
     emit({ type: 'item.updated', item: {
-      id: 'rich-reasoning', type: 'reasoning', text: 'Verified the lifecycle',
+      id: 'rich-reasoning', type: 'reasoning', text: 'Verified the lifecycle ' + lifecycleSecret,
     }});
     emit({ type: 'item.started', item: {
       id: 'rich-todo', type: 'todo_list', items: [
-        { text: 'Inspect events', completed: false },
-        { text: 'Run tests', completed: false },
+        { text: 'Inspect events ' + lifecycleSecret, completed: false },
+        { text: 'Run tests ' + lifecycleSecret, completed: false },
       ],
     }});
     emit({ type: 'item.completed', item: {
       id: 'rich-todo', type: 'todo_list', items: [
-        { text: 'Inspect events', completed: true },
-        { text: 'Run tests', completed: true },
+        { text: 'Inspect events ' + lifecycleSecret, completed: true },
+        { text: 'Run tests ' + lifecycleSecret, completed: true },
       ],
     }});
     emit({ type: 'item.started', item: {

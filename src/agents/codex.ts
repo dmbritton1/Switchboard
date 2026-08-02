@@ -43,33 +43,38 @@ function normalizeItem(
         : [];
     case 'command_execution':
       return withDetail({
-        kind: 'tool', id: item.id, name: 'shell', summary: item.command,
+        kind: 'tool', id: item.id, name: 'shell', summary: redactCodexText(item.command, env),
         status: itemStatus(item.status),
       }, item.aggregated_output, env);
     case 'file_change':
       return withDetail({
         kind: 'tool', id: item.id, name: 'edit',
-        summary: item.changes.map((c) => c.path).join(', '),
+        summary: redactCodexText(item.changes.map((c) => c.path).join(', '), env),
         status: itemStatus(item.status),
       }, { changes: item.changes }, env);
-    case 'mcp_tool_call':
+    case 'mcp_tool_call': {
+      const server = redactCodexText(item.server, env);
+      const tool = redactCodexText(item.tool, env);
       return withDetail({
-        kind: 'tool', id: item.id, name: item.tool, summary: `${item.server}.${item.tool}`,
+        kind: 'tool', id: item.id, name: tool, summary: `${server}.${tool}`,
         status: itemStatus(item.status),
       }, { arguments: item.arguments, result: item.result, error: item.error }, env);
+    }
     case 'web_search':
       return [{ type: 'upsert-msg', msg: {
-        kind: 'tool', id: item.id, name: 'search', summary: item.query,
+        kind: 'tool', id: item.id, name: 'search', summary: redactCodexText(item.query, env),
         status: phase === 'completed' ? 'ok' : 'running',
       } }];
     case 'reasoning':
       return [{ type: 'upsert-msg', msg: {
-        kind: 'reasoning', id: item.id, text: item.text,
+        kind: 'reasoning', id: item.id, text: redactCodexText(item.text, env),
       } }];
     case 'todo_list':
       return [{ type: 'upsert-msg', msg: {
         kind: 'todo', id: item.id,
-        items: item.items.map((todo) => ({ text: todo.text, completed: todo.completed })),
+        items: item.items.map((todo) => ({
+          text: redactCodexText(todo.text, env), completed: todo.completed,
+        })),
       } }];
     case 'error':
       return phase === 'completed'

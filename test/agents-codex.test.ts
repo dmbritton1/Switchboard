@@ -164,6 +164,60 @@ test('todo updates replace the same SDK id without fabricated status', () => {
   } }]);
 });
 
+test('lifecycle upserts redact every displayed SDK string while preserving item ids', () => {
+  const secret = 'never-expose-me';
+  const env = { FAKE_CODEX_SECRET: secret };
+  const events = [
+    normalizeCodex({ type: 'item.completed', item: {
+      id: 'command-id', type: 'command_execution', command: `echo ${secret}`,
+      aggregated_output: `output ${secret}`, exit_code: 0, status: 'completed',
+    } } as never, env)[0],
+    normalizeCodex({ type: 'item.completed', item: {
+      id: 'file-id', type: 'file_change', status: 'completed',
+      changes: [{ path: `src/${secret}.ts`, kind: 'update' }],
+    } } as never, env)[0],
+    normalizeCodex({ type: 'item.completed', item: {
+      id: 'mcp-id', type: 'mcp_tool_call', server: `server-${secret}`, tool: `tool-${secret}`,
+      arguments: { note: secret }, result: { content: [], structured_content: {} },
+      status: 'completed',
+    } } as never, env)[0],
+    normalizeCodex({ type: 'item.completed', item: {
+      id: 'search-id', type: 'web_search', query: `find ${secret}`,
+    } } as never, env)[0],
+    normalizeCodex({ type: 'item.updated', item: {
+      id: 'reasoning-id', type: 'reasoning', text: `Checking ${secret}`,
+    } } as never, env)[0],
+    normalizeCodex({ type: 'item.completed', item: {
+      id: 'todo-id', type: 'todo_list', items: [
+        { text: `Remove ${secret}`, completed: true },
+      ],
+    } } as never, env)[0],
+  ];
+
+  assert.deepEqual(events.map((event) => event.type === 'upsert-msg' ? event.msg.id : null), [
+    'command-id', 'file-id', 'mcp-id', 'search-id', 'reasoning-id', 'todo-id',
+  ]);
+  assert.deepEqual(events.map((event) => {
+    if (event.type !== 'upsert-msg') return null;
+    if (event.msg.kind === 'tool') {
+      return { id: event.msg.id, name: event.msg.name, summary: event.msg.summary };
+    }
+    if (event.msg.kind === 'reasoning') {
+      return { id: event.msg.id, text: event.msg.text };
+    }
+    return { id: event.msg.id, items: event.msg.items };
+  }), [
+    { id: 'command-id', name: 'shell', summary: 'echo [REDACTED]' },
+    { id: 'file-id', name: 'edit', summary: 'src/[REDACTED].ts' },
+    { id: 'mcp-id', name: 'tool-[REDACTED]', summary: 'server-[REDACTED].tool-[REDACTED]' },
+    { id: 'search-id', name: 'search', summary: 'find [REDACTED]' },
+    { id: 'reasoning-id', text: 'Checking [REDACTED]' },
+    { id: 'todo-id', items: [{ text: 'Remove [REDACTED]', completed: true }] },
+  ]);
+  assert.doesNotMatch(JSON.stringify(events), /never-expose-me/);
+  assert.match(JSON.stringify(events), /\[REDACTED\]/);
+});
+
 test('assistant text and item errors remain append-only and emit only when completed', () => {
   const agent = { id: 'message-1', type: 'agent_message', text: 'hello' };
   const error = { id: 'error-1', type: 'error', message: 'recoverable failure' };
