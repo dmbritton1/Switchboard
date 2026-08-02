@@ -391,8 +391,16 @@ function overflowMenu(s) {
   box.onchange = () => { menuFor = null; render(); fire({ cmd: 'auto', id: s.id, auto: box.checked }); };
   auto.append(box, ' Auto-approve');
 
+  menu.append(auto);
+  // A blocked card's one action slot is spent on Allow/Deny, so Stop has no
+  // home on the card face for `needs-you` — without it here, the only way to
+  // halt a runaway agent mid-prompt would be to Deny it first or delete the
+  // session outright. `working` gets it too, duplicating actionSlot()'s Stop,
+  // because the menu is the path that works from every stoppable state.
+  if (s.status === 'working' || s.status === 'needs-you') {
+    menu.append(menuItem('Stop', () => fire({ cmd: 'stop', id: s.id })));
+  }
   menu.append(
-    auto,
     menuItem('Graph', () => openTab(s.id, 'graph')),
     menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
     menuItem('Delete…', () => confirmDelete(s), 'danger'),

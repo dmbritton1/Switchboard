@@ -52,10 +52,11 @@ the session view. Codex runs sandboxed to its worktree with
 Opening a card opens a session view with Chat, Diff and Graph tabs, sharing
 one header that carries a `⋯` menu and the single action the session's state
 calls for. Chat is the transcript and message box for steering the agent; tool
-calls show their outcome (`ok`/`error`) once it is known. A running session
-(`working` or `needs-you`) shows a Stop button — on the card and in the open
-session view alike — which halts the agent and leaves it `stopped` with a
-Resume button; nothing is deleted.
+calls show their outcome (`ok`/`error`) once it is known. A `working` session's
+card action is a Stop button; a blocked (`needs-you`) session's card slot is
+Allow/Deny instead, so Stop for it lives in the `⋯` menu. Either way, Stop
+halts the agent and leaves the session `stopped` with a Resume button; nothing
+is deleted.
 
 Deleting a session is reached through its `⋯` menu's Delete… item, which opens
 a confirmation dialog with a "remove worktree" checkbox; deleting always
