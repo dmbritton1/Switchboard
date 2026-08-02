@@ -16,7 +16,9 @@ The core coding loop exists, but several boundaries are implicit or brittle:
 - Codex has no interactive approval callback through the installed SDK.
   Switchboard uses `approvalPolicy: 'never'`, but the resulting limitations are
   not consistently surfaced to the user.
-- Browser commands other than session creation mostly discard non-2xx errors.
+- Browser commands already expose most non-2xx errors through a transient toast,
+  but the approved interaction requires session errors to remain visible through
+  retry or dismissal.
 - Codex tests exercise pure event normalization, not process launch, streaming,
   follow-up queuing, cancellation, or resume through the real SDK boundary.
 - The transcript ignores in-progress item events and collapses useful tool
@@ -62,7 +64,8 @@ with every Codex app, cloud, connector, or external-session feature.
 ### Phase 2: richer experience
 
 - Represent the full started → updated → completed lifecycle of tool items.
-- Show bounded, redacted command and MCP details.
+- Show bounded, redacted command and MCP details without placing detail bodies in
+  the full SSE snapshot.
 - Show reasoning summaries and todo progress separately from primary messages.
 - Send image uploads using structured SDK input.
 - Add inherited-by-default Codex thread controls.
@@ -116,7 +119,7 @@ The current normalized adapter boundary stays in place:
 
 ```text
 browser
-   ↕ SSE snapshots + HTTP commands
+   ↕ summary SSE snapshots + HTTP commands/detail reads
 server.ts
    ├── Registry and persisted Session state
    ├── worktree creation/status/merge/push
@@ -311,6 +314,12 @@ type UserMsg = {
 Existing persisted user messages without these fields load as `sent` for
 backward compatibility.
 
+Every provider's initial create prompt is appended to the transcript before its
+adapter starts. Claude records it immediately as `sent`; Codex records it as
+`queued` and advances it to `sent` immediately before `runStreamed`. This keeps
+the visible user conversation provider-neutral while retaining Codex's stronger
+delivery evidence.
+
 For Codex:
 
 1. The initial create prompt and every accepted follow-up are appended as user
@@ -359,8 +368,30 @@ Tool messages use their Codex item ID as a stable key:
 
 The Registry performs an upsert by item ID, so one Codex item renders once.
 Command output, MCP results, and error detail are stored separately from the
-one-line summary. Detail has a fixed byte limit, a visible truncation marker,
-and credential redaction before persistence or SSE delivery.
+one-line summary. Each detail body has a 32 KiB UTF-8 limit including a visible
+truncation marker, and receives credential redaction before Registry admission.
+
+Detail storage has a second, global bound across every Registry session:
+
+```ts
+const MAX_CODEX_DETAIL_BYTES = 32 * 1024
+const MAX_CODEX_DETAIL_TOTAL_BYTES = 2 * 1024 * 1024
+```
+
+Every accepted detail update receives a monotonically increasing revision. When
+the total exceeds 2 MiB, the Registry removes the entire least-recently-updated
+detail body and repeats until the total is within budget. Eviction preserves the
+tool ID, summary, status, truncation metadata, revision, and an explicit
+`detailEvicted` marker. Tests may inject a smaller global budget, but production
+uses exactly 2 MiB.
+
+Normal SSE snapshots never contain detail bodies. Tool entries expose only
+`detailAvailable`, `detailTruncated`, `detailEvicted`, and `detailRevision`.
+`GET /detail?session=<session-id>&item=<tool-item-id>` resolves both identifiers
+through the Registry and returns the already-redacted stored body on demand. It
+never accepts a filesystem path. Unknown sessions/items return 404; a known item
+that never had detail returns unavailable/non-evicted metadata, and a known item
+whose detail was evicted returns explicit unavailable/evicted metadata.
 
 Reasoning summaries and todo lists are separate message kinds or session
 metadata, not fake tool calls. Switchboard does not request or display hidden
@@ -433,9 +464,13 @@ one exists. They never include tokens, authorization headers, complete process
 environments, or unredacted tool payloads.
 
 All browser commands await `/command` and surface a non-2xx response in the
-relevant dialog, card, chat, or selection toolbar. Fire-and-forget error loss is
-removed for create, send, resume, stop, auto, decide, merge, push, and delete,
-even though some commands are primarily Claude or provider-neutral.
+relevant dialog, session, queue panel, or selection toolbar. Each call site
+chooses its destination explicitly; there is no exhaustive command-to-scope map
+whose key list can become stale. Phase 1 replaces the current transient toast
+for session failures with the persistent session region rather than running two
+competing channels. Error loss is removed for create, send, resume, stop, auto,
+decide, merge, push, delete, and unschedule, even though some commands are
+primarily Claude or provider-neutral.
 
 ## Persistence and migration
 
@@ -461,13 +496,20 @@ Phase 1 adds no new top-level view.
   failure, stream failure, and missing worktree.
 - Chat renders queued/sent/unsent delivery state only where it differs from the
   normal sent state.
-- Command errors stay visible until the user retries, dismisses them, or changes
-  session.
+- Session command errors replace the current transient toast and stay visible
+  until a successful retry, explicit dismissal, or session change. Queue and
+  selection errors remain in their own persistent surfaces.
 - The disabled Codex Auto control continues explaining that the worktree
   sandbox, rather than an interactive prompt, is the boundary.
 
 Phase 2 adds collapsible detail to tool rows and optional controls to the new
-session dialog. Defaults remain visually and semantically “inherit.”
+session dialog. Detail expansion state is browser-local and keyed by session and
+item ID. Because the transcript is rebuilt on every SSE snapshot, the browser
+keeps an `expandedItems` set, a revision-aware detail cache, and an in-flight
+request map. Rebuilt rows restore their open state, reuse cached text, and fetch
+again only when an expanded item's `detailRevision` changes. Changing sessions
+clears all three structures. Defaults remain visually and semantically
+“inherit.”
 
 ## Offline verification
 
@@ -515,19 +557,24 @@ tests can assert new versus resume arguments and call ordering.
 - restart converts queued prompts to unsent
 - every command returns its error path
 - persisted state never contains account environment values
+- Claude and Codex initial prompts both appear as user transcript messages
 
 ### Browser command tests
 
 Extract the small request/error helper from `web/app.js` so it can be exercised
 with a mocked `fetch` under `node:test`, without a browser dependency. Verify
-that create, send, resume, stop, auto, decide, merge, push, and delete retain and
-display a non-2xx response in their designated UI status target. These are
-behavior tests of the command boundary, not pixel or layout tests.
+that non-2xx and network failures remain available to the call-site-specific
+session, queue, dialog, or selection reporter. Verify that the old transient
+toast is not left as a second session-error channel. These are behavior tests of
+the command boundary, not pixel or layout tests.
 
 ### Phase 2 tests
 
 - started/updated/completed upserts produce one tool item
 - detail truncation and redaction occur before persistence
+- detail bodies are absent from SSE and available only through the ID-keyed route
+- revision-aware expansion survives transcript rebuilds without redundant fetches
+- the global 2 MiB detail budget evicts least-recently-updated bodies across sessions
 - image input resolves only within the worktree
 - inherited settings remain omitted
 - explicit settings survive save/load/resume
@@ -576,6 +623,7 @@ Phase 1 is complete when:
 - Preflight failures leave no worktree or session behind.
 - Failures after worktree creation retain recoverable state.
 - Every accepted prompt is either sent or visibly marked unsent.
+- Claude and Codex initial prompts are both visible in the transcript.
 - Every browser command surfaces a non-2xx response.
 - Target-repository Codex configuration remains intact except for the three
   mandatory safety overrides.
@@ -590,7 +638,10 @@ Phase 2 is complete when:
 
 - One Codex item renders once while progressing through running to terminal
   state.
-- Tool details are useful, bounded, redacted, and persisted safely.
+- Tool details are useful, redacted, bounded to 32 KiB each and 2 MiB globally,
+  omitted from SSE snapshots, lazily fetched by IDs, and persisted safely.
+- Expanded detail stays open across transcript rebuilds and refetches only when
+  its revision changes.
 - Supported images reach the SDK as structured local-image input.
 - Omitted settings inherit; explicit settings persist and resume deterministically.
 - Safety overrides cannot be weakened through session settings.
@@ -605,7 +656,7 @@ Phase 2 is complete when:
 | SDK updates change CLI invocation or JSONL schema | Pin SDK version; run fake-CLI tests on every update; reject incompatible overrides. |
 | SDK-bundled CLI does not reuse the expected authentication | Preflight supported auth sources; normalize runtime auth errors; allow a validated explicit binary. |
 | Strict version checks reject a usable app binary | Fall back automatically for the standard app candidate; explicit overrides fail loudly because they are authoritative. |
-| Detailed tool output leaks credentials or grows state without bound | Redact and truncate before Registry persistence or SSE delivery. |
+| Detailed tool output leaks credentials or amplifies snapshots/state writes | Redact before Registry admission; cap each body at 32 KiB and all bodies at 2 MiB with least-recently-updated eviction; omit bodies from SSE and fetch by IDs on expansion. |
 | Per-session settings unexpectedly override repo policy | Omitted means inherit; display explicit overrides; keep safety fields outside user control. |
 | App-server evaluation expands into a rewrite | Time-box it and require a decision record before production transport work. |
 | Queue tracking expands provider-neutral types | Keep delivery metadata backward compatible and optional; implement only the events required to prevent silent Codex prompt loss. |
@@ -625,7 +676,7 @@ Across those plans, preserve this dependency order:
 4. Prompt delivery persistence and lifecycle errors.
 5. Browser command error handling and documentation.
 6. Phase 1 verification and compatibility cleanup.
-7. Phase 2 event lifecycle and bounded details.
+7. Phase 2 event lifecycle, globally bounded detail storage, and lazy ID-keyed reads.
 8. Structured images and optional settings.
 9. Usage improvements where supported.
 10. Approval transport prototype and decision record.

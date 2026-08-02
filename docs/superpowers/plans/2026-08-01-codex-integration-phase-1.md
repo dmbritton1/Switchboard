@@ -4,7 +4,7 @@
 
 **Goal:** Turn Switchboard's working Codex beta into a dependable, macOS-only local worker with deterministic runtime selection, pre-worktree readiness checks, durable prompt delivery state, actionable failures, visible browser command errors, and hermetic SDK-through-process tests.
 
-**Architecture:** Keep `server.ts` as the owner of sessions and worktrees, keep the normalized provider `Adapter` boundary, and continue using `@openai/codex-sdk`. Add a Codex runtime resolver that produces a prepared runtime before worktree creation, refactor the Codex adapter into a runtime-bound factory, and persist prompt delivery transitions through the Registry. The browser uses one tested command helper and one explicit error-scope map so every command handles non-2xx responses.
+**Architecture:** Keep `server.ts` as the owner of sessions and worktrees, keep the normalized provider `Adapter` boundary, and continue using `@openai/codex-sdk`. Add a Codex runtime resolver that produces a prepared runtime before worktree creation, refactor the Codex adapter into a runtime-bound factory, and persist prompt delivery transitions through the Registry. The browser extends its existing DOM-free helper module and makes every command call site choose a persistent error destination explicitly.
 
 **Tech Stack:** Node.js 22.18+ with native TypeScript execution, `node:test`, `@openai/codex-sdk` 0.145.0, the SDK-bundled Codex CLI, Node HTTP/SSE, browser ES modules, and git worktrees on macOS.
 
@@ -790,6 +790,7 @@ Filter unrelated `status` events before comparing, but do not reorder the delive
 In `test/server.test.ts`, assert:
 
 - Codex create appends its initial prompt as queued before returning HTTP 200;
+- Claude create appends its initial prompt as sent before returning HTTP 200;
 - the adapter changes it to sent before the fake process invocation;
 - a follow-up is persisted as queued before the `/command` response resolves;
 - FIFO follow-ups become sent in order;
@@ -850,7 +851,13 @@ const promptId = registry.appendPrompt(session.id, String(body.text), delivery);
 handle.send(String(body.text), promptId);
 ```
 
-For Codex create/resume, call `appendPrompt(..., 'queued')` before `launch()` and pass the returned `promptId` in `StartOpts`. If launch fails synchronously, mark that prompt `unsent` before the terminal event. Claude create keeps its existing initial-transcript behavior; Claude follow-ups use the normalized delivered user-message shape.
+For every create, append the written initial prompt before `launch()`. Use
+`sent` for Claude and `queued` for Codex. Pass the Codex prompt ID in
+`StartOpts`; if a Codex launch fails synchronously, mark that prompt `unsent`
+before the terminal event. Codex resume also appends its explicit resume prompt
+as queued. Claude follow-ups continue using the normalized delivered
+user-message shape. Do not display an adapter-generated default such as
+`continue` as though the user typed it.
 
 Inside the Codex adapter, store FIFO entries as `{ text, promptId }`. Immediately before `thread.runStreamed()`, emit `sent` for that entry. The single `finish()` path must:
 
@@ -872,7 +879,9 @@ node --test test/sessions.test.ts test/agents-codex-process.test.ts test/server.
 npm test
 ```
 
-Expected: all prompt transitions are durable and ordered, interrupted prompts remain visible as unsent, and normal tests remain fully offline.
+Expected: both providers show their written initial prompt, Codex transitions
+are durable and ordered, interrupted prompts remain visible as unsent, and
+normal tests remain fully offline.
 
 - [ ] **Step 7: Commit durable prompt delivery**
 
@@ -886,30 +895,19 @@ git commit -m "feat: persist Codex prompt delivery state"
 ### Task 5: Surface every browser command failure and render prompt delivery
 
 **Files:**
-- Create: `web/lib.js`
+- Modify: `web/lib.js`
 - Create: `test/ui-command.test.ts`
 - Modify: `web/app.js`
 - Modify: `web/index.html`
 - Modify: `web/style.css`
-- Modify: `src/server.ts`
 
 **Interfaces:**
 
-Create a side-effect-free browser module that Node tests can import:
+Extend the existing side-effect-free `web/lib.js` module. Preserve
+`sortSessions`, `cardAction`, `selectionState`, `triggerLabel`, and
+`targetLabel`; `web/app.js` and `test/ui.test.ts` already depend on them.
 
 ```js
-export const COMMAND_ERROR_SCOPE = Object.freeze({
-  create: 'new-session',
-  send: 'session',
-  resume: 'session',
-  stop: 'session',
-  auto: 'session',
-  decide: 'session',
-  merge: 'selection',
-  push: 'selection',
-  delete: 'session',
-});
-
 export const CODEX_FAILURE_LABEL = Object.freeze({
   codex_platform_unsupported: 'Unsupported platform',
   codex_binary_missing: 'Codex executable missing',
@@ -947,24 +945,26 @@ export function commandFailure(result) {
   return String(result.data?.error ?? `Command failed with HTTP ${result.status}`);
 }
 
-export function routedCommandFailure(cmd, result) {
+export function retainedSessionError(sessionId, result) {
   const message = commandFailure(result);
-  if (!message) return null;
-  return { scope: COMMAND_ERROR_SCOPE[cmd] ?? 'session', message };
+  return message ? { sessionId, message } : null;
 }
 ```
+
+There is deliberately no exhaustive command-to-scope map. Each browser call
+site selects its own visible destination, so adding `unschedule` now or
+`codex-settings` in Phase 2 cannot invalidate an unrelated exact-key test.
 
 - [ ] **Step 1: Write failing command-helper tests**
 
 Create `test/ui-command.test.ts`:
 
 ```ts
-test('every browser command has an explicit error scope', () => {
-  assert.deepEqual(Object.keys(COMMAND_ERROR_SCOPE).sort(), [
-    'auto', 'create', 'decide', 'delete', 'merge',
-    'push', 'resume', 'send', 'stop',
-  ]);
-});
+import { test } from 'node:test';
+import assert from 'node:assert';
+import {
+  CODEX_FAILURE_LABEL, commandFailure, postCommand, retainedSessionError,
+} from '../web/lib.js';
 
 test('every stable Codex failure has a user-facing label', () => {
   assert.deepEqual(Object.keys(CODEX_FAILURE_LABEL).sort(), [
@@ -976,23 +976,19 @@ test('every stable Codex failure has a user-facing label', () => {
   ]);
 });
 
-for (const cmd of Object.keys(COMMAND_ERROR_SCOPE)) {
-  test(`${cmd} routes a non-2xx failure to its designated UI scope`, async () => {
-    const result = await postCommand(
-      { cmd },
-      async () => new Response(JSON.stringify({ error: `${cmd} refused` }), {
-        status: 409,
-        headers: { 'content-type': 'application/json' },
-      }),
-    );
-    assert.equal(result.ok, false);
-    assert.equal(result.status, 409);
-    assert.deepEqual(routedCommandFailure(cmd, result), {
-      scope: COMMAND_ERROR_SCOPE[cmd],
-      message: `${cmd} refused`,
-    });
+test('a session failure is retained with the session that caused it', async () => {
+  const result = await postCommand(
+    { cmd: 'send', id: 's1' },
+    async () => new Response(JSON.stringify({ error: 'send refused' }), {
+      status: 409,
+      headers: { 'content-type': 'application/json' },
+    }),
+  );
+  assert.deepEqual(retainedSessionError('s1', result), {
+    sessionId: 's1', message: 'send refused',
   });
-}
+  assert.equal(retainedSessionError('s1', { ok: true, status: 200, data: {} }), null);
+});
 
 test('network failures become visible command errors', async () => {
   const result = await postCommand(
@@ -1011,19 +1007,51 @@ Run:
 node --test test/ui-command.test.ts
 ```
 
-Expected: FAIL because `web/lib.js` does not exist.
+Expected: FAIL because the new exports do not exist in the current `web/lib.js`.
 
-- [ ] **Step 3: Implement the helper and route every handler through it**
+- [ ] **Step 3: Implement the helper without overwriting existing view logic**
 
-Import `postCommand`, `routedCommandFailure`, `CODEX_FAILURE_LABEL`, and `COMMAND_ERROR_SCOPE` at the top of `web/app.js`. Replace the current local `send()` helper.
+Add the four new exports to `web/lib.js` below the current helpers. Import
+`postCommand`, `commandFailure`, `retainedSessionError`, and
+`CODEX_FAILURE_LABEL` at the top of `web/app.js`. Remove the current local
+`send()` and `fire()` functions only after all their call sites have moved.
 
-Add a single `reportCommandFailure(cmd, result)` function in `web/app.js`. It must consume `routedCommandFailure(cmd, result)` and update the returned scope:
+- [ ] **Step 4: Replace the transient toast with explicit persistent destinations**
 
-- `new-session`: write `#new-error`;
-- `selection`: write `selectionMessage` and rerender the selection toolbar;
-- `session`: write `#command-error` and retain it until a successful retry, explicit dismiss, or session change.
+Keep these browser-local values in `web/app.js`:
 
-Make create, send, resume, stop, auto, decide, merge, push, and delete handlers `async`, await `postCommand()`, and stop their success-side UI mutation when the result is not ok. Preserve the existing merge/push success messages.
+```js
+let sessionCommandError = null; // { sessionId, message } | null
+let queueCommandError = '';
+
+async function runSessionCommand(body) {
+  const result = await postCommand(body);
+  sessionCommandError = retainedSessionError(String(body.id), result);
+  render();
+  return result;
+}
+
+async function runQueueCommand(body) {
+  const result = await postCommand(body);
+  queueCommandError = commandFailure(result);
+  render();
+  return result;
+}
+```
+
+Route call sites explicitly:
+
+- create writes `#new-error`;
+- merge/push write `selectionMessage`;
+- send/resume/stop/auto/decide/delete use `runSessionCommand()`;
+- unschedule uses `runQueueCommand()` and renders `queueCommandError` inside the
+  queue panel.
+
+Every handler awaits its request and skips success-only mutation when `ok` is
+false. The composer retains its text on a rejected send and clears it only on
+success. Remove the six-second toast function, timer, markup, and CSS after the
+persistent destinations cover every old call site; do not leave two
+session-error channels.
 
 Add this persistent session error region to `web/index.html` near the chat/grid root:
 
@@ -1031,13 +1059,22 @@ Add this persistent session error region to `web/index.html` near the chat/grid 
 <p id="command-error" role="alert"></p>
 ```
 
-Add a small dismiss button only when the error is nonempty. Clear the region when `openId` changes. Do not clear it merely because an SSE snapshot arrived.
+Add a small dismiss button only when the error is nonempty. Clear the region
+when the user changes to a different session; opening the affected session from
+the grid preserves it because its `sessionId` still matches. Do not clear it
+merely because an SSE snapshot arrived.
+
+Render a queue error row with its own dismiss button inside the queue panel.
+Clear it after a successful unschedule or explicit dismissal, not on an SSE
+snapshot. A session command error is keyed to the affected session; opening a
+different session clears it, while rebuilding the same session preserves it.
 
 Use `CODEX_FAILURE_LABEL[s.stoppedCode]` on stopped Codex cards and in the open chat header, with the sanitized `stoppedReason` as supporting/remediation text. Fall back to `stoppedReason` for legacy sessions with no code. This makes user stop, launch, authentication, resume, stream, sandbox, and runtime-readiness failures visually distinct without branching on raw SDK messages.
 
-Add `lib.js` to the static asset allow-list and MIME handling in `src/server.ts`.
+The merged baseline already serves `lib.js`; do not modify the server solely to
+re-add that route.
 
-- [ ] **Step 4: Render only exceptional prompt delivery state**
+- [ ] **Step 5: Render only exceptional prompt delivery state**
 
 In the user-message branch of the transcript renderer:
 
@@ -1050,21 +1087,26 @@ Add CSS classes `.prompt-delivery`, `.prompt-delivery.queued`, and `.prompt-deli
 
 Keep the Codex Auto checkbox disabled. Its title/help text must say that Codex uses a fixed worktree sandbox with non-interactive permissions.
 
-- [ ] **Step 5: Add server/UI static coverage and run tests**
+- [ ] **Step 6: Verify browser failures and prompt delivery**
 
-Extend `test/server.test.ts` to request `/lib.js` and assert status 200 plus JavaScript content type. Then run:
+Run:
 
 ```bash
-node --test test/ui-command.test.ts test/server.test.ts
+node --test test/ui-command.test.ts test/ui.test.ts
 npm test
+rg -n "function send|function fire|toastTimer|id=\"toast\"|COMMAND_ERROR_SCOPE" web test
+rg -n "cmd: '(create|send|resume|stop|auto|decide|merge|push|delete|unschedule)'" web/app.js
 ```
 
-Expected: every browser command has a tested error scope, the helper retains non-2xx and network failures, `lib.js` is served, and the full suite passes.
+Expected: helper and full tests pass; the final `rg` returns no obsolete helper,
+toast, or exhaustive scope map. Review the second `rg` result line by line:
+create uses the dialog destination; merge/push use selection; the six session
+commands use `runSessionCommand()`; and unschedule uses `runQueueCommand()`.
 
-- [ ] **Step 6: Commit browser failure handling**
+- [ ] **Step 7: Commit browser failure handling**
 
 ```bash
-git add web/lib.js web/app.js web/index.html web/style.css src/server.ts test/ui-command.test.ts test/server.test.ts
+git add web/lib.js web/app.js web/index.html web/style.css test/ui-command.test.ts
 git commit -m "fix: surface browser command failures"
 ```
 
@@ -1119,7 +1161,8 @@ Document in `README.md`:
 - fixed non-interactive permission model;
 - preserved user/project configuration;
 - queued/sent/unsent meaning and no automatic replay;
-- stable failure visibility;
+- provider-consistent initial user prompts;
+- persistent session/queue failure visibility replacing the old transient toast;
 - hermetic `npm test` fake-process coverage;
 - macOS-only scope;
 - Phase 2 omissions as current limitations.
@@ -1172,6 +1215,7 @@ Verify all of the following before claiming Phase 1 complete:
 - repository/user Codex configuration remains inherited;
 - start/resume/stream/sandbox/user-stop failures remain distinguishable;
 - prompt queue state survives failure and restart without replay;
+- Claude and Codex both display the written initial user prompt;
 - all browser commands await and display non-2xx results;
 - account environment values are absent from state, SSE, logs, and errors;
 - the normal test suite covers the SDK-to-process boundary offline;

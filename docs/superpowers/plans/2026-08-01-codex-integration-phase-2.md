@@ -4,7 +4,7 @@
 
 **Goal:** Add a richer, still-safe Codex experience to the Phase 1 integration: live item lifecycles, bounded details, reasoning summaries and todos, native local-image input, inherited-by-default thread settings, reliable usage detail, and a conclusive app-server approval evaluation.
 
-**Architecture:** Build on the prepared-runtime SDK adapter and durable Registry delivered by Phase 1. Normalize rich Codex data into provider-neutral persisted messages before it reaches SSE, resolve attachments at the server trust boundary, and keep explicit Codex settings separate from mandatory safety overrides. App-server remains an isolated stdio prototype and decision record; it does not become a production transport in this plan.
+**Architecture:** Build on the prepared-runtime SDK adapter and durable Registry delivered by Phase 1. Normalize rich Codex data into provider-neutral persisted messages, but keep bounded detail bodies out of full SSE snapshots and fetch them through an ID-keyed route on expansion. Resolve attachments at the server trust boundary and keep explicit Codex settings separate from mandatory safety overrides. App-server remains an isolated stdio prototype and decision record; it does not become a production transport in this plan.
 
 **Tech Stack:** Node.js 22.18+ with native TypeScript execution, `node:test`, the post-Phase-1 pinned `@openai/codex-sdk` and SDK-bundled Codex CLI, Node HTTP/SSE, browser ES modules, JSONL/JSON-RPC for the evaluation prototype, and git worktrees on macOS.
 
@@ -16,7 +16,8 @@
 - Preserve `CODEX_HOME`, global and repository Codex configuration, `AGENTS.md`, skills, MCP configuration, and every omitted setting as inherited.
 - Keep the integration intentionally macOS-only.
 - Normal `npm test` must remain hermetic: no OpenAI calls, paid turns, real login changes, or reads/writes under the user's real `~/.codex`.
-- Redact and truncate tool detail before Registry persistence or SSE delivery. The maximum persisted detail is exactly 32 KiB in UTF-8, including the visible truncation marker.
+- Redact and truncate tool detail before Registry admission. Each body is at most 32 KiB in UTF-8 including its visible marker; all detail bodies across the Registry are at most 2 MiB and use least-recently-updated whole-body eviction.
+- Never include a detail body in the normal SSE snapshot. Fetch it only through `GET /detail` keyed by Registry session ID and tool item ID, never a client path.
 - Display reasoning summaries only. Never request, persist, or render hidden/raw chain-of-thought content.
 - Treat all tool output, MCP arguments/results, paths, filenames, settings, and model-provided text as untrusted browser text. Render with `textContent`, not HTML injection.
 - Resolve every attachment on the server. Absolute attachment paths are adapter-only data and must never enter `state.json`, SSE, or the browser transcript.
@@ -119,14 +120,16 @@ git commit -m "docs: lock Codex phase 2 compatibility"
 
 ---
 
-### Task 1: Add bounded detail types and Registry upserts
+### Task 1: Add globally bounded detail storage, Registry upserts, and lazy reads
 
 **Files:**
 - Create: `src/agents/codex-detail.ts`
 - Create: `test/codex-detail.test.ts`
 - Modify: `src/types.ts`
 - Modify: `src/sessions.ts`
+- Modify: `src/server.ts`
 - Modify: `test/sessions.test.ts`
+- Modify: `test/server.test.ts`
 
 **Interfaces:**
 
@@ -141,6 +144,8 @@ export type ToolMsg = {
   status: 'running' | 'ok' | 'error';
   detail?: string;
   detailTruncated?: boolean;
+  detailEvicted?: boolean;
+  detailRevision?: number;
 };
 
 export type ReasoningMsg = { kind: 'reasoning'; id: string; text: string };
@@ -154,6 +159,21 @@ export type UpsertMsg =
   | (ToolMsg & { id: string })
   | ReasoningMsg
   | TodoMsg;
+
+export type PublicToolMsg = Omit<
+  ToolMsg,
+  'detail' | 'detailTruncated' | 'detailEvicted' | 'detailRevision'
+> & {
+  detailAvailable: boolean;
+  detailTruncated: boolean;
+  detailEvicted: boolean;
+  detailRevision: number;
+};
+
+export type PublicMsg = Exclude<Msg, ToolMsg> | PublicToolMsg;
+export type PublicSession = Omit<Session, 'transcript'> & {
+  transcript: PublicMsg[];
+};
 ```
 
 Add `{ type: 'upsert-msg'; msg: UpsertMsg }` to `AdapterEvent`. Keep the existing `msg` event for append-only user, assistant, and error messages.
@@ -162,6 +182,7 @@ Create this sanitizer contract:
 
 ```ts
 export const MAX_CODEX_DETAIL_BYTES = 32 * 1024;
+export const MAX_CODEX_DETAIL_TOTAL_BYTES = 2 * 1024 * 1024;
 export type SafeDetail = { text: string; truncated: boolean };
 
 export function safeCodexDetail(
@@ -170,6 +191,25 @@ export function safeCodexDetail(
   maxBytes?: number,
 ): SafeDetail | null;
 ```
+
+Add Registry-owned public/read contracts:
+
+```ts
+export type ToolDetailRead = {
+  text: string | null;
+  truncated: boolean;
+  evicted: boolean;
+  revision: number;
+};
+
+type RegistryOptions = { maxTotalDetailBytes?: number };
+
+Registry.getToolDetail(sessionId: string, itemId: string): ToolDetailRead | null;
+Registry.publicSessions(): PublicSession[];
+```
+
+Production constructs Registry with the default 2 MiB budget. Tests inject a
+small `maxTotalDetailBytes`; no user-facing configuration is added.
 
 - [ ] **Step 1: Write failing detail-sanitizer tests**
 
@@ -213,7 +253,7 @@ Use a `JSON.stringify` replacer with a `WeakSet`. Replace values whose key match
 
 Truncate the UTF-8 buffer to leave room for `\n[truncated]`. Repeatedly remove a trailing replacement character after decoding the sliced buffer. The returned text, including the marker, must never exceed `maxBytes`.
 
-- [ ] **Step 4: Write failing Registry upsert tests**
+- [ ] **Step 4: Write failing Registry upsert and global-budget tests**
 
 Add to `test/sessions.test.ts`:
 
@@ -231,32 +271,116 @@ test('upsert-msg keeps one lifecycle row per kind and id', () => {
   assert.deepEqual(reg.get(id)!.transcript, [{
     kind: 'tool', id: 'item-1', name: 'shell', summary: 'npm test', status: 'ok',
     detail: '84 tests passed', detailTruncated: false,
+    detailEvicted: false, detailRevision: 1,
   }]);
 });
 ```
 
 Also test different IDs, a tool and todo sharing the same ID, reasoning replacement, todo replacement, and legacy `msg` append behavior.
 
-- [ ] **Step 5: Implement Registry upserts**
+Add a two-session eviction test with a 10-byte injected budget:
+
+```ts
+test('detail budget evicts the least-recently-updated whole body across sessions', () => {
+  const { reg, first, second } = makeTwo({ maxTotalDetailBytes: 10 });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'old', name: 'shell', summary: 'old', status: 'ok',
+    detail: 'aaaaaa', detailTruncated: false,
+  } });
+  reg.apply(second, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'new', name: 'shell', summary: 'new', status: 'ok',
+    detail: 'bbbbbb', detailTruncated: false,
+  } });
+
+  assert.deepEqual(reg.getToolDetail(first, 'old'), {
+    text: null, truncated: false, evicted: true, revision: 3,
+  });
+  assert.deepEqual(reg.getToolDetail(second, 'new'), {
+    text: 'bbbbbb', truncated: false, evicted: false, revision: 2,
+  });
+});
+```
+
+Also prove: touching an older detail makes it newest; eviction removes an
+entire body rather than slicing it; summaries/statuses remain; UTF-8 byte totals
+not character counts drive the limit; loading an over-budget legacy state
+enforces the same rule; and `publicSessions()` contains availability,
+truncation, eviction, and revision metadata but no detail string.
+
+- [ ] **Step 5: Implement Registry upserts, revisions, projection, and LRU eviction**
 
 In `Registry.apply()`, find an existing transcript entry only when both `kind` and `id` match. Replace it in place to preserve transcript order; append when absent. Never merge fields from an old item into a terminal item.
 
-- [ ] **Step 6: Run focused and full tests**
+When an upsert carries detail, assign the next Registry-wide monotonically
+increasing `detailRevision`, set `detailEvicted: false`, and then total
+`Buffer.byteLength(detail, 'utf8')` for every tool in every session. While the
+total exceeds the configured budget, select the detail-bearing tool with the
+lowest revision, delete its whole `detail`, set `detailEvicted: true`, and assign
+another revision so a browser cache invalidates. Repeat until within budget.
+
+On load, seed missing revisions in stable session/transcript order, set the next
+revision above the observed maximum, and enforce the budget once. `publicSessions()`
+must clone sessions/messages and replace every tool detail body with
+`detailAvailable: message.detail !== undefined`. It defaults absent truncation
+and eviction flags to `false` and absent revision to `0`; never mutate the
+persisted Registry object while projecting it.
+
+Keep Claude's existing `tool-result` correlation. Claude reports tool start and
+result in separate SDK messages, so retaining that provider-specific status
+event avoids making `normalizeClaude()` stateful or merging incomplete terminal
+messages into Codex's whole-item upsert contract.
+
+- [ ] **Step 6: Write failing SSE and detail-route tests**
+
+In `test/server.test.ts`, create a Registry tool whose detail contains
+`DETAIL_SENTINEL`, open `/events`, and assert the snapshot includes the tool ID,
+`detailAvailable: true`, and its revision but not `DETAIL_SENTINEL`. Then call:
+
+```ts
+const detail = await getJson(
+  server,
+  `/detail?session=${encodeURIComponent(session.id)}&item=${encodeURIComponent('cmd-1')}`,
+);
+assert.deepEqual(detail, {
+  text: 'DETAIL_SENTINEL', truncated: false, evicted: false, revision: 1,
+});
+```
+
+Also assert unknown session/item returns 404, known evicted detail returns 200
+with `{ text: null, evicted: true, ... }`, a known tool that never had detail
+returns 200 with `{ text: null, evicted: false, revision: 0, ... }`, a `path`
+parameter is ignored rather than resolved, and the existing Host guard protects
+`/detail`.
+
+- [ ] **Step 7: Implement the ID-keyed detail route and summary snapshot**
+
+Change `snapshot()` to use `registry.publicSessions()`. Add
+`GET /detail?session=<session-id>&item=<tool-item-id>` after the Host guard and
+before `/status`. Resolve only through `Registry.getToolDetail()`; do not accept,
+join, stat, or read a client-supplied path. Return JSON with `cache-control:
+no-store`, 404 for an unknown Registry key, and 200 for both available and
+known-evicted detail metadata.
+
+`getToolDetail()` searches only `kind: 'tool'` entries, so a reasoning or todo
+item that happens to reuse the same SDK ID cannot satisfy a detail read.
+
+- [ ] **Step 8: Run focused and full tests**
 
 Run:
 
 ```bash
-node --test test/codex-detail.test.ts test/sessions.test.ts
+node --test test/codex-detail.test.ts test/sessions.test.ts test/server.test.ts
 npm test
 ```
 
-Expected: sanitizer and upsert tests pass; legacy state and Claude behavior remain green.
+Expected: sanitizer, global budget, projection, and detail-route tests pass;
+SSE contains no detail body; legacy state and Claude behavior remain green.
 
-- [ ] **Step 7: Commit bounded detail storage**
+- [ ] **Step 9: Commit bounded detail storage**
 
 ```bash
-git add src/agents/codex-detail.ts src/types.ts src/sessions.ts test/codex-detail.test.ts test/sessions.test.ts
-git commit -m "feat: add bounded Codex transcript details"
+git add src/agents/codex-detail.ts src/types.ts src/sessions.ts src/server.ts test/codex-detail.test.ts test/sessions.test.ts test/server.test.ts
+git commit -m "feat: add bounded lazy Codex details"
 ```
 
 ---
@@ -369,12 +493,49 @@ Add a DOM-free view projection in `web/lib.js`:
 
 ```ts
 type TranscriptView =
-  | { kind: 'tool'; className: string; summary: string; detail?: string; truncated: boolean }
+  | {
+      kind: 'tool'; id: string; className: string; summary: string;
+      detailAvailable: boolean; detailEvicted: boolean;
+      detailRevision: number; truncated: boolean;
+    }
   | { kind: 'reasoning'; className: string; summary: string }
   | { kind: 'todo'; className: string; items: { text: string; completed: boolean }[] }
   | { kind: 'text'; className: string; summary: string };
 
 declare function transcriptView(message: Msg): TranscriptView;
+
+declare function detailKey(sessionId: string, itemId: string): string;
+declare function requestOnce<T>(
+  requests: Map<string, Promise<T>>,
+  key: string,
+  load: () => Promise<T>,
+): Promise<T>;
+declare function needsDetailFetch(
+  view: Extract<TranscriptView, { kind: 'tool' }>,
+  cached?: { revision: number },
+): boolean;
+type DetailCacheEntry = {
+  revision: number;
+  text: string | null;
+  truncated: boolean;
+  error?: string;
+};
+type DetailPresentation = {
+  open: boolean;
+  mode: 'hidden' | 'loading' | 'content' | 'evicted' | 'error';
+  text: string;
+  fetch: boolean;
+};
+declare function detailPresentation(
+  view: Extract<TranscriptView, { kind: 'tool' }>,
+  expanded: boolean,
+  cached?: DetailCacheEntry,
+): DetailPresentation;
+declare function fetchToolDetail(
+  sessionId: string,
+  itemId: string,
+  fetchImpl?: typeof fetch,
+): Promise<ToolDetailRead>;
 ```
 
 The returned strings remain untrusted. `web/app.js` must assign them with `textContent`.
@@ -387,10 +548,12 @@ Add to `test/ui.test.ts`:
 test('transcriptView projects a running tool with collapsible detail', () => {
   assert.deepEqual(transcriptView({
     kind: 'tool', id: 'c1', name: 'shell', summary: 'npm test', status: 'running',
-    detail: 'working...', detailTruncated: false,
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, detailTruncated: false,
   }), {
-    kind: 'tool', className: 'msg tool running',
-    summary: 'shell: npm test', detail: 'working...', truncated: false,
+    kind: 'tool', id: 'c1', className: 'msg tool running',
+    summary: 'shell: npm test', detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, truncated: false,
   });
 });
 
@@ -402,7 +565,49 @@ test('transcriptView keeps reasoning and todos distinct from tools', () => {
 });
 ```
 
-Also cover terminal tool labels, truncated detail, assistant/error/user messages, and no-detail tools.
+Also cover terminal tool labels, truncated/evicted/never-present detail,
+assistant/error/user messages, and no-detail tools. Test that
+`detailKey('s1', 'i1')` differs from every other session/item pair. Test
+`needsDetailFetch()` for missing cache, matching revision, changed revision,
+unavailable detail, and eviction.
+
+Prove a transcript rebuild preserves an expanded cached item through the pure
+presentation contract:
+
+```ts
+assert.deepEqual(detailPresentation(toolView, true, {
+  revision: 4, text: 'working output', truncated: false,
+}), {
+  open: true, mode: 'content', text: 'working output', fetch: false,
+});
+assert.equal(detailPresentation(toolView, true).fetch, true);
+assert.equal(detailPresentation({ ...toolView, detailEvicted: true }, true).mode, 'evicted');
+```
+
+Also cover collapsed, loading, stale-cache, and cached-error presentations.
+
+Test request deduplication with a controlled promise:
+
+```ts
+const requests = new Map();
+let calls = 0;
+const gate = Promise.withResolvers();
+const first = requestOnce(requests, 's1:i1:4', async () => {
+  calls++;
+  await gate.promise;
+  return 'detail';
+});
+const second = requestOnce(requests, 's1:i1:4', async () => 'duplicate');
+assert.strictEqual(first, second);
+assert.equal(calls, 1);
+gate.resolve(undefined);
+assert.equal(await first, 'detail');
+assert.equal(requests.size, 0);
+```
+
+Mock `fetchToolDetail()` and assert it requests exactly
+`/detail?session=s+1&item=i%2F1`, returns the JSON body, and throws a sanitized
+error for non-2xx or malformed JSON.
 
 - [ ] **Step 2: Run UI tests and confirm failure**
 
@@ -422,24 +627,85 @@ Use these labels:
 - reasoning: `Reasoning summary` plus the summary text;
 - todo: one row per item, `✓` for complete and `○` for pending.
 
-Do not include prompt IDs, item IDs, absolute paths added by the adapter, or raw object serialization in the projection.
+Do not render prompt IDs, item IDs, absolute paths added by the adapter, or raw
+object serialization as visible text. The tool item ID may remain in the
+DOM-free projection only as the internal detail-cache key.
 
-- [ ] **Step 4: Implement safe DOM rendering**
+Use `URLSearchParams` inside `fetchToolDetail()`. `needsDetailFetch()` returns
+true only when detail is available and the cache is absent or has a different
+revision. Item IDs remain internal keys even though the projection carries one;
+they are never visible text.
+
+Implement `detailKey()` as `JSON.stringify([sessionId, itemId])`, not raw string
+concatenation, so identifiers containing delimiters cannot collide.
+`requestOnce()` returns an existing promise for the same request key; otherwise
+it stores `load().finally(() => requests.delete(key))` before returning it.
+`fetchToolDetail()` reports `Detail request failed (HTTP <status>).` for a
+non-2xx response and `Detail request failed.` for network/malformed responses;
+it never forwards an HTML body or raw exception text into the transcript.
+
+`detailPresentation()` is the only branch table used by the DOM renderer. Its
+evicted text is exactly `Detail removed to stay within the storage limit.`;
+loading text is `Loading…`; error text comes from the sanitized cached error.
+
+- [ ] **Step 4: Add persistent expansion, revision cache, and request deduplication**
+
+Add browser-local structures in `web/app.js`:
+
+```js
+const expandedItems = new Set();
+const detailCache = new Map();
+const detailRequests = new Map();
+let detailSession = null;
+```
+
+Keys are always `detailKey(sessionId, itemId)`. When the open session changes,
+clear all three collections and set `detailSession` to the new ID. Do this in
+the same helper used by card/tab opening and Back; do not rely on an SSE render
+to detect the change.
+
+`ensureToolDetail(sessionId, view)` must:
+
+1. return when the item is collapsed, unavailable, evicted, or cache-current;
+2. use `requestOnce()` with `JSON.stringify([key, view.detailRevision])` so an
+   in-flight request is reused only for the same item revision;
+3. fetch through `fetchToolDetail()` otherwise;
+4. cache only a response whose revision still matches the rendered view;
+5. remove its in-flight entry in `finally`;
+6. rerender only if that same session remains open.
+
+On failure, cache `{ revision, text: null, truncated: false, error }` so an SSE
+rebuild does not immediately retry. When SSE reports eviction or unavailability,
+delete the stale cache entry. The rendered error includes a Retry button that
+deletes that cache entry and calls `ensureToolDetail()` again.
+
+- [ ] **Step 5: Implement safe DOM rendering that survives transcript rebuilds**
 
 Refactor `renderChatPane()` to consume `transcriptView()`:
 
 - tool summary remains the visible row;
-- when detail exists, append `<details><summary>Details</summary><pre></pre></details>` and assign the detail with `pre.textContent`;
+- when detail is available or evicted, append
+  `<details><summary>Details</summary><pre></pre></details>`;
+- before appending, set `details.open = expandedItems.has(key)` so the existing
+  `t.replaceChildren()` rebuild does not collapse an open item;
+- on `toggle`, add/remove the key and call `ensureToolDetail()` only when opening;
+- render exactly from `detailPresentation()`; assign its text with
+  `pre.textContent` and append the Retry button only for `mode: 'error'`;
 - reasoning uses a visually secondary block labelled `Reasoning summary`;
 - todo uses a semantic `<ul>` with complete/pending classes;
 - ordinary text, user, prompt-delivery, and error rendering from Phase 1 remains intact;
 - preserve the current near-bottom scroll behavior during rapid updates.
 
-- [ ] **Step 5: Add focused styling**
+During each rebuild, call `ensureToolDetail()` for every currently expanded
+tool. A matching cached revision causes no request; a newer revision causes one
+deduplicated refresh. This keeps a running command open and current without a
+request storm.
+
+- [ ] **Step 6: Add focused styling**
 
 Add styles for `.tool details`, `.tool pre`, `.msg.reasoning`, `.msg.todo`, `.todo-complete`, and `.todo-pending`. Detail must wrap long lines, use a bounded viewport, and remain collapsed by default.
 
-- [ ] **Step 6: Run focused and full tests**
+- [ ] **Step 7: Run focused and full tests**
 
 Run:
 
@@ -448,9 +714,11 @@ node --test test/ui.test.ts
 npm test
 ```
 
-Expected: projections pass and all browser helper tests remain green.
+Expected: projections and detail-fetch helpers pass; expansion keys survive
+rebuild logic; unchanged revisions do not refetch; all browser helper tests
+remain green.
 
-- [ ] **Step 7: Commit rich transcript rendering**
+- [ ] **Step 8: Commit rich transcript rendering**
 
 ```bash
 git add web/lib.js web/app.js web/style.css test/ui.test.ts
@@ -786,6 +1054,10 @@ Test that:
 - resume passes the stored settings again;
 - settings contain no materialized default values in state or SSE.
 
+The browser handler must call the Phase 1 `runSessionCommand()` destination
+explicitly so validation/server failures use the persistent session region.
+There is no command-scope map or exact-key list to update.
+
 - [ ] **Step 5: Apply settings below inherited config and above no safety boundary**
 
 Build SDK thread options in this order:
@@ -843,13 +1115,11 @@ git commit -m "feat: add inherited Codex thread settings"
 - Modify: `src/types.ts`
 - Modify: `src/sessions.ts`
 - Modify: `src/agents/codex.ts`
-- Modify: `src/agents/claude.ts`
 - Modify: `src/server.ts`
 - Modify: `web/lib.js`
 - Modify: `web/app.js`
 - Modify: `web/style.css`
 - Modify: `test/agents-codex.test.ts`
-- Modify: `test/agents-claude.test.ts`
 - Modify: `test/server.test.ts`
 - Modify: `test/sessions.test.ts`
 - Modify: `test/ui.test.ts`
@@ -867,15 +1137,20 @@ export type TurnUsage = {
   reasoningOutputTokens?: number;
 };
 
-type UsageEvent = { type: 'usage'; usage: TurnUsage };
+type UsageEvent = { type: 'usage' } & TurnUsage;
 type Session = { lastUsage: TurnUsage | null };
 ```
 
 `Usage.record()` continues receiving only `inputTokens` and `outputTokens`; optional fields are subsets/informational and must not be added to budget pace.
+Keep the existing flat provider event shape. Claude continues emitting only
+`inputTokens` and `outputTokens`; no Claude adapter rewrite is required.
 
 - [ ] **Step 1: Write failing usage normalization and persistence tests**
 
-Assert one Codex `turn.completed` maps every SDK field exactly and Registry stores it as `lastUsage`. Assert the server passes only `inputTokens` and `outputTokens` to the account pace recorder. Add Claude envelope coverage and legacy-load coverage for missing `lastUsage`.
+Assert one Codex `turn.completed` maps every SDK field exactly and Registry
+stores it as `lastUsage`. Assert the server passes only `inputTokens` and
+`outputTokens` to the account pace recorder. Preserve the existing Claude flat
+usage test and add legacy-load coverage for missing `lastUsage`.
 
 - [ ] **Step 2: Run tests and confirm failure**
 
@@ -887,7 +1162,8 @@ Expected: FAIL until `TurnUsage` and `lastUsage` exist.
 
 - [ ] **Step 3: Implement usage storage**
 
-Initialize `lastUsage: null`, replace it on each usage event, and default missing legacy state to null. Adapt Claude usage events to the same `{ usage }` envelope with only input/output fields.
+Initialize `lastUsage: null`, replace it from the flat usage event on each turn,
+and default missing legacy state to null. Leave Claude normalization unchanged.
 
 - [ ] **Step 4: Add a pure browser usage projection**
 
@@ -933,7 +1209,7 @@ Expected: usage detail is SDK-backed, pace does not double-count subsets, and th
 - [ ] **Step 7: Commit reliable usage detail**
 
 ```bash
-git add src/types.ts src/sessions.ts src/agents/codex.ts src/agents/claude.ts src/server.ts web/lib.js web/app.js web/style.css test/agents-codex.test.ts test/agents-claude.test.ts test/server.test.ts test/sessions.test.ts test/ui.test.ts
+git add src/types.ts src/sessions.ts src/agents/codex.ts src/server.ts web/lib.js web/app.js web/style.css test/agents-codex.test.ts test/server.test.ts test/sessions.test.ts test/ui.test.ts
 git commit -m "feat: show reliable Codex turn usage"
 ```
 
@@ -1064,7 +1340,8 @@ git commit -m "research: evaluate Codex app-server approvals"
 
 Document:
 
-- live tool lifecycle and collapsible 32 KiB redacted details;
+- live tool lifecycle, 32 KiB-per-item/2 MiB-global detail bounds,
+  least-recently-updated eviction, and lazy ID-keyed detail reads;
 - reasoning summaries and todo status, with no raw reasoning;
 - supported native image formats and path-based fallback files;
 - pending attachment retry behavior;
@@ -1079,7 +1356,7 @@ Document:
 ```bash
 rg -n "danger-full-access|experimentalApi|ws://|wss://" src web test scripts README.md AGENTS.md
 rg -n "innerHTML|insertAdjacentHTML" web
-rg -n "MAX_CODEX_DETAIL_BYTES|safeCodexDetail|local_image|CodexThreadSettings|lastUsage" src test
+rg -n "MAX_CODEX_DETAIL_BYTES|MAX_CODEX_DETAIL_TOTAL_BYTES|safeCodexDetail|detailRevision|detailEvicted|local_image|CodexThreadSettings|lastUsage" src test
 rg -n "TODO|TBD|FIXME" src web test scripts README.md AGENTS.md
 ```
 
@@ -1093,7 +1370,9 @@ Run the focused tests that write state and read `/events`, using fake tokens in 
 node --test test/codex-detail.test.ts test/server.test.ts test/agents-codex-process.test.ts test/prompt-input.test.ts
 ```
 
-Expected: all pass and assertions explicitly reject each fake secret/path from serialized state and SSE text.
+Expected: all pass; assertions explicitly reject each fake secret/path from
+serialized state and SSE text; SSE contains no detail body, while `/detail`
+returns only the redacted body selected by Registry IDs.
 
 - [ ] **Step 4: Run the complete verification contract**
 
@@ -1111,7 +1390,11 @@ Expected: all automated tests pass offline; the real no-turn probe completes; wh
 Confirm:
 
 - each Codex item occupies one row from running to terminal;
-- detail is useful, redacted, bounded, marked, persisted, and browser-safe;
+- detail is useful, redacted, capped at 32 KiB each and 2 MiB globally,
+  least-recently-updated on eviction, omitted from SSE, persisted, and fetched
+  only by session/item IDs;
+- expanded detail survives every transcript rebuild, uses revision-aware cache
+  invalidation, and deduplicates in-flight reads;
 - reasoning summaries/todos are separate and no hidden reasoning is stored;
 - supported images reach SDK `local_image` and every path is worktree-contained;
 - omitted settings inherit and explicit settings persist/resume;
