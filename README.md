@@ -133,10 +133,14 @@ spend a model turn, or read a real Codex account.
   approval callback, only a start-of-thread `approvalPolicy`. Codex sessions run
   with `approvalPolicy: 'never'` and are sandboxed to their own worktree
   (`sandboxMode: 'workspace-write'`) instead; `decide()` on a Codex session is a
-  no-op. Runtime preflight validates a selected macOS binary, compatibility, and
-  recognizable login state before creating a worktree. Launch, resume, stream,
-  sandbox, authentication, and user-stop failures use persistent session errors
-  with stable codes and actionable remediation rather than a transient toast.
+  no-op. Runtime preflight validates a selected macOS binary and compatibility
+  before creating a worktree, and normally checks readiness with `codex login
+  status`: recognized logged-out errors fail with actionable remediation. If a
+  compatible CLI does not support that subcommand, preflight records a
+  diagnostic and defers authentication checking until Codex starts. Launch,
+  resume, stream, sandbox, authentication, and user-stop failures use
+  persistent session errors with stable codes and actionable remediation rather
+  than a transient toast.
 - Every written initial prompt is displayed for both Claude and Codex. Codex
   prompts are marked `queued`, then `sent` immediately before delivery; queued
   prompts left by a failure, stop, or restart become `unsent` and remain visible.
