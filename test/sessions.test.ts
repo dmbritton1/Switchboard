@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Registry, type RegistryOptions } from '../src/sessions.ts';
+import type { AdapterEvent } from '../src/types.ts';
 import { Usage } from '../src/usage.ts';
 
 function make(options?: RegistryOptions): { reg: Registry; id: string } {
@@ -448,6 +449,27 @@ test('legacy msg events remain append-only', () => {
     { kind: 'text', text: 'same' },
     { kind: 'text', text: 'same' },
   ]);
+});
+
+test('a detail-bearing legacy msg event cannot bypass the global detail budget', () => {
+  const { reg, id } = make({ maxTotalDetailBytes: 5 });
+  const defensiveEvent = {
+    type: 'msg',
+    msg: {
+      kind: 'tool', id: 'legacy-tool', name: 'shell', summary: 'legacy', status: 'ok',
+      detail: '123456', detailTruncated: false,
+    },
+  } as AdapterEvent;
+
+  reg.apply(id, defensiveEvent);
+
+  assert.deepEqual(reg.getToolDetail(id, 'legacy-tool'), {
+    text: null, truncated: false, evicted: true, revision: 2,
+  });
+  assert.deepEqual(reg.get(id)!.transcript, [{
+    kind: 'tool', id: 'legacy-tool', name: 'shell', summary: 'legacy', status: 'ok',
+    detailTruncated: false, detailEvicted: true, detailRevision: 2,
+  }]);
 });
 
 test('detail budget evicts the least-recently-updated whole body across sessions', () => {

@@ -22,6 +22,22 @@ test('safeCodexDetail caps valid UTF-8 including its marker', () => {
   assert.doesNotMatch(detail.text, /�/);
 });
 
+test('safeCodexDetail never exceeds limits smaller than its full marker', () => {
+  const cases = [
+    { maxBytes: 0, text: '' },
+    { maxBytes: 1, text: '[' },
+    { maxBytes: 11, text: '[truncated]' },
+    { maxBytes: 12, text: '\n[truncated]' },
+  ];
+
+  for (const { maxBytes, text } of cases) {
+    const detail = safeCodexDetail('longer than every boundary', {}, maxBytes)!;
+    assert.deepEqual(detail, { text, truncated: true }, `maxBytes=${maxBytes}`);
+    assert.ok(Buffer.byteLength(detail.text, 'utf8') <= maxBytes, `maxBytes=${maxBytes}`);
+    assert.doesNotMatch(detail.text, /�/);
+  }
+});
+
 test('safeCodexDetail returns null only for nullish values', () => {
   assert.equal(safeCodexDetail(null, {}), null);
   assert.equal(safeCodexDetail(undefined, {}), null);

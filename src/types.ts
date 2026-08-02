@@ -59,6 +59,12 @@ export type PublicToolMsg = Omit<
 
 export type PublicMsg = Exclude<Msg, ToolMsg> | PublicToolMsg;
 
+export type AppendToolMsg = Omit<
+  ToolMsg,
+  'detail' | 'detailTruncated' | 'detailEvicted' | 'detailRevision'
+>;
+export type AppendMsg = Exclude<Msg, ToolMsg | ReasoningMsg | TodoMsg> | AppendToolMsg;
+
 export type ApprovalRequest = { id: string; tool: string; summary: string };
 
 export type Session = {
@@ -88,7 +94,7 @@ export type PublicSession = Omit<Session, 'transcript'> & {
 
 export type AdapterEvent =
   | { type: 'status'; status: Status }
-  | { type: 'msg'; msg: Exclude<Msg, ReasoningMsg | TodoMsg> }
+  | { type: 'msg'; msg: AppendMsg }
   | { type: 'upsert-msg'; msg: UpsertMsg }
   | { type: 'approval'; request: ApprovalRequest }
   | { type: 'approval-resolved' }

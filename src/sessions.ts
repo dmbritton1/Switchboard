@@ -147,7 +147,12 @@ export class Registry {
         if (!s.pending) this.#setStatus(s, e.status);
         break;
       case 'msg':
-        s.transcript.push(e.msg);
+        if (e.msg.kind === 'tool') {
+          s.transcript.push(this.#prepareTool(e.msg));
+          this.#enforceDetailBudget();
+        } else {
+          s.transcript.push(e.msg);
+        }
         break;
       case 'upsert-msg': {
         const msg = this.#prepareUpsert(e.msg);
@@ -199,17 +204,18 @@ export class Registry {
         : { ...msg };
     }
 
-    const {
-      detailRevision: _revision,
-      detailEvicted: _evicted,
-      ...next
-    } = msg;
-    if (next.detail === undefined) return next;
-    return {
-      ...next,
-      detailEvicted: false,
-      detailRevision: this.#nextDetailRevision++,
-    };
+    return this.#prepareTool(msg);
+  }
+
+  #prepareTool<T extends ToolMsg>(msg: T): T {
+    const next = { ...msg };
+    delete next.detailRevision;
+    delete next.detailEvicted;
+    if (next.detail !== undefined) {
+      next.detailEvicted = false;
+      next.detailRevision = this.#nextDetailRevision++;
+    }
+    return next;
   }
 
   #enforceDetailBudget(): void {
