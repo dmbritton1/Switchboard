@@ -265,3 +265,9 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   background: none; color: var(--needs); font: inherit; cursor: pointer; white-space: nowrap; }
 #interrupt button:hover { background: var(--needs); color: #1a1000; }
 #interrupt button.more { border-color: transparent; color: var(--dim); }
+
+/* ---- Toast ------------------------------------------------------------- */
+#toast { position: fixed; left: 50%; bottom: 1.5rem; translate: -50% 0; z-index: 5;
+  max-width: min(40rem, 90vw); padding: .7rem 1.1rem; border-radius: 10px;
+  background: #2a1414; border: 1px solid #5a2626; color: #ffb4b4; font-size: .9em;
+  box-shadow: 0 12px 28px #000a; }

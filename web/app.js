@@ -24,6 +24,28 @@ async function send(body) {
   return { ok: res.ok, data: await res.json() };
 }
 
+let toastTimer = null;
+
+function toast(text) {
+  const el = $('#toast');
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+/**
+ * Fire-and-forget commands, with the failure made visible. The server already
+ * rejects the dangerous cases honestly — a send to a session with no live agent
+ * is a 404, a resume on a session that is not stopped is a 409 — but until now
+ * the browser showed nothing either way. Callers that surface their own errors
+ * (the create dialog, merge, push) keep using send() directly.
+ */
+async function fire(body) {
+  const { ok, data } = await send(body);
+  if (!ok) toast(data?.error ?? `${body.cmd} failed`);
+}
+
 // EventSource reconnects on its own, so there is no backoff code to write.
 const es = new EventSource('/events');
 es.onmessage = (e) => {
@@ -136,8 +158,7 @@ function queueRow(q) {
   del.className = 'queue-del';
   del.title = 'Remove from queue';
   del.textContent = '✕';
-  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
-  del.onclick = () => send({ cmd: 'unschedule', itemId: q.id });
+  del.onclick = () => fire({ cmd: 'unschedule', itemId: q.id });
 
   row.append(when, what, del);
 
@@ -367,8 +388,7 @@ function overflowMenu(s) {
   auto.title = s.provider === 'codex'
     ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
     : 'Approve every tool call automatically, without asking';
-  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
-  box.onchange = () => { menuFor = null; send({ cmd: 'auto', id: s.id, auto: box.checked }); };
+  box.onchange = () => { menuFor = null; render(); fire({ cmd: 'auto', id: s.id, auto: box.checked }); };
   auto.append(box, ' Auto-approve');
 
   menu.append(
@@ -406,8 +426,7 @@ $('#del').addEventListener('close', (e) => {
   // trust that whatever opened the dialog already re-rendered.
   render();
   if (!go) return;
-  // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
-  send({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
+  fire({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
 });
 
 // Any click that is not on a menu closes the open one. Registered once, in the
@@ -479,7 +498,7 @@ function stopButton(s) {
   const b = document.createElement('button');
   b.textContent = 'Stop';
   // Stopping is not destructive — no confirm. The card stays, with a Resume button.
-  b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'stop', id: s.id }); };
+  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'stop', id: s.id }); };
   return b;
 }
 
@@ -509,8 +528,7 @@ function renderInterrupt(current) {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = label;
-    // `fire()` does not exist until Task 7 — use `send()` here and swap it there.
-    b.onclick = () => send({ cmd: 'decide', id: first.id, allow });
+    b.onclick = () => fire({ cmd: 'decide', id: first.id, allow });
     box.append(b);
   }
 
@@ -545,7 +563,7 @@ function approval(s) {
   for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
     const b = document.createElement('button');
     b.textContent = label;
-    b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'decide', id: s.id, allow }); };
+    b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'decide', id: s.id, allow }); };
     box.append(b);
   }
   return box;
@@ -554,7 +572,7 @@ function approval(s) {
 function resumeButton(s) {
   const b = document.createElement('button');
   b.textContent = `Resume (${s.stoppedReason ?? 'stopped'})`;
-  b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'resume', id: s.id }); };
+  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'resume', id: s.id }); };
   return b;
 }
 
@@ -770,7 +788,7 @@ $('#composer').onsubmit = (e) => {
   const text = $('#prompt').value.trim();
   if (!text) return;
   $('#prompt').value = '';
-  send({ cmd: 'send', id: openId, text });
+  fire({ cmd: 'send', id: openId, text });
 };
 
 // Uploads go straight to disk in the session's worktree and come back as a
