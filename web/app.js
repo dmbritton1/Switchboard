@@ -1,8 +1,12 @@
-const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
+import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from './lib.js';
+
 let state = { sessions: [], accounts: [] };
 let openId = null;
+// Which header panel is open: null, 'queue', or an account name. Mutually
+// exclusive by construction — one variable, not one flag per panel.
+let panel = null;
 let seenNeedsYou = new Set();
-// Session whose chat view has already been auto-scrolled once; see renderChat().
+// Session whose chat view has already been auto-scrolled once; see renderChatPane().
 let scrolledFor = null;
 // Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
 // as openId — render() reads it, checkbox/button handlers mutate it and re-render.
@@ -20,13 +24,38 @@ async function send(body) {
   return { ok: res.ok, data: await res.json() };
 }
 
+let toastTimer = null;
+
+function toast(text) {
+  const el = $('#toast');
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+/**
+ * Fire-and-forget commands, with the failure made visible. The server already
+ * rejects the dangerous cases honestly — a send to a session with no live agent
+ * is a 404, a resume on a session that is not stopped is a 409 — but until now
+ * the browser showed nothing either way. Callers that surface their own errors
+ * (the create dialog, merge, push) keep using send() directly.
+ */
+async function fire(body) {
+  const { ok, data } = await send(body);
+  if (!ok) toast(data?.error ?? `${body.cmd} failed`);
+}
+
 // EventSource reconnects on its own, so there is no backoff code to write.
 const es = new EventSource('/events');
 es.onmessage = (e) => {
+  $('#conn').hidden = true;
   state = JSON.parse(e.data);
   notify();
   render();
 };
+// EventSource reconnects on its own; this only makes the gap visible.
+es.onerror = () => { $('#conn').hidden = false; };
 
 function notify() {
   const needs = state.sessions.filter((s) => s.status === 'needs-you');
@@ -45,16 +74,130 @@ function elapsed(since) {
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
 }
 
-// Session whose commit graph is open, and the commits last fetched for it.
-// Graph data is not in the SSE snapshot: commits change when the agent commits
-// or the user merges, neither of which is a session-state event, so this view
-// polls instead of riding render().
-let graphId = null;
+// Commits last fetched for the open session's Graph tab. Graph data is not in
+// the SSE snapshot: commits change when the agent commits or the user merges,
+// neither of which is a session-state event, so this view polls instead of
+// riding render().
 let graphCommits = [];
 
+function setPanel(next) {
+  panel = panel === next ? null : next;
+  render();
+}
+
+function accountMeter(a) {
+  const pct = Math.round(a.pace * 100);
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = `meter${panel === a.name ? ' open' : ''}`;
+  b.title = `${a.name} — ~${pct}% of its 5h budget (estimate)`;
+
+  const name = document.createElement('span');
+  name.textContent = a.name;
+
+  const bar = document.createElement('span');
+  bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
+  const fill = document.createElement('i');
+  fill.style.width = `${Math.min(pct, 100)}%`;
+  bar.append(fill);
+
+  const num = document.createElement('span');
+  num.textContent = `${pct}%`;
+
+  b.append(name, bar, num);
+  b.onclick = () => setPanel(a.name);
+  return b;
+}
+
+function accountPanel(a) {
+  const box = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = a.name;
+  const line = document.createElement('p');
+  line.className = 'meta';
+  line.textContent =
+    `${a.provider} · ~${Math.round(a.pace * 100)}% of a ${a.budget.toLocaleString()} token budget · estimate`;
+  const note = document.createElement('p');
+  note.className = 'meta';
+  note.textContent = 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.';
+  box.append(h, line, note);
+  return box;
+}
+
+// The scheduling queue rides the SSE snapshot (see the scheduling design), which
+// does not carry it yet — so this is written to render nothing until it does,
+// rather than guarded at each call site.
+const queueItems = () => state.queue ?? [];
+
+function queueRow(q) {
+  const row = document.createElement('div');
+  row.className = 'queue-row';
+
+  const when = document.createElement('span');
+  when.className = 'queue-when';
+  when.textContent = triggerLabel(q.trigger);
+
+  const what = document.createElement('span');
+  what.className = 'queue-what';
+  what.textContent = targetLabel(q.action, state.sessions);
+
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'queue-del';
+  del.title = 'Remove from queue';
+  del.textContent = '✕';
+  del.onclick = () => fire({ cmd: 'unschedule', itemId: q.id });
+
+  row.append(when, what, del);
+
+  // missed and failed items stay in the queue on purpose, so their reason has
+  // to be readable here — this is the only place they are ever shown.
+  if (q.state !== 'waiting') {
+    const why = document.createElement('p');
+    why.className = 'queue-why';
+    why.textContent = q.state === 'missed'
+      ? 'missed — its time passed while Switchboard was not running'
+      : `failed — ${q.error ?? 'unknown error'}`;
+    row.append(why);
+  }
+  return row;
+}
+
+function queuePanel() {
+  const box = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = 'Scheduled';
+  box.append(h, ...queueItems().map(queueRow));
+  return box;
+}
+
+/** The open panel's contents, or null. */
+function panelBody() {
+  if (!panel) return null;
+  if (panel === 'queue') return queueItems().length ? queuePanel() : null;
+  const account = state.accounts.find((a) => a.name === panel);
+  return account ? accountPanel(account) : null;
+}
+
+function renderHeader() {
+  $('#meters').replaceChildren(...state.accounts.map(accountMeter));
+  const badge = $('#queue-badge');
+  const n = queueItems().length;
+  badge.hidden = n === 0;
+  badge.textContent = `⏱ ${n}`;
+  badge.className = panel === 'queue' ? 'open' : '';
+  badge.title = `${n} scheduled item${n === 1 ? '' : 's'}`;
+  const body = panelBody();
+  // A panel whose subject vanished (account renamed out of accounts.json)
+  // closes itself rather than leaving an empty box open.
+  if (panel && !body) panel = null;
+  $('#panel').hidden = !body;
+  $('#panel').replaceChildren(...(body ? [body] : []));
+}
+
 function render() {
-  if (graphId) return renderGraph();
-  openId ? renderChat() : renderGrid();
+  renderHeader();
+  openId ? renderSession() : renderGrid();
 }
 
 // ponytail: renderGrid() rebuilds every card on every render, and render() runs on
@@ -64,13 +207,20 @@ function render() {
 // per-session cache of results — cards are torn down and rebuilt every render
 // regardless, so a result cache would need its own invalidation story for no
 // real benefit here.
+//
+// renderDiffPane() shares this same timestamp rather than keeping a second timer:
+// renderGrid() only runs while openId is null and renderDiffPane() only while it
+// isn't, so the two never race for the throttle window.
 let lastStatusFetch = 0;
 const STATUS_THROTTLE_MS = 4000;
+// Set by openTab() on a fresh switch onto Diff; consumed by the next
+// renderDiffPane() to bypass the throttle just this once. See openTab().
+let forceDiffFetch = false;
 
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
-  $('#chat').hidden = true;
-  $('#graph').hidden = true;
+  $('#session').hidden = true;
+  $('#interrupt').hidden = true;
   const grid = $('#grid');
   grid.hidden = false;
   grid.replaceChildren();
@@ -82,46 +232,22 @@ function renderGrid() {
   for (const id of selected) if (!live.has(id)) selected.delete(id);
   if (selected.size) grid.append(selectionBar());
 
-  const accounts = document.createElement('div');
-  accounts.className = 'accounts';
-  for (const a of state.accounts) {
-    const pct = Math.round(a.pace * 100);
-    const el = document.createElement('div');
-    el.className = 'card';
-
-    const status = document.createElement('div');
-    status.className = 'status';
-    status.textContent = a.name;
-
-    const bar = document.createElement('div');
-    bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
-    const i = document.createElement('i');
-    i.style.width = `${Math.min(pct, 100)}%`;
-    bar.append(i);
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = `~${pct}% of 5h budget · estimate`;
-
-    el.append(status, bar, meta);
-    accounts.append(el);
-  }
-  grid.append(accounts);
-
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
-  const sorted = [...state.sessions].sort(
-    (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince,
-  );
+  const sorted = sortSessions(state.sessions);
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
-  const add = document.createElement('div');
-  add.className = 'card';
-  add.id = 'new-card';
-  add.textContent = '+ new worktree';
-  add.onclick = openNew;
-  grid.append(add);
+  if (!state.sessions.length) {
+    const empty = document.createElement('div');
+    empty.id = 'grid-empty';
+    const line = document.createElement('p');
+    line.textContent = 'No sessions yet.';
+    const hint = document.createElement('p');
+    hint.textContent = 'Start one with + New in the header.';
+    empty.append(line, hint);
+    grid.append(empty);
+  }
 }
 
 /**
@@ -136,9 +262,7 @@ function renderGrid() {
  */
 function selectionBar() {
   const ids = [...selected];
-  const sessions = state.sessions.filter((s) => ids.includes(s.id));
-  const repos = new Set(sessions.map((s) => s.repo));
-  const busy = sessions.find((s) => s.status === 'working' || s.status === 'needs-you');
+  const st = selectionState(state.sessions, selected);
 
   const bar = document.createElement('div');
   bar.id = 'selection-bar';
@@ -146,25 +270,19 @@ function selectionBar() {
 
   const label = document.createElement('span');
   label.className = 'selection-label';
-  label.textContent = repos.size > 1
-    ? `${sessions.length} selected across ${repos.size} repos`
-    : `${sessions.length} selected · ${sessions[0].repo.split('/').filter(Boolean).pop() ?? sessions[0].repo}`;
+  label.textContent = st.label;
   bar.append(label);
 
   const mergeBtn = document.createElement('button');
   mergeBtn.textContent = 'Merge selected';
-  mergeBtn.disabled = repos.size !== 1 || Boolean(busy);
-  mergeBtn.title = repos.size > 1
-    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
-    : busy ? `"${busy.branch}" is still running — stop it or wait` : '';
+  mergeBtn.disabled = !st.merge.enabled;
+  mergeBtn.title = st.merge.reason;
   mergeBtn.onclick = () => doMerge(ids);
 
   const pushBtn = document.createElement('button');
   pushBtn.textContent = 'Push';
-  pushBtn.disabled = repos.size !== 1;
-  pushBtn.title = repos.size > 1
-    ? 'Selected worktrees belong to different repos — pick worktrees from one repo'
-    : '';
+  pushBtn.disabled = !st.push.enabled;
+  pushBtn.title = st.push.reason;
   pushBtn.onclick = () => doPush(ids);
 
   const clearBtn = document.createElement('button');
@@ -198,6 +316,141 @@ async function doPush(ids) {
   render();
 }
 
+/** The single contextual control a session's state calls for. */
+function actionSlot(s) {
+  const act = cardAction(s, queueItems());
+  if (act.kind === 'approve') return approval(s);
+  if (act.kind === 'stop') return stopButton(s);
+  if (act.kind === 'resume') return resumeButton(s);
+  if (act.kind === 'waiting') {
+    const p = document.createElement('p');
+    p.className = 'waiting';
+    p.textContent = `⏱ waiting for ${act.account} to reset`;
+    return p;
+  }
+  return null;
+}
+
+// The session whose ⋯ menu is open, or null. Same pattern as openId: render()
+// reads it, handlers mutate it and re-render.
+let menuFor = null;
+
+function menuItem(label, onclick, extra = '') {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = extra;
+  b.textContent = label;
+  // render() is unconditional here, not left as a side effect of onclick(): Copy
+  // worktree path mutates no state and triggers no render of its own, so the
+  // stale .menu node was never torn down, and the outside-click closer further
+  // down (guarded on `menuFor`, which is already null by then) couldn't help either.
+  b.onclick = (e) => { e.stopPropagation(); menuFor = null; onclick(); render(); };
+  return b;
+}
+
+/**
+ * Every per-session control that is not the one contextual action. New
+ * per-session features go here, so the card face never grows again.
+ */
+function overflowMenu(s) {
+  const wrap = document.createElement('div');
+  wrap.className = 'menu-wrap';
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `menu-btn${menuFor === s.id ? ' open' : ''}`;
+  btn.title = 'More';
+  btn.textContent = '⋯';
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menuFor = menuFor === s.id ? null : s.id;
+    render();
+  };
+  wrap.append(btn);
+  if (menuFor !== s.id) return wrap;
+
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  menu.onclick = (e) => e.stopPropagation();
+
+  // Codex sessions never prompt (approvalPolicy 'never'), so the toggle would
+  // be a lie there — shown disabled with the reason, not hidden.
+  const auto = document.createElement('label');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = s.auto;
+  box.disabled = s.provider === 'codex';
+  auto.title = s.provider === 'codex'
+    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
+    : 'Approve every tool call automatically, without asking';
+  box.onchange = () => { menuFor = null; render(); fire({ cmd: 'auto', id: s.id, auto: box.checked }); };
+  auto.append(box, ' Auto-approve');
+
+  menu.append(auto);
+  // A blocked card's one action slot is spent on Allow/Deny, so Stop has no
+  // home on the card face for `needs-you` — without it here, the only way to
+  // halt a runaway agent mid-prompt would be to Deny it first or delete the
+  // session outright. `working` gets it too, duplicating actionSlot()'s Stop,
+  // because the menu is the path that works from every stoppable state.
+  if (s.status === 'working' || s.status === 'needs-you') {
+    menu.append(menuItem('Stop', () => fire({ cmd: 'stop', id: s.id })));
+  }
+  menu.append(
+    menuItem('Graph', () => openTab(s.id, 'graph')),
+    menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
+    menuItem('Delete…', () => confirmDelete(s), 'danger'),
+  );
+  wrap.append(menu);
+  return wrap;
+}
+
+function confirmDelete(s) {
+  const dialog = $('#del');
+  $('#del-branch').textContent = s.branch;
+  $('#del-wt').checked = false;
+  setDelHint(false);
+  dialog.returnValue = '';
+  dialog.dataset.id = s.id;
+  dialog.showModal();
+}
+
+const DEL_HINT = {
+  false: 'Without the checkbox, the worktree is left on disk untouched — only Switchboard forgets the session.',
+  true: 'Uncommitted changes in this worktree will be lost.',
+};
+
+function setDelHint(removeWorktree) {
+  $('#del-hint').textContent = DEL_HINT[removeWorktree];
+}
+
+// Registered once at module level, not inside confirmDelete() (which runs per
+// open): the checkbox element itself never changes, only its checked state.
+$('#del-wt').addEventListener('change', (e) => setDelHint(e.target.checked));
+
+$('#del').addEventListener('close', (e) => {
+  const dialog = e.target;
+  // Consumed for the same reason the create dialog consumes it: Escape closes
+  // without setting returnValue, so a stale 'delete' would make the next
+  // Escape destroy a worktree.
+  const go = dialog.returnValue === 'delete';
+  dialog.returnValue = '';
+  // Unconditional, regardless of go: this dialog only ever opens from the ⋯
+  // menu's Delete… item, behind which a stale .menu node can otherwise be left
+  // rendered until an unrelated render (next SSE snapshot or the 30s timer)
+  // happens to clean it up. Cheap enough to run on every close rather than
+  // trust that whatever opened the dialog already re-rendered.
+  render();
+  if (!go) return;
+  fire({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
+});
+
+// Any click that is not on a menu closes the open one. Registered once, in the
+// capture phase so a card's own onclick (which opens the chat) does not fire
+// first and navigate away while a menu is open.
+document.addEventListener('click', (e) => {
+  if (menuFor && !e.target.closest('.menu-wrap')) { menuFor = null; render(); }
+}, true);
+
 function card(s, fetchStatus) {
   const el = document.createElement('div');
   el.className = `card ${s.status}`;
@@ -216,24 +469,15 @@ function card(s, fetchStatus) {
   };
   select.append(checkbox);
 
-  // s.branch is whatever the user typed into the create-session form (and it
-  // survives into the session basically unsanitized on the server side), so it
-  // is untrusted text and must go through textContent, not innerHTML.
+  // s.branch is whatever the user typed into the create form and reaches the
+  // session essentially unsanitized, so it is untrusted text — textContent only.
   const status = document.createElement('div');
   status.className = `status ${s.status}`;
   status.textContent = `${s.status} · ${elapsed(s.statusSince)}`;
 
-  // The card itself opens the chat, so this has to stop the click from bubbling.
-  const tree = document.createElement('button');
-  tree.className = 'tree-btn';
-  tree.type = 'button';
-  tree.title = 'Commit graph';
-  tree.textContent = 'graph';
-  tree.onclick = (e) => { e.stopPropagation(); openGraph(s.id); };
-
   const head = document.createElement('div');
   head.className = 'card-head';
-  head.append(select, status, autoToggle(s), tree);
+  head.append(select, status, overflowMenu(s));
 
   const branch = document.createElement('div');
   branch.className = 'branch';
@@ -241,21 +485,17 @@ function card(s, fetchStatus) {
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = s.account;
+  meta.textContent = `${s.repo.split('/').filter(Boolean).pop() ?? s.repo} · ${s.account}`;
 
   const wt = document.createElement('div');
   wt.className = 'wt';
 
   el.append(head, branch, meta, wt);
-  el.onclick = () => { openId = s.id; render(); };
+  el.onclick = () => openTab(s.id, 'chat');
 
-  // renderGrid() replaceChildren()s the whole grid on every render, so the `wt`
-  // node captured by this closure is very likely detached by the time the fetch
-  // resolves (a fresh SSE snapshot mid-burst rebuilds it before the network
-  // round trip finishes). Look the node up fresh by session id at write time —
-  // `.card[data-id] > .wt` picks the direct-child stats div, not the unrelated
-  // `.wt`-classed line inside an approval box — and skip silently if the card
-  // is gone (session deleted or scrolled off in a future render).
+  // renderGrid() replaceChildren()s the whole grid on every render, so this
+  // node is very likely detached by the time the fetch resolves. Look the card
+  // up fresh by id at write time and skip silently if it is gone.
   if (fetchStatus) {
     fetch(`/status?id=${s.id}`).then((r) => r.json()).then((data) => {
       if (!data) return;
@@ -264,69 +504,63 @@ function card(s, fetchStatus) {
     }).catch(() => {});
   }
 
-  if (s.pending) el.append(approval(s));
-  if (s.status === 'stopped') el.append(resumeButton(s));
-  // Only where there is something to stop: a `done` session has finished its turn
-  // and a `stopped` one is already terminal, so Stop on either is a no-op button.
-  // Without this, Delete was the only way to halt a runaway write-capable agent.
-  if (s.status === 'working' || s.status === 'needs-you') el.append(stopButton(s));
-  el.append(deleteControl(s));
+  const slot = actionSlot(s);
+  if (slot) el.append(slot);
   return el;
-}
-
-/**
- * Auto-approve toggle. Codex sessions never prompt in the first place
- * (approvalPolicy 'never'), so the checkbox would be a lie there — show it
- * disabled and explain, rather than offering a switch that changes nothing.
- */
-function autoToggle(s) {
-  const label = document.createElement('label');
-  label.className = 'auto';
-  label.onclick = (e) => e.stopPropagation();
-  const box = document.createElement('input');
-  box.type = 'checkbox';
-  box.checked = s.auto;
-  box.disabled = s.provider === 'codex';
-  label.title = s.provider === 'codex'
-    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
-    : 'Approve every tool call automatically, without asking';
-  box.onchange = () => send({ cmd: 'auto', id: s.id, auto: box.checked });
-  label.append(box, ' auto');
-  return label;
 }
 
 function stopButton(s) {
   const b = document.createElement('button');
   b.textContent = 'Stop';
   // Stopping is not destructive — no confirm. The card stays, with a Resume button.
-  b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'stop', id: s.id }); };
+  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'stop', id: s.id }); };
   return b;
 }
 
-function deleteControl(s) {
-  const box = document.createElement('div');
-  box.className = 'delete';
+/**
+ * The only cross-session element in the session view: another session blocking
+ * on an approval while you are reading this one. Answerable in place, because
+ * walking back to the grid to click Allow is the whole friction this removes.
+ */
+function renderInterrupt(current) {
+  const blocked = state.sessions
+    .filter((s) => s.id !== current.id && s.pending)
+    .sort((a, b) => a.statusSince - b.statusSince);
+  const box = $('#interrupt');
+  box.hidden = !blocked.length;
+  if (!blocked.length) return;
 
-  const label = document.createElement('label');
-  label.onclick = (e) => e.stopPropagation();
-  const checkbox = document.createElement('input');
-  checkbox.type = 'checkbox';
-  label.append(checkbox, ' remove worktree');
+  const [first, ...rest] = blocked;
+  box.replaceChildren();
 
-  const b = document.createElement('button');
-  b.textContent = 'Delete';
-  b.onclick = (e) => {
-    e.stopPropagation();
-    const removeWorktree = checkbox.checked;
-    const msg = removeWorktree
-      ? `Delete "${s.branch}" and remove its git worktree? Uncommitted changes in it will be lost.`
-      : `Delete "${s.branch}" from Switchboard? Its git worktree will be left on disk, untouched.`;
-    if (!window.confirm(msg)) return;
-    send({ cmd: 'delete', id: s.id, removeWorktree });
-  };
+  // Branch name and tool summary are both untrusted — the summary is chosen by
+  // the agent, transitively by whatever it read while working.
+  const line = document.createElement('span');
+  line.textContent = `${first.branch} needs you — ${first.pending.tool}: ${first.pending.summary}`;
+  box.append(line);
 
-  box.append(label, b);
-  return box;
+  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.onclick = () => fire({ cmd: 'decide', id: first.id, allow });
+    box.append(b);
+  }
+
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.textContent = 'Open';
+  open.onclick = () => openTab(first.id, 'chat');
+  box.append(open);
+
+  if (rest.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'more';
+    more.textContent = `+${rest.length} more`;
+    more.onclick = () => { openId = null; render(); };
+    box.append(more);
+  }
 }
 
 function approval(s) {
@@ -344,7 +578,7 @@ function approval(s) {
   for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
     const b = document.createElement('button');
     b.textContent = label;
-    b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'decide', id: s.id, allow }); };
+    b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'decide', id: s.id, allow }); };
     box.append(b);
   }
   return box;
@@ -353,31 +587,68 @@ function approval(s) {
 function resumeButton(s) {
   const b = document.createElement('button');
   b.textContent = `Resume (${s.stoppedReason ?? 'stopped'})`;
-  b.onclick = (e) => { e.stopPropagation(); send({ cmd: 'resume', id: s.id }); };
+  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'resume', id: s.id }); };
   return b;
 }
 
-function renderChat() {
+// Which facet of the open session is showing. Resets to 'chat' on open — you
+// open a session to read what it said, not to land on the tab you last used
+// somewhere else.
+let tab = 'chat';
+
+function openTab(id, which) {
+  // A genuine switch onto Diff (new session, or arriving from another tab) must
+  // show fresh data immediately rather than wait out the throttle below — this
+  // is the one case where the pane would otherwise sit empty for up to
+  // STATUS_THROTTLE_MS with nothing on screen yet.
+  if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
+  openId = id;
+  tab = which;
+  if (which === 'graph') { graphCommits = []; loadGraph(); }
+  render();
+}
+
+const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
+
+function renderSession() {
   const s = state.sessions.find((x) => x.id === openId);
   if (!s) { openId = null; return renderGrid(); }
   $('#grid').hidden = true;
-  $('#graph').hidden = true;
-  $('#chat').hidden = false;
-  $('#chat-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
-  // Rebuilt rather than mutated: renderChat() runs on every SSE snapshot, so the
-  // checkbox has to re-read s.auto to stay honest if another tab flips it.
-  $('#chat-auto').replaceChildren(autoToggle(s));
+  $('#session').hidden = false;
+  $('#session-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
+  $('#session-menu').replaceChildren(overflowMenu(s));
 
+  const slot = actionSlot(s);
+  $('#session-action').replaceChildren(...(slot ? [slot] : []));
+  renderInterrupt(s);
+
+  $('#tabs').replaceChildren(...TABS.map(([key, label]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.role = 'tab';
+    b.textContent = label;
+    b.setAttribute('aria-selected', String(tab === key));
+    b.onclick = () => openTab(s.id, key);
+    return b;
+  }));
+
+  for (const [key] of TABS) $(`#pane-${key}`).hidden = tab !== key;
+
+  if (tab === 'chat') renderChatPane(s);
+  if (tab === 'diff') renderDiffPane(s);
+  if (tab === 'graph') renderGraphPane(s);
+}
+
+function renderChatPane(s) {
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
   // unconditionally yanked the view out from under anyone reading scrollback.
-  // The first render after opening a card always scrolls — that one is the user
-  // asking to see the latest, not reading back.
+  // The first render after opening a session always scrolls — that one is the
+  // user asking to see the latest, not reading back.
   const firstOpen = scrolledFor !== openId;
-  // Clear any upload error from a previous session, but only on an actual
-  // session switch: renderChat() re-runs on every SSE snapshot and on a 30s
-  // interval while the agent works, so an unconditional clear here erased the
-  // error before the user had a chance to read it.
+  // Only cleared on an actual session switch: this re-runs on every snapshot
+  // and on the 30s timer, and an unconditional clear erased upload errors
+  // before they could be read.
   if (firstOpen) $('#upload-error').textContent = '';
   scrolledFor = openId;
   const nearBottom = firstOpen
@@ -390,14 +661,66 @@ function renderChat() {
     // The status class doubles as the styling hook: a tool message with status
     // 'error' picks up the existing .msg.error colour.
     el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
+    // A denied `rm -rf` and a successful one used to be pixel-identical.
     el.textContent = m.kind === 'tool'
-      // A denied `rm -rf` and a successful one used to be pixel-identical.
       ? `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`
       : m.text;
     t.append(el);
   }
-  if (s.pending) t.append(approval(s));
   if (nearBottom) t.scrollIntoView({ block: 'end' });
+}
+
+// The named slot for the diff spec. /status returns only the totals today, so
+// that is what this shows — a real file-by-file diff needs a server route and
+// is spec'd separately.
+function renderDiffPane(s) {
+  const due = forceDiffFetch || Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
+  forceDiffFetch = false;
+  if (!due) return;
+  lastStatusFetch = Date.now();
+  const pane = $('#pane-diff');
+  fetch(`/status?id=${s.id}`).then((r) => r.json()).then((d) => {
+    if (openId !== s.id || tab !== 'diff') return;
+    const p = document.createElement('p');
+    p.className = 'meta';
+    p.textContent = d
+      ? `${d.branch} · +${d.added} −${d.removed} · ${d.dirty ? 'uncommitted changes' : 'clean'}`
+      : 'No worktree status available.';
+    const note = document.createElement('p');
+    note.className = 'meta';
+    note.textContent = 'File-by-file diff is not implemented yet.';
+    pane.replaceChildren(p, note);
+  }).catch(() => {});
+}
+
+function renderGraphPane(s) {
+  const rows = $('#graph-rows');
+  if (!graphCommits.length) {
+    rows.replaceChildren(Object.assign(document.createElement('p'), {
+      id: 'graph-empty', textContent: 'No commits yet.',
+    }));
+    $('#graph-svg').replaceChildren();
+    return;
+  }
+  const width = drawGraph(graphCommits);
+  rows.replaceChildren(...graphCommits.map((c) => {
+    const row = document.createElement('div');
+    row.className = 'commit';
+    row.style.marginLeft = `${width + 14}px`;
+    const hash = document.createElement('span');
+    hash.className = 'hash';
+    hash.textContent = c.h.slice(0, 7);
+    row.append(hash);
+    for (const r of c.refs) row.append(refPill(r, c.lane));
+    const subject = document.createElement('span');
+    subject.className = 'subject';
+    subject.textContent = c.subject;
+    const when = document.createElement('span');
+    when.className = 'when';
+    when.textContent = `${c.author} · ${c.when}`;
+    row.append(subject, when);
+    return row;
+  }));
 }
 
 // ---- Commit graph -------------------------------------------------------
@@ -458,71 +781,40 @@ function refPill(raw, lane) {
   return pill;
 }
 
-function renderGraph() {
-  const s = state.sessions.find((x) => x.id === graphId);
-  if (!s) { graphId = null; return renderGrid(); }
-  $('#grid').hidden = true;
-  $('#chat').hidden = true;
-  $('#graph').hidden = false;
-  $('#graph-title').textContent = `${s.branch} · commit graph`;
-
-  const rows = $('#graph-rows');
-  if (!graphCommits.length) {
-    rows.replaceChildren(Object.assign(document.createElement('p'), {
-      id: 'graph-empty', textContent: 'No commits yet.',
-    }));
-    $('#graph-svg').replaceChildren();
-    return;
-  }
-  const width = drawGraph(graphCommits);
-  rows.replaceChildren(...graphCommits.map((c) => {
-    const row = document.createElement('div');
-    row.className = 'commit';
-    row.style.marginLeft = `${width + 14}px`;
-    const hash = document.createElement('span');
-    hash.className = 'hash';
-    hash.textContent = c.h.slice(0, 7);
-    row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.lane));
-    const subject = document.createElement('span');
-    subject.className = 'subject';
-    subject.textContent = c.subject;
-    const when = document.createElement('span');
-    when.className = 'when';
-    when.textContent = `${c.author} · ${c.when}`;
-    row.append(subject, when);
-    return row;
-  }));
-}
-
 async function loadGraph() {
-  if (!graphId) return;
-  const id = graphId;
+  if (!openId || tab !== 'graph') return;
+  const id = openId;
   const commits = await fetch(`/graph?id=${id}`).then((r) => r.json()).catch(() => null);
   // The view can close or switch sessions while this is in flight; dropping a
   // stale response keeps one session's commits from landing under another's.
-  if (!commits || graphId !== id) return;
+  if (!commits || openId !== id || tab !== 'graph') return;
   graphCommits = commits;
-  renderGraph();
+  renderSession();
 }
+// The 2s interval stays, but the guard above makes it a no-op unless the
+// Graph tab is showing — before this task it polled whether or not the view
+// was even open.
 setInterval(loadGraph, 2000);
 
-function openGraph(id) {
-  graphId = id;
-  graphCommits = [];
-  render();
-  loadGraph();
-}
-
-$('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
+$('#new-btn').onclick = openNew;
+$('#queue-badge').onclick = () => setPanel('queue');
+
+// Escape closes the panel. Registered on document rather than on the panel so
+// it works with focus anywhere; dialogs handle their own Escape natively and
+// stopPropagation is not needed, since a dialog's Escape never reaches here as
+// a keydown on document while the dialog is modal.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && panel) { panel = null; render(); }
+  else if (e.key === 'Escape' && menuFor) { menuFor = null; render(); }
+});
 
 $('#composer').onsubmit = (e) => {
   e.preventDefault();
   const text = $('#prompt').value.trim();
   if (!text) return;
   $('#prompt').value = '';
-  send({ cmd: 'send', id: openId, text });
+  fire({ cmd: 'send', id: openId, text });
 };
 
 // Uploads go straight to disk in the session's worktree and come back as a
@@ -558,7 +850,9 @@ $('#attach input').onchange = (e) => {
   e.target.value = '';
 };
 
-const chat = $('#chat');
+// Bound to the chat pane, not the whole session view: a file dropped on the
+// commit graph is not an upload.
+const chat = $('#pane-chat');
 chat.addEventListener('dragover', (e) => {
   e.preventDefault(); // Without this the browser navigates to the dropped file.
   chat.classList.add('dropping');

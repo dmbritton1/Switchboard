@@ -3,23 +3,45 @@
 <title>Switchboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="stylesheet" href="/style.css">
+<header id="bar">
+  <span id="brand">Switchboard</span>
+  <span id="conn" hidden>reconnecting…</span>
+  <div id="meters"></div>
+  <button id="queue-badge" type="button" hidden></button>
+  <button id="new-btn" type="button">+ New</button>
+</header>
+<div id="panel" hidden></div>
 <div id="notif-bar" hidden>
   <span id="notif-msg"></span>
   <button id="notif-btn" type="button">Enable notifications</button>
 </div>
 <main id="grid"></main>
-<section id="graph" hidden>
-  <header><button id="graph-back">← grid</button><h2 id="graph-title"></h2></header>
-  <div id="graph-map"><svg id="graph-svg"></svg><div id="graph-rows"></div></div>
-</section>
-<section id="chat" hidden>
-  <header><button id="back">← grid</button><h2 id="chat-title"></h2><span id="chat-auto"></span></header>
-  <div id="transcript"></div>
-  <form id="composer">
-    <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
-    <input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button>
-  </form>
-  <p id="upload-error"></p>
+<section id="session" hidden>
+  <header>
+    <button id="back">← grid</button>
+    <h2 id="session-title"></h2>
+    <span id="session-menu"></span>
+  </header>
+  <nav id="tabs" role="tablist"></nav>
+  <div id="session-sticky">
+    <div id="interrupt" hidden></div>
+    <div id="session-action"></div>
+  </div>
+
+  <div id="pane-chat">
+    <div id="transcript"></div>
+    <form id="composer">
+      <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
+      <input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button>
+    </form>
+    <p id="upload-error"></p>
+  </div>
+
+  <div id="pane-diff" hidden></div>
+
+  <div id="pane-graph" hidden>
+    <div id="graph-map"><svg id="graph-svg"></svg><div id="graph-rows"></div></div>
+  </div>
 </section>
 <dialog id="new">
   <form method="dialog">
@@ -60,4 +82,19 @@
     <menu><button value="cancel" formnovalidate>Cancel</button><button id="create" value="create">Create worktree</button></menu>
   </form>
 </dialog>
+<dialog id="del">
+  <form method="dialog">
+    <h2>Delete session</h2>
+    <p id="del-branch"></p>
+    <!-- The checkbox lives inside the confirmation it modifies. On the card
+         face it was one misclick from discarding uncommitted work. -->
+    <label class="del-wt"><input type="checkbox" id="del-wt"> Also remove the git worktree</label>
+    <p class="hint" id="del-hint"></p>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button id="del-go" value="delete">Delete</button>
+    </menu>
+  </form>
+</dialog>
+<div id="toast" hidden></div>
 <script type="module" src="/app.js"></script>

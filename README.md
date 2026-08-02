@@ -43,17 +43,24 @@ loads, minus usage history.
 
 Each session runs in its own git worktree at `<repo>/.claude/worktrees/<branch>`.
 The grid sorts blocked-first: `needs-you`, `working`, `done`, `stopped`. Claude
-permission prompts (Allow/Deny) are answered from the card or from the open chat
-view. Codex runs sandboxed to its worktree with `approvalPolicy: 'never'` and
-never enters `needs-you` — see Limits below.
+permission prompts (Allow/Deny) are answered from the card, from the open
+session's own header (visible on whichever of its tabs you're on), or — for a
+*different* session while one is already open — from an interrupt band inside
+the session view. Codex runs sandboxed to its worktree with
+`approvalPolicy: 'never'` and never enters `needs-you` — see Limits below.
 
-Opening a card shows its transcript and a message box to keep steering the
-agent. Tool calls show their outcome (`ok`/`error`) once it is known. A running
-card (`working` or `needs-you`) has a Stop button, which halts the agent and
-leaves the card in `stopped` with a Resume button — nothing is deleted.
+Opening a card opens a session view with Chat, Diff and Graph tabs, sharing
+one header that carries a `⋯` menu and the single action the session's state
+calls for. Chat is the transcript and message box for steering the agent; tool
+calls show their outcome (`ok`/`error`) once it is known. A `working` session's
+card action is a Stop button; a blocked (`needs-you`) session's card slot is
+Allow/Deny instead, so Stop for it lives in the `⋯` menu. Either way, Stop
+halts the agent and leaves the session `stopped` with a Resume button; nothing
+is deleted.
 
-Each card also has a delete control with a "remove worktree" checkbox;
-deleting always forgets the session, and checking the box additionally runs
+Deleting a session is reached through its `⋯` menu's Delete… item, which opens
+a confirmation dialog with a "remove worktree" checkbox; deleting always
+forgets the session, and checking the box additionally runs
 `git worktree remove` (falling back to deleting the directory) on confirmation
 — which **discards any uncommitted work in that worktree**.
 
@@ -104,13 +111,16 @@ npm test
 - Transport is SSE (`GET /events`) + `POST /command`, not WebSocket — the
   traffic is one-directional in each channel (server pushes state, browser
   posts commands), and `EventSource` reconnects on its own with no extra code.
-- Command failures are mostly silent in the UI: only the create-session dialog
-  checks `/command`'s response and shows the error; send, decide, resume, stop,
-  and delete all fire-and-forget. The server does reject the dangerous cases
-  rather than pretending — a `send` to a session with no live agent is a 404,
-  not a 200 with the prompt dropped, and a `resume` on a session that is not
-  `stopped` is a 409 rather than a second agent launched into the same worktree
-  — but the browser shows nothing either way. Delete's actual risk is stale
+- Command failures now surface as a toast: `send`, `decide`, `resume`, `stop`,
+  `delete`, `auto` and `unschedule` all go through a `fire()` wrapper that reads
+  `/command`'s response and, on failure, shows the server's error text (falling
+  back to a generic message) for six seconds. Merge, push and the
+  create-session dialog still call `/command` directly and render their errors
+  in place instead, as they did before. The server does reject the dangerous
+  cases rather than pretending — a `send` to a session with no live agent is a
+  404, not a 200 with the prompt dropped, and a `resume` on a session that is
+  not `stopped` is a 409 rather than a second agent launched into the same
+  worktree. Delete's actual risk is stale
   bookkeeping, not lost work: if `git worktree remove --force` fails, the fallback already
   `rm -rf`s the directory before the session is removed from the registry
   unconditionally — so a vanished card means git's own worktree registration

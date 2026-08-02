@@ -116,8 +116,11 @@ One contextual action per state, in the slot at the bottom:
 | `done` | empty |
 
 **`⋯` menu** holds everything else: `Auto-approve` (a checked item, disabled with
-its existing explanation for Codex sessions), `Graph`, `Schedule…`, `Open
-worktree path`, and `Delete…`.
+its existing explanation for Codex sessions), `Stop` (`working` and `needs-you`
+only), `Graph`, `Schedule…`, `Open worktree path`, and `Delete…`. Stop is in the
+menu, not just the action slot, because a blocked session's action slot is
+already spent on Allow/Deny — the menu is the halt path that works from every
+stoppable state.
 
 `Delete…` opens a confirm dialog with the "remove worktree" checkbox inside it.
 That checkbox is currently loose on the card face, one misclick away from
