@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { chmod, mkdir, mkdtemp, writeFile, rm, readFile, stat, symlink } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, writeFile, realpath, rm, readFile, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -9,6 +9,7 @@ import { request as httpRequest } from 'node:http';
 import { Registry, type RegistryOptions } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { createServer } from '../src/server.ts';
+import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 
@@ -74,7 +75,11 @@ type CodexFixture = Awaited<ReturnType<typeof boot>> & {
 
 async function bootCodex(
   t: { after: (fn: () => void) => void },
-  options: { bin?: string; env?: Record<string, string> } = {},
+  options: {
+    bin?: string;
+    env?: Record<string, string>;
+    resolvePrompt?: typeof resolveAgentPrompt;
+  } = {},
 ): Promise<CodexFixture> {
   const dir = await mkdtemp(join(tmpdir(), 'sb-codex-server-'));
   const repo = join(dir, 'repo');
@@ -109,7 +114,10 @@ process.exit(result.status ?? 1);
     bin,
     env: { FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome, ...options.env },
   };
-  const server = createServer({ registry, usage, accounts: [account] });
+  const server = createServer({
+    registry, usage, accounts: [account],
+    ...(options.resolvePrompt ? { resolvePrompt: options.resolvePrompt } : {}),
+  });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
@@ -211,7 +219,7 @@ test('Codex send validates attachments, persists only names, and resumes without
   const [, attachmentInvocation] = await fixture.invocations();
   assert.equal(attachmentInvocation.prompt, 'Review these\nAttached file: uploads/notes.txt');
   assert.deepEqual(attachmentInvocation.argv.flatMap((arg, index, argv) =>
-    arg === '--image' ? [argv[index + 1]] : []), [imagePath]);
+    arg === '--image' ? [argv[index + 1]] : []), [await realpath(imagePath)]);
 
   assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
   const resumed = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'Continue cleanly' });
@@ -245,6 +253,62 @@ test('invalid attachment paths neither append a prompt nor call the live handle'
 
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal((await fixture.invocations()).length, 1, 'validation failures never call handle.send');
+});
+
+test('an unreadable image returns a path-free 400 and appends nothing', async (t) => {
+  const fixture = await bootCodex(t);
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  const session = fixture.registry.get(created.id)!;
+  const imagePath = join(session.cwd, 'customer-secret.png');
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  await chmod(imagePath, 0o000);
+  const transcriptLength = session.transcript.length;
+
+  const response = await fixture.command({
+    cmd: 'send', id: created.id, text: 'inspect', attachments: ['customer-secret.png'],
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.data.error, 'Attachment 1 could not be read.');
+  assert.ok(!JSON.stringify(response.data).includes(imagePath));
+  assert.ok(!JSON.stringify(response.data).includes('customer-secret.png'));
+  assert.equal(session.transcript.length, transcriptLength);
+});
+
+test('send stopped during attachment resolution does not append or call the stale handle', async (t) => {
+  let enterResolution!: () => void;
+  let releaseResolution!: () => void;
+  const entered = new Promise<void>((resolve) => { enterResolution = resolve; });
+  const released = new Promise<void>((resolve) => { releaseResolution = resolve; });
+  const fixture = await bootCodex(t, {
+    resolvePrompt: async (...args) => {
+      enterResolution();
+      await released;
+      return resolveAgentPrompt(...args);
+    },
+  });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  const session = fixture.registry.get(created.id)!;
+  await writeFile(join(session.cwd, 'notes.txt'), 'notes');
+  const transcriptLength = session.transcript.length;
+  const send = fixture.command({
+    cmd: 'send', id: created.id, text: 'read', attachments: ['notes.txt'],
+  });
+
+  const resolverWasEntered = await Promise.race([
+    entered.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 250)),
+  ]);
+  assert.equal(resolverWasEntered, true, 'the test resolver must control the validation await');
+  assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
+  releaseResolution();
+  const response = await send;
+
+  assert.notEqual(response.status, 200);
+  assert.equal(session.transcript.length, transcriptLength);
+  assert.equal((await fixture.invocations()).length, 1);
 });
 
 test('Codex create persists its written initial prompt as queued before the response', async (t) => {

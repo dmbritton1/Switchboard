@@ -22,6 +22,17 @@ function unsentMessage(count: number): string {
   return `${count} queued ${noun} not sent. Resend ${count === 1 ? 'it' : 'them'} manually if still needed.`;
 }
 
+function safeAttachmentNames(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((name): name is string => typeof name === 'string'
+    && name.length > 0
+    && name !== '.'
+    && name !== '..'
+    && !name.includes('/')
+    && !name.includes('\\')
+    && !name.includes('\0'));
+}
+
 export class Registry {
   #sessions = new Map<string, Session>();
   #subs = new Set<() => void>();
@@ -374,11 +385,13 @@ export class Registry {
           if (message.kind !== 'user') return message;
           const wasQueued = message.delivery === 'queued';
           if (wasQueued) interruptedCount++;
+          const attachments = safeAttachmentNames(message.attachments);
           return [{
             kind: 'user' as const,
             id: message.id ?? randomUUID(),
             text: message.text,
             delivery: wasQueued ? 'unsent' as const : message.delivery ?? 'sent' as const,
+            ...(attachments.length ? { attachments } : {}),
           }];
         });
         if (interruptedCount > 0) {

@@ -12,7 +12,7 @@ export async function writeFakeCodex(
   const version = options.version ?? '0.145.0';
   const login = options.login ?? 'ready';
   const source = `#!/usr/bin/env node
-const { appendFileSync } = require('node:fs');
+const { appendFileSync, existsSync } = require('node:fs');
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
   process.stdout.write('codex-cli ${version}\\n');
@@ -85,6 +85,21 @@ process.stdin.on('end', () => {
       note('aborted');
       process.exit(0);
     });
+    return;
+  }
+  if (prompt === 'releasable-hold') {
+    const releaseFile = process.env.FAKE_CODEX_RELEASE_FILE;
+    const wait = setInterval(() => {
+      if (releaseFile && !existsSync(releaseFile)) return;
+      clearInterval(wait);
+      emit({ type: 'item.completed', item: {
+        id: 'message-1', type: 'agent_message', text: 'released',
+      }});
+      emit({ type: 'turn.completed', usage: {
+        input_tokens: 1, cached_input_tokens: 0, cache_write_input_tokens: 0,
+        output_tokens: 1, reasoning_output_tokens: 0,
+      }});
+    }, 10);
     return;
   }
   if (prompt === 'malformed-json') {

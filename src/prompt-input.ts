@@ -38,12 +38,16 @@ async function classifyImage(path: string, index: number): Promise<PromptAttachm
   if (!IMAGE_EXTENSIONS.has(extension)) return 'file';
 
   const header = Buffer.alloc(12);
-  const file = await open(path, 'r');
   let bytesRead = 0;
   try {
-    ({ bytesRead } = await file.read(header, 0, header.length, 0));
-  } finally {
-    await file.close();
+    const file = await open(path, 'r');
+    try {
+      ({ bytesRead } = await file.read(header, 0, header.length, 0));
+    } finally {
+      await file.close();
+    }
+  } catch {
+    throw new Error(`Attachment ${index + 1} could not be read.`);
   }
   if (!hasImageSignature(extension, header.subarray(0, bytesRead))) {
     throw new Error(`Attachment ${index + 1} has invalid image contents.`);
@@ -108,10 +112,19 @@ export async function resolveAgentPrompt(
     attachments.push({
       name: basename(relativePath),
       relativePath,
-      absolutePath: submittedPath,
+      absolutePath: realCandidate,
       kind: await classifyImage(realCandidate, index),
     });
   }
 
   return { text, attachments };
+}
+
+/** Rebuilds every filesystem-derived field immediately before delivery. */
+export async function revalidateAgentPrompt(cwd: string, prompt: AgentPrompt): Promise<AgentPrompt> {
+  return resolveAgentPrompt(
+    cwd,
+    prompt.text,
+    prompt.attachments.map((attachment) => attachment.relativePath),
+  );
 }

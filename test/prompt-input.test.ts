@@ -1,9 +1,11 @@
 import assert from 'node:assert';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import * as promptInput from '../src/prompt-input.ts';
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
+import type { AgentPrompt } from '../src/types.ts';
 
 const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
 const JPEG_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0x00]);
@@ -27,8 +29,23 @@ test('resolveAgentPrompt classifies a real PNG inside the worktree', async (t) =
 
   assert.deepEqual(prompt.attachments[0], {
     name: 'screen.png', relativePath: 'uploads/screen.png',
-    absolutePath: join(fixture.cwd, 'uploads', 'screen.png'), kind: 'image',
+    absolutePath: await realpath(join(fixture.cwd, 'uploads', 'screen.png')), kind: 'image',
   });
+});
+
+test('resolveAgentPrompt returns a canonical path through an internal symlinked parent', async (t) => {
+  const fixture = await promptFixture(t);
+  const realUploads = join(fixture.cwd, 'real-uploads');
+  await mkdir(realUploads);
+  await writeFile(join(realUploads, 'screen.png'), PNG_BYTES);
+  await symlink(realUploads, join(fixture.cwd, 'linked-uploads'));
+
+  const prompt = await resolveAgentPrompt(
+    fixture.cwd, 'Inspect this screenshot', ['linked-uploads/screen.png'],
+  );
+
+  assert.equal(prompt.attachments[0].absolutePath, await realpath(join(realUploads, 'screen.png')));
+  assert.doesNotMatch(prompt.attachments[0].absolutePath, /linked-uploads/);
 });
 
 test('resolveAgentPrompt recognizes exact JPEG and WebP signatures', async (t) => {
@@ -141,11 +158,66 @@ test('resolveAgentPrompt rejects escape through a symlinked parent', async (t) =
   });
 });
 
+test('revalidateAgentPrompt rejects a leaf swapped to a symlink after resolution', async (t) => {
+  const fixture = await promptFixture(t);
+  const submitted = join(fixture.cwd, 'uploads', 'notes.txt');
+  const outside = join(fixture.root, 'outside.txt');
+  await Promise.all([writeFile(submitted, 'inside'), writeFile(outside, 'outside')]);
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'Read it', ['uploads/notes.txt']);
+  await rm(submitted);
+  await symlink(outside, submitted);
+  const revalidate = (promptInput as {
+    revalidateAgentPrompt?: (cwd: string, prompt: AgentPrompt) => Promise<AgentPrompt>;
+  }).revalidateAgentPrompt;
+
+  assert.ok(revalidate, 'revalidation must happen immediately before adapter delivery');
+  await assert.rejects(revalidate(fixture.cwd, prompt), {
+    message: 'Attachment 1 must be a regular file, not a symbolic link.',
+  });
+});
+
+test('revalidateAgentPrompt rejects a parent swapped outside after resolution', async (t) => {
+  const fixture = await promptFixture(t);
+  const parent = join(fixture.cwd, 'pending');
+  const outside = join(fixture.root, 'outside');
+  await Promise.all([mkdir(parent), mkdir(outside)]);
+  await Promise.all([
+    writeFile(join(parent, 'notes.txt'), 'inside'),
+    writeFile(join(outside, 'notes.txt'), 'outside'),
+  ]);
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'Read it', ['pending/notes.txt']);
+  await rm(parent, { recursive: true });
+  await symlink(outside, parent);
+  const revalidate = (promptInput as {
+    revalidateAgentPrompt?: (cwd: string, prompt: AgentPrompt) => Promise<AgentPrompt>;
+  }).revalidateAgentPrompt;
+
+  assert.ok(revalidate, 'revalidation must happen immediately before adapter delivery');
+  await assert.rejects(revalidate(fixture.cwd, prompt), {
+    message: 'Attachment paths must stay inside the worktree.',
+  });
+});
+
 test('resolveAgentPrompt rejects directories', async (t) => {
   const fixture = await promptFixture(t);
   await assert.rejects(resolveAgentPrompt(fixture.cwd, 'x', ['uploads']), {
     message: 'Attachment 1 must be a regular file.',
   });
+});
+
+test('resolveAgentPrompt wraps unreadable image failures without exposing the path', async (t) => {
+  const fixture = await promptFixture(t);
+  const path = join(fixture.cwd, 'uploads', 'customer-secret.png');
+  await writeFile(path, PNG_BYTES);
+  await chmod(path, 0o000);
+
+  await assert.rejects(resolveAgentPrompt(fixture.cwd, 'x', ['uploads/customer-secret.png']),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'Attachment 1 could not be read.');
+      assert.doesNotMatch(error.message, /customer-secret|switchboard-prompt-input/);
+      return true;
+    });
 });
 
 for (const [name, bytes] of [

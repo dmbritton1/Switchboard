@@ -168,8 +168,9 @@ export function createServer(opts: {
   registry: Registry;
   usage: Usage;
   accounts: Account[];
+  resolvePrompt?: typeof resolveAgentPrompt;
 }): Server {
-  const { registry, usage, accounts } = opts;
+  const { registry, usage, accounts, resolvePrompt = resolveAgentPrompt } = opts;
   const handles = new Map<string, AgentHandle>();
 
   function snapshot() {
@@ -293,15 +294,21 @@ export function createServer(opts: {
       }
 
       case 'send': {
-        const session = registry.get(String(body.id));
-        const handle = handles.get(String(body.id));
+        const sessionId = String(body.id);
+        const session = registry.get(sessionId);
+        const handle = handles.get(sessionId);
         if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
         const text = String(body.text);
         let prompt: AgentPrompt;
         try {
-          prompt = await resolveAgentPrompt(session.cwd, text, body.attachments);
+          prompt = await resolvePrompt(session.cwd, text, body.attachments);
         } catch (error) {
           return { status: 400, json: { error: String((error as Error).message ?? error) } };
+        }
+        const currentSession = registry.get(sessionId);
+        const currentHandle = handles.get(sessionId);
+        if (currentSession !== session || currentHandle !== handle || currentSession.status === 'stopped') {
+          return { status: 409, json: { error: 'session changed while attachments were being validated' } };
         }
         const promptId = registry.appendPrompt(
           session.id, text, session.provider === 'codex' ? 'queued' : 'sent',

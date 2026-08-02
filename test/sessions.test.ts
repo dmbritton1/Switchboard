@@ -108,6 +108,51 @@ test('load converts every queued prompt to unsent and preserves sent prompts', a
   });
 });
 
+test('attachment names survive Registry save, reload, and public projection', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-attachment-reload-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const registry = new Registry(path);
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt',
+    branch: 'attachments', title: 'attachments',
+  });
+  registry.appendPrompt(session.id, 'Inspect these', 'sent', ['screen.png', 'notes.txt']);
+  await registry.save();
+
+  const loaded = await Registry.load(path);
+  const message = loaded.get(session.id)!.transcript[0];
+  assert.ok(message.kind === 'user');
+  assert.deepEqual(message.attachments, ['screen.png', 'notes.txt']);
+  const publicMessage = loaded.publicSessions()[0].transcript[0];
+  assert.ok(publicMessage.kind === 'user');
+  assert.deepEqual(publicMessage.attachments, ['screen.png', 'notes.txt']);
+});
+
+test('load drops malformed and path-bearing attachment values but preserves safe names', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    {
+      kind: 'user', id: 'safe-prompt', text: 'inspect', delivery: 'sent',
+      attachments: [
+        'screen.png', '../secret.txt', '/tmp/secret.txt', 'nested/file.txt',
+        'folder\\secret.txt', '', '.', '..', 42, null,
+      ],
+    },
+    {
+      kind: 'user', id: 'malformed-array', text: 'inspect', delivery: 'sent',
+      attachments: 'screen.png',
+    },
+  ]);
+
+  const loaded = await Registry.load(path);
+  const [safe, malformed] = loaded.all()[0].transcript;
+  assert.ok(safe.kind === 'user');
+  assert.deepEqual(safe.attachments, ['screen.png']);
+  assert.ok(malformed.kind === 'user');
+  assert.equal('attachments' in malformed, false);
+  assert.ok(!JSON.stringify(loaded.publicSessions()).includes('secret.txt'));
+});
+
 test('load ignores malformed transcript entries without losing the valid session', async (t) => {
   const path = await writePromptMigrationState(t, [
     null,

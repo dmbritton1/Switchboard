@@ -3,6 +3,7 @@ import type { Input, ThreadEvent, ThreadItem } from '@openai/codex-sdk';
 import { safeCodexDetail } from './codex-detail.ts';
 import { redactCodexText } from './codex-runtime.ts';
 import type { PreparedCodexRuntime } from './codex-runtime.ts';
+import { revalidateAgentPrompt } from '../prompt-input.ts';
 import type {
   Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, StartOpts, ToolMsg,
 } from '../types.ts';
@@ -221,9 +222,15 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       running = true;
       try {
         while (queue.length && !stopped) {
-          const prompt = queue.shift()!;
-          if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'sent' });
-          const { events } = await thread.runStreamed(codexPromptInput(prompt.prompt), {
+          // Keep the entry in the queue until its filesystem paths have been
+          // rebuilt. If validation fails, finish() can still mark this prompt
+          // unsent, and no stale absolute path reaches the SDK.
+          const queued = queue[0];
+          const prompt = await revalidateAgentPrompt(opts.cwd, queued.prompt);
+          if (stopped || queue[0] !== queued) return;
+          queue.shift();
+          if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'sent' });
+          const { events } = await thread.runStreamed(codexPromptInput(prompt), {
             signal: abortController.signal,
           });
           for await (const e of events) {

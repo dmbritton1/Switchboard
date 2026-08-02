@@ -1,11 +1,12 @@
 import assert from 'node:assert';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createCodexAdapter, classifyCodexFailure } from '../src/agents/codex.ts';
 import { MAX_CODEX_DETAIL_BYTES } from '../src/agents/codex-detail.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
+import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { Registry } from '../src/sessions.ts';
 import type { Adapter, AdapterEvent } from '../src/types.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
@@ -21,6 +22,7 @@ type ProcessFixture = {
   cwd: string;
   codexHome: string;
   runtime: PreparedCodexRuntime;
+  release(): Promise<void>;
   readInvocations(): Promise<FakeInvocation[]>;
   readHoldLifecycle(): Promise<string[]>;
 };
@@ -31,6 +33,7 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
   const codexHome = join(dir, 'codex-home');
   const log = join(dir, 'fake-codex.jsonl');
   const holdLog = join(dir, 'fake-codex-hold.log');
+  const releaseFile = join(dir, 'fake-codex-release');
   await Promise.all([mkdir(cwd), mkdir(codexHome), writeFile(log, ''), writeFile(holdLog, '')]);
   const bin = await writeFakeCodex(dir);
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -48,6 +51,7 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
         CODEX_HOME: codexHome,
         FAKE_CODEX_LOG: log,
         FAKE_CODEX_HOLD_LOG: holdLog,
+        FAKE_CODEX_RELEASE_FILE: releaseFile,
         FAKE_CODEX_SECRET: 'never-expose-me',
       },
       diagnostics: [],
@@ -55,6 +59,9 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
     async readInvocations() {
       const contents = await readFile(log, 'utf8');
       return contents.split('\n').filter(Boolean).map((line) => JSON.parse(line) as FakeInvocation);
+    },
+    async release() {
+      await writeFile(releaseFile, 'release');
     },
     async readHoldLifecycle() {
       return (await readFile(holdLog, 'utf8')).split('\n').filter(Boolean);
@@ -153,8 +160,44 @@ test('PNG, JPEG, and WebP attachments reach the real SDK as native image argumen
   const [invocation] = await fixture.readInvocations();
   assert.equal(invocation.prompt, 'Inspect the attachments\nAttached file: notes.txt');
   assert.deepEqual(invocation.argv.flatMap((arg, index, argv) =>
-    arg === '--image' ? [argv[index + 1]] : []), [paths.png, paths.jpeg, paths.webp]);
+    arg === '--image' ? [argv[index + 1]] : []), await Promise.all([
+    realpath(paths.png), realpath(paths.jpeg), realpath(paths.webp),
+  ]));
   assert.ok(!invocation.argv.includes(paths.file), 'ordinary files belong in prompt text, not --image');
+});
+
+test('a queued image swapped to a symlink is rejected before the SDK invocation', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const imagePath = join(fixture.cwd, 'queued.png');
+  const outsidePath = join(fixture.cwd, '..', 'outside.png');
+  await Promise.all([
+    writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+    writeFile(outsidePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  ]);
+  const queuedPrompt = await resolveAgentPrompt(fixture.cwd, 'Inspect it', ['queued.png']);
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAdapter(fixture.runtime).start({
+    cwd: fixture.cwd, env: {},
+    prompt: { text: 'releasable-hold', attachments: [] },
+  }, (event) => events.push(event));
+  await waitFor(async () => (await fixture.readInvocations()).length === 1);
+  handle.send(queuedPrompt, 'queued-image');
+  await rm(imagePath);
+  await symlink(outsidePath, imagePath);
+  await fixture.release();
+
+  await waitFor(async () => (await fixture.readInvocations()).length > 1
+    || events.some((event) => event.type === 'stopped'));
+  assert.equal((await fixture.readInvocations()).length, 1,
+    'an unsafe swapped path must never reach Codex --image');
+  assert.deepEqual(events.filter((event) =>
+    event.type === 'prompt-delivery' && event.id === 'queued-image'), [
+    { type: 'prompt-delivery', id: 'queued-image', delivery: 'unsent' },
+  ]);
+  const failure = stopped(events);
+  assert.equal(failure.reason, 'Attachment 1 must be a regular file, not a symbolic link.');
+  assert.ok(!failure.reason.includes(imagePath));
+  assert.ok(!failure.reason.includes(outsidePath));
 });
 
 test('completed SDK JSONL items normalize into append-only text and tool upserts', async (t) => {
