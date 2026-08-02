@@ -20,6 +20,7 @@ type ProcessFixture = {
   codexHome: string;
   runtime: PreparedCodexRuntime;
   readInvocations(): Promise<FakeInvocation[]>;
+  readHoldLifecycle(): Promise<string[]>;
 };
 
 async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promise<ProcessFixture> {
@@ -27,7 +28,8 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
   const cwd = join(dir, 'workspace');
   const codexHome = join(dir, 'codex-home');
   const log = join(dir, 'fake-codex.jsonl');
-  await Promise.all([mkdir(cwd), mkdir(codexHome), writeFile(log, '')]);
+  const holdLog = join(dir, 'fake-codex-hold.log');
+  await Promise.all([mkdir(cwd), mkdir(codexHome), writeFile(log, ''), writeFile(holdLog, '')]);
   const bin = await writeFakeCodex(dir);
   t.after(() => rm(dir, { recursive: true, force: true }));
 
@@ -43,6 +45,7 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
         ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
         CODEX_HOME: codexHome,
         FAKE_CODEX_LOG: log,
+        FAKE_CODEX_HOLD_LOG: holdLog,
         FAKE_CODEX_SECRET: 'never-expose-me',
       },
       diagnostics: [],
@@ -50,6 +53,9 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
     async readInvocations() {
       const contents = await readFile(log, 'utf8');
       return contents.split('\n').filter(Boolean).map((line) => JSON.parse(line) as FakeInvocation);
+    },
+    async readHoldLifecycle() {
+      return (await readFile(holdLog, 'utf8')).split('\n').filter(Boolean);
     },
   };
 }
@@ -217,13 +223,17 @@ test('stop aborts a holding SDK turn exactly once with the user-stopped code', a
   const adapter = createCodexAdapter(fixture.runtime);
   const { events, handle } = await collect(adapter, fixture, 'hold', (all) =>
     all.some((event) => event.type === 'status' && event.status === 'working'));
+  await waitFor(async () => (await fixture.readHoldLifecycle()).includes('alive'));
+  assert.deepEqual(await fixture.readHoldLifecycle(), ['started', 'alive']);
   handle.stop();
   handle.stop();
   await waitFor(() => events.some((event) => event.type === 'stopped'));
+  await waitFor(async () => (await fixture.readHoldLifecycle()).includes('aborted'));
 
   assert.deepEqual(events.filter((event) => event.type === 'stopped'), [{
     type: 'stopped', reason: 'stopped from switchboard', code: 'codex_user_stopped',
   }]);
+  assert.deepEqual(await fixture.readHoldLifecycle(), ['started', 'alive', 'aborted']);
 });
 
 test('public Codex failure classification prefers auth and sandbox over fallback', () => {

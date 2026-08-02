@@ -71,7 +71,22 @@ process.stdin.on('end', () => {
   }
   emit({ type: 'thread.started', thread_id: 'fake-thread' });
   emit({ type: 'turn.started' });
-  if (prompt === 'hold') return;
+  if (prompt === 'hold') {
+    const lifecycleLog = process.env.FAKE_CODEX_HOLD_LOG;
+    const note = (state) => {
+      if (lifecycleLog) appendFileSync(lifecycleLog, state + '\\n');
+    };
+    note('started');
+    const alive = setTimeout(() => note('alive'), 25);
+    const keepAlive = setInterval(() => {}, 1_000);
+    process.once('SIGTERM', () => {
+      clearTimeout(alive);
+      clearInterval(keepAlive);
+      note('aborted');
+      process.exit(0);
+    });
+    return;
+  }
   if (prompt === 'malformed-json') {
     process.stdout.write('{not json}\\n');
     return;
