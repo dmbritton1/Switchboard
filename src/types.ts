@@ -40,6 +40,7 @@ export type Session = {
   transcript: Msg[];
   pending: ApprovalRequest | null;
   stoppedReason: string | null;
+  stoppedCode: CodexFailureCode | null;
   startedAt: number;
   statusSince: number;
 };

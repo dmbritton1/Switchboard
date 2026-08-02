@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
-import type { AdapterEvent, Session } from './types.ts';
+import type { AdapterEvent, CodexFailureCode, Session } from './types.ts';
 import type { Usage } from './usage.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
@@ -33,6 +33,7 @@ export class Registry {
       transcript: [],
       pending: null,
       stoppedReason: null,
+      stoppedCode: null,
       startedAt: now,
       statusSince: now,
     };
@@ -95,6 +96,7 @@ export class Registry {
       case 'stopped':
         s.pending = null;
         s.stoppedReason = e.reason;
+        s.stoppedCode = e.code ?? null;
         this.#setStatus(s, 'stopped');
         break;
       case 'usage':
@@ -122,7 +124,21 @@ export class Registry {
     if (!s) return;
     s.pending = null;
     s.stoppedReason = null;
+    s.stoppedCode = null;
     this.#setStatus(s, 'working');
+    this.#notify();
+  }
+
+  /** Records a readiness failure while preserving the terminal stopped state. */
+  recordStoppedFailure(id: string, reason: string, code: CodexFailureCode): void {
+    const s = this.#sessions.get(id);
+    if (!s) return;
+    s.pending = null;
+    s.stoppedReason = reason;
+    s.stoppedCode = code;
+    s.transcript.push({ kind: 'error', text: reason });
+    s.status = 'stopped';
+    s.statusSince = Math.max(Date.now(), s.statusSince + 1);
     this.#notify();
   }
 
@@ -194,6 +210,7 @@ export class Registry {
           status: 'stopped',
           statusSince: Date.now(),
           stoppedReason: s.stoppedReason ?? 'switchboard restarted',
+          stoppedCode: s.stoppedCode ?? null,
           pending: null,
           // Predates the auto toggle in any state.json written before it existed,
           // and `undefined` would render as an indeterminate checkbox.

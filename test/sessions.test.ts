@@ -65,6 +65,27 @@ test('a stopped event records the reason and never reverts', () => {
   assert.equal(s.stoppedReason, 'exit 1');
 });
 
+test('a stopped event persists its stable code', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'stopped', reason: 'sandbox refused the command', code: 'codex_sandbox_denied',
+  });
+  assert.equal(reg.get(id)!.stoppedCode, 'codex_sandbox_denied');
+});
+
+test('recordStoppedFailure updates a terminal session without reviving it', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'stopped', reason: 'first failure' });
+  reg.recordStoppedFailure(id, 'Codex login is unavailable', 'codex_auth_unavailable');
+
+  const session = reg.get(id)!;
+  assert.equal(session.status, 'stopped');
+  assert.equal(session.stoppedCode, 'codex_auth_unavailable');
+  assert.deepEqual(session.transcript.at(-1), {
+    kind: 'error', text: 'Codex login is unavailable',
+  });
+});
+
 test('statusSince advances only when the status actually changes', () => {
   const { reg, id } = make();
   const first = reg.get(id)!.statusSince;
@@ -229,6 +250,7 @@ test('revive clears stopped state and notifies subscribers', () => {
   const s = reg.get(id)!;
   assert.equal(s.status, 'working');
   assert.equal(s.stoppedReason, null);
+  assert.equal(s.stoppedCode, null);
   assert.equal(s.pending, null);
   assert.equal(calls, 1, 'revive should notify subscribers');
 });

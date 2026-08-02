@@ -93,8 +93,6 @@ export function classifyCodexFailure(
   return fallback;
 }
 
-const CODEX_BIN = '/Applications/ChatGPT.app/Contents/Resources/codex';
-
 export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
   return {
     start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle {
@@ -199,15 +197,3 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
     },
   };
 }
-
-/** @deprecated Task 3 prepares an account runtime before creating the adapter. */
-export const codexAdapter = createCodexAdapter({
-  source: 'chatgpt',
-  commandPath: CODEX_BIN,
-  codexPathOverride: CODEX_BIN,
-  version: 'unknown',
-  env: Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-  ),
-  diagnostics: [],
-});

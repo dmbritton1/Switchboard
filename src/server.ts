@@ -10,8 +10,9 @@ import { Usage } from './usage.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
-import { codexAdapter } from './agents/codex.ts';
-import type { AgentHandle, Session } from './types.ts';
+import { createCodexAdapter } from './agents/codex.ts';
+import { CodexRuntimeError, prepareCodexRuntime, redactCodexText } from './agents/codex-runtime.ts';
+import type { Adapter, AgentHandle, CodexFailureCode, Session } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -22,6 +23,16 @@ export type Account = {
   env: Record<string, string>;
   bin?: string;
 };
+
+type PreparedProvider = {
+  adapter: Adapter;
+};
+
+async function prepareProvider(account: Account): Promise<PreparedProvider> {
+  if (account.provider === 'claude') return { adapter: claudeAdapter };
+  const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
+  return { adapter: createCodexAdapter(runtime) };
+}
 
 const WEB = new URL('../web/', import.meta.url).pathname;
 const MIME: Record<string, string> = {
@@ -153,12 +164,14 @@ export function createServer(opts: {
     return { repo: sessions[0].repo, sessions };
   }
 
-  function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
-    const adapter = account.provider === 'claude' ? claudeAdapter : codexAdapter;
+  function launch(
+    sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: string, resumeId?: string,
+  ): { error: string; code?: CodexFailureCode } | null {
     const auto = registry.get(sessionId)?.auto ?? false;
-    const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
-      if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
-      if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
+    try {
+      const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
+        if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
+        if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
       // the prompt, and every event it produced was dropped by the terminal guard.
@@ -169,12 +182,23 @@ export function createServer(opts: {
       // pass finds no handle and cannot recurse; apply before stop(), so the real
       // reason is recorded and the re-entrant "stopped from switchboard" is the one
       // the terminal guard drops, not the other way round.
-      const dead = handles.get(sessionId);
-      handles.delete(sessionId);
-      registry.apply(sessionId, e);
-      dead?.stop();
-    });
-    handles.set(sessionId, handle);
+        const dead = handles.get(sessionId);
+        handles.delete(sessionId);
+        registry.apply(sessionId, e);
+        dead?.stop();
+      });
+      handles.set(sessionId, handle);
+      return null;
+    } catch (error) {
+      const reason = account.provider === 'codex'
+        ? redactCodexText(String((error as Error).message ?? error), account.env)
+        : String((error as Error).message ?? error);
+      const code = account.provider === 'codex'
+        ? (resumeId ? 'codex_resume_failed' : 'codex_start_failed')
+        : undefined;
+      registry.apply(sessionId, { type: 'stopped', reason, ...(code ? { code } : {}) });
+      return { error: reason, ...(code ? { code } : {}) };
+    }
   }
 
   async function command(body: Record<string, unknown>): Promise<{ status: number; json: unknown }> {
@@ -182,6 +206,18 @@ export function createServer(opts: {
       case 'create': {
         const account = accounts.find((a) => a.name === body.account);
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareProvider(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            return {
+              status: 400,
+              json: { error: redactCodexText(error.message, account.env), code: error.code },
+            };
+          }
+          throw error;
+        }
         let cwd: string;
         try {
           cwd = await createWorktree(String(body.repo), String(body.branch));
@@ -196,7 +232,8 @@ export function createServer(opts: {
           branch: String(body.branch),
           title: String(body.branch),
         });
-        launch(session.id, account, cwd, String(body.prompt));
+        const launchError = launch(session.id, account, prepared.adapter, cwd, String(body.prompt));
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
       }
 
@@ -256,15 +293,27 @@ export function createServer(opts: {
         if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
           return { status: 409, json: { error: `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree` } };
         }
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareProvider(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            const reason = redactCodexText(error.message, account.env);
+            registry.recordStoppedFailure(session.id, reason, error.code);
+            return { status: 400, json: { error: reason, code: error.code } };
+          }
+          throw error;
+        }
         // registry.revive() (not a direct mutation) so subscribers get #notify()'d
         // immediately; neither adapter emits a synchronous status event at start(),
         // so without this an SSE client would keep showing 'stopped' until the
         // resumed agent's first async event arrived.
         registry.revive(session.id);
-        launch(
-          session.id, account, session.cwd, String(body.prompt ?? 'continue'),
+        const launchError = launch(
+          session.id, account, prepared.adapter, session.cwd, String(body.prompt ?? 'continue'),
           session.vendorSessionId ?? undefined,
         );
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { ok: true } };
       }
 
