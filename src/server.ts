@@ -10,8 +10,11 @@ import { Usage } from './usage.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
-import { codexAdapter } from './agents/codex.ts';
-import type { AgentHandle, Session } from './types.ts';
+import { createCodexAdapter } from './agents/codex.ts';
+import {
+  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
+} from './agents/codex-runtime.ts';
+import type { Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -20,7 +23,57 @@ export type Account = {
   provider: 'claude' | 'codex';
   budget: number;
   env: Record<string, string>;
+  bin?: string;
 };
+
+type PreparedProvider = {
+  adapter: Adapter;
+};
+
+async function prepareProvider(account: Account): Promise<PreparedProvider> {
+  if (account.provider === 'claude') return { adapter: claudeAdapter };
+  const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
+  return { adapter: createCodexAdapter(runtime) };
+}
+
+/**
+ * Account values are launch-only configuration, so any of them — not just the
+ * credential-shaped keys redactCodexText() knows about — is removed from text
+ * the browser will see. Short values are left alone: see MIN_REDACTABLE, a
+ * substring search for "1" redacts arithmetic, not a secret.
+ */
+function redactAccountValue(text: string, account: Account): string {
+  let safe = redactCodexText(text, account.env);
+  for (const value of Object.values(account.env)) {
+    if (redactable(value)) safe = safe.replaceAll(value, '[REDACTED]');
+  }
+  return safe;
+}
+
+function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent {
+  if (account.provider !== 'codex') return event;
+  switch (event.type) {
+    case 'msg': {
+      const msg = event.msg;
+      if (msg.kind === 'tool') {
+        return {
+          ...event,
+          msg: { ...msg, name: redactAccountValue(msg.name, account), summary: redactAccountValue(msg.summary, account) },
+        };
+      }
+      return { ...event, msg: { ...msg, text: redactAccountValue(msg.text, account) } };
+    }
+    case 'stopped':
+      return { ...event, reason: redactAccountValue(event.reason, account) };
+    // vendor-session-id is deliberately not redacted: it is an identifier the
+    // server hands straight back to resumeThread(), never rendered as prose. A
+    // value that happened to contain an account value would come back rewritten
+    // to [REDACTED] and resume the wrong thread — or no thread at all — with
+    // nothing on screen to explain it.
+    default:
+      return event;
+  }
+}
 
 const WEB = new URL('../web/', import.meta.url).pathname;
 const MIME: Record<string, string> = {
@@ -152,12 +205,16 @@ export function createServer(opts: {
     return { repo: sessions[0].repo, sessions };
   }
 
-  function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
-    const adapter = account.provider === 'claude' ? claudeAdapter : codexAdapter;
+  function launch(
+    sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: string, resumeId?: string,
+    promptId?: string,
+  ): { error: string; code?: CodexFailureCode } | null {
     const auto = registry.get(sessionId)?.auto ?? false;
-    const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
-      if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
-      if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
+    try {
+      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto }, (e) => {
+        const safeEvent = sanitizeCodexEvent(e, account);
+        if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
+        if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
       // the prompt, and every event it produced was dropped by the terminal guard.
@@ -168,12 +225,26 @@ export function createServer(opts: {
       // pass finds no handle and cannot recurse; apply before stop(), so the real
       // reason is recorded and the re-entrant "stopped from switchboard" is the one
       // the terminal guard drops, not the other way round.
-      const dead = handles.get(sessionId);
-      handles.delete(sessionId);
-      registry.apply(sessionId, e);
-      dead?.stop();
-    });
-    handles.set(sessionId, handle);
+        const dead = handles.get(sessionId);
+        handles.delete(sessionId);
+        registry.apply(sessionId, safeEvent);
+        dead?.stop();
+      });
+      handles.set(sessionId, handle);
+      return null;
+    } catch (error) {
+      const reason = account.provider === 'codex'
+        ? redactAccountValue(String((error as Error).message ?? error), account)
+        : String((error as Error).message ?? error);
+      const code = account.provider === 'codex'
+        ? (resumeId ? 'codex_resume_failed' : 'codex_start_failed')
+        : undefined;
+      if (account.provider === 'codex' && promptId) {
+        registry.apply(sessionId, { type: 'prompt-delivery', id: promptId, delivery: 'unsent' });
+      }
+      registry.apply(sessionId, { type: 'stopped', reason, ...(code ? { code } : {}) });
+      return { error: reason, ...(code ? { code } : {}) };
+    }
   }
 
   async function command(body: Record<string, unknown>): Promise<{ status: number; json: unknown }> {
@@ -181,6 +252,18 @@ export function createServer(opts: {
       case 'create': {
         const account = accounts.find((a) => a.name === body.account);
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareProvider(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            return {
+              status: 400,
+              json: { error: redactCodexText(error.message, account.env), code: error.code },
+            };
+          }
+          throw error;
+        }
         let cwd: string;
         try {
           cwd = await createWorktree(String(body.repo), String(body.branch));
@@ -195,17 +278,24 @@ export function createServer(opts: {
           branch: String(body.branch),
           title: String(body.branch),
         });
-        launch(session.id, account, cwd, String(body.prompt));
+        const prompt = String(body.prompt);
+        const promptId = registry.appendPrompt(
+          session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
+        );
+        const launchError = launch(session.id, account, prepared.adapter, cwd, prompt, undefined, promptId);
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
       }
 
       case 'send': {
+        const session = registry.get(String(body.id));
         const handle = handles.get(String(body.id));
-        if (!handle) return { status: 404, json: { error: 'no live session' } };
-        registry.apply(String(body.id), {
-          type: 'msg', msg: { kind: 'user', text: String(body.text) },
-        });
-        handle.send(String(body.text));
+        if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
+        const text = String(body.text);
+        const promptId = registry.appendPrompt(
+          session.id, text, session.provider === 'codex' ? 'queued' : 'sent',
+        );
+        handle.send(text, promptId);
         return { status: 200, json: { ok: true } };
       }
 
@@ -253,17 +343,39 @@ export function createServer(opts: {
         // fine, the directory is gone — so check here and say what actually
         // happened rather than passing that error on.
         if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
-          return { status: 409, json: { error: `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree` } };
+          const rawReason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
+          if (account.provider === 'codex') {
+            const reason = redactAccountValue(rawReason, account);
+            registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+            return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+          }
+          return { status: 409, json: { error: rawReason } };
+        }
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareProvider(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            const reason = redactCodexText(error.message, account.env);
+            registry.recordStoppedFailure(session.id, reason, error.code);
+            return { status: 400, json: { error: reason, code: error.code } };
+          }
+          throw error;
         }
         // registry.revive() (not a direct mutation) so subscribers get #notify()'d
         // immediately; neither adapter emits a synchronous status event at start(),
         // so without this an SSE client would keep showing 'stopped' until the
         // resumed agent's first async event arrived.
         registry.revive(session.id);
-        launch(
-          session.id, account, session.cwd, String(body.prompt ?? 'continue'),
-          session.vendorSessionId ?? undefined,
+        const prompt = typeof body.prompt === 'string' ? body.prompt : 'continue';
+        const promptId = account.provider === 'codex' && typeof body.prompt === 'string'
+          ? registry.appendPrompt(session.id, prompt, 'queued')
+          : undefined;
+        const launchError = launch(
+          session.id, account, prepared.adapter, session.cwd, prompt,
+          session.vendorSessionId ?? undefined, promptId,
         );
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { ok: true } };
       }
 

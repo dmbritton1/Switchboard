@@ -1,7 +1,22 @@
 export type Status = 'working' | 'needs-you' | 'done' | 'stopped';
 
+export type CodexFailureCode =
+  | 'codex_platform_unsupported'
+  | 'codex_binary_missing'
+  | 'codex_binary_not_executable'
+  | 'codex_version_unreadable'
+  | 'codex_version_mismatch'
+  | 'codex_auth_unavailable'
+  | 'codex_start_failed'
+  | 'codex_resume_failed'
+  | 'codex_stream_failed'
+  | 'codex_sandbox_denied'
+  | 'codex_user_stopped';
+
+export type PromptDelivery = 'queued' | 'sent' | 'unsent';
+
 export type Msg =
-  | { kind: 'user'; text: string }
+  | { kind: 'user'; id: string; text: string; delivery: PromptDelivery }
   | { kind: 'text'; text: string }
   // id is optional: it correlates a tool call to its later result so the registry
   // can flip status running -> ok/error. The Codex adapter (Task 5) emits tool
@@ -27,6 +42,7 @@ export type Session = {
   transcript: Msg[];
   pending: ApprovalRequest | null;
   stoppedReason: string | null;
+  stoppedCode: CodexFailureCode | null;
   startedAt: number;
   statusSince: number;
 };
@@ -39,11 +55,13 @@ export type AdapterEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
-  | { type: 'stopped'; reason: string };
+  | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
+  | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 
 export type StartOpts = {
   cwd: string;
   prompt: string;
+  promptId?: string;
   env: Record<string, string>;
   resumeId?: string;
   /** Start with auto-approval already on, so a resumed session keeps the toggle
@@ -52,7 +70,7 @@ export type StartOpts = {
 };
 
 export type AgentHandle = {
-  send(text: string): void;
+  send(text: string, promptId?: string): void;
   decide(allow: boolean): void;
   setAuto(on: boolean): void;
   stop(): void;

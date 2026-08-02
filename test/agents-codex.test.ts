@@ -104,7 +104,40 @@ test('turn.completed reports usage and sets done', () => {
 test('turn.failed stops the session with the error message', () => {
   assert.deepEqual(
     normalizeCodex({ type: 'turn.failed', error: { message: 'nope' } } as never),
-    [{ type: 'stopped', reason: 'nope' }],
+    [{ type: 'stopped', reason: 'nope', code: 'codex_stream_failed' }],
+  );
+});
+
+test('an unknown future event is ignored', () => {
+  assert.deepEqual(
+    normalizeCodex({ type: 'future.event', payload: { value: 1 } } as never),
+    [],
+  );
+});
+
+test('an unknown future event reports only its type during development', (t) => {
+  const previousEnvironment = process.env.NODE_ENV;
+  const previousWarn = console.warn;
+  const warnings: unknown[][] = [];
+  process.env.NODE_ENV = 'development';
+  console.warn = (...args: unknown[]) => { warnings.push(args); };
+  t.after(() => {
+    console.warn = previousWarn;
+    if (previousEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousEnvironment;
+  });
+
+  assert.deepEqual(
+    normalizeCodex({ type: 'future.event', payload: { credential: 'do-not-log-me' } } as never),
+    [],
+  );
+  assert.deepEqual(warnings, [['[codex] ignored event type: future.event']]);
+});
+
+test('turn.failed is assigned a stable stream failure code', () => {
+  assert.deepEqual(
+    normalizeCodex({ type: 'turn.failed', error: { message: 'nope' } } as never),
+    [{ type: 'stopped', reason: 'nope', code: 'codex_stream_failed' }],
   );
 });
 

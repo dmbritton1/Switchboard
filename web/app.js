@@ -1,4 +1,7 @@
-import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from './lib.js';
+import {
+  sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
+  postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
+} from './lib.js';
 
 let state = { sessions: [], accounts: [] };
 let openId = null;
@@ -16,34 +19,23 @@ let selected = new Set();
 // server's SSE snapshot, it's local UI feedback for a fire-and-forget-style
 // command that, unlike most of this app's commands, we do want to surface.
 let selectionMessage = '';
+let sessionCommandError = null;
+let queueCommandError = '';
 
 const $ = (sel) => document.querySelector(sel);
 
-async function send(body) {
-  const res = await fetch('/command', { method: 'POST', body: JSON.stringify(body) });
-  return { ok: res.ok, data: await res.json() };
+async function runSessionCommand(body) {
+  const result = await postCommand(body);
+  sessionCommandError = retainedSessionError(String(body.id), result);
+  render();
+  return result;
 }
 
-let toastTimer = null;
-
-function toast(text) {
-  const el = $('#toast');
-  el.textContent = text;
-  el.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
-}
-
-/**
- * Fire-and-forget commands, with the failure made visible. The server already
- * rejects the dangerous cases honestly — a send to a session with no live agent
- * is a 404, a resume on a session that is not stopped is a 409 — but until now
- * the browser showed nothing either way. Callers that surface their own errors
- * (the create dialog, merge, push) keep using send() directly.
- */
-async function fire(body) {
-  const { ok, data } = await send(body);
-  if (!ok) toast(data?.error ?? `${body.cmd} failed`);
+async function runQueueCommand(body) {
+  const result = await postCommand(body);
+  queueCommandError = commandFailure(result);
+  render();
+  return result;
 }
 
 // EventSource reconnects on its own, so there is no backoff code to write.
@@ -72,6 +64,10 @@ function notify() {
 function elapsed(since) {
   const m = Math.floor((Date.now() - since) / 60000);
   return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${m % 60}m`;
+}
+
+function stoppedLabel(s) {
+  return CODEX_FAILURE_LABEL[s.stoppedCode] ?? s.stoppedReason ?? 'stopped';
 }
 
 // Commits last fetched for the open session's Graph tab. Graph data is not in
@@ -146,7 +142,7 @@ function queueRow(q) {
   del.className = 'queue-del';
   del.title = 'Remove from queue';
   del.textContent = '✕';
-  del.onclick = () => fire({ cmd: 'unschedule', itemId: q.id });
+  del.onclick = async () => { await runQueueCommand({ cmd: 'unschedule', itemId: q.id }); };
 
   row.append(when, what, del);
 
@@ -168,13 +164,25 @@ function queuePanel() {
   const h = document.createElement('h3');
   h.textContent = 'Scheduled';
   box.append(h, ...queueItems().map(queueRow));
+  if (queueCommandError) {
+    const error = document.createElement('p');
+    error.className = 'queue-error';
+    error.setAttribute('role', 'alert');
+    error.append(queueCommandError, ' ');
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.textContent = 'Dismiss';
+    dismiss.onclick = () => { queueCommandError = ''; render(); };
+    error.append(dismiss);
+    box.append(error);
+  }
   return box;
 }
 
 /** The open panel's contents, or null. */
 function panelBody() {
   if (!panel) return null;
-  if (panel === 'queue') return queueItems().length ? queuePanel() : null;
+  if (panel === 'queue') return queueItems().length || queueCommandError ? queuePanel() : null;
   const account = state.accounts.find((a) => a.name === panel);
   return account ? accountPanel(account) : null;
 }
@@ -197,7 +205,21 @@ function renderHeader() {
 
 function render() {
   renderHeader();
+  renderCommandError();
   openId ? renderSession() : renderGrid();
+}
+
+function renderCommandError() {
+  const error = $('#command-error');
+  error.replaceChildren();
+  const text = commandErrorText(sessionCommandError, state.sessions, openId);
+  if (!text) return;
+  error.append(text, ' ');
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.textContent = 'Dismiss';
+  dismiss.onclick = () => { sessionCommandError = null; render(); };
+  error.append(dismiss);
 }
 
 // ponytail: renderGrid() rebuilds every card on every render, and render() runs on
@@ -304,15 +326,19 @@ function selectionBar() {
 async function doMerge(ids) {
   const branches = state.sessions.filter((s) => ids.includes(s.id)).map((s) => s.branch);
   if (!window.confirm(`Commit outstanding changes and merge ${branches.join(', ')} into the repo's checked-out branch?`)) return;
-  const { ok, data } = await send({ cmd: 'merge', ids });
-  selectionMessage = ok ? `Merged ${data.merged.join(', ')} into ${data.target}.` : data.error;
-  if (ok) selected.clear();
+  const result = await postCommand({ cmd: 'merge', ids });
+  selectionMessage = result.ok
+    ? `Merged ${result.data.merged.join(', ')} into ${result.data.target}.`
+    : commandFailure(result);
+  if (result.ok) selected.clear();
   render();
 }
 
 async function doPush(ids) {
-  const { ok, data } = await send({ cmd: 'push', ids });
-  selectionMessage = ok ? (data.output ? `Pushed: ${data.output}` : 'Pushed — already up to date.') : data.error;
+  const result = await postCommand({ cmd: 'push', ids });
+  selectionMessage = result.ok
+    ? (result.data.output ? `Pushed: ${result.data.output}` : 'Pushed — already up to date.')
+    : commandFailure(result);
   render();
 }
 
@@ -344,7 +370,7 @@ function menuItem(label, onclick, extra = '') {
   // worktree path mutates no state and triggers no render of its own, so the
   // stale .menu node was never torn down, and the outside-click closer further
   // down (guarded on `menuFor`, which is already null by then) couldn't help either.
-  b.onclick = (e) => { e.stopPropagation(); menuFor = null; onclick(); render(); };
+  b.onclick = async (e) => { e.stopPropagation(); menuFor = null; await onclick(); render(); };
   return b;
 }
 
@@ -381,9 +407,12 @@ function overflowMenu(s) {
   box.checked = s.auto;
   box.disabled = s.provider === 'codex';
   auto.title = s.provider === 'codex'
-    ? 'Codex never asks for approval — it is sandboxed to its worktree instead'
+    ? 'Codex uses a fixed worktree sandbox with non-interactive permissions.'
     : 'Approve every tool call automatically, without asking';
-  box.onchange = () => { menuFor = null; render(); fire({ cmd: 'auto', id: s.id, auto: box.checked }); };
+  box.onchange = async () => {
+    menuFor = null;
+    await runSessionCommand({ cmd: 'auto', id: s.id, auto: box.checked });
+  };
   auto.append(box, ' Auto-approve');
 
   menu.append(auto);
@@ -393,7 +422,7 @@ function overflowMenu(s) {
   // session outright. `working` gets it too, duplicating actionSlot()'s Stop,
   // because the menu is the path that works from every stoppable state.
   if (s.status === 'working' || s.status === 'needs-you') {
-    menu.append(menuItem('Stop', () => fire({ cmd: 'stop', id: s.id })));
+    menu.append(menuItem('Stop', async () => { await runSessionCommand({ cmd: 'stop', id: s.id }); }));
   }
   menu.append(
     menuItem('Graph', () => openTab(s.id, 'graph')),
@@ -427,7 +456,7 @@ function setDelHint(removeWorktree) {
 // open): the checkbox element itself never changes, only its checked state.
 $('#del-wt').addEventListener('change', (e) => setDelHint(e.target.checked));
 
-$('#del').addEventListener('close', (e) => {
+$('#del').addEventListener('close', async (e) => {
   const dialog = e.target;
   // Consumed for the same reason the create dialog consumes it: Escape closes
   // without setting returnValue, so a stale 'delete' would make the next
@@ -441,7 +470,7 @@ $('#del').addEventListener('close', (e) => {
   // trust that whatever opened the dialog already re-rendered.
   render();
   if (!go) return;
-  fire({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
+  await runSessionCommand({ cmd: 'delete', id: dialog.dataset.id, removeWorktree: $('#del-wt').checked });
 });
 
 // Any click that is not on a menu closes the open one. Registered once, in the
@@ -491,6 +520,17 @@ function card(s, fetchStatus) {
   wt.className = 'wt';
 
   el.append(head, branch, meta, wt);
+  if (s.status === 'stopped' && s.provider === 'codex') {
+    const failure = document.createElement('p');
+    failure.className = 'stopped-detail';
+    failure.textContent = stoppedLabel(s);
+    if (s.stoppedCode && s.stoppedReason) {
+      const reason = document.createElement('span');
+      reason.textContent = ` — ${s.stoppedReason}`;
+      failure.append(reason);
+    }
+    el.append(failure);
+  }
   el.onclick = () => openTab(s.id, 'chat');
 
   // renderGrid() replaceChildren()s the whole grid on every render, so this
@@ -513,7 +553,7 @@ function stopButton(s) {
   const b = document.createElement('button');
   b.textContent = 'Stop';
   // Stopping is not destructive — no confirm. The card stays, with a Resume button.
-  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'stop', id: s.id }); };
+  b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'stop', id: s.id }); };
   return b;
 }
 
@@ -543,7 +583,7 @@ function renderInterrupt(current) {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = label;
-    b.onclick = () => fire({ cmd: 'decide', id: first.id, allow });
+    b.onclick = async () => { await runSessionCommand({ cmd: 'decide', id: first.id, allow }); };
     box.append(b);
   }
 
@@ -578,7 +618,7 @@ function approval(s) {
   for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
     const b = document.createElement('button');
     b.textContent = label;
-    b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'decide', id: s.id, allow }); };
+    b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'decide', id: s.id, allow }); };
     box.append(b);
   }
   return box;
@@ -586,8 +626,8 @@ function approval(s) {
 
 function resumeButton(s) {
   const b = document.createElement('button');
-  b.textContent = `Resume (${s.stoppedReason ?? 'stopped'})`;
-  b.onclick = (e) => { e.stopPropagation(); fire({ cmd: 'resume', id: s.id }); };
+  b.textContent = `Resume (${stoppedLabel(s)})`;
+  b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'resume', id: s.id }); };
   return b;
 }
 
@@ -615,7 +655,10 @@ function renderSession() {
   if (!s) { openId = null; return renderGrid(); }
   $('#grid').hidden = true;
   $('#session').hidden = false;
-  $('#session-title').textContent = `${s.branch} · ${s.account} · ${s.status}`;
+  $('#session-title').textContent = `${s.branch} · ${s.account} · ${s.status === 'stopped' && s.provider === 'codex' ? stoppedLabel(s) : s.status}`;
+  const stoppedReason = $('#session-stopped-reason');
+  stoppedReason.hidden = !(s.status === 'stopped' && s.provider === 'codex' && s.stoppedCode && s.stoppedReason);
+  stoppedReason.textContent = stoppedReason.hidden ? '' : s.stoppedReason;
   $('#session-menu').replaceChildren(overflowMenu(s));
 
   const slot = actionSlot(s);
@@ -662,9 +705,18 @@ function renderChatPane(s) {
     // 'error' picks up the existing .msg.error colour.
     el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
     // A denied `rm -rf` and a successful one used to be pixel-identical.
-    el.textContent = m.kind === 'tool'
-      ? `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`
-      : m.text;
+    if (m.kind === 'tool') {
+      el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
+    } else {
+      el.textContent = m.text;
+      if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
+      if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
+        const delivery = document.createElement('span');
+        delivery.className = `prompt-delivery ${m.delivery}`;
+        delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
+        el.append(' ', delivery);
+      }
+    }
     t.append(el);
   }
   if (nearBottom) t.scrollIntoView({ block: 'end' });
@@ -809,12 +861,12 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape' && menuFor) { menuFor = null; render(); }
 });
 
-$('#composer').onsubmit = (e) => {
+$('#composer').onsubmit = async (e) => {
   e.preventDefault();
   const text = $('#prompt').value.trim();
   if (!text) return;
-  $('#prompt').value = '';
-  fire({ cmd: 'send', id: openId, text });
+  const result = await runSessionCommand({ cmd: 'send', id: openId, text });
+  if (result.ok) $('#prompt').value = '';
 };
 
 // Uploads go straight to disk in the session's worktree and come back as a
@@ -1016,13 +1068,13 @@ $('#new').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
-  const { ok, data } = await send({
+  const result = await postCommand({
     cmd: 'create',
     repo: f.get('repo'), branch: f.get('branch'),
     account: f.get('account'), prompt: f.get('prompt'),
   });
-  if (!ok) {
-    $('#new-error').textContent = data.error;
+  if (!result.ok) {
+    $('#new-error').textContent = commandFailure(result);
     dialog.showModal();
   }
 });
