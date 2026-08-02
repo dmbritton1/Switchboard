@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   CODEX_FAILURE_LABEL, commandFailure, postCommand, retainedSessionError,
+  sessionCommandErrorForView,
 } from '../web/lib.js';
 
 test('every stable Codex failure has a user-facing label', () => {
@@ -34,4 +35,13 @@ test('network failures become visible command errors', async () => {
     async () => { throw new Error('connection closed'); },
   );
   assert.equal(commandFailure(result), 'Switchboard request failed: connection closed');
+});
+
+test('a session error stays visible in the grid and clears only for another session or dismissal', () => {
+  const error = { sessionId: 's1', message: 'stop refused' };
+  assert.deepEqual(sessionCommandErrorForView(error, null), error, 'grid render');
+  assert.deepEqual(sessionCommandErrorForView(error, null), error, 'SSE grid rerender');
+  assert.deepEqual(sessionCommandErrorForView(error, 's1'), error, 'affected session opens');
+  assert.equal(sessionCommandErrorForView(error, 's2'), null, 'different session opens');
+  assert.equal(sessionCommandErrorForView(null, 's1'), null, 'dismissal');
 });

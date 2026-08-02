@@ -120,3 +120,9 @@ export function retainedSessionError(sessionId, result) {
   const message = commandFailure(result);
   return message ? { sessionId, message } : null;
 }
+
+/** Keeps a session error visible in the grid and its own session only. */
+export function sessionCommandErrorForView(error, openId) {
+  if (!error || (openId && error.sessionId !== openId)) return null;
+  return error;
+}
