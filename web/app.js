@@ -1,8 +1,9 @@
 import {
   sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
-  transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
-  fetchToolDetail,
+  transcriptView, requestOnce, fetchToolDetail,
+  createDetailController, changeDetailSession, setDetailExpanded,
+  detailControllerView, storeToolDetail, storeToolDetailError, invalidateToolDetail,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -10,11 +11,7 @@ let openId = null;
 // Transcript rows are rebuilt for every SSE snapshot. These browser-local
 // collections restore the open live trace, cache only its current revision,
 // and keep repeated renders from creating duplicate requests.
-const expandedItems = new Set();
-const detailCache = new Map();
-const detailRequests = new Map();
-let detailSession = null;
-let detailGeneration = 0;
+const detailController = createDetailController();
 // Which header panel is open: null, 'queue', or an account name. Mutually
 // exclusive by construction — one variable, not one flag per panel.
 let panel = null;
@@ -36,13 +33,10 @@ const $ = (sel) => document.querySelector(sel);
 
 /** The one navigation boundary for opening, switching, and closing sessions. */
 function setOpenSession(id) {
-  if (detailSession !== id) {
-    expandedItems.clear();
-    detailCache.clear();
-    detailRequests.clear();
-    detailSession = id;
-    detailGeneration++;
-  }
+  // Closing and reopening the same session is still a real transition because
+  // Back first moves the controller through null. Resetting scrolledFor here
+  // restores the first-open jump to the latest transcript message.
+  if (changeDetailSession(detailController, id)) scrolledFor = null;
   openId = id;
 }
 
@@ -774,49 +768,29 @@ function sanitizedDetailError(error) {
 }
 
 function ensureToolDetail(sessionId, view) {
-  const key = detailKey(sessionId, view.id);
-  const cached = detailCache.get(key);
-  if (!expandedItems.has(key) || !needsDetailFetch(view, cached)) return;
-
-  const requestKey = JSON.stringify([key, view.detailRevision]);
-  const generation = detailGeneration;
-  return requestOnce(detailRequests, requestKey, async () => {
+  const { request } = detailControllerView(detailController, sessionId, view);
+  if (!request) return;
+  return requestOnce(detailController.detailRequests, request.requestKey, async () => {
     try {
       const detail = await fetchToolDetail(sessionId, view.id);
       const current = currentToolView(sessionId, view.id);
-      if (generation !== detailGeneration || detailSession !== sessionId
-        || !current || current.kind !== 'tool'
-        || current.detailRevision !== view.detailRevision
-        || detail.revision !== view.detailRevision) return;
-      detailCache.set(key, {
-        revision: detail.revision,
-        text: detail.text,
-        truncated: detail.truncated,
-      });
+      storeToolDetail(detailController, request, current, detail);
     } catch (error) {
       const current = currentToolView(sessionId, view.id);
-      if (generation !== detailGeneration || detailSession !== sessionId
-        || !current || current.kind !== 'tool'
-        || current.detailRevision !== view.detailRevision) return;
-      detailCache.set(key, {
-        revision: view.detailRevision,
-        text: null,
-        truncated: false,
-        error: sanitizedDetailError(error),
-      });
+      storeToolDetailError(
+        detailController,
+        request,
+        current,
+        sanitizedDetailError(error),
+      );
     } finally {
-      if (generation === detailGeneration && openId === sessionId) render();
+      if (request.generation === detailController.generation && openId === sessionId) render();
     }
   });
 }
 
 function paintToolDetail(details, pre, sessionId, view) {
-  const key = detailKey(sessionId, view.id);
-  const presentation = detailPresentation(
-    view,
-    expandedItems.has(key),
-    detailCache.get(key),
-  );
+  const { presentation } = detailControllerView(detailController, sessionId, view);
   details.open = presentation.open;
   pre.textContent = presentation.text;
   details.querySelector('.detail-retry')?.remove();
@@ -827,7 +801,7 @@ function paintToolDetail(details, pre, sessionId, view) {
   retry.className = 'detail-retry';
   retry.textContent = 'Retry';
   retry.onclick = () => {
-    detailCache.delete(key);
+    invalidateToolDetail(detailController, sessionId, view.id);
     paintToolDetail(details, pre, sessionId, view);
     ensureToolDetail(sessionId, view);
   };
@@ -838,10 +812,8 @@ function renderToolMessage(el, sessionId, view) {
   // Summary and detail are both model-controlled text. Only textContent is
   // used; the stable item ID stays inside the browser-local cache key.
   el.textContent = view.summary;
-  const key = detailKey(sessionId, view.id);
-  if (!view.detailAvailable || view.detailEvicted) detailCache.delete(key);
+  const projected = detailControllerView(detailController, sessionId, view);
   if (!view.detailAvailable && !view.detailEvicted) {
-    expandedItems.delete(key);
     return;
   }
 
@@ -853,16 +825,16 @@ function renderToolMessage(el, sessionId, view) {
   paintToolDetail(details, pre, sessionId, view);
   details.addEventListener('toggle', () => {
     if (details.open) {
-      expandedItems.add(key);
+      setDetailExpanded(detailController, sessionId, view.id, true);
       paintToolDetail(details, pre, sessionId, view);
       ensureToolDetail(sessionId, view);
     } else {
-      expandedItems.delete(key);
+      setDetailExpanded(detailController, sessionId, view.id, false);
     }
   });
   el.append(details);
 
-  if (expandedItems.has(key)) ensureToolDetail(sessionId, view);
+  if (projected.presentation.open) ensureToolDetail(sessionId, view);
 }
 
 // The named slot for the diff spec. /status returns only the totals today, so

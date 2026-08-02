@@ -3,7 +3,8 @@ import assert from 'node:assert';
 import {
   sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
   transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
-  fetchToolDetail,
+  fetchToolDetail, createDetailController, changeDetailSession, setDetailExpanded,
+  detailControllerView, storeToolDetail, storeToolDetailError, invalidateToolDetail,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -163,12 +164,13 @@ test('transcriptView projects a running tool with collapsible detail', () => {
 
 test('transcriptView labels terminal tools and preserves bounded-detail metadata', () => {
   assert.deepEqual(transcriptView({
-    kind: 'tool', id: 'ok', name: 'edit', summary: 'two files', status: 'ok',
+    kind: 'tool', id: 'ok', name: 'edit',
+    summary: '/Users/operator/project/src/a.ts, /private/tmp/project/src/b.ts', status: 'ok',
     detailAvailable: true, detailEvicted: false,
     detailRevision: 8, detailTruncated: true,
   }), {
     kind: 'tool', id: 'ok', className: 'msg tool ok',
-    summary: 'edit: two files · ok', detailAvailable: true, detailEvicted: false,
+    summary: 'edit: 2 files · ok', detailAvailable: true, detailEvicted: false,
     detailRevision: 8, truncated: true,
   });
   assert.equal(transcriptView({
@@ -176,6 +178,22 @@ test('transcriptView labels terminal tools and preserves bounded-detail metadata
     detailAvailable: false, detailEvicted: true,
     detailRevision: 9, detailTruncated: false,
   }).summary, 'shell: false · error');
+});
+
+test('transcriptView never exposes absolute file-change paths and preserves other tool summaries', () => {
+  const edit = transcriptView({
+    kind: 'tool', id: 'edit-1', name: 'edit',
+    summary: '/Users/operator/secret-one.ts, /opt/project/secret-two.ts', status: 'running',
+    detailAvailable: false, detailEvicted: false,
+    detailRevision: 0, detailTruncated: false,
+  });
+  assert.equal(edit.summary, 'edit: 2 files');
+  assert.doesNotMatch(edit.summary, /Users|operator|opt|secret/);
+  assert.equal(transcriptView({
+    kind: 'tool', id: 'shell-1', name: 'shell', summary: 'npm test', status: 'running',
+    detailAvailable: false, detailEvicted: false,
+    detailRevision: 0, detailTruncated: false,
+  }).summary, 'shell: npm test');
 });
 
 test('transcriptView distinguishes evicted, never-present, and legacy no-detail tools', () => {
@@ -305,6 +323,149 @@ test('requestOnce deduplicates a live request and removes it after settlement', 
   gate.resolve(undefined);
   assert.equal(await first, 'detail');
   assert.equal(requests.size, 0);
+});
+
+test('requestOnce does not let a stale settled request delete a newer request for the same key', async () => {
+  const requests = new Map();
+  const a = Promise.withResolvers();
+  const b = Promise.withResolvers();
+  const first = requestOnce(requests, 'same', () => a.promise);
+  requests.clear();
+  const second = requestOnce(requests, 'same', () => b.promise);
+
+  a.resolve('old');
+  assert.equal(await first, 'old');
+  assert.strictEqual(requests.get('same'), second);
+
+  b.resolve('new');
+  assert.equal(await second, 'new');
+  assert.equal(requests.size, 0);
+});
+
+const richTool = (revision = 4, over = {}) => transcriptView({
+  kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'npm test', status: 'running',
+  detailAvailable: true, detailEvicted: false,
+  detailRevision: revision, detailTruncated: false, ...over,
+});
+
+test('detail controller clears session-local state on session switches and Back', () => {
+  const controller = createDetailController();
+  assert.equal(changeDetailSession(controller, 's1'), true);
+  setDetailExpanded(controller, 's1', 'cmd-1', true);
+  controller.detailCache.set(detailKey('s1', 'cmd-1'), {
+    revision: 4, text: 'output', truncated: false,
+  });
+  controller.detailRequests.set('live', Promise.resolve());
+
+  assert.equal(changeDetailSession(controller, 's2'), true);
+  assert.equal(controller.detailSession, 's2');
+  assert.equal(controller.expandedItems.size, 0);
+  assert.equal(controller.detailCache.size, 0);
+  assert.equal(controller.detailRequests.size, 0);
+
+  setDetailExpanded(controller, 's2', 'cmd-1', true);
+  assert.equal(changeDetailSession(controller, null), true, 'Back closes the session');
+  assert.equal(controller.detailSession, null);
+  assert.equal(controller.expandedItems.size, 0);
+  assert.equal(changeDetailSession(controller, null), false, 'repeated Back is not a switch');
+});
+
+test('detail controller preserves expanded cached content across rebuild projections', () => {
+  const controller = createDetailController();
+  changeDetailSession(controller, 's1');
+  setDetailExpanded(controller, 's1', 'cmd-1', true);
+  controller.detailCache.set(detailKey('s1', 'cmd-1'), {
+    revision: 4, text: 'working output', truncated: false,
+  });
+
+  const first = detailControllerView(controller, 's1', richTool());
+  const rebuilt = detailControllerView(controller, 's1', richTool());
+  assert.deepEqual(first.presentation, {
+    open: true, mode: 'content', text: 'working output', fetch: false,
+  });
+  assert.deepEqual(rebuilt.presentation, first.presentation);
+  assert.equal(rebuilt.request, null);
+});
+
+test('detail controller refreshes changed revisions with one deduplicated request key', async () => {
+  const controller = createDetailController();
+  changeDetailSession(controller, 's1');
+  setDetailExpanded(controller, 's1', 'cmd-1', true);
+  controller.detailCache.set(detailKey('s1', 'cmd-1'), {
+    revision: 4, text: 'old', truncated: false,
+  });
+
+  const firstView = detailControllerView(controller, 's1', richTool(5));
+  const rebuiltView = detailControllerView(controller, 's1', richTool(5));
+  assert.equal(firstView.presentation.mode, 'loading');
+  assert.deepEqual(rebuiltView.request, firstView.request);
+
+  let calls = 0;
+  const gate = Promise.withResolvers();
+  const first = requestOnce(controller.detailRequests, firstView.request.requestKey, async () => {
+    calls++;
+    return gate.promise;
+  });
+  const duplicate = requestOnce(
+    controller.detailRequests,
+    rebuiltView.request.requestKey,
+    async () => 'duplicate',
+  );
+  assert.strictEqual(first, duplicate);
+  assert.equal(calls, 1);
+  gate.resolve('fresh');
+  assert.equal(await first, 'fresh');
+});
+
+test('detail controller rejects stale revisions and responses from an earlier session generation', () => {
+  const controller = createDetailController();
+  changeDetailSession(controller, 's1');
+  setDetailExpanded(controller, 's1', 'cmd-1', true);
+  const request = detailControllerView(controller, 's1', richTool(4)).request;
+  const detail = { text: 'stale', truncated: false, evicted: false, revision: 4 };
+
+  assert.equal(storeToolDetail(controller, request, richTool(5), detail), false);
+  assert.equal(controller.detailCache.size, 0);
+
+  changeDetailSession(controller, 's2');
+  assert.equal(storeToolDetail(controller, request, richTool(4), detail), false);
+  assert.equal(controller.detailCache.size, 0);
+});
+
+test('detail controller clears cache on eviction and clears expansion when detail is unavailable', () => {
+  const controller = createDetailController();
+  changeDetailSession(controller, 's1');
+  const key = setDetailExpanded(controller, 's1', 'cmd-1', true);
+  controller.detailCache.set(key, { revision: 4, text: 'old', truncated: false });
+
+  const evicted = detailControllerView(controller, 's1', richTool(5, {
+    detailAvailable: false, detailEvicted: true,
+  }));
+  assert.equal(controller.detailCache.has(key), false);
+  assert.equal(controller.expandedItems.has(key), true);
+  assert.equal(evicted.presentation.mode, 'evicted');
+
+  controller.detailCache.set(key, { revision: 5, text: 'impossible', truncated: false });
+  const unavailable = detailControllerView(controller, 's1', richTool(5, {
+    detailAvailable: false, detailEvicted: false,
+  }));
+  assert.equal(controller.detailCache.has(key), false);
+  assert.equal(controller.expandedItems.has(key), false);
+  assert.equal(unavailable.presentation.mode, 'hidden');
+});
+
+test('detail controller Retry invalidates a cached error and makes the expanded item fetchable', () => {
+  const controller = createDetailController();
+  changeDetailSession(controller, 's1');
+  setDetailExpanded(controller, 's1', 'cmd-1', true);
+  const request = detailControllerView(controller, 's1', richTool()).request;
+  assert.equal(storeToolDetailError(controller, request, richTool(), 'Detail request failed.'), true);
+  assert.equal(detailControllerView(controller, 's1', richTool()).presentation.mode, 'error');
+
+  invalidateToolDetail(controller, 's1', 'cmd-1');
+  const retry = detailControllerView(controller, 's1', richTool());
+  assert.equal(retry.presentation.mode, 'loading');
+  assert.ok(retry.request);
 });
 
 test('fetchToolDetail encodes Registry keys and returns the JSON detail body', async () => {

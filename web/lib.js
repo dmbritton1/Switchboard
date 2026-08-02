@@ -146,11 +146,16 @@ export function commandErrorText(error, sessions, openId) {
 export function transcriptView(message) {
   if (message.kind === 'tool') {
     const suffix = message.status === 'running' ? '' : ` · ${message.status}`;
+    const rawSummary = String(message.summary ?? '');
+    const editCount = rawSummary ? rawSummary.split(',').length : 0;
+    const summary = message.name.toLowerCase() === 'edit'
+      ? `${editCount} file${editCount === 1 ? '' : 's'}`
+      : rawSummary;
     return {
       kind: 'tool',
       id: message.id ?? '',
       className: `msg tool ${message.status}`,
-      summary: `${message.name}: ${message.summary}${suffix}`,
+      summary: `${message.name}: ${summary}${suffix}`,
       detailAvailable: message.detailAvailable ?? false,
       detailEvicted: message.detailEvicted ?? false,
       detailRevision: message.detailRevision ?? 0,
@@ -179,7 +184,10 @@ export function detailKey(sessionId, itemId) {
 export function requestOnce(requests, key, load) {
   const current = requests.get(key);
   if (current) return current;
-  const request = load().finally(() => requests.delete(key));
+  let request;
+  request = load().finally(() => {
+    if (requests.get(key) === request) requests.delete(key);
+  });
   requests.set(key, request);
   return request;
 }
@@ -213,6 +221,103 @@ export function detailPresentation(view, expanded, cached) {
     return { open: true, mode: 'error', text: cached.error, fetch: false };
   }
   return { open: true, mode: 'content', text: cached.text ?? '', fetch: false };
+}
+
+/** Browser-local state for lazy transcript detail, kept DOM-free for testing. */
+export function createDetailController() {
+  return {
+    expandedItems: new Set(),
+    detailCache: new Map(),
+    detailRequests: new Map(),
+    detailSession: null,
+    generation: 0,
+  };
+}
+
+/** Reset every session-scoped collection on a real open, switch, or Back. */
+export function changeDetailSession(controller, sessionId) {
+  if (controller.detailSession === sessionId) return false;
+  controller.expandedItems.clear();
+  controller.detailCache.clear();
+  controller.detailRequests.clear();
+  controller.detailSession = sessionId;
+  controller.generation++;
+  return true;
+}
+
+export function setDetailExpanded(controller, sessionId, itemId, expanded) {
+  const key = detailKey(sessionId, itemId);
+  if (expanded) controller.expandedItems.add(key);
+  else controller.expandedItems.delete(key);
+  return key;
+}
+
+/**
+ * Reconcile one SSE tool projection with browser-local state, then delegate
+ * every visible branch to detailPresentation().
+ */
+export function detailControllerView(controller, sessionId, view) {
+  const key = detailKey(sessionId, view.id);
+  if (!view.detailAvailable || view.detailEvicted) controller.detailCache.delete(key);
+  if (!view.detailAvailable && !view.detailEvicted) controller.expandedItems.delete(key);
+  const presentation = detailPresentation(
+    view,
+    controller.expandedItems.has(key),
+    controller.detailCache.get(key),
+  );
+  return {
+    key,
+    presentation,
+    request: presentation.fetch && controller.detailSession === sessionId
+      ? {
+          key,
+          requestKey: JSON.stringify([key, view.detailRevision]),
+          sessionId,
+          itemId: view.id,
+          revision: view.detailRevision,
+          generation: controller.generation,
+        }
+      : null,
+  };
+}
+
+function detailRequestIsCurrent(controller, request, currentView) {
+  return Boolean(request
+    && controller.generation === request.generation
+    && controller.detailSession === request.sessionId
+    && currentView?.kind === 'tool'
+    && currentView.id === request.itemId
+    && currentView.detailAvailable
+    && !currentView.detailEvicted
+    && currentView.detailRevision === request.revision);
+}
+
+export function storeToolDetail(controller, request, currentView, detail) {
+  if (!detailRequestIsCurrent(controller, request, currentView)
+    || detail.revision !== request.revision) return false;
+  controller.detailCache.set(request.key, {
+    revision: detail.revision,
+    text: detail.text,
+    truncated: detail.truncated,
+  });
+  return true;
+}
+
+export function storeToolDetailError(controller, request, currentView, error) {
+  if (!detailRequestIsCurrent(controller, request, currentView)) return false;
+  controller.detailCache.set(request.key, {
+    revision: request.revision,
+    text: null,
+    truncated: false,
+    error,
+  });
+  return true;
+}
+
+export function invalidateToolDetail(controller, sessionId, itemId) {
+  const key = detailKey(sessionId, itemId);
+  controller.detailCache.delete(key);
+  return key;
 }
 
 export async function fetchToolDetail(sessionId, itemId, fetchImpl = fetch) {
