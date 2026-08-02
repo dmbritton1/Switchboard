@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
-import { Registry } from '../src/sessions.ts';
+import { Registry, type RegistryOptions } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { createServer } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
@@ -41,9 +41,9 @@ const accounts = [
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
 
-async function boot(t: { after: (fn: () => void) => void }) {
+async function boot(t: { after: (fn: () => void) => void }, registryOptions?: RegistryOptions) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
-  const registry = new Registry(join(dir, 'state.json'));
+  const registry = new Registry(join(dir, 'state.json'), undefined, registryOptions);
   const usage = new Usage();
   const server = createServer({ registry, usage, accounts });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -448,6 +448,124 @@ test('GET /events opens an SSE stream with an immediate snapshot', async (t) => 
   assert.equal(payload.sessions[0].title, 'a title');
   assert.equal(payload.accounts[0].name, 'claude-main');
   await reader.cancel();
+});
+
+test('SSE projects tool metadata while GET /detail lazily returns the body', async (t) => {
+  const { base, registry } = await boot(t);
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'detail',
+  });
+  registry.apply(session.id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'command', status: 'ok',
+    detail: 'DETAIL_SENTINEL', detailTruncated: false,
+  } });
+
+  const events = await fetch(`${base}/events`);
+  const reader = events.body!.getReader();
+  try {
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    assert.doesNotMatch(chunk, /DETAIL_SENTINEL/);
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.deepEqual(payload.sessions[0].transcript[0], {
+      kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'command', status: 'ok',
+      detailAvailable: true, detailTruncated: false, detailEvicted: false, detailRevision: 1,
+    });
+  } finally {
+    await reader.cancel();
+  }
+
+  const response = await fetch(
+    `${base}/detail?session=${encodeURIComponent(session.id)}&item=${encodeURIComponent('cmd-1')}`,
+  );
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await response.json(), {
+    text: 'DETAIL_SENTINEL', truncated: false, evicted: false, revision: 1,
+  });
+});
+
+test('GET /detail returns 404 for unknown session, item, and non-tool ids', async (t) => {
+  const { base, registry } = await boot(t);
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'detail',
+  });
+  registry.apply(session.id, {
+    type: 'upsert-msg', msg: { kind: 'reasoning', id: 'reasoning-1', text: 'summary' },
+  });
+
+  for (const query of [
+    `session=missing&item=reasoning-1`,
+    `session=${encodeURIComponent(session.id)}&item=missing`,
+    `session=${encodeURIComponent(session.id)}&item=reasoning-1`,
+  ]) {
+    const response = await fetch(`${base}/detail?${query}`);
+    assert.equal(response.status, 404, query);
+  }
+});
+
+test('GET /detail returns metadata for evicted and never-populated tool bodies', async (t) => {
+  const { base, registry } = await boot(t, { maxTotalDetailBytes: 5 });
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'detail',
+  });
+  registry.apply(session.id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'evicted', name: 'shell', summary: 'large', status: 'ok', detail: '123456',
+  } });
+  registry.apply(session.id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'empty', name: 'shell', summary: 'running', status: 'running',
+  } });
+
+  const evicted = await fetch(
+    `${base}/detail?session=${encodeURIComponent(session.id)}&item=evicted`,
+  );
+  assert.equal(evicted.status, 200);
+  assert.deepEqual(await evicted.json(), {
+    text: null, truncated: false, evicted: true, revision: 2,
+  });
+
+  const empty = await fetch(
+    `${base}/detail?session=${encodeURIComponent(session.id)}&item=empty`,
+  );
+  assert.equal(empty.status, 200);
+  assert.deepEqual(await empty.json(), {
+    text: null, truncated: false, evicted: false, revision: 0,
+  });
+});
+
+test('GET /detail ignores a client path and resolves only Registry keys', async (t) => {
+  const { base, registry } = await boot(t);
+  const dir = await mkdtemp(join(tmpdir(), 'sb-client-detail-path-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const clientPath = join(dir, 'secret.txt');
+  await writeFile(clientPath, 'PATH_SENTINEL');
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'detail',
+  });
+  registry.apply(session.id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'empty', name: 'shell', summary: 'running', status: 'running',
+  } });
+
+  const response = await fetch(
+    `${base}/detail?session=${encodeURIComponent(session.id)}&item=empty&path=${encodeURIComponent(clientPath)}`,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.doesNotMatch(body, /PATH_SENTINEL/);
+  assert.deepEqual(JSON.parse(body), {
+    text: null, truncated: false, evicted: false, revision: 0,
+  });
+});
+
+test('GET /detail with a foreign Host is rejected', async (t) => {
+  const { base } = await boot(t);
+  const response = await rawRequest(new URL(`${base}/detail`), {
+    method: 'GET', headers: { host: 'evil.example:9999' },
+  });
+  assert.equal(response.status, 403);
 });
 
 test('POST /command with an unknown cmd is a 400', async (t) => {

@@ -171,7 +171,7 @@ export function createServer(opts: {
 
   function snapshot() {
     return {
-      sessions: registry.all(),
+      sessions: registry.publicSessions(),
       accounts: accounts.map((a) => ({
         name: a.name,
         provider: a.provider,
@@ -457,6 +457,26 @@ export function createServer(opts: {
       if (url.pathname === '/repos') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(await recentRepos()));
+        return;
+      }
+
+      if (url.pathname === '/detail' && req.method === 'GET') {
+        const sessionId = url.searchParams.get('session') ?? '';
+        const itemId = url.searchParams.get('item') ?? '';
+        const detail = registry.getToolDetail(sessionId, itemId);
+        if (!detail) {
+          res.writeHead(404, {
+            'content-type': 'application/json',
+            'cache-control': 'no-store',
+          });
+          res.end('{}');
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
+        });
+        res.end(JSON.stringify(detail));
         return;
       }
 

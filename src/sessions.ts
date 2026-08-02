@@ -1,9 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
-import type { AdapterEvent, CodexFailureCode, PromptDelivery, Session } from './types.ts';
+import { MAX_CODEX_DETAIL_TOTAL_BYTES } from './agents/codex-detail.ts';
+import type {
+  AdapterEvent, CodexFailureCode, PromptDelivery, PublicMsg, PublicSession, Session, ToolMsg, UpsertMsg,
+} from './types.ts';
 import type { Usage } from './usage.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
+
+export type ToolDetailRead = {
+  text: string | null;
+  truncated: boolean;
+  evicted: boolean;
+  revision: number;
+};
+
+export type RegistryOptions = { maxTotalDetailBytes?: number };
 
 function unsentMessage(count: number): string {
   const noun = count === 1 ? 'prompt was' : 'prompts were';
@@ -18,13 +30,16 @@ export class Registry {
   // The Registry owns the one save/load path, so persisting usage means handing
   // the Usage instance to it rather than inventing a second state file.
   #usage: Usage | undefined;
+  #maxTotalDetailBytes: number;
+  #nextDetailRevision = 1;
   // Chains every save() behind the previous one so concurrent callers never
   // run writeFile/rename on the same temp path at once. See save() below.
   #saveChain: Promise<void> = Promise.resolve();
 
-  constructor(path: string, usage?: Usage) {
+  constructor(path: string, usage?: Usage, options: RegistryOptions = {}) {
     this.#path = path;
     this.#usage = usage;
+    this.#maxTotalDetailBytes = options.maxTotalDetailBytes ?? MAX_CODEX_DETAIL_TOTAL_BYTES;
   }
 
   create(init: Init): Session {
@@ -53,6 +68,49 @@ export class Registry {
 
   all(): Session[] {
     return [...this.#sessions.values()];
+  }
+
+  publicSessions(): PublicSession[] {
+    return this.all().map((session) => ({
+      ...session,
+      pending: session.pending ? { ...session.pending } : null,
+      transcript: session.transcript.map((message): PublicMsg => {
+        if (message.kind !== 'tool') {
+          if (message.kind === 'todo') {
+            return { ...message, items: message.items.map((item) => ({ ...item })) };
+          }
+          return { ...message };
+        }
+        const {
+          detail: _detail,
+          detailTruncated,
+          detailEvicted,
+          detailRevision,
+          ...summary
+        } = message;
+        return {
+          ...summary,
+          detailAvailable: message.detail !== undefined,
+          detailTruncated: detailTruncated ?? false,
+          detailEvicted: detailEvicted ?? false,
+          detailRevision: detailRevision ?? 0,
+        };
+      }),
+    }));
+  }
+
+  getToolDetail(sessionId: string, itemId: string): ToolDetailRead | null {
+    const session = this.#sessions.get(sessionId);
+    const message = session?.transcript.find(
+      (candidate): candidate is ToolMsg => candidate.kind === 'tool' && candidate.id === itemId,
+    );
+    if (!message) return null;
+    return {
+      text: message.detail ?? null,
+      truncated: message.detailTruncated ?? false,
+      evicted: message.detailEvicted ?? false,
+      revision: message.detailRevision ?? 0,
+    };
   }
 
   remove(id: string): void {
@@ -91,6 +149,16 @@ export class Registry {
       case 'msg':
         s.transcript.push(e.msg);
         break;
+      case 'upsert-msg': {
+        const msg = this.#prepareUpsert(e.msg);
+        const index = s.transcript.findIndex(
+          (candidate) => candidate.kind === msg.kind && 'id' in candidate && candidate.id === msg.id,
+        );
+        if (index === -1) s.transcript.push(msg);
+        else s.transcript[index] = msg;
+        this.#enforceDetailBudget();
+        break;
+      }
       case 'approval':
         s.pending = e.request;
         this.#setStatus(s, 'needs-you');
@@ -122,6 +190,74 @@ export class Registry {
         break; // handled by the caller, which owns the Usage instance
     }
     this.#notify();
+  }
+
+  #prepareUpsert(msg: UpsertMsg): UpsertMsg {
+    if (msg.kind !== 'tool') {
+      return msg.kind === 'todo'
+        ? { ...msg, items: msg.items.map((item) => ({ ...item })) }
+        : { ...msg };
+    }
+
+    const {
+      detailRevision: _revision,
+      detailEvicted: _evicted,
+      ...next
+    } = msg;
+    if (next.detail === undefined) return next;
+    return {
+      ...next,
+      detailEvicted: false,
+      detailRevision: this.#nextDetailRevision++,
+    };
+  }
+
+  #enforceDetailBudget(): void {
+    let totalBytes = 0;
+    const details: ToolMsg[] = [];
+    for (const session of this.#sessions.values()) {
+      for (const message of session.transcript) {
+        if (message.kind !== 'tool' || message.detail === undefined) continue;
+        totalBytes += Buffer.byteLength(message.detail, 'utf8');
+        details.push(message);
+      }
+    }
+
+    while (totalBytes > this.#maxTotalDetailBytes && details.length > 0) {
+      let oldestIndex = 0;
+      for (let index = 1; index < details.length; index++) {
+        if ((details[index].detailRevision ?? 0) < (details[oldestIndex].detailRevision ?? 0)) {
+          oldestIndex = index;
+        }
+      }
+      const [oldest] = details.splice(oldestIndex, 1);
+      totalBytes -= Buffer.byteLength(oldest.detail!, 'utf8');
+      delete oldest.detail;
+      oldest.detailEvicted = true;
+      oldest.detailRevision = this.#nextDetailRevision++;
+    }
+  }
+
+  #seedDetailRevisions(): void {
+    let greatestRevision = 0;
+    for (const session of this.#sessions.values()) {
+      for (const message of session.transcript) {
+        if (message.kind !== 'tool') continue;
+        if (typeof message.detailRevision === 'number' && Number.isFinite(message.detailRevision)) {
+          greatestRevision = Math.max(greatestRevision, message.detailRevision);
+        }
+      }
+    }
+
+    this.#nextDetailRevision = greatestRevision + 1;
+    for (const session of this.#sessions.values()) {
+      for (const message of session.transcript) {
+        if (message.kind !== 'tool') continue;
+        if (message.detail === undefined && !message.detailEvicted) continue;
+        if (message.detailRevision === undefined) message.detailRevision = this.#nextDetailRevision++;
+        if (message.detail !== undefined && message.detailEvicted === undefined) message.detailEvicted = false;
+      }
+    }
   }
 
   #setStatus(s: Session, status: Session['status']): void {
@@ -207,8 +343,8 @@ export class Registry {
     await rename(tmpPath, this.#path);
   }
 
-  static async load(path: string, usage?: Usage): Promise<Registry> {
-    const reg = new Registry(path, usage);
+  static async load(path: string, usage?: Usage, options: RegistryOptions = {}): Promise<Registry> {
+    const reg = new Registry(path, usage, options);
     try {
       const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
       // state.json used to be a bare array of sessions; it is now
@@ -253,6 +389,8 @@ export class Registry {
           auto: s.auto ?? false,
         });
       }
+      reg.#seedDetailRevisions();
+      reg.#enforceDetailBudget();
     } catch {
       return reg;
     }

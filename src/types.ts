@@ -15,14 +15,49 @@ export type CodexFailureCode =
 
 export type PromptDelivery = 'queued' | 'sent' | 'unsent';
 
+export type ToolMsg = {
+  kind: 'tool';
+  id?: string;
+  name: string;
+  summary: string;
+  status: 'running' | 'ok' | 'error';
+  detail?: string;
+  detailTruncated?: boolean;
+  detailEvicted?: boolean;
+  detailRevision?: number;
+};
+
+export type ReasoningMsg = { kind: 'reasoning'; id: string; text: string };
+export type TodoMsg = {
+  kind: 'todo';
+  id: string;
+  items: { text: string; completed: boolean }[];
+};
+
 export type Msg =
   | { kind: 'user'; id: string; text: string; delivery: PromptDelivery }
   | { kind: 'text'; text: string }
-  // id is optional: it correlates a tool call to its later result so the registry
-  // can flip status running -> ok/error. The Codex adapter (Task 5) emits tool
-  // messages already resolved and has no equivalent id.
-  | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error'; id?: string }
+  | ToolMsg
+  | ReasoningMsg
+  | TodoMsg
   | { kind: 'error'; text: string };
+
+export type UpsertMsg =
+  | (ToolMsg & { id: string })
+  | ReasoningMsg
+  | TodoMsg;
+
+export type PublicToolMsg = Omit<
+  ToolMsg,
+  'detail' | 'detailTruncated' | 'detailEvicted' | 'detailRevision'
+> & {
+  detailAvailable: boolean;
+  detailTruncated: boolean;
+  detailEvicted: boolean;
+  detailRevision: number;
+};
+
+export type PublicMsg = Exclude<Msg, ToolMsg> | PublicToolMsg;
 
 export type ApprovalRequest = { id: string; tool: string; summary: string };
 
@@ -47,9 +82,14 @@ export type Session = {
   statusSince: number;
 };
 
+export type PublicSession = Omit<Session, 'transcript'> & {
+  transcript: PublicMsg[];
+};
+
 export type AdapterEvent =
   | { type: 'status'; status: Status }
-  | { type: 'msg'; msg: Msg }
+  | { type: 'msg'; msg: Exclude<Msg, ReasoningMsg | TodoMsg> }
+  | { type: 'upsert-msg'; msg: UpsertMsg }
   | { type: 'approval'; request: ApprovalRequest }
   | { type: 'approval-resolved' }
   | { type: 'usage'; inputTokens: number; outputTokens: number }

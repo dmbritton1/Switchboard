@@ -3,16 +3,29 @@ import assert from 'node:assert';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Registry } from '../src/sessions.ts';
+import { Registry, type RegistryOptions } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 
-function make(): { reg: Registry; id: string } {
-  const reg = new Registry('/dev/null');
+function make(options?: RegistryOptions): { reg: Registry; id: string } {
+  const reg = new Registry('/dev/null', undefined, options);
   const s = reg.create({
     provider: 'claude', account: 'main', repo: '/r',
     cwd: '/r/.claude/worktrees/x', branch: 'x', title: 'x',
   });
   return { reg, id: s.id };
+}
+
+function makeTwo(options?: RegistryOptions): { reg: Registry; first: string; second: string } {
+  const reg = new Registry('/dev/null', undefined, options);
+  const first = reg.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/first', branch: 'first', title: 'first',
+  }).id;
+  const second = reg.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/second', branch: 'second', title: 'second',
+  }).id;
+  return { reg, first, second };
 }
 
 async function writePromptMigrationState(
@@ -369,4 +382,188 @@ test('a state.json of the right syntax but the wrong shape loads as empty', asyn
     const reg = await Registry.load(path, new Usage());
     assert.deepEqual(reg.all(), [], `${content} should load as empty`);
   }
+});
+
+test('upsert-msg keeps one lifecycle row per kind and id', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'item-1', name: 'shell', summary: 'npm test', status: 'running',
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'item-1', name: 'shell', summary: 'npm test', status: 'ok',
+    detail: '84 tests passed', detailTruncated: false,
+  } });
+
+  assert.deepEqual(reg.get(id)!.transcript, [{
+    kind: 'tool', id: 'item-1', name: 'shell', summary: 'npm test', status: 'ok',
+    detail: '84 tests passed', detailTruncated: false,
+    detailEvicted: false, detailRevision: 1,
+  }]);
+});
+
+test('upsert identity requires both kind and id while preserving row order', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'shared', name: 'shell', summary: 'first', status: 'running',
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'todo', id: 'shared', items: [{ text: 'one', completed: false }],
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'other', name: 'shell', summary: 'other', status: 'ok',
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'shared', name: 'shell', summary: 'finished', status: 'ok',
+  } });
+
+  assert.deepEqual(reg.get(id)!.transcript, [
+    { kind: 'tool', id: 'shared', name: 'shell', summary: 'finished', status: 'ok' },
+    { kind: 'todo', id: 'shared', items: [{ text: 'one', completed: false }] },
+    { kind: 'tool', id: 'other', name: 'shell', summary: 'other', status: 'ok' },
+  ]);
+});
+
+test('upsert replaces reasoning and todo bodies rather than appending or merging', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'upsert-msg', msg: { kind: 'reasoning', id: 'r1', text: 'draft' } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'todo', id: 't1', items: [{ text: 'first', completed: false }],
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: { kind: 'reasoning', id: 'r1', text: 'final' } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'todo', id: 't1', items: [{ text: 'replacement', completed: true }],
+  } });
+
+  assert.deepEqual(reg.get(id)!.transcript, [
+    { kind: 'reasoning', id: 'r1', text: 'final' },
+    { kind: 'todo', id: 't1', items: [{ text: 'replacement', completed: true }] },
+  ]);
+});
+
+test('legacy msg events remain append-only', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'msg', msg: { kind: 'text', text: 'same' } });
+  reg.apply(id, { type: 'msg', msg: { kind: 'text', text: 'same' } });
+  assert.deepEqual(reg.get(id)!.transcript, [
+    { kind: 'text', text: 'same' },
+    { kind: 'text', text: 'same' },
+  ]);
+});
+
+test('detail budget evicts the least-recently-updated whole body across sessions', () => {
+  const { reg, first, second } = makeTwo({ maxTotalDetailBytes: 10 });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'old', name: 'shell', summary: 'old', status: 'ok',
+    detail: 'aaaaaa', detailTruncated: false,
+  } });
+  reg.apply(second, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'new', name: 'shell', summary: 'new', status: 'ok',
+    detail: 'bbbbbb', detailTruncated: false,
+  } });
+
+  assert.deepEqual(reg.getToolDetail(first, 'old'), {
+    text: null, truncated: false, evicted: true, revision: 3,
+  });
+  assert.deepEqual(reg.getToolDetail(second, 'new'), {
+    text: 'bbbbbb', truncated: false, evicted: false, revision: 2,
+  });
+  assert.deepEqual(reg.get(first)!.transcript[0], {
+    kind: 'tool', id: 'old', name: 'shell', summary: 'old', status: 'ok',
+    detailTruncated: false, detailEvicted: true, detailRevision: 3,
+  }, 'eviction removes the whole body without losing its summary or status');
+});
+
+test('upserting an older detail touches it so the other body is evicted', () => {
+  const { reg, first, second } = makeTwo({ maxTotalDetailBytes: 12 });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'first', name: 'shell', summary: 'first', status: 'ok', detail: 'aaaaaa',
+  } });
+  reg.apply(second, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'second', name: 'shell', summary: 'second', status: 'ok', detail: 'bbbbbb',
+  } });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'first', name: 'shell', summary: 'touched', status: 'ok', detail: 'aaaaaa',
+  } });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'third', name: 'shell', summary: 'third', status: 'ok', detail: 'cccccc',
+  } });
+
+  assert.equal(reg.getToolDetail(first, 'first')!.text, 'aaaaaa');
+  assert.deepEqual(reg.getToolDetail(second, 'second'), {
+    text: null, truncated: false, evicted: true, revision: 5,
+  });
+  assert.equal(reg.getToolDetail(first, 'third')!.text, 'cccccc');
+});
+
+test('detail budget counts UTF-8 bytes instead of characters', () => {
+  const { reg, first, second } = makeTwo({ maxTotalDetailBytes: 5 });
+  reg.apply(first, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'emoji', name: 'shell', summary: 'emoji', status: 'ok', detail: '🙂',
+  } });
+  reg.apply(second, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'ascii', name: 'shell', summary: 'ascii', status: 'ok', detail: 'aa',
+  } });
+
+  assert.equal(reg.getToolDetail(first, 'emoji')!.text, null);
+  assert.equal(reg.getToolDetail(first, 'emoji')!.evicted, true);
+  assert.equal(reg.getToolDetail(second, 'ascii')!.text, 'aa');
+});
+
+test('load seeds legacy detail revisions and enforces the global budget', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-detail-migration-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const base = {
+    provider: 'codex', account: 'codex', vendorSessionId: null, repo: '/r',
+    branch: 'b', title: 'legacy', status: 'working', pending: null,
+    stoppedReason: null, startedAt: 1, statusSince: 1,
+  };
+  await writeFile(path, JSON.stringify({ sessions: [
+    { ...base, id: 'first', cwd: '/r/first', transcript: [{
+      kind: 'tool', id: 'old', name: 'shell', summary: 'old', status: 'ok', detail: 'aaaaaa',
+    }] },
+    { ...base, id: 'second', cwd: '/r/second', transcript: [{
+      kind: 'tool', id: 'new', name: 'shell', summary: 'new', status: 'ok', detail: 'bbbbbb',
+    }] },
+  ] }));
+
+  const reg = await Registry.load(path, undefined, { maxTotalDetailBytes: 10 });
+  assert.deepEqual(reg.getToolDetail('first', 'old'), {
+    text: null, truncated: false, evicted: true, revision: 3,
+  });
+  assert.deepEqual(reg.getToolDetail('second', 'new'), {
+    text: 'bbbbbb', truncated: false, evicted: false, revision: 2,
+  });
+});
+
+test('publicSessions exposes detail metadata without bodies or mutating storage', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'with', name: 'shell', summary: 'with', status: 'ok',
+    detail: 'private body', detailTruncated: true,
+  } });
+  reg.apply(id, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'without', name: 'shell', summary: 'without', status: 'running',
+  } });
+
+  const publicSession = reg.publicSessions()[0];
+  assert.deepEqual(publicSession.transcript, [
+    {
+      kind: 'tool', id: 'with', name: 'shell', summary: 'with', status: 'ok',
+      detailAvailable: true, detailTruncated: true, detailEvicted: false, detailRevision: 1,
+    },
+    {
+      kind: 'tool', id: 'without', name: 'shell', summary: 'without', status: 'running',
+      detailAvailable: false, detailTruncated: false, detailEvicted: false, detailRevision: 0,
+    },
+  ]);
+  assert.equal(JSON.stringify(publicSession).includes('private body'), false);
+  assert.equal(reg.getToolDetail(id, 'with')!.text, 'private body', 'projection must not mutate Registry state');
+});
+
+test('getToolDetail only resolves tool entries with the matching id', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'upsert-msg', msg: { kind: 'reasoning', id: 'shared', text: 'summary' } });
+  assert.equal(reg.getToolDetail(id, 'shared'), null);
+  assert.equal(reg.getToolDetail('missing-session', 'shared'), null);
 });
