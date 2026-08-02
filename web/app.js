@@ -1,6 +1,9 @@
 const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
 let state = { sessions: [], accounts: [] };
 let openId = null;
+// Which header panel is open: null, 'queue', or an account name. Mutually
+// exclusive by construction — one variable, not one flag per panel.
+let panel = null;
 let seenNeedsYou = new Set();
 // Session whose chat view has already been auto-scrolled once; see renderChat().
 let scrolledFor = null;
@@ -23,10 +26,13 @@ async function send(body) {
 // EventSource reconnects on its own, so there is no backoff code to write.
 const es = new EventSource('/events');
 es.onmessage = (e) => {
+  $('#conn').hidden = true;
   state = JSON.parse(e.data);
   notify();
   render();
 };
+// EventSource reconnects on its own; this only makes the gap visible.
+es.onerror = () => { $('#conn').hidden = false; };
 
 function notify() {
   const needs = state.sessions.filter((s) => s.status === 'needs-you');
@@ -52,7 +58,69 @@ function elapsed(since) {
 let graphId = null;
 let graphCommits = [];
 
+function setPanel(next) {
+  panel = panel === next ? null : next;
+  render();
+}
+
+function accountMeter(a) {
+  const pct = Math.round(a.pace * 100);
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = `meter${panel === a.name ? ' open' : ''}`;
+  b.title = `${a.name} — ~${pct}% of its 5h budget (estimate)`;
+
+  const name = document.createElement('span');
+  name.textContent = a.name;
+
+  const bar = document.createElement('span');
+  bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
+  const fill = document.createElement('i');
+  fill.style.width = `${Math.min(pct, 100)}%`;
+  bar.append(fill);
+
+  const num = document.createElement('span');
+  num.textContent = `${pct}%`;
+
+  b.append(name, bar, num);
+  b.onclick = () => setPanel(a.name);
+  return b;
+}
+
+function accountPanel(a) {
+  const box = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = a.name;
+  const line = document.createElement('p');
+  line.className = 'meta';
+  line.textContent =
+    `${a.provider} · ~${Math.round(a.pace * 100)}% of a ${a.budget.toLocaleString()} token budget · estimate`;
+  const note = document.createElement('p');
+  note.className = 'meta';
+  note.textContent = 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.';
+  box.append(h, line, note);
+  return box;
+}
+
+/** The open panel's contents, or null. Task 3 adds the 'queue' branch. */
+function panelBody() {
+  if (!panel) return null;
+  const account = state.accounts.find((a) => a.name === panel);
+  return account ? accountPanel(account) : null;
+}
+
+function renderHeader() {
+  $('#meters').replaceChildren(...state.accounts.map(accountMeter));
+  const body = panelBody();
+  // A panel whose subject vanished (account renamed out of accounts.json)
+  // closes itself rather than leaving an empty box open.
+  if (panel && !body) panel = null;
+  $('#panel').hidden = !body;
+  $('#panel').replaceChildren(...(body ? [body] : []));
+}
+
 function render() {
+  renderHeader();
   if (graphId) return renderGraph();
   openId ? renderChat() : renderGrid();
 }
@@ -82,32 +150,6 @@ function renderGrid() {
   for (const id of selected) if (!live.has(id)) selected.delete(id);
   if (selected.size) grid.append(selectionBar());
 
-  const accounts = document.createElement('div');
-  accounts.className = 'accounts';
-  for (const a of state.accounts) {
-    const pct = Math.round(a.pace * 100);
-    const el = document.createElement('div');
-    el.className = 'card';
-
-    const status = document.createElement('div');
-    status.className = 'status';
-    status.textContent = a.name;
-
-    const bar = document.createElement('div');
-    bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
-    const i = document.createElement('i');
-    i.style.width = `${Math.min(pct, 100)}%`;
-    bar.append(i);
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = `~${pct}% of 5h budget · estimate`;
-
-    el.append(status, bar, meta);
-    accounts.append(el);
-  }
-  grid.append(accounts);
-
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
@@ -116,12 +158,16 @@ function renderGrid() {
   );
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
-  const add = document.createElement('div');
-  add.className = 'card';
-  add.id = 'new-card';
-  add.textContent = '+ new worktree';
-  add.onclick = openNew;
-  grid.append(add);
+  if (!state.sessions.length) {
+    const empty = document.createElement('div');
+    empty.id = 'grid-empty';
+    const line = document.createElement('p');
+    line.textContent = 'No sessions yet.';
+    const hint = document.createElement('p');
+    hint.textContent = 'Start one with + New in the header.';
+    empty.append(line, hint);
+    grid.append(empty);
+  }
 }
 
 /**
@@ -516,6 +562,15 @@ function openGraph(id) {
 
 $('#graph-back').onclick = () => { graphId = null; render(); };
 $('#back').onclick = () => { openId = null; render(); };
+$('#new-btn').onclick = openNew;
+
+// Escape closes the panel. Registered on document rather than on the panel so
+// it works with focus anywhere; dialogs handle their own Escape natively and
+// stopPropagation is not needed, since a dialog's Escape never reaches here as
+// a keydown on document while the dialog is modal.
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && panel) { panel = null; render(); }
+});
 
 $('#composer').onsubmit = (e) => {
   e.preventDefault();

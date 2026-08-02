@@ -24,8 +24,6 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 [hidden] { display: none !important; }
 #notif-bar button[hidden] { display: none; }
 #grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-.accounts { grid-column: 1 / -1; display: grid; gap: 1rem;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .card { background: var(--card); border-radius: 14px; padding: 1rem; cursor: pointer;
   border: 1px solid transparent; }
 .card.needs-you { border-color: var(--needs); }
@@ -43,7 +41,6 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .approval button { margin-right: .4rem; }
 .delete { margin-top: .6rem; display: flex; align-items: center; gap: .5rem; }
 .delete label { color: var(--dim); font-size: .9em; }
-#new-card { display: grid; place-content: center; color: var(--dim); min-height: 120px; }
 
 /* ---- Selection / merge / push ------------------------------------------ */
 /* A session card's checkbox sits in its own row above .status: the accounts
@@ -186,3 +183,34 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #new menu button:focus-visible { outline: 2px solid var(--working); outline-offset: 2px; }
 #new-error { margin: 0; color: #e05555; font-size: .85rem; }
 #new-error:empty { display: none; }
+
+/* ---- Header ------------------------------------------------------------ */
+/* Always mounted, and the only chrome above the view — the account row, the
+   + New card and (once scheduling lands) the queue live here instead of as
+   conditional bands that shove the grid down under the cursor. Negative
+   margins cancel body's padding so the bar spans the window. */
+#bar { position: sticky; top: 0; z-index: 4; display: flex; align-items: center;
+  gap: .8rem; flex-wrap: wrap; margin: -1.5rem -1.5rem 1rem; padding: .7rem 1.5rem;
+  background: var(--bg); border-bottom: 1px solid var(--line); }
+#brand { font-weight: 700; letter-spacing: -.01em; }
+/* EventSource retries silently, so a frozen grid and an idle one are otherwise
+   pixel-identical. */
+#conn { color: var(--needs); font-size: .85em; }
+#meters { display: flex; gap: .5rem; flex-wrap: wrap; margin-left: auto; }
+.meter { display: flex; align-items: center; gap: .45rem; padding: .3rem .6rem;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--card);
+  color: var(--fg); font: inherit; font-size: .8rem; cursor: pointer; }
+.meter:hover, .meter.open { border-color: var(--done); }
+.meter .bar { width: 46px; margin: 0; flex: none; }
+#queue-badge, #new-btn { padding: .35rem .75rem; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--fg);
+  font: inherit; font-size: .85rem; cursor: pointer; white-space: nowrap; }
+#queue-badge.open { border-color: var(--done); }
+#new-btn { background: var(--working); border-color: var(--working);
+  color: #08210f; font-weight: 650; }
+#panel { background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
+#panel h3 { margin: 0 0 .6rem; font-size: .95rem; font-weight: 700; }
+#panel .meta { margin: .2rem 0; }
+#grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
+  padding: 4rem 1rem; color: var(--dim); text-align: center; }

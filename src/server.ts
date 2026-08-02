@@ -122,6 +122,7 @@ export function createServer(opts: {
       accounts: accounts.map((a) => ({
         name: a.name,
         provider: a.provider,
+        budget: a.budget,
         pace: usage.pace(a.name, a.budget),
       })),
     };
