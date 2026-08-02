@@ -7,6 +7,7 @@ import type { CodexFailureCode } from '../types.ts';
 const VERSION = /\bcodex(?:-cli)?\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)/i;
 const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
 const CHATGPT_PATH = '/Applications/ChatGPT.app/Contents/Resources/codex';
+const DEFAULT_PREFLIGHT_TIMEOUT_MS = 10_000;
 const require = createRequire(import.meta.url);
 const run = promisify(execFile);
 
@@ -39,15 +40,18 @@ export type CodexRuntimeDeps = {
   chatgptPath?: string;
   bundledPath?: string;
   sdkVersion?: string;
+  preflightTimeoutMs?: number;
   runFile?: (
     file: string,
     args: string[],
-    options: { env: Record<string, string> },
+    options: { env: Record<string, string>; signal?: AbortSignal },
   ) => Promise<{ stdout: string; stderr: string }>;
 };
 
 type AccountConfig = { bin?: string; env: Record<string, string> };
 type CommandOutput = { stdout: string; stderr: string };
+
+class CodexPreflightTimeoutError extends Error {}
 
 function publishedVersion(version: string): string {
   return version.split('+', 1)[0];
@@ -108,10 +112,35 @@ function outputFrom(error: unknown): CommandOutput {
 async function defaultRunFile(
   file: string,
   args: string[],
-  options: { env: Record<string, string> },
+  options: { env: Record<string, string>; signal?: AbortSignal },
 ): Promise<CommandOutput> {
-  const result = await run(file, args, { env: options.env });
+  const result = await run(file, args, { env: options.env, signal: options.signal });
   return { stdout: result.stdout, stderr: result.stderr };
+}
+
+async function runPreflightFile(
+  runFile: NonNullable<CodexRuntimeDeps['runFile']>,
+  file: string,
+  args: string[],
+  env: Record<string, string>,
+  timeoutMs: number,
+): Promise<CommandOutput> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new CodexPreflightTimeoutError());
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      runFile(file, args, { env, signal: controller.signal }),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function assertCandidateFile(path: string, source: 'explicit' | 'chatgpt' | 'sdk'): Promise<void> {
@@ -147,6 +176,12 @@ async function readCompatibleVersion(
   try {
     result = await runFile(path, ['--version'], { env });
   } catch (error) {
+    if (error instanceof CodexPreflightTimeoutError) {
+      throw new CodexRuntimeError(
+        'codex_version_unreadable',
+        `Codex version check timed out at ${path}. Check that the executable starts normally and try again.`,
+      );
+    }
     // The combined output is deliberately redacted before considering it. It is
     // not exposed, but treating it as safe here keeps future diagnostics safe.
     redactCodexText(`${outputFrom(error).stdout}\n${outputFrom(error).stderr}`, env);
@@ -180,6 +215,12 @@ async function assertAuthentication(
   try {
     await runFile(path, ['login', 'status'], { env });
   } catch (error) {
+    if (error instanceof CodexPreflightTimeoutError) {
+      throw new CodexRuntimeError(
+        'codex_auth_unavailable',
+        `Codex authentication check timed out at ${path}. Run ${path} login status and try again.`,
+      );
+    }
     const { stdout, stderr } = outputFrom(error);
     const output = redactCodexText(`${stdout}\n${stderr}`, env);
     const unsupported = /unrecognized subcommand|unknown subcommand|unexpected argument.*status/i;
@@ -255,7 +296,13 @@ export async function prepareCodexRuntime(
     Object.entries({ ...process.env, ...safeAccount.env })
       .filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
-  const runFile = deps.runFile ?? defaultRunFile;
+  const timeoutMs = typeof deps.preflightTimeoutMs === 'number'
+    && Number.isFinite(deps.preflightTimeoutMs) && deps.preflightTimeoutMs > 0
+    ? deps.preflightTimeoutMs
+    : DEFAULT_PREFLIGHT_TIMEOUT_MS;
+  const baseRunFile = deps.runFile ?? defaultRunFile;
+  const runFile: NonNullable<CodexRuntimeDeps['runFile']> = (file, args, options) =>
+    runPreflightFile(baseRunFile, file, args, options.env, timeoutMs);
   const diagnostics: string[] = [];
 
   if (safeAccount.bin !== undefined) {

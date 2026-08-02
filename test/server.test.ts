@@ -63,6 +63,7 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 type CodexFixture = Awaited<ReturnType<typeof boot>> & {
   repo: string;
   bin: string;
+  statePath: string;
   command(body: Record<string, unknown>): Promise<{ status: number; data: any }>;
   create(prompt: string): Promise<{ id: string }>;
   waitForSession(id: string, predicate: (session: NonNullable<ReturnType<Registry['get']>>) => boolean): Promise<void>;
@@ -100,7 +101,8 @@ process.exit(result.status ?? 1);
 `);
     await chmod(bin, 0o755);
   }
-  const registry = new Registry(join(dir, 'state.json'));
+  const statePath = join(dir, 'state.json');
+  const registry = new Registry(statePath);
   const usage = new Usage();
   const account = {
     name: 'codex', provider: 'codex' as const, budget: 1000,
@@ -113,7 +115,7 @@ process.exit(result.status ?? 1);
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${port}`;
   return {
-    base, registry, repo, bin,
+    base, registry, repo, bin, statePath,
     async command(body) {
       const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
       return { status: response.status, data: await response.json() };
@@ -310,8 +312,20 @@ test('a missing worktree rejects Codex resume before Registry revival', async (t
   await rm(session.cwd, { recursive: true, force: true });
 
   const response = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'continue' });
+  const reason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
   assert.equal(response.status, 409);
+  assert.deepEqual(response.data, { error: reason, code: 'codex_resume_failed' });
   assert.equal(fixture.registry.get(created.id)!.status, 'stopped');
+  assert.equal(fixture.registry.get(created.id)!.stoppedReason, reason);
+  assert.equal(fixture.registry.get(created.id)!.stoppedCode, 'codex_resume_failed');
+  assert.deepEqual(fixture.registry.get(created.id)!.transcript.at(-1), {
+    kind: 'error', text: reason,
+  });
+
+  const reloaded = (await Registry.load(fixture.statePath)).get(created.id)!;
+  assert.equal(reloaded.status, 'stopped');
+  assert.equal(reloaded.stoppedReason, reason);
+  assert.equal(reloaded.stoppedCode, 'codex_resume_failed');
 });
 
 test('a successful Codex resume prepares again and reuses its vendor session id', async (t) => {

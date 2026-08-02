@@ -332,7 +332,13 @@ export function createServer(opts: {
         // fine, the directory is gone — so check here and say what actually
         // happened rather than passing that error on.
         if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
-          return { status: 409, json: { error: `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree` } };
+          const rawReason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
+          if (account.provider === 'codex') {
+            const reason = redactAccountValue(rawReason, account);
+            registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+            return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+          }
+          return { status: 409, json: { error: rawReason } };
         }
         let prepared: PreparedProvider;
         try {

@@ -37,11 +37,11 @@ test('network failures become visible command errors', async () => {
   assert.equal(commandFailure(result), 'Switchboard request failed: connection closed');
 });
 
-test('a session error stays visible in the grid and clears only for another session or dismissal', () => {
-  const error = { sessionId: 's1', message: 'stop refused' };
+test('a cross-session approval error stays visible while another session is open', () => {
+  const error = { sessionId: 'blocked', message: 'approval decision refused' };
   assert.deepEqual(sessionCommandErrorForView(error, null), error, 'grid render');
   assert.deepEqual(sessionCommandErrorForView(error, null), error, 'SSE grid rerender');
-  assert.deepEqual(sessionCommandErrorForView(error, 's1'), error, 'affected session opens');
-  assert.equal(sessionCommandErrorForView(error, 's2'), null, 'different session opens');
-  assert.equal(sessionCommandErrorForView(null, 's1'), null, 'dismissal');
+  assert.deepEqual(sessionCommandErrorForView(error, 'blocked'), error, 'affected session opens');
+  assert.deepEqual(sessionCommandErrorForView(error, 'current'), error, 'different session stays open');
+  assert.equal(sessionCommandErrorForView(null, 'current'), null, 'dismissal');
 });

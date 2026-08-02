@@ -115,6 +115,22 @@ test('an explicit binary with an unreadable version fails closed', async (t) => 
   );
 });
 
+test('a wedged version preflight times out with the version readiness code', async (t) => {
+  const dir = await fixture(t);
+  const bin = await writeFakeCodex(dir);
+
+  await assert.rejects(
+    prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'version-secret' } }, {
+      platform: 'darwin', sdkVersion: '0.145.0', preflightTimeoutMs: 25,
+      runFile: async () => new Promise<never>(() => {}),
+    }),
+    (error: unknown) => error instanceof CodexRuntimeError
+      && error.code === 'codex_version_unreadable'
+      && /version check timed out/i.test(error.message)
+      && !error.message.includes('version-secret'),
+  );
+});
+
 test('semver build metadata does not make a compatible explicit binary mismatch', async (t) => {
   const dir = await fixture(t);
   const bin = await writeFakeCodex(dir, { version: '0.145.0+local.build' });
@@ -134,6 +150,24 @@ test('a logged-out explicit binary reports authentication unavailable', async (t
   await assert.rejects(
     prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
     expectCode('codex_auth_unavailable'),
+  );
+});
+
+test('a wedged login preflight times out with the authentication readiness code', async (t) => {
+  const dir = await fixture(t);
+  const bin = await writeFakeCodex(dir);
+
+  await assert.rejects(
+    prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'login-secret' } }, {
+      platform: 'darwin', sdkVersion: '0.145.0', preflightTimeoutMs: 25,
+      runFile: async (_file, args) => args.includes('--version')
+        ? { stdout: 'codex-cli 0.145.0\n', stderr: '' }
+        : new Promise<never>(() => {}),
+    }),
+    (error: unknown) => error instanceof CodexRuntimeError
+      && error.code === 'codex_auth_unavailable'
+      && /authentication check timed out/i.test(error.message)
+      && !error.message.includes('login-secret'),
   );
 });
 

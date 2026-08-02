@@ -121,8 +121,7 @@ export function retainedSessionError(sessionId, result) {
   return message ? { sessionId, message } : null;
 }
 
-/** Keeps a session error visible in the grid and its own session only. */
-export function sessionCommandErrorForView(error, openId) {
-  if (!error || (openId && error.sessionId !== openId)) return null;
-  return error;
+/** Keeps the last session command error visible regardless of the open view. */
+export function sessionCommandErrorForView(error, _openId) {
+  return error ?? null;
 }
