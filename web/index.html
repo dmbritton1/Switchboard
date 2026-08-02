@@ -16,10 +16,12 @@
   <button id="notif-btn" type="button">Enable notifications</button>
 </div>
 <main id="grid"></main>
+<p id="command-error" role="alert"></p>
 <section id="session" hidden>
   <header>
     <button id="back">← grid</button>
     <h2 id="session-title"></h2>
+    <p id="session-stopped-reason" class="meta" hidden></p>
     <span id="session-menu"></span>
   </header>
   <nav id="tabs" role="tablist"></nav>
@@ -96,5 +98,4 @@
     </menu>
   </form>
 </dialog>
-<div id="toast" hidden></div>
 <script type="module" src="/app.js"></script>

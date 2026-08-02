@@ -78,3 +78,45 @@ export function selectionState(sessions, selected) {
     push: { enabled: !mixed, reason: mixed ? MIXED : '' },
   };
 }
+
+export const CODEX_FAILURE_LABEL = Object.freeze({
+  codex_platform_unsupported: 'Unsupported platform',
+  codex_binary_missing: 'Codex executable missing',
+  codex_binary_not_executable: 'Codex executable is not runnable',
+  codex_version_unreadable: 'Codex version unavailable',
+  codex_version_mismatch: 'Codex version mismatch',
+  codex_auth_unavailable: 'Codex login unavailable',
+  codex_start_failed: 'Codex failed to start',
+  codex_resume_failed: 'Codex failed to resume',
+  codex_stream_failed: 'Codex stream failed',
+  codex_sandbox_denied: 'Blocked by worktree sandbox',
+  codex_user_stopped: 'Stopped by you',
+});
+
+export async function postCommand(body, fetchImpl = fetch) {
+  try {
+    const response = await fetchImpl('/command', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({ error: `HTTP ${response.status}` }));
+    return { ok: response.ok, status: response.status, data };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      data: { error: `Switchboard request failed: ${error instanceof Error ? error.message : String(error)}` },
+    };
+  }
+}
+
+export function commandFailure(result) {
+  if (result.ok) return '';
+  return String(result.data?.error ?? `Command failed with HTTP ${result.status}`);
+}
+
+export function retainedSessionError(sessionId, result) {
+  const message = commandFailure(result);
+  return message ? { sessionId, message } : null;
+}

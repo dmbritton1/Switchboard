@@ -70,6 +70,15 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }
 .msg.error { color: #e05555; }
+.prompt-delivery { margin-left: .25rem; color: var(--dim); font-size: .8em; font-weight: 600; }
+.prompt-delivery.queued { color: var(--dim); }
+.prompt-delivery.unsent { color: #e05555; }
+#command-error { display: flex; align-items: center; gap: .6rem; max-width: 60rem;
+  margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid #5a2626; border-radius: 10px;
+  background: #2a1414; color: #ffb4b4; font-size: .9em; }
+#command-error:empty { display: none; }
+#command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
+  border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
 #composer { display: flex; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
 #prompt { flex: 1; padding: .6rem; background: var(--card); color: var(--fg);
   border: 1px solid #333; border-radius: 8px; }
@@ -98,6 +107,7 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   background: var(--bg); }
 #session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
 #session h2 { margin: 0; font-size: 1.05rem; font-weight: 700; word-break: break-word; }
+#session-stopped-reason { flex-basis: 100%; margin: -.4rem 0 0 3.9rem; }
 #session-menu { margin-left: auto; position: relative; }
 #session-menu .menu-wrap { margin-left: 0; }
 #back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--line);
@@ -241,6 +251,8 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   color: var(--dim); font: inherit; cursor: pointer; }
 .queue-del:hover { color: #e05555; }
 .queue-why { grid-column: 1 / -1; margin: 0 0 .2rem; color: var(--needs); font-size: .8rem; }
+.queue-error { display: flex; align-items: center; gap: .6rem; margin: .6rem 0 0;
+  padding-top: .6rem; border-top: 1px solid #5a2626; color: #ffb4b4; font-size: .85rem; }
 
 /* ---- Overflow menu ----------------------------------------------------- */
 .card { position: relative; }
@@ -258,6 +270,8 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .menu .danger { color: #e05555; }
 .menu label:has(:disabled) { opacity: .45; cursor: not-allowed; }
 .waiting { margin: .6rem 0 0; color: var(--needs); font-size: .9em; }
+.stopped-detail { margin: .6rem 0 0; color: var(--dim); font-size: .85em; }
+.stopped-detail span { color: var(--dim); }
 
 /* ---- Delete dialog ----------------------------------------------------- */
 #del { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--line);
@@ -283,9 +297,3 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   background: none; color: var(--needs); font: inherit; cursor: pointer; white-space: nowrap; }
 #interrupt button:hover { background: var(--needs); color: #1a1000; }
 #interrupt button.more { border-color: transparent; color: var(--dim); }
-
-/* ---- Toast ------------------------------------------------------------- */
-#toast { position: fixed; left: 50%; bottom: 1.5rem; translate: -50% 0; z-index: 5;
-  max-width: min(40rem, 90vw); padding: .7rem 1.1rem; border-radius: 10px;
-  background: #2a1414; border: 1px solid #5a2626; color: #ffb4b4; font-size: .9em;
-  box-shadow: 0 12px 28px #000a; }
