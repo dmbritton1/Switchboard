@@ -1,6 +1,10 @@
 import { Codex } from '@openai/codex-sdk';
 import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
-import type { Adapter, AdapterEvent, AgentHandle, Msg, StartOpts } from '../types.ts';
+import { redactCodexText } from './codex-runtime.ts';
+import type { PreparedCodexRuntime } from './codex-runtime.ts';
+import type {
+  Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Msg, StartOpts,
+} from '../types.ts';
 
 function itemToMsg(item: ThreadItem): Msg | null {
   switch (item.type) {
@@ -57,7 +61,7 @@ export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
         { type: 'status', status: 'done' },
       ];
     case 'turn.failed':
-      return [{ type: 'stopped', reason: e.error.message }];
+      return [{ type: 'stopped', reason: e.error.message, code: 'codex_stream_failed' }];
     case 'error':
       return [{ type: 'stopped', reason: e.message }];
     case 'item.completed': {
@@ -68,16 +72,35 @@ export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
     case 'item.started':
     case 'item.updated':
       return [];
+    default:
+      if (process.env.NODE_ENV === 'development') {
+        console.warn(`[codex] ignored event type: ${String((e as { type?: unknown }).type)}`);
+      }
+      return [];
   }
+}
+
+export function classifyCodexFailure(
+  reason: string,
+  fallback: 'codex_start_failed' | 'codex_resume_failed' | 'codex_stream_failed',
+): CodexFailureCode {
+  if (/not logged in|authentication|unauthorized|\b401\b/i.test(reason)) {
+    return 'codex_auth_unavailable';
+  }
+  if (/sandbox|permission denied|operation not permitted|read-only file system/i.test(reason)) {
+    return 'codex_sandbox_denied';
+  }
+  return fallback;
 }
 
 const CODEX_BIN = '/Applications/ChatGPT.app/Contents/Resources/codex';
 
-export const codexAdapter: Adapter = {
-  start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle {
+export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
+  return {
+    start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle {
     const codex = new Codex({
-      codexPathOverride: CODEX_BIN,
-      env: { ...process.env, ...opts.env } as Record<string, string>,
+      ...(runtime.codexPathOverride ? { codexPathOverride: runtime.codexPathOverride } : {}),
+      env: runtime.env,
     });
 
     const threadOptions = {
@@ -98,6 +121,25 @@ export const codexAdapter: Adapter = {
     const abortController = new AbortController();
     let running = false;
     let stopped = false;
+    let aborted = false;
+    let turnStarted = false;
+
+    function finish(reason: string, code: CodexFailureCode, abort = true): void {
+      if (stopped) return;
+      stopped = true;
+      queue.length = 0;
+      if (abort && !aborted) {
+        aborted = true;
+        abortController.abort();
+      }
+      const safeReason = redactCodexText(reason, runtime.env);
+      const stableCode = code === 'codex_start_failed'
+        || code === 'codex_resume_failed'
+        || code === 'codex_stream_failed'
+        ? classifyCodexFailure(safeReason, code)
+        : code;
+      emit({ type: 'stopped', reason: safeReason, code: stableCode });
+    }
 
     async function drain(): Promise<void> {
       if (running || stopped) return;
@@ -108,7 +150,14 @@ export const codexAdapter: Adapter = {
           const { events } = await thread.runStreamed(text, { signal: abortController.signal });
           for await (const e of events) {
             if (stopped) break;
-            for (const ev of normalizeCodex(e)) emit(ev);
+            if (e.type === 'turn.started') turnStarted = true;
+            for (const ev of normalizeCodex(e)) {
+              if (ev.type === 'stopped') {
+                finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
+                break;
+              }
+              emit(ev);
+            }
           }
         }
       } catch (err) {
@@ -116,8 +165,11 @@ export const codexAdapter: Adapter = {
         // `stopped` already true, this throw is the abort unwinding — stop() already
         // emitted its own 'stopped' event and this is not a session failure to report.
         if (stopped) return;
-        stopped = true;
-        emit({ type: 'stopped', reason: String((err as Error).message ?? err) });
+        finish(
+          String((err as Error).message ?? err),
+          turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed',
+          false,
+        );
       } finally {
         running = false;
       }
@@ -141,12 +193,21 @@ export const codexAdapter: Adapter = {
       // `stopped` handler, and this stop() emits `stopped` — without the early
       // return a UI double-click, or drain()'s failure path, would re-enter.
       stop() {
-        if (stopped) return;
-        stopped = true;
-        queue.length = 0;
-        abortController.abort();
-        emit({ type: 'stopped', reason: 'stopped from switchboard' });
+        finish('stopped from switchboard', 'codex_user_stopped');
       },
     };
-  },
-};
+    },
+  };
+}
+
+/** @deprecated Task 3 prepares an account runtime before creating the adapter. */
+export const codexAdapter = createCodexAdapter({
+  source: 'chatgpt',
+  commandPath: CODEX_BIN,
+  codexPathOverride: CODEX_BIN,
+  version: 'unknown',
+  env: Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  ),
+  diagnostics: [],
+});

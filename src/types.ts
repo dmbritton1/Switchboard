@@ -52,7 +52,7 @@ export type AdapterEvent =
   | { type: 'usage'; inputTokens: number; outputTokens: number }
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
-  | { type: 'stopped'; reason: string };
+  | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 
 export type StartOpts = {
   cwd: string;
