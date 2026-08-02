@@ -12,7 +12,7 @@ import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { codexAdapter } from './agents/codex.ts';
-import type { Action, AgentHandle, Session, Trigger } from './types.ts';
+import type { Action, Adapter, AgentHandle, Session, Trigger } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -146,8 +146,11 @@ export function createServer(opts: {
   usage: Usage;
   scheduler: Scheduler;
   accounts: Account[];
+  /** Defaults to the real Claude/Codex pair; overridable so tests can drive
+   *  launch() through a fake adapter instead of a real subprocess. */
+  adapters?: { claude: Adapter; codex: Adapter };
 }): Server & { tick: () => Promise<void> } {
-  const { registry, usage, scheduler, accounts } = opts;
+  const { registry, usage, scheduler, accounts, adapters = { claude: claudeAdapter, codex: codexAdapter } } = opts;
   const handles = new Map<string, AgentHandle>();
 
   function snapshot() {
@@ -187,7 +190,7 @@ export function createServer(opts: {
   }
 
   function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
-    const adapter = account.provider === 'claude' ? claudeAdapter : codexAdapter;
+    const adapter = account.provider === 'claude' ? adapters.claude : adapters.codex;
     const auto = registry.get(sessionId)?.auto ?? false;
     const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
       if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
@@ -451,10 +454,12 @@ export function createServer(opts: {
    * dialog, so there is no second launch path to keep in sync, and scheduled
    * actions inherit `command()`'s validation and 404/409 handling for free.
    *
-   * Saves unconditionally at the end, not only when something fired: `due()`
-   * marks overdue items `missed`, and that transition has to survive a restart.
-   * The registry's coalesced save subscribes to registry changes only, and a
-   * scheduler-only change is not one.
+   * No save here: `due()`'s `missed` transition and every `remove()`/`fail()`
+   * below all go through Scheduler#notify(), and the coalesced save timer
+   * (`unsubSave` below) is subscribed to the scheduler as well as the
+   * registry — so a scheduler-only change persists on its own, coalesced
+   * schedule instead of this function rewriting all of state.json on every
+   * 30s tick regardless of whether anything happened.
    */
   async function tick(): Promise<void> {
     if (ticking) return;
@@ -473,16 +478,28 @@ export function createServer(opts: {
       };
 
       for (const item of scheduler.due(Date.now(), ctx)) {
+        let action = item.action;
+        // A queued `send` can only be decided against the session's status at
+        // schedule time — but the headline use of this feature is scheduling a
+        // send hours out against a session that is live *right now*. By fire
+        // time the server has very likely restarted, and Registry.load marks
+        // every session `stopped` on load (see GRACE_MS's own restart-survival
+        // reasoning above). Deciding at schedule time would then queue a `send`
+        // that 404s at fire time — the message silently never reaches anyone.
+        // Only fire time knows the real answer, so the downgrade happens here,
+        // not in the client.
+        if (action.kind === 'send' && registry.get(action.sessionId)?.status === 'stopped') {
+          action = { kind: 'resume', sessionId: action.sessionId, prompt: action.text };
+        }
         let result: { status: number; json: unknown };
         try {
-          result = await command(toCommand(item.action));
+          result = await command(toCommand(action));
         } catch (err) {
           result = { status: 500, json: { error: String((err as Error).message ?? err) } };
         }
         if (result.status === 200) scheduler.remove(item.id);
         else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
       }
-      await registry.save().catch(() => {});
     } finally {
       ticking = false;
     }
@@ -686,21 +703,31 @@ export function createServer(opts: {
   // try/catch, where an unguarded rejection is fatal to the whole process and
   // would take every live agent with it.
   //
+  // Also subscribed to the scheduler, not just the registry: `state.json` holds
+  // the queue too, and `tick()`'s `missed` transition and the auto-requeue
+  // `scheduler.add()` in launch()'s emit callback both need to survive a
+  // restart just like a registry change does. One shared timer coalesces
+  // whichever source fires first, so a burst of scheduler and registry changes
+  // in the same 30s tick still writes state.json once, not twice.
+  //
   // unref()'d rather than flushed on close: the timer must never be the reason
   // the process stays alive (it would also hold test runs open for 2s each, and
   // fire a write into an already-deleted temp dir), while the server handle keeps
   // the loop alive for as long as saving actually matters. Cleared on 'close' too
   // so a closed server can't write after its state dir is gone.
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  const unsubSave = registry.subscribe(() => {
+  const scheduleSave = () => {
     if (saveTimer) return;
     saveTimer = setTimeout(() => {
       saveTimer = null;
       void registry.save().catch(() => {});
     }, 2000).unref();
-  });
+  };
+  const unsubSave = registry.subscribe(scheduleSave);
+  const unsubSchedulerSave = scheduler.subscribe(scheduleSave);
   server.on('close', () => {
     unsubSave();
+    unsubSchedulerSave();
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
   });

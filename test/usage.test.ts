@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { Usage, RESET_PACE } from '../src/usage.ts';
+import { Usage } from '../src/usage.ts';
 
 const HOUR = 3600_000;
 

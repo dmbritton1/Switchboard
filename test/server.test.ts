@@ -11,6 +11,7 @@ import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
 import { createServer, shouldRequeue } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
+import type { Adapter, AdapterEvent } from '../src/types.ts';
 
 const run = promisify(execFile);
 
@@ -41,16 +42,43 @@ const accounts = [
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
 
-async function boot(t: { after: (fn: () => void) => void }) {
+async function boot(
+  t: { after: (fn: () => void) => void },
+  adapters?: { claude: Adapter; codex: Adapter },
+) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'));
   const usage = new Usage();
   const scheduler = new Scheduler();
-  const server = createServer({ registry, usage, scheduler, accounts });
+  const server = createServer({ registry, usage, scheduler, accounts, adapters });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   return { base: `http://127.0.0.1:${port}`, registry, usage, scheduler, server };
+}
+
+/**
+ * A minimal fake `Adapter` for tests that need to drive `launch()`'s real
+ * emit callback in src/server.ts — the wiring that calls `usage.noteLimit()`
+ * and `shouldRequeue()` — without spawning a real Claude/Codex subprocess.
+ * `start()` captures the emit callback so the test can fire events into it
+ * whenever it likes; `stop()` emits `stopped` itself, matching the real
+ * adapters (both re-enter the emit callback from their own stop()).
+ */
+function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void } {
+  let cb: ((e: AdapterEvent) => void) | null = null;
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      cb = emit;
+      return {
+        send() {},
+        decide() {},
+        setAuto() {},
+        stop() { cb?.({ type: 'stopped', reason: 'stopped by handle' }); },
+      };
+    },
+  };
+  return { adapter, emit: (e) => cb?.(e) };
 }
 
 test('GET / serves the app shell', async (t) => {
@@ -72,13 +100,20 @@ test('GET /events opens an SSE stream with an immediate snapshot', async (t) => 
   assert.equal(res.headers.get('content-type'), 'text/event-stream');
 
   const reader = res.body!.getReader();
-  const chunk = new TextDecoder().decode((await reader.read()).value);
-  assert.match(chunk, /^data: /m);
-  const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
-  assert.equal(payload.sessions.length, 1);
-  assert.equal(payload.sessions[0].title, 'a title');
-  assert.equal(payload.accounts[0].name, 'claude-main');
-  await reader.cancel();
+  // try/finally, not a bare await at the end: if the assertion throws, an
+  // uncancelled reader leaves the SSE fetch open, and boot()'s t.after
+  // (server.close()) waits for that connection to end before it resolves — so
+  // node --test hangs on a failure here instead of reporting one.
+  try {
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    assert.match(chunk, /^data: /m);
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.sessions.length, 1);
+    assert.equal(payload.sessions[0].title, 'a title');
+    assert.equal(payload.accounts[0].name, 'claude-main');
+  } finally {
+    await reader.cancel();
+  }
 });
 
 test('POST /command with an unknown cmd is a 400', async (t) => {
@@ -783,6 +818,26 @@ test('overlapping ticks consult the scheduler once, not twice', async (t) => {
   assert.equal(calls, 1, 'the second, overlapping tick must skip rather than re-dispatch the same item');
 });
 
+test('a queued send whose target went stopped by fire time is dispatched as a resume, not a 404 send', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'parked for the test' });
+  scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  // A `send` to a stopped session would fail with "no live session" (404). A
+  // `resume` against this fake cwd instead fails with "worktree is gone"
+  // (409) before ever touching an adapter — that specific error is the proof
+  // the downgrade happened, not a coincidental other failure.
+  assert.equal(scheduler.all()[0].state, 'failed');
+  assert.match(scheduler.all()[0].error ?? '', /worktree is gone/);
+});
+
 test('a self-inflicted stop during a limit window is requeued', () => {
   const now = 1000;
   assert.equal(shouldRequeue(true, now + 3600_000, now), true);
@@ -803,4 +858,62 @@ test('a stop with no known limit is not requeued', () => {
 test('a stop after the window already rolled is not requeued', () => {
   const now = 1000;
   assert.equal(shouldRequeue(true, now - 1, now), false);
+});
+
+// ---- auto-requeue wiring --------------------------------------------------
+//
+// shouldRequeue() above is a well-tested pure function, but nothing above
+// proves it is ever actually *called* from launch()'s emit callback — the
+// automatic half of the feature, which a user never triggers by hand and so
+// cannot notice is broken. These two drive a real session through the real
+// `create` -> launch() -> emit path with a fake adapter standing in for the
+// subprocess.
+
+test('a session that dies on its own during a rate limit is requeued for when the account resets', async (t) => {
+  const { adapter, emit } = fakeAdapter();
+  const { base, scheduler } = await boot(t, { claude: adapter, codex: adapter });
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'b', account: 'claude-main', prompt: 'hi' }),
+  });
+  assert.equal(res.status, 200);
+  const { id } = await res.json();
+
+  const resetsAt = Date.now() + 3600_000;
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt });
+  // The adapter died on its own (no `stop` command called first), so the
+  // handle is still in the map when this fires — the `dead` case.
+  emit({ type: 'stopped', reason: 'rate limited' });
+
+  const queued = scheduler.all();
+  assert.equal(queued.length, 1, 'a reset-triggered resume should now be queued');
+  assert.deepEqual(queued[0].trigger, { kind: 'reset', account: 'claude-main' });
+  assert.deepEqual(queued[0].action, { kind: 'resume', sessionId: id, prompt: 'continue' });
+});
+
+test('a session stopped via the stop command is never requeued, even past the limit', async (t) => {
+  const { adapter, emit } = fakeAdapter();
+  const { base, scheduler } = await boot(t, { claude: adapter, codex: adapter });
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'b', account: 'claude-main', prompt: 'hi' }),
+  });
+  const { id } = await res.json();
+
+  // Account is past its limit at the time the user presses Stop.
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt: Date.now() + 3600_000 });
+
+  const stopRes = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'stop', id }),
+  });
+  assert.equal(stopRes.status, 200);
+
+  assert.deepEqual(scheduler.all(), [], 'a deliberate Stop must not resurrect the session');
 });

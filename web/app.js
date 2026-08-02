@@ -631,12 +631,13 @@ $('#when-dialog').addEventListener('close', async (e) => {
 
   const text = $('#prompt').value.trim();
   if (!text) return;
-  const session = state.sessions.find((s) => s.id === openId);
-  // A stopped session has no live agent for a `send` to reach, so schedule the
-  // resume that will bring it back instead.
-  const action = session?.status === 'stopped'
-    ? { kind: 'resume', sessionId: openId, prompt: text }
-    : { kind: 'send', sessionId: openId, text };
+  // Always schedule a `send`, even for a session that is stopped right now: the
+  // headline use of this feature is "send this tonight" against a session
+  // that's live at schedule time but very likely won't be by fire time (a
+  // server restart marks every session `stopped`). Only the server, at fire
+  // time, knows which is true — see the downgrade to `resume` in tick() in
+  // src/server.ts — so the client no longer guesses here.
+  const action = { kind: 'send', sessionId: openId, text };
 
   const f = new FormData(dialog.querySelector('form'));
   const { ok: sent, data } = await send({
