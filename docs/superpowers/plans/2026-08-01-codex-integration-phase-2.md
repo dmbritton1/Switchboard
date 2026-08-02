@@ -1240,7 +1240,7 @@ export type AppServerEvidence = {
   cancellationRoundTrip: boolean;
   commandApprovalRoundTrip: boolean;
   fileApprovalRoundTrip: boolean;
-  mcpApprovalObserved: boolean;
+  mcpElicitationObserved: boolean;
   processCrashHandled: boolean;
   vendorThreadMigration: 'verified' | 'not-proven';
   cleanShutdown: boolean;
@@ -1266,13 +1266,13 @@ Create `test/helpers/fake-app-server.ts` that supports newline-delimited JSON-RP
 - `thread/resume`;
 - `turn/interrupt` ending interrupted;
 - server requests for command and file approval, plus `serverRequest/resolved`;
-- an MCP approval-shaped request;
+- the stable `mcpServer/elicitation/request` flow plus `serverRequest/resolved`;
 - a controlled unexpected-exit mode for process-crash handling;
 - clean EOF shutdown.
 
 - [ ] **Step 2: Write failing probe tests**
 
-Create `test/app-server-probe.test.ts`. Assert the fake proves lifecycle, follow-up, resume, cancellation, both stable approvals, the observed MCP request shape, controlled process-crash handling, and clean shutdown. Assert `vendorThreadMigration` remains `not-proven` because fixture identifiers cannot prove continuity with SDK-created vendor threads. Also assert request IDs correlate under interleaved notifications, approval responses use documented decisions, malformed JSON rejects safely, unexpected exits reject without hanging, and timeout kills the child.
+Create `test/app-server-probe.test.ts`. Assert the fake proves lifecycle, follow-up, resume, cancellation, both stable approvals, the stable MCP elicitation request shape, controlled process-crash handling, and clean shutdown. Do not opt into or simulate the experimental app/connector tool-approval flow. Assert `vendorThreadMigration` remains `not-proven` because fixture identifiers cannot prove continuity with SDK-created vendor threads. Also assert request IDs correlate under interleaved notifications, approval responses use documented decisions, malformed JSON rejects safely, unexpected exits reject without hanging, and timeout kills the child.
 
 - [ ] **Step 3: Run tests and implement the JSON-RPC probe**
 
@@ -1310,7 +1310,7 @@ Expected: `npm test` uses only the fake; the explicit evaluation performs schema
 
 - [ ] **Step 6: Write the deterministic decision record**
 
-Create `docs/superpowers/reports/2026-08-01-codex-app-server-decision.md` with the measured matrix for documented approvals, lifecycle, typed schema stability, authentication reuse, MCP approvals, process ownership, crash recovery, fake testing, and vendor-thread migration.
+Create `docs/superpowers/reports/2026-08-01-codex-app-server-decision.md` with the measured matrix for documented stable approvals, lifecycle, typed schema stability, authentication reuse, stable MCP elicitation, the exclusion of experimental MCP app-tool approvals, process ownership, crash recovery, fake testing, and vendor-thread migration.
 
 Apply these rules:
 
