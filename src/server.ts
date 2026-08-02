@@ -531,6 +531,9 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   ) as Account[];
   const usage = new Usage();
   const registry = await Registry.load(statePath, usage);
+  // ponytail: env override so a second copy (a worktree, a test drive) can run
+  // beside the real one instead of failing on EADDRINUSE.
+  const port = Number(process.env.PORT) || 4711;
   createServer({ registry, usage, accounts })
-    .listen(4711, '127.0.0.1', () => console.log('switchboard on http://127.0.0.1:4711'));
+    .listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }
