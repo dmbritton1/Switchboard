@@ -581,7 +581,11 @@ $('#back').onclick = () => { openId = null; render(); };
 
 // The datetime input is only meaningful for the "at" choice; `required` is set
 // with it so an empty value can't be submitted, and cleared with it so the
-// other two choices don't trip the form's own validation.
+// other two choices don't trip the form's own validation. Returns `sync` so a
+// caller that resets the form afterward (openNew(), the schedule button below)
+// can re-run it: form.reset() puts the select back to its default option
+// without firing 'change', so without a manual re-sync the datetime field's
+// hidden/required state is left matching whatever was selected before the reset.
 function bindWhen(selectSel, inputSel) {
   const sel = $(selectSel);
   const at = $(inputSel);
@@ -591,9 +595,10 @@ function bindWhen(selectSel, inputSel) {
   };
   sel.onchange = sync;
   sync();
+  return sync;
 }
-bindWhen('#when-select', '#when-at');
-bindWhen('#when2-select', '#when2-at');
+const syncWhen = bindWhen('#when-select', '#when-at');
+const syncWhen2 = bindWhen('#when2-select', '#when2-at');
 
 $('#composer').onsubmit = (e) => {
   e.preventDefault();
@@ -606,7 +611,14 @@ $('#composer').onsubmit = (e) => {
 $('#schedule-btn').onclick = () => {
   const text = $('#prompt').value.trim();
   if (!text) return;
-  $('#when-dialog').showModal();
+  const dialog = $('#when-dialog');
+  // Same reason as openNew(): without this, a dialog reopened after an earlier
+  // "When usage resets" pick still shows that choice (and the datetime field
+  // stays hidden to match) for an unrelated later message.
+  dialog.querySelector('form').reset();
+  syncWhen2();
+  $('#when-error').textContent = '';
+  dialog.showModal();
 };
 
 $('#when-dialog').addEventListener('close', async (e) => {
@@ -627,10 +639,16 @@ $('#when-dialog').addEventListener('close', async (e) => {
     : { kind: 'send', sessionId: openId, text };
 
   const f = new FormData(dialog.querySelector('form'));
-  const { ok: sent } = await send({
+  const { ok: sent, data } = await send({
     cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
   });
-  if (sent) $('#prompt').value = '';
+  if (sent) { $('#prompt').value = ''; return; }
+  // Same pattern as #new: show the server's reason and let the user retry,
+  // rather than the fire-and-forget silence most other buttons in this app get.
+  // This one is a modal the user explicitly confirmed to queue something —
+  // going quiet on failure means they believe it's queued when it isn't.
+  $('#when-error').textContent = data.error;
+  dialog.showModal();
 });
 
 // Uploads go straight to disk in the session's worktree and come back as a
@@ -801,6 +819,7 @@ async function openNew() {
   // place it is ever set — see there.)
   const dialog = $('#new');
   dialog.querySelector('form').reset();
+  syncWhen();
 
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
