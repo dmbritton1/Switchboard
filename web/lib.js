@@ -146,16 +146,11 @@ export function commandErrorText(error, sessions, openId) {
 export function transcriptView(message) {
   if (message.kind === 'tool') {
     const suffix = message.status === 'running' ? '' : ` · ${message.status}`;
-    const rawSummary = String(message.summary ?? '');
-    const editCount = rawSummary ? rawSummary.split(',').length : 0;
-    const summary = message.name.toLowerCase() === 'edit'
-      ? `${editCount} file${editCount === 1 ? '' : 's'}`
-      : rawSummary;
     return {
       kind: 'tool',
       id: message.id ?? '',
       className: `msg tool ${message.status}`,
-      summary: `${message.name}: ${summary}${suffix}`,
+      summary: `${message.name}: ${message.summary}${suffix}`,
       detailAvailable: message.detailAvailable ?? false,
       detailEvicted: message.detailEvicted ?? false,
       detailRevision: message.detailRevision ?? 0,

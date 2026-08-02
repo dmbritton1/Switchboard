@@ -49,7 +49,7 @@ function normalizeItem(
     case 'file_change':
       return withDetail({
         kind: 'tool', id: item.id, name: 'edit',
-        summary: redactCodexText(item.changes.map((c) => c.path).join(', '), env),
+        summary: `${item.changes.length} file${item.changes.length === 1 ? '' : 's'}`,
         status: itemStatus(item.status),
       }, { changes: item.changes }, env);
     case 'mcp_tool_call': {

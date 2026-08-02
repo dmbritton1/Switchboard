@@ -164,8 +164,7 @@ test('transcriptView projects a running tool with collapsible detail', () => {
 
 test('transcriptView labels terminal tools and preserves bounded-detail metadata', () => {
   assert.deepEqual(transcriptView({
-    kind: 'tool', id: 'ok', name: 'edit',
-    summary: '/Users/operator/project/src/a.ts, /private/tmp/project/src/b.ts', status: 'ok',
+    kind: 'tool', id: 'ok', name: 'edit', summary: '2 files', status: 'ok',
     detailAvailable: true, detailEvicted: false,
     detailRevision: 8, detailTruncated: true,
   }), {
@@ -180,15 +179,13 @@ test('transcriptView labels terminal tools and preserves bounded-detail metadata
   }).summary, 'shell: false · error');
 });
 
-test('transcriptView never exposes absolute file-change paths and preserves other tool summaries', () => {
-  const edit = transcriptView({
-    kind: 'tool', id: 'edit-1', name: 'edit',
-    summary: '/Users/operator/secret-one.ts, /opt/project/secret-two.ts', status: 'running',
+test('transcriptView preserves SDK and MCP summaries verbatim even when the tool is named edit', () => {
+  const mcpEdit = transcriptView({
+    kind: 'tool', id: 'mcp-edit', name: 'edit', summary: 'workspace.edit', status: 'running',
     detailAvailable: false, detailEvicted: false,
     detailRevision: 0, detailTruncated: false,
   });
-  assert.equal(edit.summary, 'edit: 2 files');
-  assert.doesNotMatch(edit.summary, /Users|operator|opt|secret/);
+  assert.equal(mcpEdit.summary, 'edit: workspace.edit');
   assert.equal(transcriptView({
     kind: 'tool', id: 'shell-1', name: 'shell', summary: 'npm test', status: 'running',
     detailAvailable: false, detailEvicted: false,

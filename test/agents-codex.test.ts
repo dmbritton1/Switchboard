@@ -69,16 +69,38 @@ test('a failed command upsert keeps its terminal error and bounded detail', () =
   } }]);
 });
 
-test('file changes upsert by SDK id with serialized changes and terminal status', () => {
-  const changes = [{ path: 'a.ts', kind: 'update' }, { path: 'b.ts', kind: 'add' }];
-  assert.deepEqual(normalizeCodex({
+test('file changes expose an exact count instead of absolute paths while retaining detail', () => {
+  const changes = [
+    { path: '/Users/operator/project/a,with-comma.ts', kind: 'update' },
+    { path: '/private/tmp/project/b.ts', kind: 'add' },
+  ];
+  const [event] = normalizeCodex({
     type: 'item.completed',
     item: { id: 'file-1', type: 'file_change', status: 'failed', changes },
-  } as never), [{ type: 'upsert-msg', msg: {
-    kind: 'tool', id: 'file-1', name: 'edit', summary: 'a.ts, b.ts', status: 'error',
-    detail: '{\n  "changes": [\n    {\n      "path": "a.ts",\n      "kind": "update"\n    },\n    {\n      "path": "b.ts",\n      "kind": "add"\n    }\n  ]\n}',
-    detailTruncated: false,
-  } }]);
+  } as never);
+  assert.equal(event.type, 'upsert-msg');
+  assert.ok(event.type === 'upsert-msg' && event.msg.kind === 'tool');
+  assert.deepEqual({ ...event.msg, detail: undefined }, {
+    kind: 'tool', id: 'file-1', name: 'edit', summary: '2 files', status: 'error',
+    detail: undefined, detailTruncated: false,
+  });
+  assert.doesNotMatch(event.msg.summary, /Users|private|with-comma/);
+  assert.match(event.msg.detail ?? '', /a,with-comma\.ts/);
+  assert.match(event.msg.detail ?? '', /\/private\/tmp\/project\/b\.ts/);
+});
+
+test('one file change uses the singular summary without exposing its path', () => {
+  const [event] = normalizeCodex({
+    type: 'item.started',
+    item: {
+      id: 'file-one', type: 'file_change', status: 'in_progress',
+      changes: [{ path: '/Users/operator/private.ts', kind: 'update' }],
+    },
+  } as never);
+  assert.equal(event.type, 'upsert-msg');
+  assert.ok(event.type === 'upsert-msg' && event.msg.kind === 'tool');
+  assert.equal(event.msg.summary, '1 file');
+  assert.doesNotMatch(event.msg.summary, /Users|operator|private\.ts/);
 });
 
 test('MCP upserts serialize arguments and result while redacting launch secrets', () => {
@@ -208,7 +230,7 @@ test('lifecycle upserts redact every displayed SDK string while preserving item 
     return { id: event.msg.id, items: event.msg.items };
   }), [
     { id: 'command-id', name: 'shell', summary: 'echo [REDACTED]' },
-    { id: 'file-id', name: 'edit', summary: 'src/[REDACTED].ts' },
+    { id: 'file-id', name: 'edit', summary: '1 file' },
     { id: 'mcp-id', name: 'tool-[REDACTED]', summary: 'server-[REDACTED].tool-[REDACTED]' },
     { id: 'search-id', name: 'search', summary: 'find [REDACTED]' },
     { id: 'reasoning-id', text: 'Checking [REDACTED]' },
