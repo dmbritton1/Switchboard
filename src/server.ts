@@ -12,7 +12,7 @@ import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
 import { CodexRuntimeError, prepareCodexRuntime, redactCodexText } from './agents/codex-runtime.ts';
-import type { Adapter, AgentHandle, CodexFailureCode, Session } from './types.ts';
+import type { Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session } from './types.ts';
 
 const run = promisify(execFile);
 
@@ -32,6 +32,36 @@ async function prepareProvider(account: Account): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
   const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
   return { adapter: createCodexAdapter(runtime) };
+}
+
+function redactAccountValue(text: string, account: Account): string {
+  let safe = redactCodexText(text, account.env);
+  for (const value of Object.values(account.env)) {
+    if (value) safe = safe.replaceAll(value, '[REDACTED]');
+  }
+  return safe;
+}
+
+function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent {
+  if (account.provider !== 'codex') return event;
+  switch (event.type) {
+    case 'msg': {
+      const msg = event.msg;
+      if (msg.kind === 'tool') {
+        return {
+          ...event,
+          msg: { ...msg, name: redactAccountValue(msg.name, account), summary: redactAccountValue(msg.summary, account) },
+        };
+      }
+      return { ...event, msg: { ...msg, text: redactAccountValue(msg.text, account) } };
+    }
+    case 'stopped':
+      return { ...event, reason: redactAccountValue(event.reason, account) };
+    case 'vendor-session-id':
+      return { ...event, id: redactAccountValue(event.id, account) };
+    default:
+      return event;
+  }
 }
 
 const WEB = new URL('../web/', import.meta.url).pathname;
@@ -170,8 +200,9 @@ export function createServer(opts: {
     const auto = registry.get(sessionId)?.auto ?? false;
     try {
       const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
-        if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
-        if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
+        const safeEvent = sanitizeCodexEvent(e, account);
+        if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
+        if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
       // the prompt, and every event it produced was dropped by the terminal guard.
@@ -184,14 +215,14 @@ export function createServer(opts: {
       // the terminal guard drops, not the other way round.
         const dead = handles.get(sessionId);
         handles.delete(sessionId);
-        registry.apply(sessionId, e);
+        registry.apply(sessionId, safeEvent);
         dead?.stop();
       });
       handles.set(sessionId, handle);
       return null;
     } catch (error) {
       const reason = account.provider === 'codex'
-        ? redactCodexText(String((error as Error).message ?? error), account.env)
+        ? redactAccountValue(String((error as Error).message ?? error), account)
         : String((error as Error).message ?? error);
       const code = account.provider === 'codex'
         ? (resumeId ? 'codex_resume_failed' : 'codex_start_failed')

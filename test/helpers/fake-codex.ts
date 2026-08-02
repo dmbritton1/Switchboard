@@ -106,6 +106,12 @@ process.stdin.on('end', () => {
     emit({ type: 'turn.failed', error: { message: 'fake stream failure' } });
     return;
   }
+  if (prompt === 'non-credential-env-echo') {
+    emit({ type: 'item.completed', item: {
+      id: 'error-1', type: 'error',
+      message: 'fake backend error for workspace ' + (process.env.WORKSPACE_LABEL ?? ''),
+    }});
+  }
   if (prompt === 'nonzero-exit') {
     process.stderr.write('unexpected process failure: ' + (process.env.FAKE_CODEX_SECRET ?? '') + '\\n');
     process.exitCode = 7;

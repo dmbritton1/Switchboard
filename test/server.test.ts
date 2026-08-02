@@ -243,6 +243,24 @@ test('Codex account environment reaches its process but not public event JSON', 
   assert.ok(!payload.includes('event-secret'));
 });
 
+test('Codex item errors redact every account environment value before persistence', async (t) => {
+  const fixture = await bootCodex(t, { env: { WORKSPACE_LABEL: 'customer-internal-42' } });
+  const created = await fixture.create('non-credential-env-echo');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  const session = fixture.registry.get(created.id)!;
+  const error = session.transcript.find((msg) => msg.kind === 'error');
+
+  assert.deepEqual(error, { kind: 'error', text: 'fake backend error for workspace [REDACTED]' });
+  assert.ok(!JSON.stringify(session.transcript).includes('customer-internal-42'));
+
+  const events = await fetch(`${fixture.base}/events`);
+  const reader = events.body!.getReader();
+  const payload = new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  assert.match(payload, /fake backend error for workspace \[REDACTED\]/);
+  assert.ok(!payload.includes('customer-internal-42'));
+});
+
 test('Codex preserves repository instructions and leaves non-safety configuration to the repo', async (t) => {
   const fixture = await bootCodex(t);
   const agents = join(fixture.repo, 'AGENTS.md');
