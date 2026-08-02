@@ -94,6 +94,26 @@ test('load converts every queued prompt to unsent and preserves sent prompts', a
   });
 });
 
+test('load ignores malformed transcript entries without losing the valid session', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    null,
+    'not a transcript message',
+    { kind: 'user', text: 'legacy prompt' },
+    { kind: 'text', text: 'kept response' },
+  ]);
+
+  const loaded = await Registry.load(path);
+  assert.equal(loaded.all().length, 1);
+  assert.equal(loaded.all()[0].transcript.length, 2);
+  const [legacy, response] = loaded.all()[0].transcript;
+  assert.equal(legacy.kind, 'user');
+  assert.ok(legacy.kind === 'user');
+  assert.equal(legacy.text, 'legacy prompt');
+  assert.equal(legacy.delivery, 'sent');
+  assert.ok(legacy.id);
+  assert.deepEqual(response, { kind: 'text', text: 'kept response' });
+});
+
 test('an approval event sets needs-you and stores the request', () => {
   const { reg, id } = make();
   reg.apply(id, { type: 'approval', request: { id: 'a1', tool: 'Bash', summary: 'rm -rf dist' } });

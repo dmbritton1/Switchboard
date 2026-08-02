@@ -224,16 +224,17 @@ export class Registry {
       for (const s of (Array.isArray(raw) ? raw : []) as Session[]) {
         if (!s || typeof s.id !== 'string') continue;
         let interruptedCount = 0;
-        const transcript = (Array.isArray(s.transcript) ? s.transcript : []).map((message) => {
+        const transcript = (Array.isArray(s.transcript) ? s.transcript : []).flatMap((message) => {
+          if (!message || typeof message !== 'object') return [];
           if (message.kind !== 'user') return message;
           const wasQueued = message.delivery === 'queued';
           if (wasQueued) interruptedCount++;
-          return {
+          return [{
             kind: 'user' as const,
             id: message.id ?? randomUUID(),
             text: message.text,
             delivery: wasQueued ? 'unsent' as const : message.delivery ?? 'sent' as const,
-          };
+          }];
         });
         if (interruptedCount > 0) {
           transcript.push({ kind: 'error', text: unsentMessage(interruptedCount) });
