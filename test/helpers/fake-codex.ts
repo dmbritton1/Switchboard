@@ -117,6 +117,83 @@ process.stdin.on('end', () => {
     process.exitCode = 7;
     return;
   }
+  if (prompt === 'rich-lifecycle') {
+    emit({ type: 'item.started', item: {
+      id: 'rich-command', type: 'command_execution', command: 'npm test',
+      aggregated_output: '', status: 'in_progress',
+    }});
+    emit({ type: 'item.updated', item: {
+      id: 'rich-command', type: 'command_execution', command: 'npm test',
+      aggregated_output: 'running command output', status: 'in_progress',
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-command', type: 'command_execution', command: 'npm test',
+      aggregated_output: 'all command output', exit_code: 0, status: 'completed',
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
+      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' }, status: 'in_progress',
+    }});
+    emit({ type: 'item.updated', item: {
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
+      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' },
+      result: { content: [], structured_content: { progress: 'working' } }, status: 'in_progress',
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-mcp', type: 'mcp_tool_call', server: 'fake-server', tool: 'rich-tool',
+      arguments: { note: process.env.FAKE_CODEX_SECRET ?? '' },
+      result: { content: [], structured_content: { output: 'x'.repeat(40 * 1024) } }, status: 'completed',
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-file', type: 'file_change', status: 'completed',
+      changes: [{ path: 'rich.ts', kind: 'update' }],
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-file', type: 'file_change', status: 'completed',
+      changes: [{ path: 'rich.ts', kind: 'update' }],
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+    }});
+    emit({ type: 'item.updated', item: {
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-search', type: 'web_search', query: 'Codex lifecycle',
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-reasoning', type: 'reasoning', text: 'Checking the lifecycle',
+    }});
+    emit({ type: 'item.updated', item: {
+      id: 'rich-reasoning', type: 'reasoning', text: 'Verified the lifecycle',
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-todo', type: 'todo_list', items: [
+        { text: 'Inspect events', completed: false },
+        { text: 'Run tests', completed: false },
+      ],
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-todo', type: 'todo_list', items: [
+        { text: 'Inspect events', completed: true },
+        { text: 'Run tests', completed: true },
+      ],
+    }});
+    emit({ type: 'item.started', item: {
+      id: 'rich-message', type: 'agent_message', text: 'partial response',
+    }});
+    emit({ type: 'item.updated', item: {
+      id: 'rich-message', type: 'agent_message', text: 'updated response',
+    }});
+    emit({ type: 'item.completed', item: {
+      id: 'rich-message', type: 'agent_message', text: 'rich lifecycle response',
+    }});
+    emit({ type: 'turn.completed', usage: {
+      input_tokens: 21, cached_input_tokens: 4, cache_write_input_tokens: 6,
+      output_tokens: 13, reasoning_output_tokens: 3,
+    }});
+    return;
+  }
   emit({ type: 'item.completed', item: {
     id: 'message-1', type: 'agent_message', text: 'fake response: ' + prompt,
   }});

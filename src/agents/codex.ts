@@ -1,44 +1,93 @@
 import { Codex } from '@openai/codex-sdk';
 import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
+import { safeCodexDetail } from './codex-detail.ts';
 import { redactCodexText } from './codex-runtime.ts';
 import type { PreparedCodexRuntime } from './codex-runtime.ts';
 import type {
-  Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Msg, StartOpts,
+  Adapter, AdapterEvent, AgentHandle, CodexFailureCode, StartOpts, ToolMsg,
 } from '../types.ts';
 
-function itemToMsg(item: ThreadItem): Msg | null {
+type ItemPhase = 'started' | 'updated' | 'completed';
+
+function itemStatus(status: 'in_progress' | 'completed' | 'failed'): ToolMsg['status'] {
+  switch (status) {
+    case 'in_progress': return 'running';
+    case 'completed': return 'ok';
+    case 'failed': return 'error';
+  }
+}
+
+function withDetail(
+  msg: ToolMsg & { id: string },
+  value: unknown,
+  env: Record<string, string>,
+): AdapterEvent[] {
+  const detail = safeCodexDetail(value, env);
+  return [{
+    type: 'upsert-msg',
+    msg: detail && detail.text.length > 0
+      ? { ...msg, detail: detail.text, detailTruncated: detail.truncated }
+      : msg,
+  }];
+}
+
+function normalizeItem(
+  phase: ItemPhase,
+  item: ThreadItem,
+  env: Record<string, string>,
+): AdapterEvent[] {
   switch (item.type) {
     case 'agent_message':
-      return { kind: 'text', text: item.text };
+      return phase === 'completed'
+        ? [{ type: 'msg', msg: { kind: 'text', text: redactCodexText(item.text, env) } }]
+        : [];
     case 'command_execution':
-      return {
-        kind: 'tool', name: 'shell', summary: item.command,
-        status: item.status === 'failed' ? 'error' : 'ok',
-      };
+      return withDetail({
+        kind: 'tool', id: item.id, name: 'shell', summary: item.command,
+        status: itemStatus(item.status),
+      }, item.aggregated_output, env);
     case 'file_change':
-      return {
-        kind: 'tool', name: 'edit',
+      return withDetail({
+        kind: 'tool', id: item.id, name: 'edit',
         summary: item.changes.map((c) => c.path).join(', '),
-        status: item.status === 'failed' ? 'error' : 'ok',
-      };
+        status: itemStatus(item.status),
+      }, { changes: item.changes }, env);
     case 'mcp_tool_call':
-      return {
-        kind: 'tool', name: item.tool, summary: `${item.server}.${item.tool}`,
-        status: item.status === 'failed' ? 'error' : 'ok',
-      };
+      return withDetail({
+        kind: 'tool', id: item.id, name: item.tool, summary: `${item.server}.${item.tool}`,
+        status: itemStatus(item.status),
+      }, { arguments: item.arguments, result: item.result, error: item.error }, env);
     case 'web_search':
-      return { kind: 'tool', name: 'search', summary: item.query, status: 'ok' };
-    case 'error':
-      return { kind: 'error', text: item.message };
-    // Reasoning and todo lists are noise in a card grid.
+      return [{ type: 'upsert-msg', msg: {
+        kind: 'tool', id: item.id, name: 'search', summary: item.query,
+        status: phase === 'completed' ? 'ok' : 'running',
+      } }];
     case 'reasoning':
+      return [{ type: 'upsert-msg', msg: {
+        kind: 'reasoning', id: item.id, text: item.text,
+      } }];
     case 'todo_list':
-      return null;
+      return [{ type: 'upsert-msg', msg: {
+        kind: 'todo', id: item.id,
+        items: item.items.map((todo) => ({ text: todo.text, completed: todo.completed })),
+      } }];
+    case 'error':
+      return phase === 'completed'
+        ? [{ type: 'msg', msg: { kind: 'error', text: redactCodexText(item.message, env) } }]
+        : [];
+    default:
+      if (process.env.NODE_ENV === 'development') {
+        console.warn(`[codex] ignored item type: ${String((item as { type?: unknown }).type)}`);
+      }
+      return [];
   }
 }
 
 /** Pure: one Codex thread event in, zero or more normalized events out. */
-export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
+export function normalizeCodex(
+  e: ThreadEvent,
+  env: Record<string, string> = {},
+): AdapterEvent[] {
   switch (e.type) {
     case 'thread.started':
       return [{ type: 'vendor-session-id', id: e.thread_id }];
@@ -64,14 +113,9 @@ export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
       return [{ type: 'stopped', reason: e.error.message, code: 'codex_stream_failed' }];
     case 'error':
       return [{ type: 'stopped', reason: e.message }];
-    case 'item.completed': {
-      const msg = itemToMsg(e.item);
-      return msg ? [{ type: 'msg', msg }] : [];
-    }
-    // Only completed items are rendered, so an item never appears twice.
-    case 'item.started':
-    case 'item.updated':
-      return [];
+    case 'item.started': return normalizeItem('started', e.item, env);
+    case 'item.updated': return normalizeItem('updated', e.item, env);
+    case 'item.completed': return normalizeItem('completed', e.item, env);
     default:
       if (process.env.NODE_ENV === 'development') {
         console.warn(`[codex] ignored event type: ${String((e as { type?: unknown }).type)}`);
@@ -163,7 +207,7 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
           for await (const e of events) {
             if (stopped) break;
             if (e.type === 'turn.started') turnStarted = true;
-            for (const ev of normalizeCodex(e)) {
+            for (const ev of normalizeCodex(e, runtime.env)) {
               if (ev.type === 'stopped') {
                 finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
                 break;

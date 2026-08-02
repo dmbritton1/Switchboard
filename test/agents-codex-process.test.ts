@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createCodexAdapter, classifyCodexFailure } from '../src/agents/codex.ts';
+import { MAX_CODEX_DETAIL_BYTES } from '../src/agents/codex-detail.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
+import { Registry } from '../src/sessions.ts';
 import type { Adapter, AdapterEvent } from '../src/types.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 
@@ -117,17 +119,80 @@ test('a resume id is passed to the SDK CLI', async (t) => {
   assert.deepEqual(invocation.argv.slice(-2), ['resume', 'fake-thread']);
 });
 
-test('completed SDK JSONL items normalize without retaining raw tool payloads', async (t) => {
+test('completed SDK JSONL items normalize into append-only text and tool upserts', async (t) => {
   const fixture = await makeProcessFixture(t);
   const { events } = await collect(createCodexAdapter(fixture.runtime), fixture, 'basic', (all) =>
     all.some((event) => event.type === 'status' && event.status === 'done'));
 
   assert.deepEqual(events.filter((event) => event.type === 'msg'), [
     { type: 'msg', msg: { kind: 'text', text: 'fake response: basic' } },
-    { type: 'msg', msg: { kind: 'tool', name: 'shell', summary: 'echo shell', status: 'ok' } },
-    { type: 'msg', msg: { kind: 'tool', name: 'edit', summary: 'fake.ts', status: 'ok' } },
-    { type: 'msg', msg: { kind: 'tool', name: 'fake-tool', summary: 'fake-server.fake-tool', status: 'ok' } },
-    { type: 'msg', msg: { kind: 'tool', name: 'search', summary: 'fake search', status: 'ok' } },
+  ]);
+  assert.deepEqual(events.filter((event) => event.type === 'upsert-msg').map((event) =>
+    event.type === 'upsert-msg' && event.msg.kind === 'tool'
+      ? { id: event.msg.id, name: event.msg.name, status: event.msg.status }
+      : null), [
+    { id: 'command-1', name: 'shell', status: 'ok' },
+    { id: 'file-1', name: 'edit', status: 'ok' },
+    { id: 'mcp-1', name: 'fake-tool', status: 'ok' },
+    { id: 'search-1', name: 'search', status: 'ok' },
+  ]);
+});
+
+test('rich SDK lifecycles update one Registry row per item with safe bounded detail', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const registry = new Registry('/dev/null');
+  const session = registry.create({
+    provider: 'codex', account: 'fake', repo: fixture.cwd, cwd: fixture.cwd,
+    branch: 'codex/rich-lifecycle', title: 'Rich lifecycle',
+  });
+  const events: AdapterEvent[] = [];
+  createCodexAdapter(fixture.runtime).start(
+    { cwd: fixture.cwd, prompt: 'rich-lifecycle', env: {} },
+    (event) => {
+      events.push(event);
+      registry.apply(session.id, event);
+    },
+  );
+  await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'done'));
+
+  const upserts = events.filter((event) => event.type === 'upsert-msg');
+  const detailEvents = upserts.filter((event) => event.msg.kind === 'tool' && event.msg.detail !== undefined);
+  assert.ok(detailEvents.length > 0);
+  for (const event of detailEvents) {
+    assert.equal(Buffer.byteLength(event.msg.kind === 'tool' ? event.msg.detail! : '', 'utf8')
+      <= MAX_CODEX_DETAIL_BYTES, true);
+    assert.doesNotMatch(event.msg.kind === 'tool' ? event.msg.detail! : '', /never-expose-me/);
+  }
+
+  const transcript = registry.get(session.id)!.transcript;
+  for (const id of ['rich-command', 'rich-mcp', 'rich-file', 'rich-search', 'rich-reasoning', 'rich-todo']) {
+    assert.equal(transcript.filter((message) => 'id' in message && message.id === id).length, 1, id);
+  }
+
+  const command = transcript.find((message) => message.kind === 'tool' && message.id === 'rich-command');
+  assert.ok(command?.kind === 'tool');
+  assert.equal(command.status, 'ok');
+  assert.equal(command.detail, 'all command output');
+
+  const mcp = transcript.find((message) => message.kind === 'tool' && message.id === 'rich-mcp');
+  assert.ok(mcp?.kind === 'tool');
+  assert.equal(mcp.status, 'ok');
+  assert.equal(mcp.detailTruncated, true);
+  assert.match(mcp.detail ?? '', /\n\[truncated\]$/);
+  assert.match(mcp.detail ?? '', /\[REDACTED\]/);
+  assert.doesNotMatch(mcp.detail ?? '', /never-expose-me/);
+
+  assert.deepEqual(transcript.find((message) => message.kind === 'reasoning'), {
+    kind: 'reasoning', id: 'rich-reasoning', text: 'Verified the lifecycle',
+  });
+  assert.deepEqual(transcript.find((message) => message.kind === 'todo'), {
+    kind: 'todo', id: 'rich-todo', items: [
+      { text: 'Inspect events', completed: true },
+      { text: 'Run tests', completed: true },
+    ],
+  });
+  assert.deepEqual(transcript.filter((message) => message.kind === 'text'), [
+    { kind: 'text', text: 'rich lifecycle response' },
   ]);
 });
 
@@ -202,7 +267,7 @@ test('a sandbox denial reports its failed tool before a sandbox failure', async 
   const { events } = await collect(createCodexAdapter(fixture.runtime), fixture, 'sandbox-denied', (all) =>
     all.some((event) => event.type === 'stopped'));
 
-  assert.ok(events.some((event) => event.type === 'msg' && event.msg.kind === 'tool'
+  assert.ok(events.some((event) => event.type === 'upsert-msg' && event.msg.kind === 'tool'
     && event.msg.name === 'shell' && event.msg.status === 'error'));
   assert.equal(stopped(events).code, 'codex_sandbox_denied');
 });

@@ -16,65 +16,186 @@ test('turn.started sets working', () => {
   );
 });
 
-test('an agent_message item becomes a text msg', () => {
-  assert.deepEqual(
-    normalizeCodex({
-      type: 'item.completed',
-      item: { id: 'i1', type: 'agent_message', text: 'hello' },
-    } as never),
-    [{ type: 'msg', msg: { kind: 'text', text: 'hello' } }],
-  );
-});
-
-test('a completed command_execution becomes an ok tool msg', () => {
-  assert.deepEqual(
-    normalizeCodex({
+test('a command lifecycle upserts one stable row from running through completion', () => {
+  const events = [
+    {
+      type: 'item.started',
+      item: {
+        id: 'cmd-1', type: 'command_execution', command: 'npm test',
+        aggregated_output: '', status: 'in_progress',
+      },
+    },
+    {
+      type: 'item.updated',
+      item: {
+        id: 'cmd-1', type: 'command_execution', command: 'npm test',
+        aggregated_output: 'running output', status: 'in_progress',
+      },
+    },
+    {
       type: 'item.completed',
       item: {
-        id: 'i2', type: 'command_execution', command: 'ls -la',
-        aggregated_output: '...', exit_code: 0, status: 'completed',
+        id: 'cmd-1', type: 'command_execution', command: 'npm test',
+        aggregated_output: 'all passed', exit_code: 0, status: 'completed',
       },
-    } as never),
-    [{ type: 'msg', msg: { kind: 'tool', name: 'shell', summary: 'ls -la', status: 'ok' } }],
-  );
+    },
+  ] as const;
+
+  assert.deepEqual(events.flatMap((event) => normalizeCodex(event as never)), [
+    { type: 'upsert-msg', msg: {
+      kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'npm test', status: 'running',
+    } },
+    { type: 'upsert-msg', msg: {
+      kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'npm test', status: 'running',
+      detail: 'running output', detailTruncated: false,
+    } },
+    { type: 'upsert-msg', msg: {
+      kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'npm test', status: 'ok',
+      detail: 'all passed', detailTruncated: false,
+    } },
+  ]);
 });
 
-test('a failed command_execution becomes an error tool msg', () => {
-  const events = normalizeCodex({
+test('a failed command upsert keeps its terminal error and bounded detail', () => {
+  assert.deepEqual(normalizeCodex({
     type: 'item.completed',
     item: {
-      id: 'i3', type: 'command_execution', command: 'false',
-      aggregated_output: '', exit_code: 1, status: 'failed',
+      id: 'cmd-failed', type: 'command_execution', command: 'false',
+      aggregated_output: 'command failed', exit_code: 1, status: 'failed',
     },
-  } as never);
-  assert.equal(events[0].type, 'msg');
-  assert.deepEqual(events[0], {
-    type: 'msg',
-    msg: { kind: 'tool', name: 'shell', summary: 'false', status: 'error' },
+  } as never), [{ type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'cmd-failed', name: 'shell', summary: 'false', status: 'error',
+    detail: 'command failed', detailTruncated: false,
+  } }]);
+});
+
+test('file changes upsert by SDK id with serialized changes and terminal status', () => {
+  const changes = [{ path: 'a.ts', kind: 'update' }, { path: 'b.ts', kind: 'add' }];
+  assert.deepEqual(normalizeCodex({
+    type: 'item.completed',
+    item: { id: 'file-1', type: 'file_change', status: 'failed', changes },
+  } as never), [{ type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'file-1', name: 'edit', summary: 'a.ts, b.ts', status: 'error',
+    detail: '{\n  "changes": [\n    {\n      "path": "a.ts",\n      "kind": "update"\n    },\n    {\n      "path": "b.ts",\n      "kind": "add"\n    }\n  ]\n}',
+    detailTruncated: false,
+  } }]);
+});
+
+test('MCP upserts serialize arguments and result while redacting launch secrets', () => {
+  const env = { FAKE_TOKEN: 'abcdefghijklmnop' };
+  const started = normalizeCodex({
+    type: 'item.started',
+    item: {
+      id: 'mcp-1', type: 'mcp_tool_call', server: 'files', tool: 'read',
+      arguments: { path: '/tmp/example', token: 'abcdefghijklmnop' }, status: 'in_progress',
+    },
+  } as never, env);
+  const completed = normalizeCodex({
+    type: 'item.completed',
+    item: {
+      id: 'mcp-1', type: 'mcp_tool_call', server: 'files', tool: 'read',
+      arguments: { path: '/tmp/example' },
+      result: { content: [], structured_content: { value: 'done' } },
+      status: 'completed',
+    },
+  } as never, env);
+
+  assert.equal(started[0].type, 'upsert-msg');
+  assert.ok(started[0].type === 'upsert-msg' && started[0].msg.kind === 'tool');
+  assert.equal(started[0].msg.status, 'running');
+  assert.match(started[0].msg.detail ?? '', /\[REDACTED\]/);
+  assert.doesNotMatch(started[0].msg.detail ?? '', /abcdefghijklmnop/);
+  assert.deepEqual(completed, [{ type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'mcp-1', name: 'read', summary: 'files.read', status: 'ok',
+    detail: '{\n  "arguments": {\n    "path": "/tmp/example"\n  },\n  "result": {\n    "content": [],\n    "structured_content": {\n      "value": "done"\n    }\n  }\n}',
+    detailTruncated: false,
+  } }]);
+});
+
+test('a failed MCP upsert serializes its error without retaining the vendor object', () => {
+  assert.deepEqual(normalizeCodex({
+    type: 'item.completed',
+    item: {
+      id: 'mcp-failed', type: 'mcp_tool_call', server: 'files', tool: 'write',
+      arguments: { path: 'x' }, error: { message: 'denied' }, status: 'failed',
+    },
+  } as never), [{ type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'mcp-failed', name: 'write', summary: 'files.write', status: 'error',
+    detail: '{\n  "arguments": {\n    "path": "x"\n  },\n  "error": {\n    "message": "denied"\n  }\n}',
+    detailTruncated: false,
+  } }]);
+});
+
+test('web searches upsert from running to completed using the SDK id', () => {
+  assert.deepEqual([
+    ...normalizeCodex({ type: 'item.started', item: {
+      id: 'search-1', type: 'web_search', query: 'Codex SDK',
+    } } as never),
+    ...normalizeCodex({ type: 'item.completed', item: {
+      id: 'search-1', type: 'web_search', query: 'Codex SDK',
+    } } as never),
+  ], [
+    { type: 'upsert-msg', msg: {
+      kind: 'tool', id: 'search-1', name: 'search', summary: 'Codex SDK', status: 'running',
+    } },
+    { type: 'upsert-msg', msg: {
+      kind: 'tool', id: 'search-1', name: 'search', summary: 'Codex SDK', status: 'ok',
+    } },
+  ]);
+});
+
+test('reasoning emits only the SDK reasoning summary text as an upsert', () => {
+  assert.deepEqual(normalizeCodex({
+    type: 'item.updated', item: { id: 'reason-1', type: 'reasoning', text: 'Checking the tests' },
+  } as never), [{ type: 'upsert-msg', msg: {
+    kind: 'reasoning', id: 'reason-1', text: 'Checking the tests',
+  } }]);
+});
+
+test('todo updates replace the same SDK id without fabricated status', () => {
+  assert.deepEqual(normalizeCodex({
+    type: 'item.completed', item: { id: 'todo-1', type: 'todo_list', items: [
+      { text: 'Inspect', completed: true }, { text: 'Test', completed: false },
+    ] },
+  } as never), [{ type: 'upsert-msg', msg: {
+    kind: 'todo', id: 'todo-1', items: [
+      { text: 'Inspect', completed: true }, { text: 'Test', completed: false },
+    ],
+  } }]);
+});
+
+test('assistant text and item errors remain append-only and emit only when completed', () => {
+  const agent = { id: 'message-1', type: 'agent_message', text: 'hello' };
+  const error = { id: 'error-1', type: 'error', message: 'recoverable failure' };
+
+  assert.deepEqual(normalizeCodex({ type: 'item.started', item: agent } as never), []);
+  assert.deepEqual(normalizeCodex({ type: 'item.updated', item: agent } as never), []);
+  assert.deepEqual(normalizeCodex({ type: 'item.completed', item: agent } as never), [
+    { type: 'msg', msg: { kind: 'text', text: 'hello' } },
+  ]);
+  assert.deepEqual(normalizeCodex({ type: 'item.started', item: error } as never), []);
+  assert.deepEqual(normalizeCodex({ type: 'item.updated', item: error } as never), []);
+  assert.deepEqual(normalizeCodex({ type: 'item.completed', item: error } as never), [
+    { type: 'msg', msg: { kind: 'error', text: 'recoverable failure' } },
+  ]);
+});
+
+test('an unknown future item reports only its type during development', (t) => {
+  const previousEnvironment = process.env.NODE_ENV;
+  const previousWarn = console.warn;
+  const warnings: unknown[][] = [];
+  process.env.NODE_ENV = 'development';
+  console.warn = (...args: unknown[]) => { warnings.push(args); };
+  t.after(() => {
+    console.warn = previousWarn;
+    if (previousEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousEnvironment;
   });
-});
 
-test('a file_change item lists the touched paths', () => {
-  assert.deepEqual(
-    normalizeCodex({
-      type: 'item.completed',
-      item: {
-        id: 'i4', type: 'file_change', status: 'completed',
-        changes: [{ path: 'a.ts', kind: 'update' }, { path: 'b.ts', kind: 'add' }],
-      },
-    } as never),
-    [{ type: 'msg', msg: { kind: 'tool', name: 'edit', summary: 'a.ts, b.ts', status: 'ok' } }],
-  );
-});
-
-test('item.started is ignored so items are only rendered once', () => {
-  assert.deepEqual(
-    normalizeCodex({
-      type: 'item.started',
-      item: { id: 'i5', type: 'agent_message', text: 'partial' },
-    } as never),
-    [],
-  );
+  assert.deepEqual(normalizeCodex({ type: 'item.completed', item: {
+    id: 'future-1', type: 'future_item', credential: 'do-not-log-me',
+  } } as never), []);
+  assert.deepEqual(warnings, [['[codex] ignored item type: future_item']]);
 });
 
 // Pins the decision this task exists to get right: cached_input_tokens,
