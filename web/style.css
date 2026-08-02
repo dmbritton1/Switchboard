@@ -70,6 +70,36 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }
 .msg.error { color: #e05555; }
+/* A tool row stays one scannable line until the operator opens its live trace.
+   The inset rule is the one distinctive gesture: it reads like a terminal's
+   continuation prompt without changing the console's existing visual system. */
+.tool details { margin: .35rem 0 .1rem .15rem; padding-left: .75rem;
+  border-left: 2px solid var(--line); color: var(--dim); }
+.tool details[open] { border-left-color: var(--working); }
+.tool summary { width: max-content; cursor: pointer; color: var(--dim);
+  font-family: ui-sans-serif, system-ui, sans-serif; font-size: .8rem;
+  user-select: none; }
+.tool summary:hover { color: var(--fg); }
+.tool summary:focus-visible { outline: 2px solid var(--working); outline-offset: 2px;
+  border-radius: 3px; }
+.tool pre { box-sizing: border-box; max-width: 100%; max-height: 22rem;
+  margin: .45rem 0 .2rem; padding: .65rem .75rem; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere; background: var(--field);
+  border: 1px solid var(--line); border-radius: 6px; color: var(--fg);
+  font: .86rem/1.45 var(--mono); }
+.detail-retry { margin: .25rem 0 .15rem; padding: .25rem .55rem;
+  border: 1px solid currentColor; border-radius: 6px; background: none;
+  color: #e05555; font: .8rem ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
+.detail-retry:focus-visible { outline: 2px solid var(--working); outline-offset: 2px; }
+.msg.reasoning { padding-left: .75rem; border-left: 2px solid #333; color: var(--dim); }
+.reasoning-label { display: block; margin-bottom: .18rem; font-size: .68rem;
+  font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #aaa; }
+.msg.reasoning p { margin: 0; }
+.msg.todo { color: var(--fg); }
+.msg.todo ul { display: grid; gap: .2rem; margin: 0; padding: 0; list-style: none; }
+.msg.todo li { font-size: .9rem; }
+.todo-complete { color: var(--dim); text-decoration: line-through; }
+.todo-pending { color: var(--fg); }
 .prompt-delivery { margin-left: .25rem; color: var(--dim); font-size: .8em; font-weight: 600; }
 .prompt-delivery.queued { color: var(--dim); }
 .prompt-delivery.unsent { color: #e05555; }

@@ -1,10 +1,20 @@
 import {
   sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
+  transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
+  fetchToolDetail,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
 let openId = null;
+// Transcript rows are rebuilt for every SSE snapshot. These browser-local
+// collections restore the open live trace, cache only its current revision,
+// and keep repeated renders from creating duplicate requests.
+const expandedItems = new Set();
+const detailCache = new Map();
+const detailRequests = new Map();
+let detailSession = null;
+let detailGeneration = 0;
 // Which header panel is open: null, 'queue', or an account name. Mutually
 // exclusive by construction — one variable, not one flag per panel.
 let panel = null;
@@ -23,6 +33,18 @@ let sessionCommandError = null;
 let queueCommandError = '';
 
 const $ = (sel) => document.querySelector(sel);
+
+/** The one navigation boundary for opening, switching, and closing sessions. */
+function setOpenSession(id) {
+  if (detailSession !== id) {
+    expandedItems.clear();
+    detailCache.clear();
+    detailRequests.clear();
+    detailSession = id;
+    detailGeneration++;
+  }
+  openId = id;
+}
 
 async function runSessionCommand(body) {
   const result = await postCommand(body);
@@ -598,7 +620,7 @@ function renderInterrupt(current) {
     more.type = 'button';
     more.className = 'more';
     more.textContent = `+${rest.length} more`;
-    more.onclick = () => { openId = null; render(); };
+    more.onclick = () => { setOpenSession(null); render(); };
     box.append(more);
   }
 }
@@ -642,7 +664,7 @@ function openTab(id, which) {
   // is the one case where the pane would otherwise sit empty for up to
   // STATUS_THROTTLE_MS with nothing on screen yet.
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
-  openId = id;
+  setOpenSession(id);
   tab = which;
   if (which === 'graph') { graphCommits = []; loadGraph(); }
   render();
@@ -652,7 +674,7 @@ const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
 
 function renderSession() {
   const s = state.sessions.find((x) => x.id === openId);
-  if (!s) { openId = null; return renderGrid(); }
+  if (!s) { setOpenSession(null); return renderGrid(); }
   $('#grid').hidden = true;
   $('#session').hidden = false;
   $('#session-title').textContent = `${s.branch} · ${s.account} · ${s.status === 'stopped' && s.provider === 'codex' ? stoppedLabel(s) : s.status}`;
@@ -700,15 +722,29 @@ function renderChatPane(s) {
   const t = $('#transcript');
   t.replaceChildren();
   for (const m of s.transcript) {
+    const view = transcriptView(m);
     const el = document.createElement('div');
-    // The status class doubles as the styling hook: a tool message with status
-    // 'error' picks up the existing .msg.error colour.
-    el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
-    // A denied `rm -rf` and a successful one used to be pixel-identical.
-    if (m.kind === 'tool') {
-      el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
+    el.className = view.className;
+    if (view.kind === 'tool') {
+      renderToolMessage(el, s.id, view);
+    } else if (view.kind === 'reasoning') {
+      const label = document.createElement('span');
+      label.className = 'reasoning-label';
+      label.textContent = 'Reasoning summary';
+      const summary = document.createElement('p');
+      summary.textContent = view.summary;
+      el.append(label, summary);
+    } else if (view.kind === 'todo') {
+      const list = document.createElement('ul');
+      for (const item of view.items) {
+        const row = document.createElement('li');
+        row.className = item.completed ? 'todo-complete' : 'todo-pending';
+        row.textContent = `${item.completed ? '✓' : '○'} ${item.text}`;
+        list.append(row);
+      }
+      el.append(list);
     } else {
-      el.textContent = m.text;
+      el.textContent = view.summary;
       if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
       if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
         const delivery = document.createElement('span');
@@ -720,6 +756,113 @@ function renderChatPane(s) {
     t.append(el);
   }
   if (nearBottom) t.scrollIntoView({ block: 'end' });
+}
+
+function currentToolView(sessionId, itemId) {
+  const session = state.sessions.find((candidate) => candidate.id === sessionId);
+  const message = session?.transcript.find(
+    (candidate) => candidate.kind === 'tool' && candidate.id === itemId,
+  );
+  return message ? transcriptView(message) : null;
+}
+
+function sanitizedDetailError(error) {
+  const message = error instanceof Error ? error.message : '';
+  return /^Detail request failed(?: \(HTTP \d+\))?\.$/.test(message)
+    ? message
+    : 'Detail request failed.';
+}
+
+function ensureToolDetail(sessionId, view) {
+  const key = detailKey(sessionId, view.id);
+  const cached = detailCache.get(key);
+  if (!expandedItems.has(key) || !needsDetailFetch(view, cached)) return;
+
+  const requestKey = JSON.stringify([key, view.detailRevision]);
+  const generation = detailGeneration;
+  return requestOnce(detailRequests, requestKey, async () => {
+    try {
+      const detail = await fetchToolDetail(sessionId, view.id);
+      const current = currentToolView(sessionId, view.id);
+      if (generation !== detailGeneration || detailSession !== sessionId
+        || !current || current.kind !== 'tool'
+        || current.detailRevision !== view.detailRevision
+        || detail.revision !== view.detailRevision) return;
+      detailCache.set(key, {
+        revision: detail.revision,
+        text: detail.text,
+        truncated: detail.truncated,
+      });
+    } catch (error) {
+      const current = currentToolView(sessionId, view.id);
+      if (generation !== detailGeneration || detailSession !== sessionId
+        || !current || current.kind !== 'tool'
+        || current.detailRevision !== view.detailRevision) return;
+      detailCache.set(key, {
+        revision: view.detailRevision,
+        text: null,
+        truncated: false,
+        error: sanitizedDetailError(error),
+      });
+    } finally {
+      if (generation === detailGeneration && openId === sessionId) render();
+    }
+  });
+}
+
+function paintToolDetail(details, pre, sessionId, view) {
+  const key = detailKey(sessionId, view.id);
+  const presentation = detailPresentation(
+    view,
+    expandedItems.has(key),
+    detailCache.get(key),
+  );
+  details.open = presentation.open;
+  pre.textContent = presentation.text;
+  details.querySelector('.detail-retry')?.remove();
+  if (presentation.mode !== 'error') return;
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'detail-retry';
+  retry.textContent = 'Retry';
+  retry.onclick = () => {
+    detailCache.delete(key);
+    paintToolDetail(details, pre, sessionId, view);
+    ensureToolDetail(sessionId, view);
+  };
+  details.append(retry);
+}
+
+function renderToolMessage(el, sessionId, view) {
+  // Summary and detail are both model-controlled text. Only textContent is
+  // used; the stable item ID stays inside the browser-local cache key.
+  el.textContent = view.summary;
+  const key = detailKey(sessionId, view.id);
+  if (!view.detailAvailable || view.detailEvicted) detailCache.delete(key);
+  if (!view.detailAvailable && !view.detailEvicted) {
+    expandedItems.delete(key);
+    return;
+  }
+
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'Details';
+  const pre = document.createElement('pre');
+  details.append(summary, pre);
+  paintToolDetail(details, pre, sessionId, view);
+  details.addEventListener('toggle', () => {
+    if (details.open) {
+      expandedItems.add(key);
+      paintToolDetail(details, pre, sessionId, view);
+      ensureToolDetail(sessionId, view);
+    } else {
+      expandedItems.delete(key);
+    }
+  });
+  el.append(details);
+
+  if (expandedItems.has(key)) ensureToolDetail(sessionId, view);
 }
 
 // The named slot for the diff spec. /status returns only the totals today, so
@@ -848,7 +991,7 @@ async function loadGraph() {
 // was even open.
 setInterval(loadGraph, 2000);
 
-$('#back').onclick = () => { openId = null; render(); };
+$('#back').onclick = () => { setOpenSession(null); render(); };
 $('#new-btn').onclick = openNew;
 $('#queue-badge').onclick = () => setPanel('queue');
 

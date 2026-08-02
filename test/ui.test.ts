@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from '../web/lib.js';
+import {
+  sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
+  transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
+  fetchToolDetail,
+} from '../web/lib.js';
 
 const session = (over = {}) => ({
   id: 'a', repo: '/r/one', branch: 'feat/a', account: 'claude-main',
@@ -143,4 +147,190 @@ test('targetLabel names the branch and kind for a resume action on a live sessio
 test('targetLabel falls back to "deleted session" for a session id no longer in the list', () => {
   const action = { kind: 'resume', sessionId: 'gone', prompt: 'continue' };
   assert.equal(targetLabel(action, []), 'deleted session · resume');
+});
+
+test('transcriptView projects a running tool with collapsible detail', () => {
+  assert.deepEqual(transcriptView({
+    kind: 'tool', id: 'c1', name: 'shell', summary: 'npm test', status: 'running',
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, detailTruncated: false,
+  }), {
+    kind: 'tool', id: 'c1', className: 'msg tool running',
+    summary: 'shell: npm test', detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, truncated: false,
+  });
+});
+
+test('transcriptView labels terminal tools and preserves bounded-detail metadata', () => {
+  assert.deepEqual(transcriptView({
+    kind: 'tool', id: 'ok', name: 'edit', summary: 'two files', status: 'ok',
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 8, detailTruncated: true,
+  }), {
+    kind: 'tool', id: 'ok', className: 'msg tool ok',
+    summary: 'edit: two files · ok', detailAvailable: true, detailEvicted: false,
+    detailRevision: 8, truncated: true,
+  });
+  assert.equal(transcriptView({
+    kind: 'tool', id: 'bad', name: 'shell', summary: 'false', status: 'error',
+    detailAvailable: false, detailEvicted: true,
+    detailRevision: 9, detailTruncated: false,
+  }).summary, 'shell: false · error');
+});
+
+test('transcriptView distinguishes evicted, never-present, and legacy no-detail tools', () => {
+  const evicted = transcriptView({
+    kind: 'tool', id: 'old', name: 'shell', summary: 'old', status: 'ok',
+    detailAvailable: false, detailEvicted: true,
+    detailRevision: 7, detailTruncated: false,
+  });
+  assert.equal(evicted.detailAvailable, false);
+  assert.equal(evicted.detailEvicted, true);
+
+  const neverPresent = transcriptView({
+    kind: 'tool', id: 'live', name: 'shell', summary: 'waiting', status: 'running',
+    detailAvailable: false, detailEvicted: false,
+    detailRevision: 0, detailTruncated: false,
+  });
+  assert.equal(neverPresent.detailAvailable, false);
+  assert.equal(neverPresent.detailEvicted, false);
+
+  assert.deepEqual(transcriptView({
+    kind: 'tool', name: 'Bash', summary: 'pwd', status: 'running',
+  }), {
+    kind: 'tool', id: '', className: 'msg tool running', summary: 'Bash: pwd',
+    detailAvailable: false, detailEvicted: false, detailRevision: 0, truncated: false,
+  });
+});
+
+test('transcriptView keeps reasoning and todos distinct from tools', () => {
+  assert.deepEqual(
+    transcriptView({ kind: 'reasoning', id: 'r1', text: 'Checking the failing path.' }),
+    { kind: 'reasoning', className: 'msg reasoning', summary: 'Checking the failing path.' },
+  );
+  assert.deepEqual(transcriptView({
+    kind: 'todo', id: 't1', items: [{ text: 'Run tests', completed: true }],
+  }), {
+    kind: 'todo', className: 'msg todo', items: [{ text: 'Run tests', completed: true }],
+  });
+});
+
+test('transcriptView preserves assistant, error, and user text without exposing prompt ids', () => {
+  assert.deepEqual(transcriptView({ kind: 'text', text: 'Done.' }), {
+    kind: 'text', className: 'msg text', summary: 'Done.',
+  });
+  assert.deepEqual(transcriptView({ kind: 'error', text: 'Failed.' }), {
+    kind: 'text', className: 'msg error', summary: 'Failed.',
+  });
+  assert.deepEqual(transcriptView({
+    kind: 'user', id: '/private/prompt-id', text: 'Please continue.', delivery: 'queued',
+  }), {
+    kind: 'text', className: 'msg user', summary: 'Please continue.',
+  });
+});
+
+test('detailKey cannot collide across session and item identifier boundaries', () => {
+  const key = detailKey('s1', 'i1');
+  assert.notEqual(key, detailKey('s1', 'i2'));
+  assert.notEqual(key, detailKey('s2', 'i1'));
+  assert.notEqual(detailKey('a:b', 'c'), detailKey('a', 'b:c'));
+});
+
+test('needsDetailFetch fetches only available, current, non-evicted detail', () => {
+  const view = transcriptView({
+    kind: 'tool', id: 'c1', name: 'shell', summary: 'npm test', status: 'running',
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, detailTruncated: false,
+  });
+  assert.equal(needsDetailFetch(view), true, 'missing cache');
+  assert.equal(needsDetailFetch(view, { revision: 4 }), false, 'matching revision');
+  assert.equal(needsDetailFetch(view, { revision: 3 }), true, 'changed revision');
+  assert.equal(needsDetailFetch({ ...view, detailAvailable: false }), false, 'unavailable');
+  assert.equal(needsDetailFetch({ ...view, detailEvicted: true }), false, 'evicted');
+});
+
+test('detailPresentation restores expanded cached content across transcript rebuilds', () => {
+  const view = transcriptView({
+    kind: 'tool', id: 'c1', name: 'shell', summary: 'npm test', status: 'running',
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, detailTruncated: false,
+  });
+  assert.deepEqual(detailPresentation(view, true, {
+    revision: 4, text: 'working output', truncated: false,
+  }), {
+    open: true, mode: 'content', text: 'working output', fetch: false,
+  });
+});
+
+test('detailPresentation covers collapsed, loading, stale, evicted, and cached-error states', () => {
+  const view = transcriptView({
+    kind: 'tool', id: 'c1', name: 'shell', summary: 'npm test', status: 'running',
+    detailAvailable: true, detailEvicted: false,
+    detailRevision: 4, detailTruncated: false,
+  });
+  assert.deepEqual(detailPresentation(view, false), {
+    open: false, mode: 'hidden', text: '', fetch: false,
+  });
+  assert.deepEqual(detailPresentation(view, true), {
+    open: true, mode: 'loading', text: 'Loading…', fetch: true,
+  });
+  assert.deepEqual(detailPresentation(view, true, {
+    revision: 3, text: 'stale output', truncated: false,
+  }), {
+    open: true, mode: 'loading', text: 'Loading…', fetch: true,
+  });
+  assert.deepEqual(detailPresentation({ ...view, detailEvicted: true }, true), {
+    open: true, mode: 'evicted',
+    text: 'Detail removed to stay within the storage limit.', fetch: false,
+  });
+  assert.deepEqual(detailPresentation(view, true, {
+    revision: 4, text: null, truncated: false, error: 'Detail request failed.',
+  }), {
+    open: true, mode: 'error', text: 'Detail request failed.', fetch: false,
+  });
+});
+
+test('requestOnce deduplicates a live request and removes it after settlement', async () => {
+  const requests = new Map();
+  let calls = 0;
+  const gate = Promise.withResolvers();
+  const first = requestOnce(requests, 's1:i1:4', async () => {
+    calls++;
+    await gate.promise;
+    return 'detail';
+  });
+  const second = requestOnce(requests, 's1:i1:4', async () => 'duplicate');
+  assert.strictEqual(first, second);
+  assert.equal(calls, 1);
+  gate.resolve(undefined);
+  assert.equal(await first, 'detail');
+  assert.equal(requests.size, 0);
+});
+
+test('fetchToolDetail encodes Registry keys and returns the JSON detail body', async () => {
+  let requested = '';
+  const body = { text: 'output', truncated: false, evicted: false, revision: 4 };
+  const result = await fetchToolDetail('s 1', 'i/1', async (url) => {
+    requested = String(url);
+    return new Response(JSON.stringify(body), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  });
+  assert.equal(requested, '/detail?session=s+1&item=i%2F1');
+  assert.deepEqual(result, body);
+});
+
+test('fetchToolDetail sanitizes HTTP, network, and malformed response failures', async () => {
+  await assert.rejects(
+    fetchToolDetail('s', 'i', async () => new Response('<secret>', { status: 503 })),
+    { message: 'Detail request failed (HTTP 503).' },
+  );
+  await assert.rejects(
+    fetchToolDetail('s', 'i', async () => { throw new Error('token=secret'); }),
+    { message: 'Detail request failed.' },
+  );
+  await assert.rejects(
+    fetchToolDetail('s', 'i', async () => new Response('<not-json>', { status: 200 })),
+    { message: 'Detail request failed.' },
+  );
 });

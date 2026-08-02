@@ -137,3 +137,107 @@ export function commandErrorText(error, sessions, openId) {
   const session = sessions.find((s) => s.id === error.sessionId);
   return session ? `${session.branch}: ${error.message}` : error.message;
 }
+
+/**
+ * Convert an SSE transcript message into the small, untrusted view model used
+ * by the browser renderer. IDs survive only where they are needed as internal
+ * lazy-detail keys; no projection puts them into visible text.
+ */
+export function transcriptView(message) {
+  if (message.kind === 'tool') {
+    const suffix = message.status === 'running' ? '' : ` · ${message.status}`;
+    return {
+      kind: 'tool',
+      id: message.id ?? '',
+      className: `msg tool ${message.status}`,
+      summary: `${message.name}: ${message.summary}${suffix}`,
+      detailAvailable: message.detailAvailable ?? false,
+      detailEvicted: message.detailEvicted ?? false,
+      detailRevision: message.detailRevision ?? 0,
+      truncated: message.detailTruncated ?? false,
+    };
+  }
+  if (message.kind === 'reasoning') {
+    return { kind: 'reasoning', className: 'msg reasoning', summary: message.text };
+  }
+  if (message.kind === 'todo') {
+    return {
+      kind: 'todo',
+      className: 'msg todo',
+      items: message.items.map(({ text, completed }) => ({ text, completed })),
+    };
+  }
+  return { kind: 'text', className: `msg ${message.kind}`, summary: message.text };
+}
+
+/** Collision-free key for browser-local detail state. */
+export function detailKey(sessionId, itemId) {
+  return JSON.stringify([sessionId, itemId]);
+}
+
+/** Share one in-flight request for one exact session/item/revision key. */
+export function requestOnce(requests, key, load) {
+  const current = requests.get(key);
+  if (current) return current;
+  const request = load().finally(() => requests.delete(key));
+  requests.set(key, request);
+  return request;
+}
+
+export function needsDetailFetch(view, cached) {
+  return view.detailAvailable
+    && !view.detailEvicted
+    && (!cached || cached.revision !== view.detailRevision);
+}
+
+/**
+ * The renderer's only detail-state branch table. Keeping it DOM-free makes a
+ * destructive transcript rebuild equivalent to the prior render.
+ */
+export function detailPresentation(view, expanded, cached) {
+  if (!expanded || (!view.detailAvailable && !view.detailEvicted)) {
+    return { open: false, mode: 'hidden', text: '', fetch: false };
+  }
+  if (view.detailEvicted) {
+    return {
+      open: true,
+      mode: 'evicted',
+      text: 'Detail removed to stay within the storage limit.',
+      fetch: false,
+    };
+  }
+  if (!cached || cached.revision !== view.detailRevision) {
+    return { open: true, mode: 'loading', text: 'Loading…', fetch: true };
+  }
+  if (cached.error) {
+    return { open: true, mode: 'error', text: cached.error, fetch: false };
+  }
+  return { open: true, mode: 'content', text: cached.text ?? '', fetch: false };
+}
+
+export async function fetchToolDetail(sessionId, itemId, fetchImpl = fetch) {
+  const params = new URLSearchParams({ session: sessionId, item: itemId });
+  let response;
+  try {
+    response = await fetchImpl(`/detail?${params}`);
+  } catch {
+    throw new Error('Detail request failed.');
+  }
+  if (!response.ok) throw new Error(`Detail request failed (HTTP ${response.status}).`);
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error('Detail request failed.');
+  }
+  if (!body || typeof body !== 'object'
+    || (body.text !== null && typeof body.text !== 'string')
+    || typeof body.truncated !== 'boolean'
+    || typeof body.evicted !== 'boolean'
+    || typeof body.revision !== 'number'
+    || !Number.isFinite(body.revision)) {
+    throw new Error('Detail request failed.');
+  }
+  return body;
+}
