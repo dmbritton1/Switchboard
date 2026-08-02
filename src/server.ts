@@ -464,7 +464,7 @@ export function createServer(opts: {
 
       const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
       // Serve only the three known assets; never join user-controlled path segments.
-      if (!['index.html', 'app.js', 'style.css'].includes(file)) {
+      if (!['index.html', 'app.js', 'lib.js', 'style.css'].includes(file)) {
         res.writeHead(404).end('not found');
         return;
       }
