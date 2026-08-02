@@ -3,3 +3,4 @@ accounts.json
 state.json
 .claude/settings.local.json
 .claude/worktrees/
+.worktrees/
