@@ -24,11 +24,17 @@ export type Msg =
   | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error'; id?: string }
   | { kind: 'error'; text: string };
 
-/** `options` is set only for AskUserQuestion: the first question's option labels,
+/** One AskUserQuestion choice. `description` is the agent's own explanation of
+ *  what picking it means — the reason to show it rather than the label alone. */
+export type QuestionOption = { label: string; description?: string };
+
+/** `options` is set only for AskUserQuestion: the first question's choices,
  *  which the UI renders as answer buttons. Answering resolves the request with a
  *  deny whose message carries the label — deny's `message` is the SDK's only
  *  channel back into the tool result, since the CLI has no terminal to ask on. */
-export type ApprovalRequest = { id: string; tool: string; summary: string; options?: string[] };
+export type ApprovalRequest = {
+  id: string; tool: string; summary: string; options?: QuestionOption[];
+};
 
 export type Session = {
   id: string;

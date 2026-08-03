@@ -44,8 +44,18 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .bar { height: 5px; border-radius: 3px; background: #333; overflow: hidden; margin: .4rem 0; }
 .bar > i { display: block; height: 100%; background: var(--working); }
 .bar.over > i { background: var(--needs); }
-.approval { margin-top: .6rem; }
-.approval button { margin-right: .4rem; }
+.approval { margin-top: .6rem; display: flex; flex-wrap: wrap; gap: .4rem; align-items: stretch; }
+/* Captioned answer buttons are blocks of text, not chips: left-aligned, free to
+   wrap, and sized to share a row rather than stretch to it. They also drop the
+   UA button styling — a light grey face leaves the dimmed caption unreadable on
+   a dark card. Uncaptioned Allow/Deny inherit the same face, just narrower. */
+.approval button { text-align: left; white-space: normal; flex: 0 1 auto; max-width: 22rem;
+  padding: .4rem .7rem; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--field); color: var(--fg); font: inherit; cursor: pointer; }
+.approval button:hover { border-color: var(--needs); }
+.approval .wt { flex: 1 0 100%; }
+.opt-desc { display: block; margin-top: .2rem; font-size: .85em; color: var(--dim);
+  font-weight: 400; }
 
 /* ---- Selection / merge / push ------------------------------------------ */
 /* The top row of a card: selection checkbox, status, and the ⋯ overflow menu

@@ -38,21 +38,29 @@ test('cardAction gives a blocked session the approval box', () => {
   assert.deepEqual(cardAction(s), { kind: 'approve' });
 });
 
-test('decideSpecs gives an ordinary tool Allow and Deny', () => {
+test('decideSpecs gives an ordinary tool an uncaptioned Allow and Deny', () => {
   assert.deepEqual(decideSpecs({ id: 'p', tool: 'Bash', summary: 'ls' }), [
-    ['Allow', { allow: true }],
-    ['Deny', { allow: false }],
+    { label: 'Allow', command: { allow: true } },
+    { label: 'Deny', command: { allow: false } },
   ]);
 });
 
-test('decideSpecs turns question options into answer buttons plus Skip', () => {
-  assert.deepEqual(decideSpecs({
-    id: 'p', tool: 'AskUserQuestion', summary: 'TS or Py?', options: ['Python', 'TypeScript'],
-  }), [
-    ['Python', { answer: 'Python' }],
-    ['TypeScript', { answer: 'TypeScript' }],
-    ['Skip', { allow: false }],
+test('decideSpecs captions each answer button with the option description', () => {
+  const specs = decideSpecs({
+    id: 'p',
+    tool: 'AskUserQuestion',
+    summary: 'TS or Py?',
+    options: [
+      { label: 'Python', description: 'No build step.' },
+      { label: 'TypeScript' },
+    ],
+  });
+  assert.deepEqual(specs.slice(0, 2), [
+    { label: 'Python', description: 'No build step.', command: { answer: 'Python' } },
+    { label: 'TypeScript', description: undefined, command: { answer: 'TypeScript' } },
   ]);
+  assert.deepEqual(specs[2].command, { allow: false });
+  assert.equal(specs[2].label, 'Skip');
 });
 
 test('cardAction gives a working session Stop', () => {

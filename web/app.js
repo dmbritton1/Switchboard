@@ -566,14 +566,24 @@ function stopButton(s) {
  * Option labels come from the agent, so they stay textContent like every other
  * summary here.
  */
-function decideButtons(id, pending) {
-  return decideSpecs(pending).map(([label, extra]) => {
+function decideButtons(id, pending, compact = false) {
+  return decideSpecs(pending).map(({ label, description, command }) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = label;
+    // The interrupt strip is a one-line nudge about a session you are not
+    // reading, so its captions stay in the tooltip; the card is where a choice
+    // is actually weighed, so there they are on the button.
+    if (description && compact) b.title = description;
+    if (description && !compact) {
+      const caption = document.createElement('small');
+      caption.className = 'opt-desc';
+      caption.textContent = description;
+      b.append(caption);
+    }
     b.onclick = async (e) => {
       e.stopPropagation();
-      await runSessionCommand({ cmd: 'decide', id, ...extra });
+      await runSessionCommand({ cmd: 'decide', id, ...command });
     };
     return b;
   });
@@ -601,7 +611,7 @@ function renderInterrupt(current) {
   line.textContent = `${first.branch} needs you — ${first.pending.tool}: ${first.pending.summary}`;
   box.append(line);
 
-  box.append(...decideButtons(first.id, first.pending));
+  box.append(...decideButtons(first.id, first.pending, true));
 
   const open = document.createElement('button');
   open.type = 'button';

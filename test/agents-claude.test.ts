@@ -96,12 +96,15 @@ test('an AskUserQuestion tool_use surfaces the question and its options', () => 
   }]);
 });
 
-test('questionOptions returns the first question labels, and null for anything else', () => {
+test('questionOptions returns the first question choices, and null for anything else', () => {
   const questions = [
-    { question: 'a?', options: [{ label: 'One' }, { label: 'Two' }] },
-    { question: 'b?', options: [{ label: 'Three' }] },
+    { question: 'a?', options: [{ label: 'One', description: 'the first' }, { label: 'Two' }] },
+    { question: 'b?', options: [{ label: 'Three', description: 'the third' }] },
   ];
-  assert.deepEqual(questionOptions('AskUserQuestion', { questions }), ['One', 'Two']);
+  assert.deepEqual(questionOptions('AskUserQuestion', { questions }), [
+    { label: 'One', description: 'the first' },
+    { label: 'Two' },
+  ]);
   assert.equal(questionOptions('Bash', { command: 'ls' }), null);
   assert.equal(questionOptions('AskUserQuestion', {}), null);
   assert.equal(questionOptions('AskUserQuestion', { questions: [{ question: 'a?' }] }), null);

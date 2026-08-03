@@ -35,16 +35,27 @@ export function cardAction(session, queue = []) {
 }
 
 /**
- * The buttons a pending request gets, as [label, commandFields] pairs. An
- * AskUserQuestion carries `options`, and each one answers the question outright;
- * Skip denies it normally so the agent falls back to asking in prose, which the
- * composer can answer. Everything else is the usual Allow/Deny.
+ * The buttons a pending request gets: `{ label, description, command }`, where
+ * `command` is merged into the decide call. An AskUserQuestion carries
+ * `options`, and each one answers the question outright, captioned with the
+ * agent's own explanation of that choice; Skip denies it normally so the agent
+ * falls back to asking in prose, which the composer can answer. Everything else
+ * is the usual Allow/Deny, which needs no caption.
  */
 export function decideSpecs(pending) {
-  if (!pending.options?.length) return [['Allow', { allow: true }], ['Deny', { allow: false }]];
+  if (!pending.options?.length) {
+    return [
+      { label: 'Allow', command: { allow: true } },
+      { label: 'Deny', command: { allow: false } },
+    ];
+  }
   return [
-    ...pending.options.map((label) => [label, { answer: label }]),
-    ['Skip', { allow: false }],
+    ...pending.options.map(({ label, description }) => ({
+      label,
+      description,
+      command: { answer: label },
+    })),
+    { label: 'Skip', description: 'None of these — answer in your own words instead.', command: { allow: false } },
   ];
 }
 

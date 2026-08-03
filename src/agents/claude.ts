@@ -2,10 +2,16 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { Adapter, AdapterEvent, AgentHandle, ApprovalRequest, StartOpts } from '../types.ts';
+import type {
+  Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption, StartOpts,
+} from '../types.ts';
 
-/** One line describing a tool call, for the transcript. */
-function summarize(name: string, input: Record<string, unknown>): string {
+/**
+ * One line describing a tool call. `listOptions` is off for the approval card,
+ * which renders the choices as buttons right underneath and would otherwise
+ * print each label twice; the transcript has no buttons and keeps them.
+ */
+function summarize(name: string, input: Record<string, unknown>, listOptions = true): string {
   // AskUserQuestion carries none of the fields below, so it used to render as
   // the bare tool name — the question itself never reached the UI. The SDK has
   // no interactive terminal, so allowing it returns "The user did not answer";
@@ -13,7 +19,9 @@ function summarize(name: string, input: Record<string, unknown>): string {
   if (name === 'AskUserQuestion' && Array.isArray(input.questions)) {
     type Q = { question?: string; options?: { label?: string }[] };
     return (input.questions as Q[])
-      .map((q) => `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`)
+      .map((q) => (listOptions
+        ? `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`
+        : q.question ?? ''))
       .join(' | ');
   }
   if (typeof input.command === 'string') return input.command;
@@ -23,7 +31,7 @@ function summarize(name: string, input: Record<string, unknown>): string {
 }
 
 /**
- * Option labels to render as answer buttons, or null for any tool that is not a
+ * Choices to render as answer buttons, or null for any tool that is not a
  * question. Only the first question's options: the tool allows up to four
  * questions, but one flat row of buttons cannot say which question an answer
  * belongs to. Multi-question calls still show every question in the summary and
@@ -31,13 +39,23 @@ function summarize(name: string, input: Record<string, unknown>): string {
  * ponytail: first question only — widen to a per-question row if that turns
  * out to be common.
  */
-export function questionOptions(name: string, input: Record<string, unknown>): string[] | null {
+export function questionOptions(
+  name: string,
+  input: Record<string, unknown>,
+): QuestionOption[] | null {
   if (name !== 'AskUserQuestion' || !Array.isArray(input.questions)) return null;
-  const first = input.questions[0] as { options?: { label?: unknown }[] } | undefined;
-  const labels = (first?.options ?? [])
-    .map((o) => o?.label)
-    .filter((l): l is string => typeof l === 'string' && l.length > 0);
-  return labels.length ? labels : null;
+  const first = input.questions[0] as
+    { options?: { label?: unknown; description?: unknown }[] } | undefined;
+  const options = (first?.options ?? [])
+    .filter((o) => typeof o?.label === 'string' && o.label.length > 0)
+    .map((o) => ({
+      label: o.label as string,
+      // Optional in our own type even though the tool schema requires it: the
+      // input is the agent's, not ours, and a missing description should cost a
+      // subtitle, not the whole button.
+      ...(typeof o.description === 'string' && o.description ? { description: o.description } : {}),
+    }));
+  return options.length ? options : null;
 }
 
 /** Pure: one SDK message in, zero or more normalized events out. */
@@ -238,7 +256,7 @@ export const claudeAdapter: Adapter = {
       const request = {
         id: `a${++approvalSeq}`,
         tool: toolName,
-        summary: summarize(toolName, toolInput),
+        summary: summarize(toolName, toolInput, !options),
         ...(options ? { options } : {}),
       };
       const { promise, isHead } = approvals.wait(request);
