@@ -80,11 +80,12 @@ export type SortMode = 'blocked' | 'newest' | 'account';
 // Frozen because callers spread from it; an unfrozen shared default is one
 // stray mutation away from every future session inheriting it. The `: Settings`
 // annotation contextually types the literal, so `notifyOn` needs no cast.
+// notifyOn is frozen separately because Object.freeze is shallow.
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
   autoApprove: false,
   account: null,
   branchPrefix: '',
-  notifyOn: ['needs-you'],
+  notifyOn: Object.freeze(['needs-you'] as NotifyOn[]),
   sort: 'blocked',
   collapseDone: false,
   autoRequeue: true,

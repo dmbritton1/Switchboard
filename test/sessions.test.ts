@@ -465,4 +465,10 @@ test('DEFAULT_SETTINGS is not shared mutable state', () => {
   // A frozen default that callers spread from cannot be corrupted by one
   // caller mutating what it thought was its own copy.
   assert.throws(() => { (DEFAULT_SETTINGS as { autoApprove: boolean }).autoApprove = true; });
+
+  // Spreading creates a shallow copy with a mutable top level, but the
+  // notifyOn array is still frozen, so mutation through the copy throws.
+  const copy = { ...DEFAULT_SETTINGS };
+  assert.throws(() => { copy.notifyOn.push('error'); });
+  assert.deepEqual(DEFAULT_SETTINGS.notifyOn, ['needs-you']);
 });
