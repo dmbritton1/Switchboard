@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
+import { DEFAULT_SETTINGS } from '../src/types.ts';
 
 function make(): { reg: Registry; id: string } {
   const reg = new Registry('/dev/null');
@@ -446,4 +447,22 @@ test('a state.json with no queue key loads cleanly', async (t) => {
   const sched = new Scheduler();
   await Registry.load(path, undefined, sched);
   assert.equal(sched.all().length, 0);
+});
+
+test('DEFAULT_SETTINGS reproduces the pre-settings behavior', () => {
+  assert.deepEqual(DEFAULT_SETTINGS, {
+    autoApprove: false,
+    account: null,
+    branchPrefix: '',
+    notifyOn: ['needs-you'],
+    sort: 'blocked',
+    collapseDone: false,
+    autoRequeue: true,
+  });
+});
+
+test('DEFAULT_SETTINGS is not shared mutable state', () => {
+  // A frozen default that callers spread from cannot be corrupted by one
+  // caller mutating what it thought was its own copy.
+  assert.throws(() => { (DEFAULT_SETTINGS as { autoApprove: boolean }).autoApprove = true; });
 });

@@ -57,6 +57,39 @@ export type Session = {
   statusSince: number;
 };
 
+/**
+ * User preferences. Every default is today's behavior, so a state.json that
+ * gains this block changes nothing until something is actually set.
+ *
+ * `account: null` means "rank by usage and pick the freest", which is what the
+ * New dialog does today; a name pins that account instead.
+ */
+export type Settings = {
+  autoApprove: boolean;
+  account: string | null;
+  branchPrefix: string;
+  notifyOn: NotifyOn[];
+  sort: SortMode;
+  collapseDone: boolean;
+  autoRequeue: boolean;
+};
+
+export type NotifyOn = 'needs-you' | 'done' | 'error';
+export type SortMode = 'blocked' | 'newest' | 'account';
+
+// Frozen because callers spread from it; an unfrozen shared default is one
+// stray mutation away from every future session inheriting it. The `: Settings`
+// annotation contextually types the literal, so `notifyOn` needs no cast.
+export const DEFAULT_SETTINGS: Settings = Object.freeze({
+  autoApprove: false,
+  account: null,
+  branchPrefix: '',
+  notifyOn: ['needs-you'],
+  sort: 'blocked',
+  collapseDone: false,
+  autoRequeue: true,
+});
+
 export type AdapterEvent =
   | { type: 'status'; status: Status }
   | { type: 'msg'; msg: Msg }
