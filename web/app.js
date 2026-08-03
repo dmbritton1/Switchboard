@@ -960,6 +960,36 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape' && menuFor) { menuFor = null; render(); }
 });
 
+// The datetime input is only meaningful for the "at" choice; `required` is set
+// with it so an empty value can't be submitted, and cleared with it so the
+// other two choices don't trip the form's own validation. Returns `sync` so a
+// caller that resets the form afterward (openNew(), the schedule button below)
+// can re-run it: form.reset() puts the select back to its default option
+// without firing 'change', so without a manual re-sync the datetime field's
+// hidden/required state is left matching whatever was selected before the reset.
+function bindWhen(selectSel, inputSel) {
+  const sel = $(selectSel);
+  const at = $(inputSel);
+  const sync = () => {
+    at.hidden = sel.value !== 'at';
+    at.required = sel.value === 'at';
+  };
+  sel.onchange = sync;
+  sync();
+  return sync;
+}
+const syncWhen = bindWhen('#when-select', '#when-at');
+const syncWhen2 = bindWhen('#when2-select', '#when2-at');
+
+// The server derives a reset trigger's account from the action, so the client
+// never sends one. An invalid or empty datetime yields NaN, which the server
+// rejects with a message the dialog already knows how to show.
+function triggerFor(when, at) {
+  return when === 'reset'
+    ? { kind: 'reset' }
+    : { kind: 'at', time: new Date(at).getTime() };
+}
+
 $('#composer').onsubmit = async (e) => {
   e.preventDefault();
   const text = $('#prompt').value.trim();
@@ -967,6 +997,50 @@ $('#composer').onsubmit = async (e) => {
   const result = await runSessionCommand({ cmd: 'send', id: openId, text });
   if (result.ok) $('#prompt').value = '';
 };
+
+$('#schedule-btn').onclick = () => {
+  const text = $('#prompt').value.trim();
+  if (!text) return;
+  const dialog = $('#when-dialog');
+  // Same reason as openNew(): without this, a dialog reopened after an earlier
+  // "When usage resets" pick still shows that choice (and the datetime field
+  // stays hidden to match) for an unrelated later message.
+  dialog.querySelector('form').reset();
+  syncWhen2();
+  $('#when-error').textContent = '';
+  dialog.showModal();
+};
+
+$('#when-dialog').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Same returnValue discipline as the #new dialog: Escape closes without
+  // setting one, and an unconsumed 'ok' would re-fire on the next Escape.
+  const ok = dialog.returnValue === 'ok';
+  dialog.returnValue = '';
+  if (!ok || !openId) return;
+
+  const text = $('#prompt').value.trim();
+  if (!text) return;
+  // Always schedule a `send`, even for a session that is stopped right now: the
+  // headline use of this feature is "send this tonight" against a session
+  // that's live at schedule time but very likely won't be by fire time (a
+  // server restart marks every session `stopped`). Only the server, at fire
+  // time, knows which is true — see the downgrade to `resume` in tick() in
+  // src/server.ts — so the client no longer guesses here.
+  const action = { kind: 'send', sessionId: openId, text };
+
+  const f = new FormData(dialog.querySelector('form'));
+  const result = await postCommand({
+    cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
+  });
+  if (result.ok) { $('#prompt').value = ''; render(); return; }
+  // Same pattern as #new: show the server's reason and let the user retry,
+  // rather than the fire-and-forget silence most other buttons in this app get.
+  // This one is a modal the user explicitly confirmed to queue something —
+  // going quiet on failure means they believe it's queued when it isn't.
+  $('#when-error').textContent = commandFailure(result);
+  dialog.showModal();
+});
 
 // Uploads go straight to disk in the session's worktree and come back as a
 // relative path, which is appended to the prompt box. The agent then opens it
@@ -1138,6 +1212,7 @@ async function openNew() {
   // place it is ever set — see there.)
   const dialog = $('#new');
   dialog.querySelector('form').reset();
+  syncWhen();
 
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
@@ -1168,17 +1243,24 @@ $('#new').addEventListener('close', async (e) => {
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
   const repo = f.get('repo'), branch = f.get('branch'), account = f.get('account');
+  const action = { kind: 'create', repo, branch, account, prompt: f.get('prompt') };
+  const when = f.get('when');
 
-  // Shown in the grid immediately — see pendingCreates' declaration for why
-  // this can't just wait for the next SSE snapshot.
-  const pending = { repo, branch, account };
-  pendingCreates.push(pending);
-  render();
+  // Only a create happening *now* gets a pending card. A scheduled one creates
+  // nothing yet — it lands in the queue strip, and a card that says "creating…"
+  // for something due tomorrow would be a lie.
+  const pending = when === 'now' ? { repo, branch, account } : null;
+  if (pending) {
+    // Shown in the grid immediately — see pendingCreates' declaration for why
+    // this can't just wait for the next SSE snapshot.
+    pendingCreates.push(pending);
+    render();
+  }
 
-  const result = await postCommand({
-    cmd: 'create', repo, branch, account, prompt: f.get('prompt'),
-  });
-  pendingCreates = pendingCreates.filter((p) => p !== pending);
+  const result = await postCommand(when === 'now'
+    ? { cmd: 'create', ...action }
+    : { cmd: 'schedule', trigger: triggerFor(when, f.get('at')), action });
+  if (pending) pendingCreates = pendingCreates.filter((p) => p !== pending);
   if (!result.ok) {
     $('#new-error').textContent = commandFailure(result);
     dialog.showModal();

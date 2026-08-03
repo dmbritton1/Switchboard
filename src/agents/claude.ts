@@ -75,6 +75,22 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
     return out;
   }
 
+  // SDKRateLimitEvent (sdk.d.ts) is a member of the SDKMessage union, so it
+  // arrives through the same for-await loop as everything else — the real reset
+  // timestamp costs no extra plumbing. The status is passed through as reported;
+  // deciding what a rejection means is Usage#noteLimit's job, not this one's.
+  if (m.type === 'rate_limit_event') {
+    const info = (m as { rate_limit_info?: { status?: string; resetsAt?: number } }).rate_limit_info;
+    if (info?.status) {
+      out.push({
+        type: 'rate-limit',
+        status: info.status as 'allowed' | 'allowed_warning' | 'rejected',
+        resetsAt: typeof info.resetsAt === 'number' ? info.resetsAt : null,
+      });
+    }
+    return out;
+  }
+
   if (m.type === 'assistant') {
     const content = (m as { message: { content: unknown } }).message.content;
     if (Array.isArray(content)) {

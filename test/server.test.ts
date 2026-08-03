@@ -8,9 +8,11 @@ import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
-import { createServer, refreshLimits, accountLoad } from '../src/server.ts';
+import { Scheduler } from '../src/schedule.ts';
+import { createServer, refreshLimits, accountLoad, shouldRequeue } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
+import type { Adapter, AdapterEvent } from '../src/types.ts';
 
 const run = promisify(execFile);
 
@@ -41,15 +43,48 @@ const accounts = [
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
 
-async function boot(t: { after: (fn: () => void) => void }) {
+async function boot(
+  t: { after: (fn: () => void) => void },
+  adapter?: Adapter,
+) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'));
   const usage = new Usage();
-  const server = createServer({ registry, usage, accounts });
+  const scheduler = new Scheduler();
+  // One adapter for every account rather than a claude/codex pair: since the
+  // Codex runtime landed, the server resolves a provider through an async
+  // `prepare` step instead of a lookup table, and a test that injects here
+  // wants to observe launch()'s emit wiring, not provider selection.
+  const prepare = adapter ? async () => ({ adapter }) : undefined;
+  const server = createServer({ registry, usage, scheduler, accounts, prepare });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
-  return { base: `http://127.0.0.1:${port}`, registry, usage };
+  return { base: `http://127.0.0.1:${port}`, registry, usage, scheduler, server };
+}
+
+/**
+ * A minimal fake `Adapter` for tests that need to drive `launch()`'s real
+ * emit callback in src/server.ts — the wiring that calls `usage.noteLimit()`
+ * and `shouldRequeue()` — without spawning a real Claude/Codex subprocess.
+ * `start()` captures the emit callback so the test can fire events into it
+ * whenever it likes; `stop()` emits `stopped` itself, matching the real
+ * adapters (both re-enter the emit callback from their own stop()).
+ */
+function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void } {
+  let cb: ((e: AdapterEvent) => void) | null = null;
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      cb = emit;
+      return {
+        send() {},
+        decide() {},
+        setAuto() {},
+        stop() { cb?.({ type: 'stopped', reason: 'stopped by handle' }); },
+      };
+    },
+  };
+  return { adapter, emit: (e) => cb?.(e) };
 }
 
 /** The snapshot the browser actually receives: /events pushes it on connect. */
@@ -119,7 +154,7 @@ process.exit(result.status ?? 1);
     bin,
     env: { FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome, ...options.env },
   };
-  const server = createServer({ registry, usage, accounts: [account] });
+  const server = createServer({ registry, usage, scheduler: new Scheduler(), accounts: [account] });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
@@ -451,13 +486,20 @@ test('GET /events opens an SSE stream with an immediate snapshot', async (t) => 
   assert.equal(res.headers.get('content-type'), 'text/event-stream');
 
   const reader = res.body!.getReader();
-  const chunk = new TextDecoder().decode((await reader.read()).value);
-  assert.match(chunk, /^data: /m);
-  const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
-  assert.equal(payload.sessions.length, 1);
-  assert.equal(payload.sessions[0].title, 'a title');
-  assert.equal(payload.accounts[0].name, 'claude-main');
-  await reader.cancel();
+  // try/finally, not a bare await at the end: if the assertion throws, an
+  // uncancelled reader leaves the SSE fetch open, and boot()'s t.after
+  // (server.close()) waits for that connection to end before it resolves — so
+  // node --test hangs on a failure here instead of reporting one.
+  try {
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    assert.match(chunk, /^data: /m);
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.sessions.length, 1);
+    assert.equal(payload.sessions[0].title, 'a title');
+    assert.equal(payload.accounts[0].name, 'claude-main');
+  } finally {
+    await reader.cancel();
+  }
 });
 
 test('POST /command with an unknown cmd is a 400', async (t) => {
@@ -815,6 +857,219 @@ test('GET /graph is behind the Host guard like every other route', async (t) => 
   assert.equal(res.status, 403);
 });
 
+// ---- schedule / unschedule ------------------------------------------------
+
+function post(base: string, body: unknown) {
+  return fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
+}
+
+test('scheduling a create returns an id and puts it in the queue', async (t) => {
+  const { base, scheduler } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3600_000 },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 200);
+  assert.ok((await res.json()).id);
+  assert.equal(scheduler.all().length, 1);
+});
+
+test('a reset trigger takes its account from the action, not the client', async (t) => {
+  const { base, scheduler } = await boot(t);
+  await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'reset', account: 'attacker-supplied' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'codex', prompt: 'go' },
+  });
+  assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+});
+
+test('scheduling rejects an unknown account', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'nope', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /unknown account/);
+});
+
+test('scheduling rejects a repo that is not a directory', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'create', repo: '/no/such/place', branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /not a directory/);
+});
+
+test('scheduling rejects a non-numeric time', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: 'tomorrow' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /timestamp/);
+});
+
+// Number(t.time) would happily coerce [] -> 0 and null -> 0 into a "valid"
+// finite timestamp, scheduling a nonsense-time item instead of rejecting the
+// request. A typeof guard is the only thing standing between this and a
+// silently-accepted garbage trigger.
+test('scheduling rejects a time that is coercible to a number but is not one', async (t) => {
+  const { base } = await boot(t);
+  for (const time of [[], null, [5000]]) {
+    const res = await post(base, {
+      cmd: 'schedule',
+      trigger: { kind: 'at', time },
+      action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+    });
+    assert.equal(res.status, 400, `time=${JSON.stringify(time)} must be rejected`);
+    assert.match((await res.json()).error, /timestamp/);
+  }
+});
+
+// String({}) is the non-empty, non-blank string '[object Object]' — it would
+// sail past a truthiness check and get scheduled as a real branch name or
+// prompt body. A typeof guard rejects the wrong-shaped field outright.
+test('scheduling rejects an object-valued branch or prompt', async (t) => {
+  const { base } = await boot(t);
+  const at = { kind: 'at', time: Date.now() };
+
+  const badBranch = await post(base, {
+    cmd: 'schedule', trigger: at,
+    action: { kind: 'create', repo: process.cwd(), branch: {}, account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(badBranch.status, 400);
+  assert.match((await badBranch.json()).error, /branch/);
+
+  const badPrompt = await post(base, {
+    cmd: 'schedule', trigger: at,
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: {} },
+  });
+  assert.equal(badPrompt.status, 400);
+  assert.match((await badPrompt.json()).error, /prompt/);
+});
+
+test('scheduling rejects an empty prompt and a missing branch', async (t) => {
+  const { base } = await boot(t);
+  const at = { kind: 'at', time: Date.now() };
+  const base_ = { repo: process.cwd(), account: 'claude-main' };
+
+  const noPrompt = await post(base, {
+    cmd: 'schedule', trigger: at, action: { kind: 'create', ...base_, branch: 'b', prompt: '  ' },
+  });
+  assert.equal(noPrompt.status, 400);
+
+  const noBranch = await post(base, {
+    cmd: 'schedule', trigger: at, action: { kind: 'create', ...base_, branch: '', prompt: 'go' },
+  });
+  assert.equal(noBranch.status, 400);
+});
+
+test('scheduling a send rejects an unknown session', async (t) => {
+  const { base } = await boot(t);
+  const res = await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() },
+    action: { kind: 'send', sessionId: 'nope', text: 'hi' },
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /no such session/);
+});
+
+// The other half of the design guarantee: a reset trigger on a send/resume
+// action takes its account from the target session, not from the client —
+// same rule as the create case, covered here so it isn't only proven for one
+// of the two action shapes that can carry a reset trigger.
+test('a reset trigger on a send takes its account from the target session, not the client', async (t) => {
+  const { base, registry, scheduler } = await boot(t);
+  const s = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 't',
+  });
+
+  await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'reset', account: 'attacker-supplied' },
+    action: { kind: 'send', sessionId: s.id, text: 'hi' },
+  });
+  assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+});
+
+test('unschedule removes the item', async (t) => {
+  const { base, scheduler } = await boot(t);
+  const { id } = await (await post(base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3600_000 },
+    action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+  })).json();
+
+  const res = await post(base, { cmd: 'unschedule', itemId: id });
+  assert.equal(res.status, 200);
+  assert.equal(scheduler.all().length, 0);
+});
+
+test('the SSE snapshot carries the queue', async (t) => {
+  const { base, scheduler } = await boot(t);
+  scheduler.add({ kind: 'at', time: 1 }, {
+    kind: 'create', repo: '/r', branch: 'b', account: 'claude-main', prompt: 'go',
+  });
+
+  const res = await fetch(`${base}/events`);
+  const reader = res.body!.getReader();
+  // try/finally, not a bare await at the end: if the assertion throws, an
+  // uncancelled reader leaves the SSE fetch open, and boot()'s t.after
+  // (server.close()) waits for that connection to end before it resolves —
+  // node:test's after-hooks run in registration order (FIFO), so a t.after
+  // registered here would run after boot()'s and still hang. finally runs
+  // synchronously as the test unwinds, before any after-hook, so the
+  // connection is always closed and a failure reports instead of hanging.
+  try {
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.queue.length, 1);
+  } finally {
+    await reader.cancel();
+  }
+});
+
+// The test above only proves the *first* frame (sent on connect) carries the
+// queue — it would pass even if scheduling never pushed again. This is the
+// live-update case: an already-open tab must see a `schedule` command without
+// reloading, which needs the Scheduler to notify its own subscribers the way
+// Registry does, not just get read by the next unrelated push.
+test('scheduling an item pushes a second SSE frame carrying it, without a reload', async (t) => {
+  const { base } = await boot(t);
+
+  const res = await fetch(`${base}/events`);
+  const reader = res.body!.getReader();
+  // Same try/finally discipline as the test above: an uncancelled reader on a
+  // thrown assertion hangs node --test instead of failing it (bit us in Task 5).
+  try {
+    await reader.read(); // the initial snapshot; queue is empty, not asserted here
+
+    const posted = post(base, {
+      cmd: 'schedule',
+      trigger: { kind: 'at', time: Date.now() + 3600_000 },
+      action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'claude-main', prompt: 'go' },
+    });
+    const chunk = new TextDecoder().decode((await reader.read()).value);
+    await posted;
+    const payload = JSON.parse(chunk.replace(/^data: /, '').trim());
+    assert.equal(payload.queue.length, 1);
+    assert.equal(payload.queue[0].action.branch, 'b');
+  } finally {
+    await reader.cancel();
+  }
+});
+
 test('POST /command resume on a session whose worktree is gone reports that, not an SDK error', async (t) => {
   const { base, registry } = await boot(t);
   const gone = join(tmpdir(), `sb-not-here-${Date.now()}`);
@@ -834,6 +1089,219 @@ test('POST /command resume on a session whose worktree is gone reports that, not
   // match this platform" from the SDK, which sends you debugging the wrong thing.
   assert.match((await res.json()).error, /worktree is gone/);
   assert.equal(registry.get(s.id)!.status, 'stopped', 'and the session must not have been revived');
+});
+
+test('a due item fires through command() and leaves the queue', async (t) => {
+  const { base, registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  // A `send` to a session with no live agent is a 404 from command(), which is
+  // exactly the failure path we want to observe — no agent is spawned in tests.
+  const item = scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed');
+  assert.match(scheduler.all()[0].error ?? '', /no live session/);
+  assert.equal(scheduler.all()[0].id, item.id, 'a failed item stays visible, it is not dropped');
+});
+
+test('an item whose time has not come is left alone', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  scheduler.add({ kind: 'at', time: Date.now() + 3600_000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+});
+
+test('a reset item does not fire while its account is rate limited', async (t) => {
+  const { registry, scheduler, server, usage } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  // registry.create() starts a session `working`, which would make the account
+  // busy() and block the item for the wrong reason. Park it first so the only
+  // thing under test is the rate limit.
+  registry.apply(s.id, { type: 'stopped', reason: 'parked for the test' });
+  usage.noteLimit('claude-main', 'rejected', Date.now() + 3600_000);
+  scheduler.add({ kind: 'reset', account: 'claude-main' }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+
+  usage.noteLimit('claude-main', 'allowed', null);
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed', 'it fired once the limit cleared');
+});
+
+test('a reset item waits while its account has a working session', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const busy = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'busy', title: 'busy',
+  });
+  assert.equal(busy.status, 'working', 'created sessions start working');
+
+  const target = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt2', branch: 'b', title: 'b',
+  });
+  // Park the target, so `busy` is true because of the *other* session and the
+  // test can't pass for the wrong reason.
+  registry.apply(target.id, { type: 'stopped', reason: 'parked for the test' });
+  scheduler.add({ kind: 'reset', account: 'claude-main' }, {
+    kind: 'send', sessionId: target.id, text: 'hello',
+  });
+
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'waiting');
+
+  // Retire the busy session and it goes through.
+  registry.apply(busy.id, { type: 'stopped', reason: 'done' });
+  await server.tick();
+  assert.equal(scheduler.all()[0].state, 'failed', 'fired once the account went idle');
+});
+
+test('overlapping ticks consult the scheduler once, not twice', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  // Count calls to due() rather than inspect end state: a doubled `send` to a
+  // dead session ends up looking the same either way, so the thing worth
+  // proving is that the scheduler is only consulted once per overlap.
+  let calls = 0;
+  const realDue = scheduler.due.bind(scheduler);
+  scheduler.due = (now, ctx) => { calls++; return realDue(now, ctx); };
+
+  // tick() yields at its first await (inside the loop's `command()` call, or
+  // at the trailing save if nothing is due), so calling it twice back to back
+  // without awaiting the first genuinely overlaps them — this is deterministic,
+  // not a race to hope for: the first call's synchronous prefix (which sets the
+  // in-flight guard and calls due()) always finishes before the second call's
+  // synchronous prefix begins.
+  const first = server.tick();
+  const second = server.tick();
+  await Promise.all([first, second]);
+
+  assert.equal(calls, 1, 'the second, overlapping tick must skip rather than re-dispatch the same item');
+});
+
+test('a queued send whose target went stopped by fire time is dispatched as a resume, not a 404 send', async (t) => {
+  const { registry, scheduler, server } = await boot(t);
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: '/r/wt', branch: 'b', title: 'b',
+  });
+  registry.apply(s.id, { type: 'stopped', reason: 'parked for the test' });
+  scheduler.add({ kind: 'at', time: Date.now() - 1000 }, {
+    kind: 'send', sessionId: s.id, text: 'hello',
+  });
+
+  await server.tick();
+  // A `send` to a stopped session would fail with "no live session" (404). A
+  // `resume` against this fake cwd instead fails with "worktree is gone"
+  // (409) before ever touching an adapter — that specific error is the proof
+  // the downgrade happened, not a coincidental other failure.
+  assert.equal(scheduler.all()[0].state, 'failed');
+  assert.match(scheduler.all()[0].error ?? '', /worktree is gone/);
+});
+
+test('a self-inflicted stop during a limit window is requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, now + 3600_000, now), true);
+});
+
+test('a stop we caused is never requeued', () => {
+  // Stop and Delete both drop the handle before calling stop(), so `dead` is
+  // falsy on the resulting event. Pressing Stop must not resurrect the session.
+  const now = 1000;
+  assert.equal(shouldRequeue(false, now + 3600_000, now), false);
+});
+
+test('a stop with no known limit is not requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, null, now), false);
+});
+
+test('a stop after the window already rolled is not requeued', () => {
+  const now = 1000;
+  assert.equal(shouldRequeue(true, now - 1, now), false);
+});
+
+// ---- auto-requeue wiring --------------------------------------------------
+//
+// shouldRequeue() above is a well-tested pure function, but nothing above
+// proves it is ever actually *called* from launch()'s emit callback — the
+// automatic half of the feature, which a user never triggers by hand and so
+// cannot notice is broken. These two drive a real session through the real
+// `create` -> launch() -> emit path with a fake adapter standing in for the
+// subprocess.
+
+test('a session that dies on its own during a rate limit is requeued for when the account resets', async (t) => {
+  const { adapter, emit } = fakeAdapter();
+  const { base, scheduler } = await boot(t, adapter);
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'b', account: 'claude-main', prompt: 'hi' }),
+  });
+  assert.equal(res.status, 200);
+  const { id } = await res.json();
+
+  const resetsAt = Date.now() + 3600_000;
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt });
+  // The adapter died on its own (no `stop` command called first), so the
+  // handle is still in the map when this fires — the `dead` case.
+  emit({ type: 'stopped', reason: 'rate limited' });
+
+  const queued = scheduler.all();
+  assert.equal(queued.length, 1, 'a reset-triggered resume should now be queued');
+  assert.deepEqual(queued[0].trigger, { kind: 'reset', account: 'claude-main' });
+  assert.deepEqual(queued[0].action, { kind: 'resume', sessionId: id, prompt: 'continue' });
+});
+
+test('a session stopped via the stop command is never requeued, even past the limit', async (t) => {
+  const { adapter, emit } = fakeAdapter();
+  const { base, scheduler } = await boot(t, adapter);
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'b', account: 'claude-main', prompt: 'hi' }),
+  });
+  const { id } = await res.json();
+
+  // Account is past its limit at the time the user presses Stop.
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt: Date.now() + 3600_000 });
+
+  const stopRes = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'stop', id }),
+  });
+  assert.equal(stopRes.status, 200);
+
+  assert.deepEqual(scheduler.all(), [], 'a deliberate Stop must not resurrect the session');
 });
 
 // ---- refreshLimits / accountLoad / snapshot limits fields ----------------
@@ -923,4 +1391,5 @@ test('the snapshot carries limits, limitsError and load per account', async (t) 
   assert.equal(codex.limits, null);
   assert.equal(codex.limitsError, 'not supported');
   assert.equal(codex.load, 0.4);
+
 });

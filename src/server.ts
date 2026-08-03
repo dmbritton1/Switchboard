@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
+import { Scheduler, type Ctx } from './schedule.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
@@ -15,7 +16,7 @@ import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
 import type {
-  AccountLimits, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session,
+  AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session, Trigger,
 } from './types.ts';
 
 const run = promisify(execFile);
@@ -104,6 +105,10 @@ function hostOk(req: IncomingMessage): boolean {
 
 const MAX_UPLOAD = 25 * 1024 * 1024;
 
+/** How often the scheduler is checked. Coarse on purpose: the UI picker is
+ *  minute-resolution, so a finer tick would buy nothing. */
+const TICK_MS = 30_000;
+
 /**
  * Origin guard: blocks plain cross-origin POST (Origin disagrees with
  * Host), which the hostOk() check above does not — that check only
@@ -163,6 +168,34 @@ export async function recentRepos(): Promise<string[]> {
   return [...repos].sort();
 }
 
+/** A queued action as the `command()` body that performs it. */
+function toCommand(a: Action): Record<string, unknown> {
+  if (a.kind === 'create') {
+    return { cmd: 'create', repo: a.repo, branch: a.branch, account: a.account, prompt: a.prompt };
+  }
+  if (a.kind === 'send') return { cmd: 'send', id: a.sessionId, text: a.text };
+  return { cmd: 'resume', id: a.sessionId, prompt: a.prompt };
+}
+
+/**
+ * Should a `stopped` session be auto-queued for a resume once its account's
+ * window rolls?
+ *
+ * `agentDied` is the `dead` local from launch()'s emit callback: truthy only
+ * when the agent ended on its own, because both the stop and delete commands
+ * remove the handle before calling stop(). `resetAt` is Usage's stored reset
+ * time; a non-null value in the future is exactly "this account is past its
+ * limit right now".
+ *
+ * ponytail: this will occasionally requeue a session that died of something
+ * unrelated during a limit window. Accepted on purpose — the item is visible in
+ * the queue strip and one click deletes it, whereas every tighter test means
+ * matching on provider error text, which is the brittleness this avoids.
+ */
+export function shouldRequeue(agentDied: boolean, resetAt: number | null, now: number): boolean {
+  return agentDied && resetAt !== null && resetAt > now;
+}
+
 /**
  * One fraction per account, so the meter and the New Session picker cannot
  * disagree. Real plan utilization when we have it, the local budget estimate
@@ -210,14 +243,26 @@ export async function refreshLimits(
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
+  scheduler: Scheduler;
   accounts: Account[];
-}): Server {
-  const { registry, usage, accounts } = opts;
+  /**
+   * Defaults to the real provider resolution; overridable so tests can drive
+   * launch() through a fake adapter instead of a real subprocess.
+   *
+   * This replaced a plain `adapters: { claude, codex }` pair when the Codex
+   * runtime landed: choosing a Codex adapter is now an async preflight
+   * (locating the binary, checking its version and login), not a lookup, so
+   * the seam tests need is the whole resolution step rather than its result.
+   */
+  prepare?: (account: Account) => Promise<PreparedProvider>;
+}): Server & { tick: () => Promise<void> } {
+  const { registry, usage, scheduler, accounts, prepare = prepareProvider } = opts;
   const handles = new Map<string, AgentHandle>();
 
   function snapshot() {
     return {
       sessions: registry.all(),
+      queue: scheduler.all(),
       accounts: accounts.map((a) => {
         const { limits, error } = usage.getLimits(a.name);
         return {
@@ -266,6 +311,11 @@ export function createServer(opts: {
       const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
+        // Claude only — the Codex SDK reports no rate-limit signal at all, which
+        // is why a Codex session never auto-requeues below.
+        if (safeEvent.type === 'rate-limit') {
+          usage.noteLimit(account.name, safeEvent.status, safeEvent.resetsAt);
+        }
         if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
@@ -280,6 +330,14 @@ export function createServer(opts: {
         const dead = handles.get(sessionId);
         handles.delete(sessionId);
         registry.apply(sessionId, safeEvent);
+        // Before stop(), for the same reason apply() is: stop() re-enters this
+        // callback, and by then `dead` is gone and the requeue would be skipped.
+        if (shouldRequeue(Boolean(dead), usage.resetAt(account.name), Date.now())) {
+          scheduler.add(
+            { kind: 'reset', account: account.name },
+            { kind: 'resume', sessionId, prompt: 'continue' },
+          );
+        }
         dead?.stop();
       });
       handles.set(sessionId, handle);
@@ -299,6 +357,78 @@ export function createServer(opts: {
     }
   }
 
+  /**
+   * Validates a `schedule` body into a (trigger, action) pair.
+   *
+   * The action is parsed first so a `reset` trigger can take its account from
+   * it rather than from the client — the account whose window we wait on is by
+   * definition the account the work runs on, and deriving it makes the two
+   * impossible to get out of step.
+   *
+   * Everything here is checked at schedule time so a typo surfaces now rather
+   * than at 3am. Fire-time validation is `command()`'s own and is unchanged.
+   */
+  async function parseSchedule(
+    body: Record<string, unknown>,
+  ): Promise<{ trigger: Trigger; action: Action } | { error: string }> {
+    const t = body.trigger as Record<string, unknown> | undefined;
+    const a = body.action as Record<string, unknown> | undefined;
+    if (!t || !a) return { error: 'schedule needs a trigger and an action' };
+
+    let action: Action;
+    let account: string;
+
+    if (a.kind === 'create') {
+      // typeof-guarded, not coerced: String()/Number() turn a wrong-shaped
+      // field (an array, an object, null) into a plausible-looking value
+      // instead of rejecting it — e.g. String({}) is the non-empty, non-blank
+      // string '[object Object]', which would sail past a truthiness check
+      // and get scheduled as a real branch name. A bad request must 400 here,
+      // not become a queue item that misbehaves later at fire time.
+      if (typeof a.account !== 'string') return { error: 'account must be a string' };
+      const found = accounts.find((x) => x.name === a.account);
+      if (!found) return { error: `unknown account: ${a.account}` };
+      if (typeof a.repo !== 'string') return { error: 'repo must be a string' };
+      const repo = a.repo;
+      if (!(await stat(repo).then((s) => s.isDirectory(), () => false))) {
+        return { error: `not a directory: ${repo}` };
+      }
+      if (typeof a.branch !== 'string') return { error: 'branch must be a string' };
+      const branch = a.branch.trim();
+      if (!branch) return { error: 'branch is required' };
+      if (typeof a.prompt !== 'string') return { error: 'prompt must be a string' };
+      const prompt = a.prompt.trim();
+      if (!prompt) return { error: 'prompt is required' };
+      action = { kind: 'create', repo, branch, account: found.name, prompt };
+      account = found.name;
+    } else if (a.kind === 'send' || a.kind === 'resume') {
+      if (typeof a.sessionId !== 'string') return { error: 'sessionId must be a string' };
+      const sessionId = a.sessionId;
+      const session = registry.get(sessionId);
+      if (!session) return { error: `no such session: ${sessionId}` };
+      const field = a.kind === 'send' ? 'text' : 'prompt';
+      const raw = a.kind === 'send' ? a.text : a.prompt;
+      if (typeof raw !== 'string') return { error: `${field} must be a string` };
+      const text = raw.trim();
+      if (!text) return { error: 'message is required' };
+      action = a.kind === 'send'
+        ? { kind: 'send', sessionId, text }
+        : { kind: 'resume', sessionId, prompt: text };
+      account = session.account;
+    } else {
+      return { error: `unknown action: ${String(a.kind)}` };
+    }
+
+    if (t.kind === 'at') {
+      if (typeof t.time !== 'number' || !Number.isFinite(t.time)) {
+        return { error: 'trigger.time must be a timestamp' };
+      }
+      return { trigger: { kind: 'at', time: t.time }, action };
+    }
+    if (t.kind === 'reset') return { trigger: { kind: 'reset', account }, action };
+    return { error: `unknown trigger: ${String(t.kind)}` };
+  }
+
   async function command(body: Record<string, unknown>): Promise<{ status: number; json: unknown }> {
     switch (body.cmd) {
       case 'create': {
@@ -306,7 +436,7 @@ export function createServer(opts: {
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
         let prepared: PreparedProvider;
         try {
-          prepared = await prepareProvider(account);
+          prepared = await prepare(account);
         } catch (error) {
           if (error instanceof CodexRuntimeError) {
             return {
@@ -409,7 +539,7 @@ export function createServer(opts: {
         }
         let prepared: PreparedProvider;
         try {
-          prepared = await prepareProvider(account);
+          prepared = await prepare(account);
         } catch (error) {
           if (error instanceof CodexRuntimeError) {
             const reason = redactCodexText(error.message, account.env);
@@ -472,8 +602,88 @@ export function createServer(opts: {
         return { status: 200, json: { ok: true } };
       }
 
+      case 'schedule': {
+        const parsed = await parseSchedule(body);
+        if ('error' in parsed) return { status: 400, json: { error: parsed.error } };
+        const item = scheduler.add(parsed.trigger, parsed.action);
+        return { status: 200, json: { id: item.id } };
+      }
+
+      case 'unschedule': {
+        scheduler.remove(String(body.itemId));
+        return { status: 200, json: { ok: true } };
+      }
+
       default:
         return { status: 400, json: { error: `unknown cmd: ${String(body.cmd)}` } };
+    }
+  }
+
+  // True while a tick's `command()` calls are in flight. An item stays
+  // `waiting` until its own call resolves, so if one pass runs past TICK_MS
+  // (a realistic case: due() deliberately lets a backlog build up while
+  // Switchboard is down, and each `create` in that backlog awaits a real git
+  // checkout), the next interval firing would call due() again and see the
+  // same still-waiting items — dispatching a `create` a second time and
+  // spawning two live agents for one scheduled task. Skipping the overlapping
+  // pass is correct, not just convenient: it has nothing unique to do, and
+  // the next interval will pick up whatever is still due 30s later.
+  let ticking = false;
+
+  /**
+   * One scheduler pass. Every due item is routed back through `command()` — a
+   * scheduled create is literally the same code path as a create from the
+   * dialog, so there is no second launch path to keep in sync, and scheduled
+   * actions inherit `command()`'s validation and 404/409 handling for free.
+   *
+   * No save here: `due()`'s `missed` transition and every `remove()`/`fail()`
+   * below all go through Scheduler#notify(), and the coalesced save timer
+   * (`unsubSave` below) is subscribed to the scheduler as well as the
+   * registry — so a scheduler-only change persists on its own, coalesced
+   * schedule instead of this function rewriting all of state.json on every
+   * 30s tick regardless of whether anything happened.
+   */
+  async function tick(): Promise<void> {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const ctx: Ctx = {
+        free: (name) => {
+          const a = accounts.find((x) => x.name === name);
+          // An account dropped from accounts.json can never be free — its work
+          // cannot run at all, and command() will say so if the item ever fires.
+          return a ? usage.free(a.name, a.budget) : false;
+        },
+        busy: (name) => registry.all().some(
+          (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+        ),
+      };
+
+      for (const item of scheduler.due(Date.now(), ctx)) {
+        let action = item.action;
+        // A queued `send` can only be decided against the session's status at
+        // schedule time — but the headline use of this feature is scheduling a
+        // send hours out against a session that is live *right now*. By fire
+        // time the server has very likely restarted, and Registry.load marks
+        // every session `stopped` on load (see GRACE_MS's own restart-survival
+        // reasoning above). Deciding at schedule time would then queue a `send`
+        // that 404s at fire time — the message silently never reaches anyone.
+        // Only fire time knows the real answer, so the downgrade happens here,
+        // not in the client.
+        if (action.kind === 'send' && registry.get(action.sessionId)?.status === 'stopped') {
+          action = { kind: 'resume', sessionId: action.sessionId, prompt: action.text };
+        }
+        let result: { status: number; json: unknown };
+        try {
+          result = await command(toCommand(action));
+        } catch (err) {
+          result = { status: 500, json: { error: String((err as Error).message ?? err) } };
+        }
+        if (result.status === 200) scheduler.remove(item.id);
+        else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
+      }
+    } finally {
+      ticking = false;
     }
   }
 
@@ -503,10 +713,15 @@ export function createServer(opts: {
         });
         const push = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
         push();
-        const unsub = registry.subscribe(push);
+        const unsubRegistry = registry.subscribe(push);
+        const unsubScheduler = scheduler.subscribe(push);
         // Keeps proxies and sleeping laptops from dropping an idle stream.
         const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
-        req.on('close', () => { unsub(); clearInterval(ping); });
+        req.on('close', () => {
+          unsubRegistry();
+          unsubScheduler();
+          clearInterval(ping);
+        });
         return;
       }
 
@@ -670,26 +885,45 @@ export function createServer(opts: {
   // try/catch, where an unguarded rejection is fatal to the whole process and
   // would take every live agent with it.
   //
+  // Also subscribed to the scheduler, not just the registry: `state.json` holds
+  // the queue too, and `tick()`'s `missed` transition and the auto-requeue
+  // `scheduler.add()` in launch()'s emit callback both need to survive a
+  // restart just like a registry change does. One shared timer coalesces
+  // whichever source fires first, so a burst of scheduler and registry changes
+  // in the same 30s tick still writes state.json once, not twice.
+  //
   // unref()'d rather than flushed on close: the timer must never be the reason
   // the process stays alive (it would also hold test runs open for 2s each, and
   // fire a write into an already-deleted temp dir), while the server handle keeps
   // the loop alive for as long as saving actually matters. Cleared on 'close' too
   // so a closed server can't write after its state dir is gone.
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  const unsubSave = registry.subscribe(() => {
+  const scheduleSave = () => {
     if (saveTimer) return;
     saveTimer = setTimeout(() => {
       saveTimer = null;
       void registry.save().catch(() => {});
     }, 2000).unref();
-  });
+  };
+  const unsubSave = registry.subscribe(scheduleSave);
+  const unsubSchedulerSave = scheduler.subscribe(scheduleSave);
   server.on('close', () => {
     unsubSave();
+    unsubSchedulerSave();
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
   });
 
-  return server;
+  // unref()'d and cleared on close for the same reasons as the save timer above:
+  // it must never be the reason the process stays alive, and a closed server
+  // must not fire a create into an already-deleted state directory.
+  const tickTimer = setInterval(() => { void tick().catch(() => {}); }, TICK_MS).unref();
+  server.on('close', () => clearInterval(tickTimer));
+
+  // Exposed so tests can drive exactly one pass instead of racing a 30s timer.
+  (server as Server & { tick: () => Promise<void> }).tick = tick;
+
+  return server as Server & { tick: () => Promise<void> };
 }
 
 // Entry point: only when run directly, so tests can import createServer freely.
@@ -699,7 +933,8 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
     await readFile(new URL('../accounts.json', import.meta.url), 'utf8'),
   ) as Account[];
   const usage = new Usage();
-  const registry = await Registry.load(statePath, usage);
+  const scheduler = new Scheduler();
+  const registry = await Registry.load(statePath, usage, scheduler);
   // Entry point only, never inside createServer: test/server.test.ts imports
   // createServer directly, and an interval started there would leak a timer and
   // a CLI spawn into every server test.
@@ -725,6 +960,6 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
-  createServer({ registry, usage, accounts })
+  createServer({ registry, usage, scheduler, accounts })
     .listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }

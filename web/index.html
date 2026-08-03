@@ -34,7 +34,9 @@
     <div id="transcript"></div>
     <form id="composer">
       <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
-      <input id="prompt" placeholder="Message…" autocomplete="off"><button>Send</button>
+      <input id="prompt" placeholder="Message…" autocomplete="off">
+      <button id="schedule-btn" type="button" title="Schedule this message">⏱</button>
+      <button>Send</button>
     </form>
     <p id="upload-error"></p>
   </div>
@@ -71,6 +73,18 @@
       <div class="select-wrap"><select id="account-select" name="account"></select></div>
     </div>
     <div class="field">
+      <label for="when-select">Run</label>
+      <div class="select-wrap"><select id="when-select" name="when">
+        <option value="now">Now</option>
+        <option value="at">At a time…</option>
+        <option value="reset">When usage resets</option>
+      </select></div>
+      <!-- Native picker: no date library, and it hands back a local wall-clock
+           string that `new Date()` parses as local time, which is what the user
+           meant. -->
+      <input id="when-at" name="at" type="datetime-local" hidden>
+    </div>
+    <div class="field">
       <label for="prompt-input">First prompt</label>
       <textarea id="prompt-input" name="prompt" required rows="3"
                 placeholder="What should the agent do?"></textarea>
@@ -82,6 +96,21 @@
          dialog's method="dialog" close entirely — Cancel silently does
          nothing on the form's default (empty) state. -->
     <menu><button value="cancel" formnovalidate>Cancel</button><button id="create" value="create">Create worktree</button></menu>
+  </form>
+</dialog>
+<dialog id="when-dialog">
+  <form method="dialog">
+    <h2>Schedule message</h2>
+    <div class="field">
+      <label for="when2-select">Run</label>
+      <div class="select-wrap"><select id="when2-select" name="when">
+        <option value="at">At a time…</option>
+        <option value="reset">When usage resets</option>
+      </select></div>
+      <input id="when2-at" name="at" type="datetime-local">
+    </div>
+    <p id="when-error"></p>
+    <menu><button value="cancel" formnovalidate>Cancel</button><button value="ok">Schedule</button></menu>
   </form>
 </dialog>
 <dialog id="del">

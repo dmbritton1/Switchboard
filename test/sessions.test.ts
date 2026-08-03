@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
+import { Scheduler } from '../src/schedule.ts';
 
 function make(): { reg: Registry; id: string } {
   const reg = new Registry('/dev/null');
@@ -387,4 +388,62 @@ test('a state.json of the right syntax but the wrong shape loads as empty', asyn
     const reg = await Registry.load(path, new Usage());
     assert.deepEqual(reg.all(), [], `${content} should load as empty`);
   }
+});
+
+test('the queue round-trips through state.json', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const sched = new Scheduler();
+  sched.add({ kind: 'at', time: 123 }, {
+    kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go',
+  });
+  await new Registry(path, undefined, sched).save();
+
+  const back = new Scheduler();
+  await Registry.load(path, undefined, back);
+  assert.equal(back.all().length, 1);
+  assert.equal(back.all()[0].trigger.kind, 'at');
+});
+
+test('load restores a valid queued item and drops a malformed one', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const valid = {
+    id: 'v1',
+    trigger: { kind: 'at', time: 123 },
+    action: { kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go' },
+    createdAt: 100,
+    state: 'waiting',
+    error: null,
+  };
+  // Unrecognized trigger.kind — Scheduler.restore() rejects it outright.
+  const malformed = {
+    id: 'bad',
+    trigger: { kind: 'bogus' },
+    action: { kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go' },
+    createdAt: 100,
+    state: 'waiting',
+    error: null,
+  };
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {}, queue: [valid, malformed] }));
+
+  const sched = new Scheduler();
+  await Registry.load(path, undefined, sched);
+  assert.equal(sched.all().length, 1);
+  assert.equal(sched.all()[0].id, 'v1');
+});
+
+test('a state.json with no queue key loads cleanly', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {} }));
+
+  const sched = new Scheduler();
+  await Registry.load(path, undefined, sched);
+  assert.equal(sched.all().length, 0);
 });

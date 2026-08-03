@@ -2,10 +2,19 @@ import type { AccountLimits } from './types.ts';
 
 const WINDOW_MS = 5 * 3600_000;
 
+/** ponytail: calibration knob. `budget` in accounts.json is hand-tuned per
+ *  account, so the threshold that reads pace() has to be tunable too. Lower it
+ *  if queued work keeps re-hitting the limit; raise it if items sit too long. */
+export const RESET_PACE = 0.8;
+
 type Sample = { t: number; tokens: number };
 
 export class Usage {
   #samples = new Map<string, Sample[]>();
+  /** account -> epoch ms at which its window rolls. Only set while the account is
+   *  actually rejected; an `allowed` event deletes the entry so a stale limit
+   *  can't suppress the pace fallback forever. */
+  #resets = new Map<string, number>();
 
   /** Real plan limits per account, or why there are none. Deliberately not in
    *  toJSON(): a utilization percentage is wrong the moment this process is not
@@ -21,22 +30,72 @@ export class Usage {
     this.#samples.set(account, list);
   }
 
-  /** Serialized into state.json alongside sessions so pace survives a restart. */
-  toJSON(): Record<string, Sample[]> {
-    return Object.fromEntries(this.#samples);
+  /** Records what the provider said about this account's rate limit. Only a
+   *  `rejected` status stores a reset time: `allowed_warning` means there is
+   *  still room, so storing its resetsAt would block work that is allowed. */
+  noteLimit(
+    account: string,
+    status: 'allowed' | 'allowed_warning' | 'rejected',
+    resetsAt: number | null,
+  ): void {
+    if (status !== 'rejected' || resetsAt === null || !Number.isFinite(resetsAt)) {
+      this.#resets.delete(account);
+      return;
+    }
+    // The SDK types resetsAt as a bare `number` with no documented unit. Values in
+    // the plausible-seconds band [1e9, 1e11) represent times between ~2001 and ~5138;
+    // anything outside it is either a real millisecond timestamp or a fake-clock test
+    // value, and gets left exactly as given.
+    this.#resets.set(account, resetsAt >= 1e9 && resetsAt < 1e11 ? resetsAt * 1000 : resetsAt);
+  }
+
+  resetAt(account: string): number | null {
+    return this.#resets.get(account) ?? null;
+  }
+
+  /** Is there room to start work on this account right now? A known reset time
+   *  is authoritative — the provider told us. Only when we have none (a Codex
+   *  account, whose SDK reports no rate limits at all, or a Claude account that
+   *  has never been rejected) do we fall back to the local estimate. */
+  free(account: string, budget: number, now = Date.now()): boolean {
+    const reset = this.#resets.get(account);
+    if (reset !== undefined) return now >= reset;
+    return this.pace(account, budget, now) < RESET_PACE;
+  }
+
+  /** Serialized into state.json alongside sessions so pace and known limits
+   *  survive a restart. */
+  toJSON(): { samples: Record<string, Sample[]>; resets: Record<string, number> } {
+    return {
+      samples: Object.fromEntries(this.#samples),
+      resets: Object.fromEntries(this.#resets),
+    };
   }
 
   /** Inverse of toJSON(). Tolerates anything: state.json is user-editable and may
    *  predate usage persistence entirely, so bad input is dropped, not thrown on. */
   restore(data: unknown, now = Date.now()): void {
     if (!data || typeof data !== 'object') return;
+    const d = data as Record<string, unknown>;
+    // Two shapes to read. The old one is a bare account -> Sample[] map; the new
+    // one is { samples, resets }. An account can't be mistaken for the new shape
+    // because its value is an array, and `samples` never is.
+    const isNew = !!d.samples && typeof d.samples === 'object' && !Array.isArray(d.samples);
+    const samples = (isNew ? d.samples : d) as Record<string, unknown>;
+
     const cutoff = now - WINDOW_MS;
-    for (const [account, list] of Object.entries(data as Record<string, unknown>)) {
+    for (const [account, list] of Object.entries(samples)) {
       if (!Array.isArray(list)) continue;
       const kept = (list as Sample[]).filter(
         (s) => s && typeof s.t === 'number' && typeof s.tokens === 'number' && s.t > cutoff,
       );
       if (kept.length) this.#samples.set(account, kept);
+    }
+
+    if (isNew && d.resets && typeof d.resets === 'object') {
+      for (const [account, t] of Object.entries(d.resets as Record<string, unknown>)) {
+        if (typeof t === 'number' && Number.isFinite(t)) this.#resets.set(account, t);
+      }
     }
   }
 

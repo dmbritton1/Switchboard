@@ -117,6 +117,35 @@ subsets of the reported totals rather than separate counters — an assumption
 noted in the code, not a confirmed one. Keep that in mind when tuning `budget`
 per account.
 
+## Scheduling
+
+Cards can be created for later instead of now, and messages can be scheduled into
+an existing session. The New worktree dialog's **Run** field takes `Now`, `At a
+time…` (a native date-time picker) or `When usage resets`; the ⏱ button beside
+the chat composer schedules a message the same way. Queued items show in a strip
+above the grid and can be removed from there.
+
+`When usage resets` is a real signal for Claude accounts, not a guess: the Agent
+SDK streams a `rate_limit_event` carrying the timestamp at which the window
+rolls, and that timestamp is stored per account. The Codex SDK reports no rate
+limits at all, so a Codex account falls back to the same estimate the account
+bars show — the item fires once the trailing-5h token pace (tokens spent ÷
+`budget`) drops below `RESET_PACE` (0.8, in `src/usage.ts`). That fallback is only
+as good as the budget you tuned in `accounts.json`, same caveat as the bars.
+
+When a Claude session dies while its account is past its limit, a resume is
+queued automatically for when the window rolls; the card appends a line reading
+`⏱ waiting for reset` below the status. Codex sessions never auto-requeue,
+because the Codex SDK reports no rate-limit signal. Stopping a session yourself
+never queues anything. Items waiting on one account fire one at a time, so a
+freshly reset window is not spent all at once — items waiting on a clock fire at
+their time regardless of what else is running.
+
+Scheduled items are one-shot; there is no recurrence. A time that passes while
+Switchboard is down fires on the next start if it is less than 12 hours late
+(`GRACE_MS` in `src/schedule.ts`), and is marked `missed` if it is older than
+that. The queue lives in `state.json` alongside the sessions.
+
 ## Tests
 
 ```bash
@@ -178,6 +207,14 @@ spend a model turn, or read a real Codex account.
   for that path is now orphaned, not that data survived. `git worktree list`
   shows the stale entry; `git worktree prune` clears it. (The one case a
   delete leaves the card in place is when that `rm -rf` fallback fails too.)
+- The scheduler ticks every 30 seconds and only runs while the server does — a
+  scheduled item is not an OS-level cron job, and nothing fires with Switchboard
+  closed. The auto-requeue heuristic applies only to Claude accounts: any Claude
+  session that dies on its own while its account is past its limit gets a resume
+  queued, including one that died of something unrelated. Codex sessions never
+  auto-requeue, since the Codex SDK reports no rate-limit signal. The visible
+  queue row for an auto-requeue is one you can delete, which is the trade made to
+  avoid matching on provider error text.
 
 Phase 2 remains intentionally out of scope: live item lifecycle rendering,
 bounded/redacted tool details, reasoning and todo presentation, structured

@@ -63,6 +63,9 @@ export type AdapterEvent =
   | { type: 'approval'; request: ApprovalRequest }
   | { type: 'approval-resolved' }
   | { type: 'usage'; inputTokens: number; outputTokens: number }
+  // Claude only. The Codex SDK has no rate-limit concept anywhere in its types,
+  // so a Codex account never produces this and falls back to the pace estimate.
+  | { type: 'rate-limit'; status: 'allowed' | 'allowed_warning' | 'rejected'; resetsAt: number | null }
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
   | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
@@ -109,4 +112,27 @@ export type AgentHandle = {
 
 export type Adapter = {
   start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle;
+};
+
+export type Trigger =
+  /** Fire at this wall-clock moment (epoch ms). */
+  | { kind: 'at'; time: number }
+  /** Fire once this account's usage window has room again. */
+  | { kind: 'reset'; account: string };
+
+export type Action =
+  | { kind: 'create'; repo: string; branch: string; account: string; prompt: string }
+  | { kind: 'send'; sessionId: string; text: string }
+  | { kind: 'resume'; sessionId: string; prompt: string };
+
+/** A one-shot queued chat. There is no `fired` state: an item that fires is
+ *  removed. `missed` and `failed` stick around so the user can see what happened
+ *  and re-arm or delete them. */
+export type Queued = {
+  id: string;
+  trigger: Trigger;
+  action: Action;
+  createdAt: number;
+  state: 'waiting' | 'missed' | 'failed';
+  error: string | null;
 };
