@@ -204,7 +204,7 @@ test('accountView with limits drops the estimate wording', () => {
   assert.deepEqual(v.windows.map((w) => [w.label, w.pct]), [['5h', 11], ['7d', 1]]);
 });
 
-test('accountView reports the worse window as the headline number', () => {
+test('accountView headlines the 5h window even when 7d is far worse', () => {
   const v = accountView(acct({
     limits: {
       fiveHour: { utilization: 5, resetsAt: '2026-08-03T19:10:00Z' },
@@ -213,8 +213,24 @@ test('accountView reports the worse window as the headline number', () => {
     },
     load: 0.96,
   }));
-  assert.equal(v.pct, 96);
-  assert.equal(v.title, 'claude-main — 96% of the 7d limit');
+  // The badge stays on 5h — a nearly-exhausted week does not get to steal the
+  // headline number, it only shows up in the tap-open panel's windows list.
+  assert.equal(v.pct, 5);
+  assert.equal(v.title, 'claude-main — 5% of the 5h limit');
+  // `load` is untouched: it still ranks this account as nearly out of room for
+  // the bar color and the New Session picker, even though the badge reads 5%.
+  assert.equal(v.load, 0.96);
+  assert.deepEqual(v.windows.map((w) => [w.label, w.pct]), [['5h', 5], ['7d', 96]]);
+});
+
+test('accountView falls back to 7d as the headline when the plan does not report 5h', () => {
+  const v = accountView(acct({
+    limits: { fiveHour: null, sevenDay: { utilization: 42, resetsAt: '2026-08-10T08:00:00Z' }, subscription: 'pro' },
+    load: 0.42,
+  }));
+  assert.equal(v.pct, 42);
+  assert.equal(v.title, 'claude-main — 42% of the 7d limit');
+  assert.deepEqual(v.windows.map((w) => w.label), ['7d']);
 });
 
 test('accountView omits a window the plan does not report', () => {
