@@ -24,7 +24,11 @@ export type Msg =
   | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error'; id?: string }
   | { kind: 'error'; text: string };
 
-export type ApprovalRequest = { id: string; tool: string; summary: string };
+/** `options` is set only for AskUserQuestion: the first question's option labels,
+ *  which the UI renders as answer buttons. Answering resolves the request with a
+ *  deny whose message carries the label — deny's `message` is the SDK's only
+ *  channel back into the tool result, since the CLI has no terminal to ask on. */
+export type ApprovalRequest = { id: string; tool: string; summary: string; options?: string[] };
 
 export type Session = {
   id: string;
@@ -71,7 +75,9 @@ export type StartOpts = {
 
 export type AgentHandle = {
   send(text: string, promptId?: string): void;
-  decide(allow: boolean): void;
+  /** `answer` is the AskUserQuestion option label the user picked; it overrides
+   *  `allow` and is handed back to the agent as the tool result. */
+  decide(allow: boolean, answer?: string): void;
   setAuto(on: boolean): void;
   stop(): void;
 };

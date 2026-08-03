@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
-import { normalizeClaude, approvalQueue } from '../src/agents/claude.ts';
+import { normalizeClaude, approvalQueue, questionOptions } from '../src/agents/claude.ts';
 import type { AdapterEvent } from '../src/types.ts';
 
 const fixture = JSON.parse(
@@ -63,6 +63,48 @@ test('a tool_use block is summarized to one line and carries its id', () => {
   assert.deepEqual(events, [
     { type: 'msg', msg: { kind: 'tool', name: 'Bash', summary: 'ls -la', status: 'running', id: 't1' } },
   ]);
+});
+
+test('an AskUserQuestion tool_use surfaces the question and its options', () => {
+  const events = normalizeClaude({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'tool_use',
+        id: 't5',
+        name: 'AskUserQuestion',
+        input: {
+          questions: [{
+            question: 'TypeScript or Python?',
+            header: 'Language',
+            options: [{ label: 'Python', description: 'x' }, { label: 'TypeScript', description: 'y' }],
+          }],
+        },
+      }],
+    },
+  } as never);
+  assert.deepEqual(events, [{
+    type: 'msg',
+    msg: {
+      kind: 'tool',
+      name: 'AskUserQuestion',
+      summary: 'TypeScript or Python? [Python / TypeScript]',
+      status: 'running',
+      id: 't5',
+    },
+  }]);
+});
+
+test('questionOptions returns the first question labels, and null for anything else', () => {
+  const questions = [
+    { question: 'a?', options: [{ label: 'One' }, { label: 'Two' }] },
+    { question: 'b?', options: [{ label: 'Three' }] },
+  ];
+  assert.deepEqual(questionOptions('AskUserQuestion', { questions }), ['One', 'Two']);
+  assert.equal(questionOptions('Bash', { command: 'ls' }), null);
+  assert.equal(questionOptions('AskUserQuestion', {}), null);
+  assert.equal(questionOptions('AskUserQuestion', { questions: [{ question: 'a?' }] }), null);
 });
 
 test('a tool_result block becomes a tool-result event', () => {

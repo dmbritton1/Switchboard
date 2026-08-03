@@ -302,7 +302,11 @@ export function createServer(opts: {
       case 'decide': {
         const handle = handles.get(String(body.id));
         if (!handle) return { status: 404, json: { error: 'no live session' } };
-        handle.decide(Boolean(body.allow));
+        const answer = typeof body.answer === 'string' && body.answer ? body.answer : undefined;
+        // Recorded as a prompt so the scrollback shows what was chosen; clicking
+        // an option is the user speaking, and it is delivered as the tool result.
+        if (answer) registry.appendPrompt(String(body.id), answer, 'sent');
+        handle.decide(Boolean(body.allow), answer);
         return { status: 200, json: { ok: true } };
       }
 

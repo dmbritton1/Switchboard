@@ -264,6 +264,16 @@ test('a tool-result event updates the matching tool message and ignores unknown 
   });
 });
 
+test('an answered question is not marked failed by its deny-carried tool result', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'AskUserQuestion', summary: 'TS or Py?', status: 'running', id: 'q1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 'q1', ok: false });
+  assert.equal((reg.get(id)!.transcript[0] as { status: string }).status, 'ok');
+});
+
 test('concurrent saves all resolve and leave valid, parseable state', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

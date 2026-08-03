@@ -74,6 +74,13 @@ session's own header (visible on whichever of its tabs you're on), or — for a
 the session view. Codex runs sandboxed to its worktree with
 `approvalPolicy: 'never'` and never enters `needs-you` — see Limits below.
 
+When Claude asks a question (`AskUserQuestion`), the same three places show the
+question text and one button per option instead of Allow/Deny; the pick is
+recorded in the transcript and handed back to the agent as the tool result.
+`Skip` declines the question, after which the agent re-asks in prose and the
+message box answers it. Questions ignore auto-approve — auto-approving one
+would answer it "the user did not answer" and the question would flash past.
+
 Opening a card opens a session view with Chat, Diff and Graph tabs, sharing
 one header that carries a `⋯` menu and the single action the session's state
 calls for. Chat is the transcript and message box for steering the agent; tool

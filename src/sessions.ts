@@ -104,7 +104,13 @@ export class Registry {
         break;
       case 'tool-result': {
         const msg = s.transcript.find((m) => m.kind === 'tool' && m.id === e.id);
-        if (msg && msg.kind === 'tool') msg.status = e.ok ? 'ok' : 'error';
+        // A question is always resolved by denying it — that is the only way to
+        // hand an answer back through the SDK (see claude.ts decide) — so its
+        // tool_result is unconditionally is_error. Answered and skipped are both
+        // decisions, not failures, and neither should render as a red card.
+        if (msg && msg.kind === 'tool') {
+          msg.status = e.ok || msg.name === 'AskUserQuestion' ? 'ok' : 'error';
+        }
         break;
       }
       case 'prompt-delivery': {

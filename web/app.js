@@ -1,5 +1,5 @@
 import {
-  sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
+  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
 } from './lib.js';
 
@@ -558,6 +558,28 @@ function stopButton(s) {
 }
 
 /**
+ * Buttons that resolve a pending request: one per option when the agent asked a
+ * question, Allow/Deny otherwise. Shared by the interrupt bar and the session
+ * card so the two never drift. Skip denies the question the ordinary way — the
+ * agent then re-asks in prose and the composer takes over, which is the only
+ * escape hatch while a blocked turn is holding the input queue.
+ * Option labels come from the agent, so they stay textContent like every other
+ * summary here.
+ */
+function decideButtons(id, pending) {
+  return decideSpecs(pending).map(([label, extra]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      await runSessionCommand({ cmd: 'decide', id, ...extra });
+    };
+    return b;
+  });
+}
+
+/**
  * The only cross-session element in the session view: another session blocking
  * on an approval while you are reading this one. Answerable in place, because
  * walking back to the grid to click Allow is the whole friction this removes.
@@ -579,13 +601,7 @@ function renderInterrupt(current) {
   line.textContent = `${first.branch} needs you — ${first.pending.tool}: ${first.pending.summary}`;
   box.append(line);
 
-  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = label;
-    b.onclick = async () => { await runSessionCommand({ cmd: 'decide', id: first.id, allow }); };
-    box.append(b);
-  }
+  box.append(...decideButtons(first.id, first.pending));
 
   const open = document.createElement('button');
   open.type = 'button';
@@ -615,12 +631,7 @@ function approval(s) {
   line.textContent = `${s.pending.tool}: ${s.pending.summary}`;
   box.append(line);
 
-  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'decide', id: s.id, allow }); };
-    box.append(b);
-  }
+  box.append(...decideButtons(s.id, s.pending));
   return box;
 }
 

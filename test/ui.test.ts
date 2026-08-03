@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { sortSessions, cardAction, selectionState, triggerLabel, targetLabel } from '../web/lib.js';
+import {
+  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+} from '../web/lib.js';
 
 const session = (over = {}) => ({
   id: 'a', repo: '/r/one', branch: 'feat/a', account: 'claude-main',
@@ -34,6 +36,23 @@ test('sortSessions does not mutate its input', () => {
 test('cardAction gives a blocked session the approval box', () => {
   const s = session({ status: 'needs-you', pending: { id: 'p', tool: 'Bash', summary: 'ls' } });
   assert.deepEqual(cardAction(s), { kind: 'approve' });
+});
+
+test('decideSpecs gives an ordinary tool Allow and Deny', () => {
+  assert.deepEqual(decideSpecs({ id: 'p', tool: 'Bash', summary: 'ls' }), [
+    ['Allow', { allow: true }],
+    ['Deny', { allow: false }],
+  ]);
+});
+
+test('decideSpecs turns question options into answer buttons plus Skip', () => {
+  assert.deepEqual(decideSpecs({
+    id: 'p', tool: 'AskUserQuestion', summary: 'TS or Py?', options: ['Python', 'TypeScript'],
+  }), [
+    ['Python', { answer: 'Python' }],
+    ['TypeScript', { answer: 'TypeScript' }],
+    ['Skip', { allow: false }],
+  ]);
 });
 
 test('cardAction gives a working session Stop', () => {

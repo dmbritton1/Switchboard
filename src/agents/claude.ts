@@ -6,10 +6,38 @@ import type { Adapter, AdapterEvent, AgentHandle, ApprovalRequest, StartOpts } f
 
 /** One line describing a tool call, for the transcript. */
 function summarize(name: string, input: Record<string, unknown>): string {
+  // AskUserQuestion carries none of the fields below, so it used to render as
+  // the bare tool name — the question itself never reached the UI. The SDK has
+  // no interactive terminal, so allowing it returns "The user did not answer";
+  // showing the text at least lets the answer be typed into the composer.
+  if (name === 'AskUserQuestion' && Array.isArray(input.questions)) {
+    type Q = { question?: string; options?: { label?: string }[] };
+    return (input.questions as Q[])
+      .map((q) => `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`)
+      .join(' | ');
+  }
   if (typeof input.command === 'string') return input.command;
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   return name;
+}
+
+/**
+ * Option labels to render as answer buttons, or null for any tool that is not a
+ * question. Only the first question's options: the tool allows up to four
+ * questions, but one flat row of buttons cannot say which question an answer
+ * belongs to. Multi-question calls still show every question in the summary and
+ * can be answered by typing into the composer.
+ * ponytail: first question only — widen to a per-question row if that turns
+ * out to be common.
+ */
+export function questionOptions(name: string, input: Record<string, unknown>): string[] | null {
+  if (name !== 'AskUserQuestion' || !Array.isArray(input.questions)) return null;
+  const first = input.questions[0] as { options?: { label?: unknown }[] } | undefined;
+  const labels = (first?.options ?? [])
+    .map((o) => o?.label)
+    .filter((l): l is string => typeof l === 'string' && l.length > 0);
+  return labels.length ? labels : null;
 }
 
 /** Pure: one SDK message in, zero or more normalized events out. */
@@ -200,10 +228,19 @@ export const claudeAdapter: Adapter = {
       toolName: string,
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
+      const options = questionOptions(toolName, toolInput);
       // Read at call time, not captured: setAuto() can flip this mid-session and
-      // every later tool call must see the new value.
-      if (auto) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
-      const request = { id: `a${++approvalSeq}`, tool: toolName, summary: summarize(toolName, toolInput) };
+      // every later tool call must see the new value. A question is exempt: auto
+      // means "don't make me approve tool calls", and allowing AskUserQuestion
+      // just makes the CLI answer "The user did not answer the questions" — the
+      // question would flash past with nothing to click.
+      if (auto && !options) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
+      const request = {
+        id: `a${++approvalSeq}`,
+        tool: toolName,
+        summary: summarize(toolName, toolInput),
+        ...(options ? { options } : {}),
+      };
       const { promise, isHead } = approvals.wait(request);
       if (isHead) emit({ type: 'approval', request });
       return promise;
@@ -239,10 +276,15 @@ export const claudeAdapter: Adapter = {
         emit({ type: 'status', status: 'working' });
         input.push(text);
       },
-      decide(allow: boolean) {
-        const outcome = approvals.resolve(allow
-          ? { behavior: 'allow', updatedInput: {} }
-          : { behavior: 'deny', message: 'denied from switchboard' });
+      // An answer is delivered as a deny: `message` is the only field the SDK
+      // feeds back into the tool result, and allowing AskUserQuestion would let
+      // the CLI resolve it as unanswered instead.
+      decide(allow: boolean, answer?: string) {
+        const outcome = approvals.resolve(answer
+          ? { behavior: 'deny', message: `The user answered: ${answer}` }
+          : allow
+            ? { behavior: 'allow', updatedInput: {} }
+            : { behavior: 'deny', message: 'denied from switchboard' });
         if (!outcome) return;
         emit({ type: 'approval-resolved' });
         if (outcome.next) emit({ type: 'approval', request: outcome.next });

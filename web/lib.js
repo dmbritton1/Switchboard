@@ -34,6 +34,20 @@ export function cardAction(session, queue = []) {
   return { kind: 'none' };
 }
 
+/**
+ * The buttons a pending request gets, as [label, commandFields] pairs. An
+ * AskUserQuestion carries `options`, and each one answers the question outright;
+ * Skip denies it normally so the agent falls back to asking in prose, which the
+ * composer can answer. Everything else is the usual Allow/Deny.
+ */
+export function decideSpecs(pending) {
+  if (!pending.options?.length) return [['Allow', { allow: true }], ['Deny', { allow: false }]];
+  return [
+    ...pending.options.map((label) => [label, { answer: label }]),
+    ['Skip', { allow: false }],
+  ];
+}
+
 /** A queue item's trigger, rendered for the queue strip. */
 export function triggerLabel(t) {
   if (t.kind === 'at') return new Date(t.time).toLocaleString();
