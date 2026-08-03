@@ -223,6 +223,11 @@ test('accountView omits a window the plan does not report', () => {
     load: 0.08,
   }));
   assert.deepEqual(v.windows.map((w) => w.label), ['5h']);
+  // A single-element windows array is exactly the case the reduce seed used to
+  // get wrong (windows[0] ?? {label:'5h', pct:0}) — assert on the actual value,
+  // not just its presence.
+  assert.equal(v.pct, 8);
+  assert.equal(v.title, 'claude-main — 8% of the 5h limit');
 });
 
 test('accountView keeps a probe error out of the meter title', () => {

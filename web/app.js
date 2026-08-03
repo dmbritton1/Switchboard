@@ -93,7 +93,9 @@ function accountMeter(a) {
   name.textContent = a.name;
 
   const bar = document.createElement('span');
-  bar.className = `bar ${v.load > 1 ? 'over' : ''}`;
+  // Real utilization caps at 100 (load caps at 1.0), so `> 1` was unreachable
+  // for exactly the accounts that have a real number to warn about.
+  bar.className = `bar ${v.load >= 1 ? 'over' : ''}`;
   const fill = document.createElement('i');
   fill.style.width = `${Math.min(v.pct, 100)}%`;
   bar.append(fill);

@@ -897,7 +897,7 @@ test('accountLoad falls back to pace without limits', () => {
   assert.equal(accountLoad(usage, accounts[1]), 0.4);
 });
 
-test('accountLoad prefers a real 5% over an estimated 40%', () => {
+test('accountLoad prefers a real 5% over a 90% pace estimate', () => {
   const usage = new Usage();
   usage.setLimits('claude-main', fiveAndSeven(5, 5), null);
   usage.record('claude-main', 900, 0, Date.now());
@@ -908,6 +908,10 @@ test('the snapshot carries limits, limitsError and load per account', async (t) 
   const { base, usage } = await boot(t);
   usage.setLimits('claude-main', fiveAndSeven(11, 1), null);
   usage.setLimits('codex', null, 'not supported');
+  // codex's budget is 1000 (see the `accounts` fixture above); recording spend
+  // here means `load: 0` below can only pass if load actually tracks pace —
+  // with no recorded spend at all, pace() (and a hardcoded 0) look identical.
+  usage.record('codex', 400, 0, Date.now());
 
   const snap = await firstSnapshot(base);
   const main = snap.accounts.find((a: { name: string }) => a.name === 'claude-main');
@@ -918,5 +922,5 @@ test('the snapshot carries limits, limitsError and load per account', async (t) 
   assert.equal(main.load, 0.11);
   assert.equal(codex.limits, null);
   assert.equal(codex.limitsError, 'not supported');
-  assert.equal(codex.load, 0);
+  assert.equal(codex.load, 0.4);
 });

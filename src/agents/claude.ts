@@ -3,7 +3,7 @@ import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
-  AccountLimits, Adapter, AdapterEvent, AgentHandle, ApprovalRequest, LimitWindow, QuestionOption,
+  AccountLimits, Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption,
   StartOpts,
 } from '../types.ts';
 
@@ -359,7 +359,15 @@ export async function probeLimits(
     prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
       await new Promise<never>(() => {});
     })(),
-    options: { env: { ...process.env, ...env } as Options['env'] },
+    options: {
+      env: { ...process.env, ...env } as Options['env'],
+      // Isolation: omitting settingSources loads the user's ~/.claude/settings.json
+      // plus project/local settings resolved against this server process's cwd,
+      // which can fire SessionStart hooks and boot every configured MCP server —
+      // per Claude account, every 5 minutes, forever — just to read a usage
+      // number. A usage probe must not have side effects.
+      settingSources: [],
+    },
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -379,11 +387,17 @@ export async function probeLimits(
       (w && typeof w.utilization === 'number' && w.resets_at
         ? { utilization: w.utilization, resetsAt: w.resets_at }
         : null);
-    return {
-      fiveHour: win(usage.rate_limits.five_hour),
-      sevenDay: win(usage.rate_limits.seven_day),
-      subscription: usage.subscription_type,
-    };
+    const fiveHour = win(usage.rate_limits.five_hour);
+    const sevenDay = win(usage.rate_limits.seven_day);
+    // Both windows are optional in the SDK type, so `rate_limits_available: true`
+    // does not guarantee either one is actually present. Rejecting here — the
+    // same failure channel as the check above — keeps a missing number from
+    // being reported as an authoritative 0%, which would sort this account as
+    // the freest one available and render with none of the estimate's caveats.
+    if (!fiveHour && !sevenDay) {
+      throw new Error('plan rate limits were reported available but both windows were empty');
+    }
+    return { fiveHour, sevenDay, subscription: usage.subscription_type };
   } finally {
     clearTimeout(timer);
     // Releases the child process. Without this the node event loop stays alive.

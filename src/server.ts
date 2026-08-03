@@ -197,7 +197,11 @@ export async function refreshLimits(
         try {
           usage.setLimits(a.name, await probe(a.env), null);
         } catch (err) {
-          usage.setLimits(a.name, null, String((err as Error).message ?? err));
+          // The SDK can build messages like "...exited with code N. stderr: <tail>",
+          // which may contain this account's own env values (paths, tokens) — the
+          // same reason launch()'s codex error path redacts before it reaches the
+          // browser, for an error the user never even triggered by hand.
+          usage.setLimits(a.name, null, redactAccountValue(String((err as Error).message ?? err), a));
         }
       }),
   );
@@ -704,7 +708,14 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   const refresh = async () => {
     if (refreshing) return;      // a slow probe must not stack up passes
     refreshing = true;
-    try { await refreshLimits(usage, accounts); } finally { refreshing = false; }
+    try {
+      await refreshLimits(usage, accounts);
+      // Registry#notify() is what actually reaches an open browser tab (see
+      // the /events push in createServer) — refreshLimits only wrote into
+      // Usage, which the Registry doesn't watch. Once per pass, not per
+      // account: no reason to push N snapshots for one refresh.
+      registry.touch();
+    } finally { refreshing = false; }
   };
   void refresh();
   // ponytail: unconditional timer — it does not check whether a browser is

@@ -190,7 +190,10 @@ export function accountView(a) {
     l.fiveHour && { label: '5h', pct: l.fiveHour.utilization, resetsAt: l.fiveHour.resetsAt },
     l.sevenDay && { label: '7d', pct: l.sevenDay.utilization, resetsAt: l.sevenDay.resetsAt },
   ].filter(Boolean);
-  const worst = windows.reduce((m, w) => (w.pct > m.pct ? w : m), windows[0] ?? { label: '5h', pct: 0 });
+  // windows[0] is a safe seed, not a fallback: probeLimits() now rejects rather
+  // than resolving when both windows are empty, so `limits` non-null guarantees
+  // at least one entry here.
+  const worst = windows.reduce((m, w) => (w.pct > m.pct ? w : m), windows[0]);
   return {
     load: a.load,
     pct: worst.pct,
