@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -170,4 +170,63 @@ test('targetLabel names the branch and kind for a resume action on a live sessio
 test('targetLabel falls back to "deleted session" for a session id no longer in the list', () => {
   const action = { kind: 'resume', sessionId: 'gone', prompt: 'continue' };
   assert.equal(targetLabel(action, []), 'deleted session · resume');
+});
+
+const acct = (over = {}) => ({
+  name: 'claude-main', provider: 'claude', budget: 2000000,
+  pace: 0.4, limits: null, limitsError: null, load: 0.4, ...over,
+});
+
+test('accountView without limits reproduces the estimate wording exactly', () => {
+  const v = accountView(acct());
+  assert.equal(v.real, false);
+  assert.equal(v.pct, 40);
+  assert.equal(v.title, 'claude-main — ~40% of its 5h budget (estimate)');
+  assert.equal(v.budgetLine, 'claude · ~40% of a 2,000,000 token budget · estimate');
+  assert.match(v.note, /not a real plan limit/);
+  assert.deepEqual(v.windows, []);
+});
+
+test('accountView with limits drops the estimate wording', () => {
+  const v = accountView(acct({
+    limits: {
+      fiveHour: { utilization: 11, resetsAt: '2026-08-03T19:10:00Z' },
+      sevenDay: { utilization: 1, resetsAt: '2026-08-10T08:00:00Z' },
+      subscription: 'pro',
+    },
+    load: 0.11,
+  }));
+  assert.equal(v.real, true);
+  assert.equal(v.pct, 11);
+  assert.equal(v.title, 'claude-main — 11% of the 5h limit');
+  assert.equal(v.budgetLine, 'claude · pro plan');
+  assert.equal(v.note, '');
+  assert.deepEqual(v.windows.map((w) => [w.label, w.pct]), [['5h', 11], ['7d', 1]]);
+});
+
+test('accountView reports the worse window as the headline number', () => {
+  const v = accountView(acct({
+    limits: {
+      fiveHour: { utilization: 5, resetsAt: '2026-08-03T19:10:00Z' },
+      sevenDay: { utilization: 96, resetsAt: '2026-08-10T08:00:00Z' },
+      subscription: 'max',
+    },
+    load: 0.96,
+  }));
+  assert.equal(v.pct, 96);
+  assert.equal(v.title, 'claude-main — 96% of the 7d limit');
+});
+
+test('accountView omits a window the plan does not report', () => {
+  const v = accountView(acct({
+    limits: { fiveHour: { utilization: 8, resetsAt: '2026-08-03T19:10:00Z' }, sevenDay: null, subscription: 'pro' },
+    load: 0.08,
+  }));
+  assert.deepEqual(v.windows.map((w) => w.label), ['5h']);
+});
+
+test('accountView keeps a probe error out of the meter title', () => {
+  const v = accountView(acct({ limitsError: 'logged out' }));
+  assert.equal(v.real, false);
+  assert.ok(!v.title.includes('logged out'), 'the error belongs in the panel, not the meter');
 });
