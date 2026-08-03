@@ -1,10 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
-import type { AdapterEvent, Session } from './types.ts';
+import type { AdapterEvent, CodexFailureCode, PromptDelivery, Session } from './types.ts';
 import type { Usage } from './usage.ts';
 import type { Scheduler } from './schedule.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
+
+function unsentMessage(count: number): string {
+  const noun = count === 1 ? 'prompt was' : 'prompts were';
+  return `${count} queued ${noun} not sent. Resend ${count === 1 ? 'it' : 'them'} manually if still needed.`;
+}
 
 export class Registry {
   #sessions = new Map<string, Session>();
@@ -40,6 +45,7 @@ export class Registry {
       transcript: [],
       pending: null,
       stoppedReason: null,
+      stoppedCode: null,
       startedAt: now,
       statusSince: now,
     };
@@ -59,6 +65,15 @@ export class Registry {
   remove(id: string): void {
     this.#sessions.delete(id);
     this.#notify();
+  }
+
+  appendPrompt(id: string, text: string, delivery: PromptDelivery): string {
+    const s = this.#sessions.get(id);
+    const promptId = randomUUID();
+    if (!s) return promptId;
+    s.transcript.push({ kind: 'user', id: promptId, text, delivery });
+    this.#notify();
+    return promptId;
   }
 
   apply(id: string, e: AdapterEvent): void {
@@ -96,12 +111,24 @@ export class Registry {
         break;
       case 'tool-result': {
         const msg = s.transcript.find((m) => m.kind === 'tool' && m.id === e.id);
-        if (msg && msg.kind === 'tool') msg.status = e.ok ? 'ok' : 'error';
+        // A question is always resolved by denying it — that is the only way to
+        // hand an answer back through the SDK (see claude.ts decide) — so its
+        // tool_result is unconditionally is_error. Answered and skipped are both
+        // decisions, not failures, and neither should render as a red card.
+        if (msg && msg.kind === 'tool') {
+          msg.status = e.ok || msg.name === 'AskUserQuestion' ? 'ok' : 'error';
+        }
+        break;
+      }
+      case 'prompt-delivery': {
+        const msg = s.transcript.find((m) => m.kind === 'user' && m.id === e.id);
+        if (msg && msg.kind === 'user') msg.delivery = e.delivery;
         break;
       }
       case 'stopped':
         s.pending = null;
         s.stoppedReason = e.reason;
+        s.stoppedCode = e.code ?? null;
         this.#setStatus(s, 'stopped');
         break;
       case 'usage':
@@ -131,7 +158,21 @@ export class Registry {
     if (!s) return;
     s.pending = null;
     s.stoppedReason = null;
+    s.stoppedCode = null;
     this.#setStatus(s, 'working');
+    this.#notify();
+  }
+
+  /** Records a readiness failure while preserving the terminal stopped state. */
+  recordStoppedFailure(id: string, reason: string, code: CodexFailureCode): void {
+    const s = this.#sessions.get(id);
+    if (!s) return;
+    s.pending = null;
+    s.stoppedReason = reason;
+    s.stoppedCode = code;
+    s.transcript.push({ kind: 'error', text: reason });
+    s.status = 'stopped';
+    s.statusSince = Math.max(Date.now(), s.statusSince + 1);
     this.#notify();
   }
 
@@ -148,6 +189,18 @@ export class Registry {
   subscribe(fn: () => void): () => void {
     this.#subs.add(fn);
     return () => this.#subs.delete(fn);
+  }
+
+  /**
+   * Notifies subscribers with no session mutation of its own. A refresh pass
+   * writes new plan limits straight into the Usage instance the Registry does
+   * not own, so nothing here detects that change on its own — the caller
+   * (the entry-point refresh loop) calls this once the pass completes so an
+   * open SSE stream actually sees the new numbers instead of waiting for the
+   * next unrelated session event.
+   */
+  touch(): void {
+    this.#notify();
   }
 
   #notify(): void {
@@ -206,12 +259,30 @@ export class Registry {
       // garbage sessions keyed on `undefined`.
       for (const s of (Array.isArray(raw) ? raw : []) as Session[]) {
         if (!s || typeof s.id !== 'string') continue;
+        let interruptedCount = 0;
+        const transcript = (Array.isArray(s.transcript) ? s.transcript : []).flatMap((message) => {
+          if (!message || typeof message !== 'object') return [];
+          if (message.kind !== 'user') return message;
+          const wasQueued = message.delivery === 'queued';
+          if (wasQueued) interruptedCount++;
+          return [{
+            kind: 'user' as const,
+            id: message.id ?? randomUUID(),
+            text: message.text,
+            delivery: wasQueued ? 'unsent' as const : message.delivery ?? 'sent' as const,
+          }];
+        });
+        if (interruptedCount > 0) {
+          transcript.push({ kind: 'error', text: unsentMessage(interruptedCount) });
+        }
         // Agents are children of this process; nothing survived the restart.
         reg.#sessions.set(s.id, {
           ...s,
+          transcript,
           status: 'stopped',
           statusSince: Date.now(),
           stoppedReason: s.stoppedReason ?? 'switchboard restarted',
+          stoppedCode: s.stoppedCode ?? null,
           pending: null,
           // Predates the auto toggle in any state.json written before it existed,
           // and `undefined` would render as an indeterminate checkbox.

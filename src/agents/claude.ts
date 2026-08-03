@@ -2,14 +2,61 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import type { Adapter, AdapterEvent, AgentHandle, ApprovalRequest, StartOpts } from '../types.ts';
+import type {
+  AccountLimits, Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption,
+  StartOpts,
+} from '../types.ts';
 
-/** One line describing a tool call, for the transcript. */
-function summarize(name: string, input: Record<string, unknown>): string {
+/**
+ * One line describing a tool call. `listOptions` is off for the approval card,
+ * which renders the choices as buttons right underneath and would otherwise
+ * print each label twice; the transcript has no buttons and keeps them.
+ */
+function summarize(name: string, input: Record<string, unknown>, listOptions = true): string {
+  // AskUserQuestion carries none of the fields below, so it used to render as
+  // the bare tool name — the question itself never reached the UI. The SDK has
+  // no interactive terminal, so allowing it returns "The user did not answer";
+  // showing the text at least lets the answer be typed into the composer.
+  if (name === 'AskUserQuestion' && Array.isArray(input.questions)) {
+    type Q = { question?: string; options?: { label?: string }[] };
+    return (input.questions as Q[])
+      .map((q) => (listOptions
+        ? `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`
+        : q.question ?? ''))
+      .join(' | ');
+  }
   if (typeof input.command === 'string') return input.command;
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   return name;
+}
+
+/**
+ * Choices to render as answer buttons, or null for any tool that is not a
+ * question. Only the first question's options: the tool allows up to four
+ * questions, but one flat row of buttons cannot say which question an answer
+ * belongs to. Multi-question calls still show every question in the summary and
+ * can be answered by typing into the composer.
+ * ponytail: first question only — widen to a per-question row if that turns
+ * out to be common.
+ */
+export function questionOptions(
+  name: string,
+  input: Record<string, unknown>,
+): QuestionOption[] | null {
+  if (name !== 'AskUserQuestion' || !Array.isArray(input.questions)) return null;
+  const first = input.questions[0] as
+    { options?: { label?: unknown; description?: unknown }[] } | undefined;
+  const options = (first?.options ?? [])
+    .filter((o) => typeof o?.label === 'string' && o.label.length > 0)
+    .map((o) => ({
+      label: o.label as string,
+      // Optional in our own type even though the tool schema requires it: the
+      // input is the agent's, not ours, and a missing description should cost a
+      // subtitle, not the whole button.
+      ...(typeof o.description === 'string' && o.description ? { description: o.description } : {}),
+    }));
+  return options.length ? options : null;
 }
 
 /** Pure: one SDK message in, zero or more normalized events out. */
@@ -216,10 +263,19 @@ export const claudeAdapter: Adapter = {
       toolName: string,
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
+      const options = questionOptions(toolName, toolInput);
       // Read at call time, not captured: setAuto() can flip this mid-session and
-      // every later tool call must see the new value.
-      if (auto) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
-      const request = { id: `a${++approvalSeq}`, tool: toolName, summary: summarize(toolName, toolInput) };
+      // every later tool call must see the new value. A question is exempt: auto
+      // means "don't make me approve tool calls", and allowing AskUserQuestion
+      // just makes the CLI answer "The user did not answer the questions" — the
+      // question would flash past with nothing to click.
+      if (auto && !options) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
+      const request = {
+        id: `a${++approvalSeq}`,
+        tool: toolName,
+        summary: summarize(toolName, toolInput, !options),
+        ...(options ? { options } : {}),
+      };
       const { promise, isHead } = approvals.wait(request);
       if (isHead) emit({ type: 'approval', request });
       return promise;
@@ -255,10 +311,15 @@ export const claudeAdapter: Adapter = {
         emit({ type: 'status', status: 'working' });
         input.push(text);
       },
-      decide(allow: boolean) {
-        const outcome = approvals.resolve(allow
-          ? { behavior: 'allow', updatedInput: {} }
-          : { behavior: 'deny', message: 'denied from switchboard' });
+      // An answer is delivered as a deny: `message` is the only field the SDK
+      // feeds back into the tool result, and allowing AskUserQuestion would let
+      // the CLI resolve it as unanswered instead.
+      decide(allow: boolean, answer?: string) {
+        const outcome = approvals.resolve(answer
+          ? { behavior: 'deny', message: `The user answered: ${answer}` }
+          : allow
+            ? { behavior: 'allow', updatedInput: {} }
+            : { behavior: 'deny', message: 'denied from switchboard' });
         if (!outcome) return;
         emit({ type: 'approval-resolved' });
         if (outcome.next) emit({ type: 'approval', request: outcome.next });
@@ -286,3 +347,76 @@ export const claudeAdapter: Adapter = {
     };
   },
 };
+
+/**
+ * Real claude.ai plan limits for one account, or a rejection.
+ *
+ * The SDK exposes this only on a live `Query`, but a Query does not need a
+ * session: the prompt stream below never yields, so the CLI starts, answers the
+ * control request, and is closed again without a prompt, a model turn, or a
+ * token of spend. That is what makes idle accounts pollable — which is the
+ * whole point, since "which account is freest" has to be answerable *before* a
+ * session exists.
+ *
+ * Deliberately does not reuse a running session's Query. That would mean
+ * threading a method through AgentHandle and the registry and would still need
+ * this standalone path for idle accounts.
+ *
+ * Rejects rather than returning null so the caller has one failure channel:
+ * a thrown error, a timeout, and `rate_limits_available: false` all mean the
+ * same thing to every consumer — no real number for this account.
+ */
+export async function probeLimits(
+  env: Record<string, string>,
+  timeoutMs = 30_000,
+): Promise<AccountLimits> {
+  const q = query({
+    // Never yields: the SDK pulls, gets nothing, and no turn is ever started.
+    prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+      await new Promise<never>(() => {});
+    })(),
+    options: {
+      env: { ...process.env, ...env } as Options['env'],
+      // Isolation: omitting settingSources loads the user's ~/.claude/settings.json
+      // plus project/local settings resolved against this server process's cwd,
+      // which can fire SessionStart hooks and boot every configured MCP server —
+      // per Claude account, every 5 minutes, forever — just to read a usage
+      // number. A usage probe must not have side effects.
+      settingSources: [],
+    },
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const usage = await Promise.race([
+      q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+      new Promise<never>((_, reject) => {
+        // A hung CLI must not wedge the refresh loop forever.
+        timer = setTimeout(() => reject(new Error('usage probe timed out')), timeoutMs);
+      }),
+    ]);
+    if (!usage.rate_limits_available || !usage.rate_limits) {
+      // API key, Bedrock, Vertex, or a token without the profile scope. Not an
+      // error the user can act on, but not a number either.
+      throw new Error('plan rate limits are not available for this account');
+    }
+    const win = (w: { utilization: number | null; resets_at: string | null } | null | undefined) =>
+      (w && typeof w.utilization === 'number' && w.resets_at
+        ? { utilization: w.utilization, resetsAt: w.resets_at }
+        : null);
+    const fiveHour = win(usage.rate_limits.five_hour);
+    const sevenDay = win(usage.rate_limits.seven_day);
+    // Both windows are optional in the SDK type, so `rate_limits_available: true`
+    // does not guarantee either one is actually present. Rejecting here — the
+    // same failure channel as the check above — keeps a missing number from
+    // being reported as an authoritative 0%, which would sort this account as
+    // the freest one available and render with none of the estimate's caveats.
+    if (!fiveHour && !sevenDay) {
+      throw new Error('plan rate limits were reported available but both windows were empty');
+    }
+    return { fiveHour, sevenDay, subscription: usage.subscription_type };
+  } finally {
+    clearTimeout(timer);
+    // Releases the child process. Without this the node event loop stays alive.
+    q.close();
+  }
+}

@@ -10,9 +10,14 @@ import { Usage } from './usage.ts';
 import { Scheduler, type Ctx } from './schedule.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
-import { claudeAdapter } from './agents/claude.ts';
-import { codexAdapter } from './agents/codex.ts';
-import type { Action, Adapter, AgentHandle, Session, Trigger } from './types.ts';
+import { claudeAdapter, probeLimits } from './agents/claude.ts';
+import { createCodexAdapter } from './agents/codex.ts';
+import {
+  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
+} from './agents/codex-runtime.ts';
+import type {
+  AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session, Trigger,
+} from './types.ts';
 
 const run = promisify(execFile);
 
@@ -21,7 +26,57 @@ export type Account = {
   provider: 'claude' | 'codex';
   budget: number;
   env: Record<string, string>;
+  bin?: string;
 };
+
+type PreparedProvider = {
+  adapter: Adapter;
+};
+
+async function prepareProvider(account: Account): Promise<PreparedProvider> {
+  if (account.provider === 'claude') return { adapter: claudeAdapter };
+  const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
+  return { adapter: createCodexAdapter(runtime) };
+}
+
+/**
+ * Account values are launch-only configuration, so any of them — not just the
+ * credential-shaped keys redactCodexText() knows about — is removed from text
+ * the browser will see. Short values are left alone: see MIN_REDACTABLE, a
+ * substring search for "1" redacts arithmetic, not a secret.
+ */
+function redactAccountValue(text: string, account: Account): string {
+  let safe = redactCodexText(text, account.env);
+  for (const value of Object.values(account.env)) {
+    if (redactable(value)) safe = safe.replaceAll(value, '[REDACTED]');
+  }
+  return safe;
+}
+
+function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent {
+  if (account.provider !== 'codex') return event;
+  switch (event.type) {
+    case 'msg': {
+      const msg = event.msg;
+      if (msg.kind === 'tool') {
+        return {
+          ...event,
+          msg: { ...msg, name: redactAccountValue(msg.name, account), summary: redactAccountValue(msg.summary, account) },
+        };
+      }
+      return { ...event, msg: { ...msg, text: redactAccountValue(msg.text, account) } };
+    }
+    case 'stopped':
+      return { ...event, reason: redactAccountValue(event.reason, account) };
+    // vendor-session-id is deliberately not redacted: it is an identifier the
+    // server hands straight back to resumeThread(), never rendered as prose. A
+    // value that happened to contain an account value would come back rewritten
+    // to [REDACTED] and resume the wrong thread — or no thread at all — with
+    // nothing on screen to explain it.
+    default:
+      return event;
+  }
+}
 
 const WEB = new URL('../web/', import.meta.url).pathname;
 const MIME: Record<string, string> = {
@@ -141,27 +196,85 @@ export function shouldRequeue(agentDied: boolean, resetAt: number | null, now: n
   return agentDied && resetAt !== null && resetAt > now;
 }
 
+/**
+ * One fraction per account, so the meter and the New Session picker cannot
+ * disagree. Real plan utilization when we have it, the local budget estimate
+ * otherwise. `max` of the two windows: a 95%-consumed week has to outrank a
+ * quiet five-hour window, and both are already 0-100 from the SDK.
+ */
+export function accountLoad(usage: Usage, a: Account): number {
+  const { limits } = usage.getLimits(a.name);
+  if (!limits) return usage.pace(a.name, a.budget);
+  const pct = Math.max(limits.fiveHour?.utilization ?? 0, limits.sevenDay?.utilization ?? 0);
+  return pct / 100;
+}
+
+/**
+ * One refresh pass over every Claude account, concurrently.
+ *
+ * `probe` is a parameter so tests drive this with a fake and never spawn a CLI.
+ * Every failure is swallowed into `limitsError`: a probe that throws must leave
+ * the account showing exactly the estimate UI it shows today, never block a
+ * session, and never take its neighbours down with it — hence allSettled and
+ * the per-account try.
+ */
+export async function refreshLimits(
+  usage: Usage,
+  accounts: Account[],
+  probe: (env: Record<string, string>) => Promise<AccountLimits> = probeLimits,
+): Promise<void> {
+  await Promise.allSettled(
+    accounts
+      .filter((a) => a.provider === 'claude')
+      .map(async (a) => {
+        try {
+          usage.setLimits(a.name, await probe(a.env), null);
+        } catch (err) {
+          // The SDK can build messages like "...exited with code N. stderr: <tail>",
+          // which may contain this account's own env values (paths, tokens) — the
+          // same reason launch()'s codex error path redacts before it reaches the
+          // browser, for an error the user never even triggered by hand.
+          usage.setLimits(a.name, null, redactAccountValue(String((err as Error).message ?? err), a));
+        }
+      }),
+  );
+}
+
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
   scheduler: Scheduler;
   accounts: Account[];
-  /** Defaults to the real Claude/Codex pair; overridable so tests can drive
-   *  launch() through a fake adapter instead of a real subprocess. */
-  adapters?: { claude: Adapter; codex: Adapter };
+  /**
+   * Defaults to the real provider resolution; overridable so tests can drive
+   * launch() through a fake adapter instead of a real subprocess.
+   *
+   * This replaced a plain `adapters: { claude, codex }` pair when the Codex
+   * runtime landed: choosing a Codex adapter is now an async preflight
+   * (locating the binary, checking its version and login), not a lookup, so
+   * the seam tests need is the whole resolution step rather than its result.
+   */
+  prepare?: (account: Account) => Promise<PreparedProvider>;
 }): Server & { tick: () => Promise<void> } {
-  const { registry, usage, scheduler, accounts, adapters = { claude: claudeAdapter, codex: codexAdapter } } = opts;
+  const { registry, usage, scheduler, accounts, prepare = prepareProvider } = opts;
   const handles = new Map<string, AgentHandle>();
 
   function snapshot() {
     return {
       sessions: registry.all(),
       queue: scheduler.all(),
-      accounts: accounts.map((a) => ({
-        name: a.name,
-        provider: a.provider,
-        pace: usage.pace(a.name, a.budget),
-      })),
+      accounts: accounts.map((a) => {
+        const { limits, error } = usage.getLimits(a.name);
+        return {
+          name: a.name,
+          provider: a.provider,
+          budget: a.budget,
+          pace: usage.pace(a.name, a.budget),
+          limits,
+          limitsError: error,
+          load: accountLoad(usage, a),
+        };
+      }),
     };
   }
 
@@ -189,13 +302,21 @@ export function createServer(opts: {
     return { repo: sessions[0].repo, sessions };
   }
 
-  function launch(sessionId: string, account: Account, cwd: string, prompt: string, resumeId?: string): void {
-    const adapter = account.provider === 'claude' ? adapters.claude : adapters.codex;
+  function launch(
+    sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: string, resumeId?: string,
+    promptId?: string,
+  ): { error: string; code?: CodexFailureCode } | null {
     const auto = registry.get(sessionId)?.auto ?? false;
-    const handle = adapter.start({ cwd, prompt, env: account.env, resumeId, auto }, (e) => {
-      if (e.type === 'usage') usage.record(account.name, e.inputTokens, e.outputTokens);
-      if (e.type === 'rate-limit') usage.noteLimit(account.name, e.status, e.resetsAt);
-      if (e.type !== 'stopped') { registry.apply(sessionId, e); return; }
+    try {
+      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto }, (e) => {
+        const safeEvent = sanitizeCodexEvent(e, account);
+        if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
+        // Claude only — the Codex SDK reports no rate-limit signal at all, which
+        // is why a Codex session never auto-requeues below.
+        if (safeEvent.type === 'rate-limit') {
+          usage.noteLimit(account.name, safeEvent.status, safeEvent.resetsAt);
+        }
+        if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
       // the prompt, and every event it produced was dropped by the terminal guard.
@@ -206,18 +327,34 @@ export function createServer(opts: {
       // pass finds no handle and cannot recurse; apply before stop(), so the real
       // reason is recorded and the re-entrant "stopped from switchboard" is the one
       // the terminal guard drops, not the other way round.
-      const dead = handles.get(sessionId);
-      handles.delete(sessionId);
-      registry.apply(sessionId, e);
-      if (shouldRequeue(Boolean(dead), usage.resetAt(account.name), Date.now())) {
-        scheduler.add(
-          { kind: 'reset', account: account.name },
-          { kind: 'resume', sessionId, prompt: 'continue' },
-        );
+        const dead = handles.get(sessionId);
+        handles.delete(sessionId);
+        registry.apply(sessionId, safeEvent);
+        // Before stop(), for the same reason apply() is: stop() re-enters this
+        // callback, and by then `dead` is gone and the requeue would be skipped.
+        if (shouldRequeue(Boolean(dead), usage.resetAt(account.name), Date.now())) {
+          scheduler.add(
+            { kind: 'reset', account: account.name },
+            { kind: 'resume', sessionId, prompt: 'continue' },
+          );
+        }
+        dead?.stop();
+      });
+      handles.set(sessionId, handle);
+      return null;
+    } catch (error) {
+      const reason = account.provider === 'codex'
+        ? redactAccountValue(String((error as Error).message ?? error), account)
+        : String((error as Error).message ?? error);
+      const code = account.provider === 'codex'
+        ? (resumeId ? 'codex_resume_failed' : 'codex_start_failed')
+        : undefined;
+      if (account.provider === 'codex' && promptId) {
+        registry.apply(sessionId, { type: 'prompt-delivery', id: promptId, delivery: 'unsent' });
       }
-      dead?.stop();
-    });
-    handles.set(sessionId, handle);
+      registry.apply(sessionId, { type: 'stopped', reason, ...(code ? { code } : {}) });
+      return { error: reason, ...(code ? { code } : {}) };
+    }
   }
 
   /**
@@ -297,6 +434,18 @@ export function createServer(opts: {
       case 'create': {
         const account = accounts.find((a) => a.name === body.account);
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepare(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            return {
+              status: 400,
+              json: { error: redactCodexText(error.message, account.env), code: error.code },
+            };
+          }
+          throw error;
+        }
         let cwd: string;
         try {
           cwd = await createWorktree(String(body.repo), String(body.branch));
@@ -311,24 +460,35 @@ export function createServer(opts: {
           branch: String(body.branch),
           title: String(body.branch),
         });
-        launch(session.id, account, cwd, String(body.prompt));
+        const prompt = String(body.prompt);
+        const promptId = registry.appendPrompt(
+          session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
+        );
+        const launchError = launch(session.id, account, prepared.adapter, cwd, prompt, undefined, promptId);
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
       }
 
       case 'send': {
+        const session = registry.get(String(body.id));
         const handle = handles.get(String(body.id));
-        if (!handle) return { status: 404, json: { error: 'no live session' } };
-        registry.apply(String(body.id), {
-          type: 'msg', msg: { kind: 'user', text: String(body.text) },
-        });
-        handle.send(String(body.text));
+        if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
+        const text = String(body.text);
+        const promptId = registry.appendPrompt(
+          session.id, text, session.provider === 'codex' ? 'queued' : 'sent',
+        );
+        handle.send(text, promptId);
         return { status: 200, json: { ok: true } };
       }
 
       case 'decide': {
         const handle = handles.get(String(body.id));
         if (!handle) return { status: 404, json: { error: 'no live session' } };
-        handle.decide(Boolean(body.allow));
+        const answer = typeof body.answer === 'string' && body.answer ? body.answer : undefined;
+        // Recorded as a prompt so the scrollback shows what was chosen; clicking
+        // an option is the user speaking, and it is delivered as the tool result.
+        if (answer) registry.appendPrompt(String(body.id), answer, 'sent');
+        handle.decide(Boolean(body.allow), answer);
         return { status: 200, json: { ok: true } };
       }
 
@@ -369,17 +529,39 @@ export function createServer(opts: {
         // fine, the directory is gone — so check here and say what actually
         // happened rather than passing that error on.
         if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
-          return { status: 409, json: { error: `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree` } };
+          const rawReason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
+          if (account.provider === 'codex') {
+            const reason = redactAccountValue(rawReason, account);
+            registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+            return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+          }
+          return { status: 409, json: { error: rawReason } };
+        }
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepare(account);
+        } catch (error) {
+          if (error instanceof CodexRuntimeError) {
+            const reason = redactCodexText(error.message, account.env);
+            registry.recordStoppedFailure(session.id, reason, error.code);
+            return { status: 400, json: { error: reason, code: error.code } };
+          }
+          throw error;
         }
         // registry.revive() (not a direct mutation) so subscribers get #notify()'d
         // immediately; neither adapter emits a synchronous status event at start(),
         // so without this an SSE client would keep showing 'stopped' until the
         // resumed agent's first async event arrived.
         registry.revive(session.id);
-        launch(
-          session.id, account, session.cwd, String(body.prompt ?? 'continue'),
-          session.vendorSessionId ?? undefined,
+        const prompt = typeof body.prompt === 'string' ? body.prompt : 'continue';
+        const promptId = account.provider === 'codex' && typeof body.prompt === 'string'
+          ? registry.appendPrompt(session.id, prompt, 'queued')
+          : undefined;
+        const launchError = launch(
+          session.id, account, prepared.adapter, session.cwd, prompt,
+          session.vendorSessionId ?? undefined, promptId,
         );
+        if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { ok: true } };
       }
 
@@ -665,8 +847,8 @@ export function createServer(opts: {
       }
 
       const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-      // Serve only the three known assets; never join user-controlled path segments.
-      if (!['index.html', 'app.js', 'style.css'].includes(file)) {
+      // Serve only the four known assets; never join user-controlled path segments.
+      if (!['index.html', 'app.js', 'lib.js', 'style.css'].includes(file)) {
         res.writeHead(404).end('not found');
         return;
       }
@@ -753,6 +935,31 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   const usage = new Usage();
   const scheduler = new Scheduler();
   const registry = await Registry.load(statePath, usage, scheduler);
+  // Entry point only, never inside createServer: test/server.test.ts imports
+  // createServer directly, and an interval started there would leak a timer and
+  // a CLI spawn into every server test.
+  const REFRESH_MS = 5 * 60_000;
+  let refreshing = false;
+  const refresh = async () => {
+    if (refreshing) return;      // a slow probe must not stack up passes
+    refreshing = true;
+    try {
+      await refreshLimits(usage, accounts);
+      // Registry#notify() is what actually reaches an open browser tab (see
+      // the /events push in createServer) — refreshLimits only wrote into
+      // Usage, which the Registry doesn't watch. Once per pass, not per
+      // account: no reason to push N snapshots for one refresh.
+      registry.touch();
+    } finally { refreshing = false; }
+  };
+  void refresh();
+  // ponytail: unconditional timer — it does not check whether a browser is
+  // connected. Gate it on live SSE clients if the spawns ever show up in a
+  // profile.
+  setInterval(() => void refresh(), REFRESH_MS).unref();
+  // ponytail: env override so a second copy (a worktree, a test drive) can run
+  // beside the real one instead of failing on EADDRINUSE.
+  const port = Number(process.env.PORT) || 4711;
   createServer({ registry, usage, scheduler, accounts })
-    .listen(4711, '127.0.0.1', () => console.log('switchboard on http://127.0.0.1:4711'));
+    .listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }

@@ -16,12 +16,103 @@ function make(): { reg: Registry; id: string } {
   return { reg, id: s.id };
 }
 
+async function writePromptMigrationState(
+  t: { after(fn: () => unknown): void },
+  transcript: unknown[],
+): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-prompt-migration-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [{
+    id: 'prompt-migration', provider: 'codex', account: 'codex', vendorSessionId: null,
+    repo: '/r', cwd: '/r/wt', branch: 'b', title: 'prompt migration', status: 'working',
+    transcript, pending: null, stoppedReason: null, startedAt: 1, statusSince: 1,
+  }] }));
+  return path;
+}
+
 test('a new session starts working with an empty transcript', () => {
   const { reg, id } = make();
   const s = reg.get(id)!;
   assert.equal(s.status, 'working');
   assert.deepEqual(s.transcript, []);
   assert.equal(s.pending, null);
+});
+
+test('prompt delivery moves queued to sent by stable id', () => {
+  const { reg, id } = make();
+  const promptId = reg.appendPrompt(id, 'run the tests', 'queued');
+  reg.apply(id, { type: 'prompt-delivery', id: promptId, delivery: 'sent' });
+
+  assert.deepEqual(reg.get(id)!.transcript.at(-1), {
+    kind: 'user', id: promptId, text: 'run the tests', delivery: 'sent',
+  });
+});
+
+test('unknown prompt delivery ids leave accepted prompts unchanged', () => {
+  const { reg, id } = make();
+  const promptId = reg.appendPrompt(id, 'keep this delivery', 'queued');
+  reg.apply(id, { type: 'prompt-delivery', id: 'not-a-prompt', delivery: 'sent' });
+
+  assert.deepEqual(reg.get(id)!.transcript.at(-1), {
+    kind: 'user', id: promptId, text: 'keep this delivery', delivery: 'queued',
+  });
+});
+
+test('load migrates legacy and interrupted prompts without replaying them', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    { kind: 'user', text: 'legacy' },
+    { kind: 'user', id: 'queued-1', text: 'interrupted', delivery: 'queued' },
+  ]);
+
+  const loaded = (await Registry.load(path)).all()[0];
+  const legacy = loaded.transcript[0];
+  assert.equal(legacy.kind, 'user');
+  assert.ok(legacy.kind === 'user');
+  assert.equal(legacy.delivery, 'sent');
+  assert.ok(legacy.id, 'legacy prompts receive a durable ID');
+  assert.deepEqual(loaded.transcript[1], {
+    kind: 'user', id: 'queued-1', text: 'interrupted', delivery: 'unsent',
+  });
+  assert.match((loaded.transcript.at(-1) as { text: string }).text, /1 queued prompt was not sent/);
+});
+
+test('load converts every queued prompt to unsent and preserves sent prompts', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    { kind: 'user', id: 'sent-1', text: 'already delivered', delivery: 'sent' },
+    { kind: 'user', id: 'queued-1', text: 'first interrupted', delivery: 'queued' },
+    { kind: 'user', id: 'queued-2', text: 'second interrupted', delivery: 'queued' },
+  ]);
+
+  const loaded = (await Registry.load(path)).all()[0];
+  assert.deepEqual(loaded.transcript.slice(0, 3), [
+    { kind: 'user', id: 'sent-1', text: 'already delivered', delivery: 'sent' },
+    { kind: 'user', id: 'queued-1', text: 'first interrupted', delivery: 'unsent' },
+    { kind: 'user', id: 'queued-2', text: 'second interrupted', delivery: 'unsent' },
+  ]);
+  assert.deepEqual(loaded.transcript.at(-1), {
+    kind: 'error', text: '2 queued prompts were not sent. Resend them manually if still needed.',
+  });
+});
+
+test('load ignores malformed transcript entries without losing the valid session', async (t) => {
+  const path = await writePromptMigrationState(t, [
+    null,
+    'not a transcript message',
+    { kind: 'user', text: 'legacy prompt' },
+    { kind: 'text', text: 'kept response' },
+  ]);
+
+  const loaded = await Registry.load(path);
+  assert.equal(loaded.all().length, 1);
+  assert.equal(loaded.all()[0].transcript.length, 2);
+  const [legacy, response] = loaded.all()[0].transcript;
+  assert.equal(legacy.kind, 'user');
+  assert.ok(legacy.kind === 'user');
+  assert.equal(legacy.text, 'legacy prompt');
+  assert.equal(legacy.delivery, 'sent');
+  assert.ok(legacy.id);
+  assert.deepEqual(response, { kind: 'text', text: 'kept response' });
 });
 
 test('an approval event sets needs-you and stores the request', () => {
@@ -66,6 +157,27 @@ test('a stopped event records the reason and never reverts', () => {
   assert.equal(s.stoppedReason, 'exit 1');
 });
 
+test('a stopped event persists its stable code', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'stopped', reason: 'sandbox refused the command', code: 'codex_sandbox_denied',
+  });
+  assert.equal(reg.get(id)!.stoppedCode, 'codex_sandbox_denied');
+});
+
+test('recordStoppedFailure updates a terminal session without reviving it', () => {
+  const { reg, id } = make();
+  reg.apply(id, { type: 'stopped', reason: 'first failure' });
+  reg.recordStoppedFailure(id, 'Codex login is unavailable', 'codex_auth_unavailable');
+
+  const session = reg.get(id)!;
+  assert.equal(session.status, 'stopped');
+  assert.equal(session.stoppedCode, 'codex_auth_unavailable');
+  assert.deepEqual(session.transcript.at(-1), {
+    kind: 'error', text: 'Codex login is unavailable',
+  });
+});
+
 test('statusSince advances only when the status actually changes', () => {
   const { reg, id } = make();
   const first = reg.get(id)!.statusSince;
@@ -86,6 +198,14 @@ test('subscribers are notified on every apply', () => {
   assert.equal(calls, 1);
   unsub();
   reg.apply(id, { type: 'msg', msg: { kind: 'text', text: 'again' } });
+  assert.equal(calls, 1);
+});
+
+test('touch notifies subscribers without touching any session', () => {
+  const { reg } = make();
+  let calls = 0;
+  reg.subscribe(() => { calls++; });
+  reg.touch();
   assert.equal(calls, 1);
 });
 
@@ -151,6 +271,16 @@ test('a tool-result event updates the matching tool message and ignores unknown 
   assert.deepEqual(reg.get(id)!.transcript[0], {
     kind: 'tool', name: 'Bash', summary: 'ls', status: 'error', id: 't1',
   });
+});
+
+test('an answered question is not marked failed by its deny-carried tool result', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'AskUserQuestion', summary: 'TS or Py?', status: 'running', id: 'q1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 'q1', ok: false });
+  assert.equal((reg.get(id)!.transcript[0] as { status: string }).status, 'ok');
 });
 
 test('concurrent saves all resolve and leave valid, parseable state', async (t) => {
@@ -230,6 +360,7 @@ test('revive clears stopped state and notifies subscribers', () => {
   const s = reg.get(id)!;
   assert.equal(s.status, 'working');
   assert.equal(s.stoppedReason, null);
+  assert.equal(s.stoppedCode, null);
   assert.equal(s.pending, null);
   assert.equal(calls, 1, 'revive should notify subscribers');
 });

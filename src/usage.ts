@@ -1,3 +1,5 @@
+import type { AccountLimits } from './types.ts';
+
 const WINDOW_MS = 5 * 3600_000;
 
 /** ponytail: calibration knob. `budget` in accounts.json is hand-tuned per
@@ -13,6 +15,11 @@ export class Usage {
    *  actually rejected; an `allowed` event deletes the entry so a stale limit
    *  can't suppress the pace fallback forever. */
   #resets = new Map<string, number>();
+
+  /** Real plan limits per account, or why there are none. Deliberately not in
+   *  toJSON(): a utilization percentage is wrong the moment this process is not
+   *  running, and it is re-fetched about two seconds after startup. */
+  #limits = new Map<string, { limits: AccountLimits | null; error: string | null }>();
 
   record(account: string, inputTokens: number, outputTokens: number, now = Date.now()): void {
     // Prune on write: samples outside the trailing window can never affect pace()
@@ -92,6 +99,14 @@ export class Usage {
     }
   }
 
+  setLimits(account: string, limits: AccountLimits | null, error: string | null): void {
+    this.#limits.set(account, { limits, error });
+  }
+
+  getLimits(account: string): { limits: AccountLimits | null; error: string | null } {
+    return this.#limits.get(account) ?? { limits: null, error: null };
+  }
+
   /** Fraction of `budget` spent in the trailing five hours. Can exceed 1. */
   pace(account: string, budget: number, now = Date.now()): number {
     const list = this.#samples.get(account);
@@ -102,13 +117,24 @@ export class Usage {
     return total / budget;
   }
 
-  freestAccount(accounts: { name: string; budget: number }[], now = Date.now()): string {
+  /**
+   * `load` is the caller's already-resolved fraction (real plan utilization);
+   * `pace` is the local estimate. Taking the override here rather than letting
+   * callers rank for themselves is what keeps this from disagreeing with the
+   * account picker in web/app.js, which ranks on the same server-computed number.
+   */
+  freestAccount(
+    accounts: { name: string; budget: number; load?: number }[],
+    now = Date.now(),
+  ): string {
     if (accounts.length === 0) throw new Error('no accounts configured');
+    const load = (a: { name: string; budget: number; load?: number }) =>
+      a.load ?? this.pace(a.name, a.budget, now);
     let best = accounts[0];
-    let bestPace = this.pace(best.name, best.budget, now);
+    let bestLoad = load(best);
     for (const a of accounts.slice(1)) {
-      const p = this.pace(a.name, a.budget, now);
-      if (p < bestPace) { best = a; bestPace = p; }
+      const l = load(a);
+      if (l < bestLoad) { best = a; bestLoad = l; }
     }
     return best.name;
   }

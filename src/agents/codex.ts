@@ -1,6 +1,10 @@
 import { Codex } from '@openai/codex-sdk';
 import type { ThreadEvent, ThreadItem } from '@openai/codex-sdk';
-import type { Adapter, AdapterEvent, AgentHandle, Msg, StartOpts } from '../types.ts';
+import { redactCodexText } from './codex-runtime.ts';
+import type { PreparedCodexRuntime } from './codex-runtime.ts';
+import type {
+  Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Msg, StartOpts,
+} from '../types.ts';
 
 function itemToMsg(item: ThreadItem): Msg | null {
   switch (item.type) {
@@ -57,7 +61,7 @@ export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
         { type: 'status', status: 'done' },
       ];
     case 'turn.failed':
-      return [{ type: 'stopped', reason: e.error.message }];
+      return [{ type: 'stopped', reason: e.error.message, code: 'codex_stream_failed' }];
     case 'error':
       return [{ type: 'stopped', reason: e.message }];
     case 'item.completed': {
@@ -68,16 +72,33 @@ export function normalizeCodex(e: ThreadEvent): AdapterEvent[] {
     case 'item.started':
     case 'item.updated':
       return [];
+    default:
+      if (process.env.NODE_ENV === 'development') {
+        console.warn(`[codex] ignored event type: ${String((e as { type?: unknown }).type)}`);
+      }
+      return [];
   }
 }
 
-const CODEX_BIN = '/Applications/ChatGPT.app/Contents/Resources/codex';
+export function classifyCodexFailure(
+  reason: string,
+  fallback: 'codex_start_failed' | 'codex_resume_failed' | 'codex_stream_failed',
+): CodexFailureCode {
+  if (/not logged in|authentication|unauthorized|\b401\b/i.test(reason)) {
+    return 'codex_auth_unavailable';
+  }
+  if (/sandbox|permission denied|operation not permitted|read-only file system/i.test(reason)) {
+    return 'codex_sandbox_denied';
+  }
+  return fallback;
+}
 
-export const codexAdapter: Adapter = {
-  start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle {
+export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
+  return {
+    start(opts: StartOpts, emit: (e: AdapterEvent) => void): AgentHandle {
     const codex = new Codex({
-      codexPathOverride: CODEX_BIN,
-      env: { ...process.env, ...opts.env } as Record<string, string>,
+      ...(runtime.codexPathOverride ? { codexPathOverride: runtime.codexPathOverride } : {}),
+      env: runtime.env,
     });
 
     const threadOptions = {
@@ -91,24 +112,64 @@ export const codexAdapter: Adapter = {
       ? codex.resumeThread(opts.resumeId, threadOptions)
       : codex.startThread(threadOptions);
 
-    const queue: string[] = [];
+    const queue: { text: string; promptId?: string }[] = [];
     // Cancels the in-flight Codex turn on stop(); see TurnOptions.signal in the SDK's
     // .d.ts. One controller for the adapter's lifetime — stop() is terminal, like the
     // Claude adapter's q.interrupt().
     const abortController = new AbortController();
     let running = false;
     let stopped = false;
+    let aborted = false;
+    let turnStarted = false;
+
+    function finish(reason: string, code: CodexFailureCode, abort = true): void {
+      if (stopped) return;
+      stopped = true;
+      const unsent = queue.splice(0);
+      for (const prompt of unsent) {
+        if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'unsent' });
+      }
+      if (unsent.length) {
+        const noun = unsent.length === 1 ? 'prompt was' : 'prompts were';
+        emit({
+          type: 'msg',
+          msg: {
+            kind: 'error',
+            text: `${unsent.length} queued ${noun} not sent. Resend ${unsent.length === 1 ? 'it' : 'them'} manually if still needed.`,
+          },
+        });
+      }
+      if (abort && !aborted) {
+        aborted = true;
+        abortController.abort();
+      }
+      const safeReason = redactCodexText(reason, runtime.env);
+      const stableCode = code === 'codex_start_failed'
+        || code === 'codex_resume_failed'
+        || code === 'codex_stream_failed'
+        ? classifyCodexFailure(safeReason, code)
+        : code;
+      emit({ type: 'stopped', reason: safeReason, code: stableCode });
+    }
 
     async function drain(): Promise<void> {
       if (running || stopped) return;
       running = true;
       try {
         while (queue.length && !stopped) {
-          const text = queue.shift()!;
-          const { events } = await thread.runStreamed(text, { signal: abortController.signal });
+          const prompt = queue.shift()!;
+          if (prompt.promptId) emit({ type: 'prompt-delivery', id: prompt.promptId, delivery: 'sent' });
+          const { events } = await thread.runStreamed(prompt.text, { signal: abortController.signal });
           for await (const e of events) {
             if (stopped) break;
-            for (const ev of normalizeCodex(e)) emit(ev);
+            if (e.type === 'turn.started') turnStarted = true;
+            for (const ev of normalizeCodex(e)) {
+              if (ev.type === 'stopped') {
+                finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
+                break;
+              }
+              emit(ev);
+            }
           }
         }
       } catch (err) {
@@ -116,20 +177,23 @@ export const codexAdapter: Adapter = {
         // `stopped` already true, this throw is the abort unwinding — stop() already
         // emitted its own 'stopped' event and this is not a session failure to report.
         if (stopped) return;
-        stopped = true;
-        emit({ type: 'stopped', reason: String((err as Error).message ?? err) });
+        finish(
+          String((err as Error).message ?? err),
+          turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed',
+          false,
+        );
       } finally {
         running = false;
       }
     }
 
-    queue.push(opts.prompt);
+    queue.push({ text: opts.prompt, promptId: opts.promptId });
     void drain();
 
     return {
-      send(text: string) {
+      send(text: string, promptId?: string) {
         emit({ type: 'status', status: 'working' });
-        queue.push(text);
+        queue.push({ text, promptId });
         void drain();
       },
       // Codex approvals are policy, not interactive. Nothing to decide.
@@ -141,12 +205,9 @@ export const codexAdapter: Adapter = {
       // `stopped` handler, and this stop() emits `stopped` — without the early
       // return a UI double-click, or drain()'s failure path, would re-enter.
       stop() {
-        if (stopped) return;
-        stopped = true;
-        queue.length = 0;
-        abortController.abort();
-        emit({ type: 'stopped', reason: 'stopped from switchboard' });
+        finish('Stopped by user.', 'codex_user_stopped');
       },
     };
-  },
-};
+    },
+  };
+}
