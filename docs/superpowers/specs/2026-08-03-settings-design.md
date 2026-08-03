@@ -86,7 +86,9 @@ transitions a Codex session has.
 
 ## Storage
 
-`state.json` becomes `{ sessions, usage, settings }`.
+`state.json` becomes `{ sessions, usage, queue, settings }`. (The README still
+describes it as `{ sessions, usage }`; `queue` was added by scheduling and the
+README was not updated — `src/sessions.ts:232` is authoritative.)
 
 ```ts
 export type Settings = {
