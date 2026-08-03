@@ -200,6 +200,14 @@ test('subscribers are notified on every apply', () => {
   assert.equal(calls, 1);
 });
 
+test('touch notifies subscribers without touching any session', () => {
+  const { reg } = make();
+  let calls = 0;
+  reg.subscribe(() => { calls++; });
+  reg.touch();
+  assert.equal(calls, 1);
+});
+
 test('a saved registry reloads with sessions marked stopped', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

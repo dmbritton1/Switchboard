@@ -68,6 +68,25 @@ export type AdapterEvent =
   | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
   | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 
+/** One claude.ai plan rate-limit window. `utilization` is 0-100, not a
+ *  fraction — that is the SDK's unit, kept as-is so a stray /100 is a visible
+ *  bug rather than a plausible-looking number. */
+export type LimitWindow = {
+  utilization: number;
+  /** ISO 8601, straight from the SDK. */
+  resetsAt: string;
+};
+
+/** Real plan limits for one account. A window is null when the SDK reports it
+ *  as null, which it does for windows that do not apply to the plan. */
+export type AccountLimits = {
+  fiveHour: LimitWindow | null;
+  sevenDay: LimitWindow | null;
+  /** 'pro' | 'max' | 'team' | 'enterprise', or null. Not an enum here: it is a
+   *  display string and an unrecognized plan should render, not throw. */
+  subscription: string | null;
+};
+
 export type StartOpts = {
   cwd: string;
   prompt: string;

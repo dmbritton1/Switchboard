@@ -51,3 +51,55 @@ test('freestAccount throws when given no accounts', () => {
   const u = new Usage();
   assert.throws(() => u.freestAccount([], 0), /no accounts/i);
 });
+
+const limits = (five: number, seven: number) => ({
+  fiveHour: { utilization: five, resetsAt: '2026-08-03T19:10:00Z' },
+  sevenDay: { utilization: seven, resetsAt: '2026-08-10T08:00:00Z' },
+  subscription: 'pro',
+});
+
+test('getLimits on an unprobed account is empty, not undefined', () => {
+  const u = new Usage();
+  assert.deepEqual(u.getLimits('main'), { limits: null, error: null });
+});
+
+test('setLimits stores limits and a later success clears a previous error', () => {
+  const u = new Usage();
+  u.setLimits('main', null, 'logged out');
+  assert.deepEqual(u.getLimits('main'), { limits: null, error: 'logged out' });
+
+  u.setLimits('main', limits(11, 1), null);
+  assert.deepEqual(u.getLimits('main'), { limits: limits(11, 1), error: null });
+});
+
+test('limits are not persisted: a percentage is wrong the moment we are not running', () => {
+  const u = new Usage();
+  u.record('main', 100, 100, 0);
+  u.setLimits('main', limits(11, 1), null);
+  assert.deepEqual(u.toJSON(), { main: [{ t: 0, tokens: 200 }] });
+});
+
+test('freestAccount prefers a supplied load over pace', () => {
+  const u = new Usage();
+  // 'real' looks the busiest by local estimate (90% of budget) but its real plan
+  // utilization is 5%; 'est' has no real number and a 40% estimate. Ranking on
+  // pace alone would pick 'est' — which is the point: drop the `load` override
+  // from freestAccount and this test must fail.
+  u.record('real', 900, 0, 0);
+  u.record('est', 400, 0, 0);
+  const freest = u.freestAccount(
+    [{ name: 'real', budget: 1000, load: 0.05 }, { name: 'est', budget: 1000 }],
+    0,
+  );
+  assert.equal(freest, 'real');
+});
+
+test('freestAccount falls back to pace for accounts with no load', () => {
+  const u = new Usage();
+  u.record('busy', 800, 0, 0);
+  const freest = u.freestAccount(
+    [{ name: 'busy', budget: 1000 }, { name: 'quiet', budget: 1000 }],
+    0,
+  );
+  assert.equal(freest, 'quiet');
+});

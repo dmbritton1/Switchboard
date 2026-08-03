@@ -162,3 +162,45 @@ export function commandErrorText(error, sessions, openId) {
   const session = sessions.find((s) => s.id === error.sessionId);
   return session ? `${session.branch}: ${error.message}` : error.message;
 }
+
+/**
+ * Everything the meter and the account panel need to decide *what* to say,
+ * with no DOM. The two branches are the point: an account with real plan
+ * limits and one falling back to the local budget estimate must not be worded
+ * the same, or an estimate reads as fact.
+ *
+ * The headline number is the worse of the two windows, matching the server's
+ * `load` — a nearly-exhausted week must not hide behind a quiet 5h window.
+ */
+export function accountView(a) {
+  const l = a.limits;
+  if (!l) {
+    const pct = Math.round(a.pace * 100);
+    return {
+      load: a.load ?? a.pace,
+      pct,
+      real: false,
+      title: `${a.name} — ~${pct}% of its 5h budget (estimate)`,
+      budgetLine: `${a.provider} · ~${pct}% of a ${a.budget.toLocaleString()} token budget · estimate`,
+      note: 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.',
+      windows: [],
+    };
+  }
+  const windows = [
+    l.fiveHour && { label: '5h', pct: l.fiveHour.utilization, resetsAt: l.fiveHour.resetsAt },
+    l.sevenDay && { label: '7d', pct: l.sevenDay.utilization, resetsAt: l.sevenDay.resetsAt },
+  ].filter(Boolean);
+  // windows[0] is a safe seed, not a fallback: probeLimits() now rejects rather
+  // than resolving when both windows are empty, so `limits` non-null guarantees
+  // at least one entry here.
+  const worst = windows.reduce((m, w) => (w.pct > m.pct ? w : m), windows[0]);
+  return {
+    load: a.load,
+    pct: worst.pct,
+    real: true,
+    title: `${a.name} — ${worst.pct}% of the ${worst.label} limit`,
+    budgetLine: `${a.provider} · ${l.subscription ?? 'unknown'} plan`,
+    note: '',
+    windows,
+  };
+}

@@ -9,12 +9,14 @@ import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
-import { claudeAdapter } from './agents/claude.ts';
+import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
-import type { Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session } from './types.ts';
+import type {
+  AccountLimits, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session,
+} from './types.ts';
 
 const run = promisify(execFile);
 
@@ -161,6 +163,50 @@ export async function recentRepos(): Promise<string[]> {
   return [...repos].sort();
 }
 
+/**
+ * One fraction per account, so the meter and the New Session picker cannot
+ * disagree. Real plan utilization when we have it, the local budget estimate
+ * otherwise. `max` of the two windows: a 95%-consumed week has to outrank a
+ * quiet five-hour window, and both are already 0-100 from the SDK.
+ */
+export function accountLoad(usage: Usage, a: Account): number {
+  const { limits } = usage.getLimits(a.name);
+  if (!limits) return usage.pace(a.name, a.budget);
+  const pct = Math.max(limits.fiveHour?.utilization ?? 0, limits.sevenDay?.utilization ?? 0);
+  return pct / 100;
+}
+
+/**
+ * One refresh pass over every Claude account, concurrently.
+ *
+ * `probe` is a parameter so tests drive this with a fake and never spawn a CLI.
+ * Every failure is swallowed into `limitsError`: a probe that throws must leave
+ * the account showing exactly the estimate UI it shows today, never block a
+ * session, and never take its neighbours down with it — hence allSettled and
+ * the per-account try.
+ */
+export async function refreshLimits(
+  usage: Usage,
+  accounts: Account[],
+  probe: (env: Record<string, string>) => Promise<AccountLimits> = probeLimits,
+): Promise<void> {
+  await Promise.allSettled(
+    accounts
+      .filter((a) => a.provider === 'claude')
+      .map(async (a) => {
+        try {
+          usage.setLimits(a.name, await probe(a.env), null);
+        } catch (err) {
+          // The SDK can build messages like "...exited with code N. stderr: <tail>",
+          // which may contain this account's own env values (paths, tokens) — the
+          // same reason launch()'s codex error path redacts before it reaches the
+          // browser, for an error the user never even triggered by hand.
+          usage.setLimits(a.name, null, redactAccountValue(String((err as Error).message ?? err), a));
+        }
+      }),
+  );
+}
+
 export function createServer(opts: {
   registry: Registry;
   usage: Usage;
@@ -172,12 +218,18 @@ export function createServer(opts: {
   function snapshot() {
     return {
       sessions: registry.all(),
-      accounts: accounts.map((a) => ({
-        name: a.name,
-        provider: a.provider,
-        budget: a.budget,
-        pace: usage.pace(a.name, a.budget),
-      })),
+      accounts: accounts.map((a) => {
+        const { limits, error } = usage.getLimits(a.name);
+        return {
+          name: a.name,
+          provider: a.provider,
+          budget: a.budget,
+          pace: usage.pace(a.name, a.budget),
+          limits,
+          limitsError: error,
+          load: accountLoad(usage, a),
+        };
+      }),
     };
   }
 
@@ -648,6 +700,28 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   ) as Account[];
   const usage = new Usage();
   const registry = await Registry.load(statePath, usage);
+  // Entry point only, never inside createServer: test/server.test.ts imports
+  // createServer directly, and an interval started there would leak a timer and
+  // a CLI spawn into every server test.
+  const REFRESH_MS = 5 * 60_000;
+  let refreshing = false;
+  const refresh = async () => {
+    if (refreshing) return;      // a slow probe must not stack up passes
+    refreshing = true;
+    try {
+      await refreshLimits(usage, accounts);
+      // Registry#notify() is what actually reaches an open browser tab (see
+      // the /events push in createServer) — refreshLimits only wrote into
+      // Usage, which the Registry doesn't watch. Once per pass, not per
+      // account: no reason to push N snapshots for one refresh.
+      registry.touch();
+    } finally { refreshing = false; }
+  };
+  void refresh();
+  // ponytail: unconditional timer — it does not check whether a browser is
+  // connected. Gate it on live SSE clients if the spawns ever show up in a
+  // profile.
+  setInterval(() => void refresh(), REFRESH_MS).unref();
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;

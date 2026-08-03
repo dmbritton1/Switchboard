@@ -3,7 +3,8 @@ import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
-  Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption, StartOpts,
+  AccountLimits, Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption,
+  StartOpts,
 } from '../types.ts';
 
 /**
@@ -330,3 +331,76 @@ export const claudeAdapter: Adapter = {
     };
   },
 };
+
+/**
+ * Real claude.ai plan limits for one account, or a rejection.
+ *
+ * The SDK exposes this only on a live `Query`, but a Query does not need a
+ * session: the prompt stream below never yields, so the CLI starts, answers the
+ * control request, and is closed again without a prompt, a model turn, or a
+ * token of spend. That is what makes idle accounts pollable — which is the
+ * whole point, since "which account is freest" has to be answerable *before* a
+ * session exists.
+ *
+ * Deliberately does not reuse a running session's Query. That would mean
+ * threading a method through AgentHandle and the registry and would still need
+ * this standalone path for idle accounts.
+ *
+ * Rejects rather than returning null so the caller has one failure channel:
+ * a thrown error, a timeout, and `rate_limits_available: false` all mean the
+ * same thing to every consumer — no real number for this account.
+ */
+export async function probeLimits(
+  env: Record<string, string>,
+  timeoutMs = 30_000,
+): Promise<AccountLimits> {
+  const q = query({
+    // Never yields: the SDK pulls, gets nothing, and no turn is ever started.
+    prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+      await new Promise<never>(() => {});
+    })(),
+    options: {
+      env: { ...process.env, ...env } as Options['env'],
+      // Isolation: omitting settingSources loads the user's ~/.claude/settings.json
+      // plus project/local settings resolved against this server process's cwd,
+      // which can fire SessionStart hooks and boot every configured MCP server —
+      // per Claude account, every 5 minutes, forever — just to read a usage
+      // number. A usage probe must not have side effects.
+      settingSources: [],
+    },
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const usage = await Promise.race([
+      q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+      new Promise<never>((_, reject) => {
+        // A hung CLI must not wedge the refresh loop forever.
+        timer = setTimeout(() => reject(new Error('usage probe timed out')), timeoutMs);
+      }),
+    ]);
+    if (!usage.rate_limits_available || !usage.rate_limits) {
+      // API key, Bedrock, Vertex, or a token without the profile scope. Not an
+      // error the user can act on, but not a number either.
+      throw new Error('plan rate limits are not available for this account');
+    }
+    const win = (w: { utilization: number | null; resets_at: string | null } | null | undefined) =>
+      (w && typeof w.utilization === 'number' && w.resets_at
+        ? { utilization: w.utilization, resetsAt: w.resets_at }
+        : null);
+    const fiveHour = win(usage.rate_limits.five_hour);
+    const sevenDay = win(usage.rate_limits.seven_day);
+    // Both windows are optional in the SDK type, so `rate_limits_available: true`
+    // does not guarantee either one is actually present. Rejecting here — the
+    // same failure channel as the check above — keeps a missing number from
+    // being reported as an authoritative 0%, which would sort this account as
+    // the freest one available and render with none of the estimate's caveats.
+    if (!fiveHour && !sevenDay) {
+      throw new Error('plan rate limits were reported available but both windows were empty');
+    }
+    return { fiveHour, sevenDay, subscription: usage.subscription_type };
+  } finally {
+    clearTimeout(timer);
+    // Releases the child process. Without this the node event loop stays alive.
+    q.close();
+  }
+}

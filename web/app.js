@@ -1,6 +1,7 @@
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
+  accountView,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -82,23 +83,25 @@ function setPanel(next) {
 }
 
 function accountMeter(a) {
-  const pct = Math.round(a.pace * 100);
+  const v = accountView(a);
   const b = document.createElement('button');
   b.type = 'button';
   b.className = `meter${panel === a.name ? ' open' : ''}`;
-  b.title = `${a.name} — ~${pct}% of its 5h budget (estimate)`;
+  b.title = v.title;
 
   const name = document.createElement('span');
   name.textContent = a.name;
 
   const bar = document.createElement('span');
-  bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
+  // Real utilization caps at 100 (load caps at 1.0), so `> 1` was unreachable
+  // for exactly the accounts that have a real number to warn about.
+  bar.className = `bar ${v.load >= 1 ? 'over' : ''}`;
   const fill = document.createElement('i');
-  fill.style.width = `${Math.min(pct, 100)}%`;
+  fill.style.width = `${Math.min(v.pct, 100)}%`;
   bar.append(fill);
 
   const num = document.createElement('span');
-  num.textContent = `${pct}%`;
+  num.textContent = `${v.pct}%`;
 
   b.append(name, bar, num);
   b.onclick = () => setPanel(a.name);
@@ -106,17 +109,38 @@ function accountMeter(a) {
 }
 
 function accountPanel(a) {
+  const v = accountView(a);
   const box = document.createElement('div');
   const h = document.createElement('h3');
   h.textContent = a.name;
+
   const line = document.createElement('p');
   line.className = 'meta';
-  line.textContent =
-    `${a.provider} · ~${Math.round(a.pace * 100)}% of a ${a.budget.toLocaleString()} token budget · estimate`;
-  const note = document.createElement('p');
-  note.className = 'meta';
-  note.textContent = 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.';
-  box.append(h, line, note);
+  line.textContent = v.budgetLine;
+  box.append(h, line);
+
+  for (const w of v.windows) {
+    const row = document.createElement('p');
+    row.className = 'meta';
+    // Local time: a UTC reset timestamp is a small puzzle every single glance.
+    row.textContent = `${w.label} · ${w.pct}% · resets ${new Date(w.resetsAt).toLocaleString()}`;
+    box.append(row);
+  }
+
+  if (v.note) {
+    const note = document.createElement('p');
+    note.className = 'meta';
+    note.textContent = v.note;
+    box.append(note);
+  }
+  // Panel only: the meter stays a number, and a logged-out alt account should
+  // not make every glance at the header look like a failure.
+  if (a.limitsError) {
+    const err = document.createElement('p');
+    err.className = 'meta';
+    err.textContent = `No real plan limits: ${a.limitsError}`;
+    box.append(err);
+  }
   return box;
 }
 
@@ -1071,7 +1095,10 @@ async function openNew() {
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
   const sel = document.querySelector('select[name=account]');
-  const freest = [...state.accounts].sort((a, b) => a.pace - b.pace)[0];
+  // `load` is the server's one ranking number — real plan utilization where we
+  // have it, the local estimate otherwise. Sorting on `pace` here would default
+  // the dialog to a different account than the meters imply is freest.
+  const freest = [...state.accounts].sort((a, b) => a.load - b.load)[0];
   sel.replaceChildren(...state.accounts.map((a) => {
     const o = document.createElement('option');
     o.value = a.name;

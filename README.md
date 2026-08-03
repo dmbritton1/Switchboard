@@ -96,9 +96,18 @@ forgets the session, and checking the box additionally runs
 `git worktree remove` (falling back to deleting the directory) on confirmation
 — which **discards any uncommitted work in that worktree**.
 
-Usage percentages are estimates from observed token spend against the `budget`
-in `accounts.json`, not real plan limits — no CLI exposes those. The two
-providers aren't measured identically: the Claude adapter folds
+Claude accounts show their real claude.ai plan usage: Switchboard asks the
+Agent SDK for the 5-hour and 7-day rate-limit windows every five minutes, using
+each account's own launch environment. This costs no tokens — the probe starts
+a session that is never given a prompt. The meter shows whichever window is
+further along, so a nearly-exhausted week cannot hide behind a quiet afternoon.
+The API is marked experimental by the SDK and may change.
+
+Everything else falls back to an estimate from observed token spend against the
+`budget` in `accounts.json`: Codex accounts, API-key/Bedrock/Vertex accounts
+(where plan limits do not apply), and any account whose probe fails — the
+account panel says which. Those estimates are labelled `~` and "estimate" in
+the UI, and the two providers aren't measured identically: the Claude adapter folds
 `cache_creation_input_tokens` and `cache_read_input_tokens` into the input
 count (a recorded session showed 86 tokens counted before that fix, 38,012
 after — cache tokens are most of real spend under prompt caching), while the
@@ -172,6 +181,6 @@ spend a model turn, or read a real Codex account.
 
 Phase 2 remains intentionally out of scope: live item lifecycle rendering,
 bounded/redacted tool details, reasoning and todo presentation, structured
-local-image input, inherited-by-default per-session settings, improved usage
-reporting where supported, and the SDK-versus-app-server interactive-approval
+local-image input, inherited-by-default per-session settings, and the
+SDK-versus-app-server interactive-approval
 evaluation.

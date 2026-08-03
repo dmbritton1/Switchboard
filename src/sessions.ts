@@ -182,6 +182,18 @@ export class Registry {
     return () => this.#subs.delete(fn);
   }
 
+  /**
+   * Notifies subscribers with no session mutation of its own. A refresh pass
+   * writes new plan limits straight into the Usage instance the Registry does
+   * not own, so nothing here detects that change on its own — the caller
+   * (the entry-point refresh loop) calls this once the pass completes so an
+   * open SSE stream actually sees the new numbers instead of waiting for the
+   * next unrelated session event.
+   */
+  touch(): void {
+    this.#notify();
+  }
+
   #notify(): void {
     for (const fn of this.#subs) fn();
   }
