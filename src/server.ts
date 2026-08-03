@@ -696,6 +696,21 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   ) as Account[];
   const usage = new Usage();
   const registry = await Registry.load(statePath, usage);
+  // Entry point only, never inside createServer: test/server.test.ts imports
+  // createServer directly, and an interval started there would leak a timer and
+  // a CLI spawn into every server test.
+  const REFRESH_MS = 5 * 60_000;
+  let refreshing = false;
+  const refresh = async () => {
+    if (refreshing) return;      // a slow probe must not stack up passes
+    refreshing = true;
+    try { await refreshLimits(usage, accounts); } finally { refreshing = false; }
+  };
+  void refresh();
+  // ponytail: unconditional timer — it does not check whether a browser is
+  // connected. Gate it on live SSE clients if the spawns ever show up in a
+  // profile.
+  setInterval(() => void refresh(), REFRESH_MS).unref();
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
