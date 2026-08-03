@@ -740,7 +740,14 @@ function renderChatPane(s) {
     }
     t.append(el);
   }
-  if (nearBottom) t.scrollIntoView({ block: 'end' });
+  // Scroll the whole pane — not #transcript — to the viewport bottom. The
+  // composer is in normal flow *below* the transcript, so aligning the
+  // transcript's end with the bottom edge pushed the input box off-screen, and
+  // it re-fired on every snapshot because the leftover scroll (composer height)
+  // stayed inside the nearBottom threshold. The pane's end is the composer, or
+  // #upload-error when it has text (it's display:none when empty), so an upload
+  // error lands on-screen too instead of one line below the fold.
+  if (nearBottom) $('#pane-chat').scrollIntoView({ block: 'end' });
 }
 
 // The named slot for the diff spec. /status returns only the totals today, so
