@@ -172,6 +172,24 @@ export function commandErrorText(error, sessions, openId) {
  * The headline number is the worse of the two windows, matching the server's
  * `load` — a nearly-exhausted week must not hide behind a quiet 5h window.
  */
+/**
+ * The account the New worktree dialog defaults to.
+ *
+ * Not simply the lowest `load`. Since real plan limits landed, an account that
+ * has them reports true utilization while one that doesn't falls back to the
+ * local token-spend estimate — which reads 0% until Switchboard has watched it
+ * spend something, and is 0% forever for a provider it can't probe. Ranking
+ * those two numbers against each other made every un-probed account the
+ * "freest" one available, so the dialog silently defaulted to it. A real number
+ * outranks an estimate (`real` in accountView() is the same test); ties fall
+ * back to load.
+ */
+export function freestAccount(accounts) {
+  return [...accounts].sort(
+    (a, b) => Number(Boolean(b.limits)) - Number(Boolean(a.limits)) || a.load - b.load,
+  )[0];
+}
+
 export function accountView(a) {
   const l = a.limits;
   if (!l) {

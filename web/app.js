@@ -1,7 +1,7 @@
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
-  accountView,
+  accountView, freestAccount,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -1095,10 +1095,7 @@ async function openNew() {
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
   const sel = document.querySelector('select[name=account]');
-  // `load` is the server's one ranking number — real plan utilization where we
-  // have it, the local estimate otherwise. Sorting on `pace` here would default
-  // the dialog to a different account than the meters imply is freest.
-  const freest = [...state.accounts].sort((a, b) => a.load - b.load)[0];
+  const freest = freestAccount(state.accounts);
   sel.replaceChildren(...state.accounts.map((a) => {
     const o = document.createElement('option');
     o.value = a.name;

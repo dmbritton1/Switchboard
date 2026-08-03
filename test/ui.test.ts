@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
+  freestAccount,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -234,4 +235,30 @@ test('accountView keeps a probe error out of the meter title', () => {
   const v = accountView(acct({ limitsError: 'logged out' }));
   assert.equal(v.real, false);
   assert.ok(!v.title.includes('logged out'), 'the error belongs in the panel, not the meter');
+});
+
+const withLimits = (name: string, pct: number) => acct({
+  name,
+  limits: { fiveHour: { utilization: pct, resetsAt: '2026-08-03T19:10:00Z' }, sevenDay: null, subscription: 'max' },
+  load: pct / 100,
+});
+
+test('freestAccount does not let an unprobed account outrank a real number', () => {
+  // The regression: codex has no plan limits, so its estimate reads 0% and the
+  // dialog defaulted to it over every Claude account with a real utilization.
+  const accounts = [
+    withLimits('claude-main', 83),
+    withLimits('claude-alt', 58),
+    acct({ name: 'codex', provider: 'codex', pace: 0, load: 0 }),
+  ];
+  assert.equal(freestAccount(accounts).name, 'claude-alt');
+});
+
+test('freestAccount falls back to load when nobody has real limits', () => {
+  const accounts = [acct({ name: 'a', load: 0.7 }), acct({ name: 'b', load: 0.2 })];
+  assert.equal(freestAccount(accounts).name, 'b');
+});
+
+test('freestAccount picks the lowest load among accounts that all have limits', () => {
+  assert.equal(freestAccount([withLimits('a', 90), withLimits('b', 12)]).name, 'b');
 });
