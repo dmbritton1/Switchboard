@@ -34,11 +34,18 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .card { background: var(--card); border-radius: 14px; padding: 1rem; cursor: pointer;
   border: 1px solid transparent; }
 .card.needs-you { border-color: var(--needs); }
+/* Placeholder for a worktree still being created (see pendingCard() in
+   app.js): dashed border marks it as "not real yet" at a glance, and it
+   isn't clickable like a real card, so no pointer cursor. */
+.card.pending { cursor: default; border-style: dashed; border-color: var(--line); opacity: .8; }
 .status { font-weight: 600; text-transform: lowercase; }
 .status.working { color: var(--working); }
 .status.needs-you { color: var(--needs); }
 .status.done { color: var(--done); }
 .status.stopped { color: var(--stopped); }
+.status.pending { color: var(--dim); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .status.pending { animation: none; } }
 .branch { font-weight: 700; margin: .4rem 0; word-break: break-word; }
 .meta, .wt { color: var(--dim); font-size: .9em; }
 .bar { height: 5px; border-radius: 3px; background: #333; overflow: hidden; margin: .4rem 0; }

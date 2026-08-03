@@ -22,6 +22,17 @@ let selected = new Set();
 let selectionMessage = '';
 let sessionCommandError = null;
 let queueCommandError = '';
+// Worktrees whose `create` command is in flight. `git worktree add` (and the
+// launch after it) takes long enough that the dialog closes and the grid
+// re-renders well before the real session exists in `state` — without this,
+// the user is left staring at an unchanged grid and can't tell anything
+// happened. Not part of `state`: it never comes from an SSE snapshot, and
+// `state` is fully overwritten on every message (see es.onmessage) so
+// anything stuffed into state.sessions would be wiped by the next unrelated
+// snapshot. Cleared once the create command settles, success or failure —
+// on success the real card takes over on the next snapshot; on failure the
+// dialog reopens with an error and there is nothing left to show as pending.
+let pendingCreates = [];
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -278,13 +289,18 @@ function renderGrid() {
   for (const id of selected) if (!live.has(id)) selected.delete(id);
   if (selected.size) grid.append(selectionBar());
 
+  // Pending creates first: they're newer than anything with a real
+  // statusSince, and the whole point is that the user should see one
+  // appear the instant they close the dialog, not scroll to find it.
+  for (const p of pendingCreates) grid.append(pendingCard(p));
+
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
   const sorted = sortSessions(state.sessions);
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
-  if (!state.sessions.length) {
+  if (!state.sessions.length && !pendingCreates.length) {
     const empty = document.createElement('div');
     empty.id = 'grid-empty';
     const line = document.createElement('p');
@@ -503,6 +519,37 @@ $('#del').addEventListener('close', async (e) => {
 document.addEventListener('click', (e) => {
   if (menuFor && !e.target.closest('.menu-wrap')) { menuFor = null; render(); }
 }, true);
+
+// A stand-in for the real card while `git worktree add` + launch are still
+// running server-side (see the 'close' handler on #new). Deliberately a
+// simplified subset of card(): no checkbox, no overflow menu, no click — none
+// of those actions make sense on a session that doesn't exist yet, and this
+// card is gone within a render or two once the real one lands.
+function pendingCard(p) {
+  const el = document.createElement('div');
+  el.className = 'card pending';
+
+  const status = document.createElement('div');
+  status.className = 'status pending';
+  status.textContent = 'creating…';
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  head.append(status);
+
+  // p.branch/p.repo/p.account are straight from the create form, same as a
+  // real session's fields — untrusted text only, same as card() below.
+  const branch = document.createElement('div');
+  branch.className = 'branch';
+  branch.textContent = p.branch;
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = `${p.repo.split('/').filter(Boolean).pop() ?? p.repo} · ${p.account}`;
+
+  el.append(head, branch, meta);
+  return el;
+}
 
 function card(s, fetchStatus) {
   const el = document.createElement('div');
@@ -1120,15 +1167,23 @@ $('#new').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
+  const repo = f.get('repo'), branch = f.get('branch'), account = f.get('account');
+
+  // Shown in the grid immediately — see pendingCreates' declaration for why
+  // this can't just wait for the next SSE snapshot.
+  const pending = { repo, branch, account };
+  pendingCreates.push(pending);
+  render();
+
   const result = await postCommand({
-    cmd: 'create',
-    repo: f.get('repo'), branch: f.get('branch'),
-    account: f.get('account'), prompt: f.get('prompt'),
+    cmd: 'create', repo, branch, account, prompt: f.get('prompt'),
   });
+  pendingCreates = pendingCreates.filter((p) => p !== pending);
   if (!result.ok) {
     $('#new-error').textContent = commandFailure(result);
     dialog.showModal();
   }
+  render();
 });
 
 // Chrome and Safari largely ignore (or silently fall back to a "quiet",
