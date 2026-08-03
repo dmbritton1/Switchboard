@@ -81,9 +81,12 @@ test('limits are not persisted: a percentage is wrong the moment we are not runn
 
 test('freestAccount prefers a supplied load over pace', () => {
   const u = new Usage();
-  // 'real' has burned 90% of its budget locally but the plan says it is idle;
-  // 'est' looks clean locally. The real number has to win.
+  // 'real' looks the busiest by local estimate (90% of budget) but its real plan
+  // utilization is 5%; 'est' has no real number and a 40% estimate. Ranking on
+  // pace alone would pick 'est' — which is the point: drop the `load` override
+  // from freestAccount and this test must fail.
   u.record('real', 900, 0, 0);
+  u.record('est', 400, 0, 0);
   const freest = u.freestAccount(
     [{ name: 'real', budget: 1000, load: 0.05 }, { name: 'est', budget: 1000 }],
     0,
