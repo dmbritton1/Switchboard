@@ -84,15 +84,22 @@ setLimits(account: string, limits: AccountLimits | null, error: string | null): 
 getLimits(account: string): { limits: AccountLimits | null; error: string | null };
 ```
 
-`src/server.ts` refreshes every Claude account at startup and on a 5-minute
-interval, running the accounts concurrently. The interval is unconditional —
-it does not check whether a browser is connected. Three accounts at ~2.2s every
-five minutes is not worth the connection-tracking code, and an unconditional
-timer means the first page load after an idle period shows a fresh number
-instead of triggering a two-second wait.
+`src/server.ts` exports `refreshLimits(usage, accounts, probe)`: one pass that
+probes every Claude account concurrently and writes each result into `Usage`.
+It takes the probe as a parameter so tests can drive it with a fake and never
+spawn a CLI.
 
-The interval is `unref()`d so it never holds the server process open, and a
-refresh already in flight is not started again.
+The 5-minute `setInterval` that calls it lives in the entry-point block at the
+bottom of `src/server.ts`, **not** inside `createServer`. `createServer` is
+imported directly by `test/server.test.ts`; an interval started there would
+leak a timer and a CLI spawn into every server test.
+
+The interval is unconditional — it does not check whether a browser is
+connected. Three accounts at ~2.2s every five minutes is not worth the
+connection-tracking code, and an unconditional timer means the first page load
+after an idle period shows a fresh number instead of triggering a two-second
+wait. It is `unref()`d so it never holds the process open, and a refresh
+already in flight is not started again.
 
 Limits are **not** written to `state.json`. They are re-fetched two seconds
 after startup, and a persisted utilization percentage is wrong the moment the
@@ -100,13 +107,22 @@ process is not running. `state.json`'s shape is unchanged by this work.
 
 ## Account selection
 
-`freestAccount` keeps its job but stops assuming every account is measured the
-same way. The caller resolves each account's load before calling:
+`Usage.freestAccount` has no production caller — only tests. The New Session
+dialog picks the default account itself, at `web/app.js:1067`, by sorting the
+snapshot on `a.pace`. Ranking therefore has to change where it actually
+happens, and there must not end up being two rules.
+
+One number, computed once, server-side. `snapshot()` emits `load` per account:
 
 - Claude account with limits: `max(fiveHour, sevenDay) / 100`. A weekly window
   at 95% has to outrank a quiet five-hour window; taking the max is what makes
   the two comparable to a `pace()` fraction.
 - Anything else: `pace(name, budget)`, exactly as today.
+
+`web/app.js` sorts on `load` instead of `pace`. `Usage.freestAccount` takes an
+optional per-account `load` and prefers it when present, so the one remaining
+caller-less ranking function cannot silently disagree with the UI if something
+starts using it.
 
 `Usage` gains no knowledge of the SDK — it receives numbers. A real utilization
 and an estimated pace are both "fraction of this account's headroom consumed",
@@ -132,17 +148,27 @@ rendered only in the account panel, never on the meter.
 
 ## UI
 
-`web/app.js`, two functions:
+The repo splits browser code into `web/lib.js` (pure, covered by
+`test/ui.test.ts`) and `web/app.js` (DOM, untested). The branching this feature
+needs is decision logic, so it goes in `lib.js` behind one function:
 
-- `accountMeter` — when `limits` is present, the tooltip reads
-  `<name> — 11% of the 5h limit` and drops the `~` and the word "estimate".
-  Without limits it is byte-for-byte what it renders today.
-- `accountPanel` — with limits: plan name, both windows with their percentages
-  and reset times as local time. Without limits: today's budget line and
-  estimate disclaimer, plus `limitsError` when there is one.
+```js
+export function accountView(a)
+// → { load, pct, real, title, budgetLine, note, windows }
+```
 
-The bar itself still fills from a 0–1 fraction, now sourced from real
-utilization when available. The `over` class threshold is unchanged.
+`app.js` then stays dumb:
+
+- `accountMeter` — reads `pct`, `title`, and `load` (for the `over` class and
+  the fill width) off `accountView`. With real limits the title reads
+  `<name> — 11% of the 5h limit`, dropping the `~` and the word "estimate";
+  without them it is byte-for-byte today's string.
+- `accountPanel` — renders `budgetLine`, `note`, and `windows` (each window's
+  label, percentage, and reset time as local time), plus `limitsError` when
+  there is one. Error text appears in the panel only, never on the meter.
+
+The bar still fills from a 0–1 fraction, now `load`. The `over` threshold is
+unchanged.
 
 ## Failure handling
 
@@ -156,15 +182,26 @@ The probe gets a 30-second timeout so a hung CLI cannot wedge the refresh loop.
 
 ## Testing
 
-`test/usage.test.ts` covers the parts that are logic:
+`test/usage.test.ts`:
 
-- `freestAccount` picks the account with real limits when its utilization beats
-  another account's estimated pace, and vice versa.
-- An account whose probe failed falls back to `pace()` and stays selectable.
-- `max(fiveHour, sevenDay)` — a 5% five-hour window with a 96% weekly window
-  loses to a 40% estimated account.
 - `setLimits(null, err)` then `getLimits` returns the error, and a later
   successful `setLimits` clears it.
+- `freestAccount` prefers a supplied `load` over `pace`, and falls back to
+  `pace` for accounts without one.
+
+`test/server.test.ts`:
+
+- `refreshLimits` with a fake probe writes limits for Claude accounts and never
+  calls the probe for a Codex account.
+- A probe that rejects leaves `limits: null` and a non-null `limitsError`.
+- `snapshot()`'s `load` is `max(fiveHour, sevenDay)/100` for an account with
+  limits and `pace` for one without — a 5% five-hour window with a 96% weekly
+  window must outrank a 40% estimated account.
+
+`test/ui.test.ts`:
+
+- `accountView` with limits produces the real title and no estimate wording.
+- `accountView` without limits reproduces today's estimate strings exactly.
 
 The probe itself is a network call and gets no unit test; nothing fake would
 prove anything about it. The implementation plan carries one manual
