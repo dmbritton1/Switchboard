@@ -99,9 +99,14 @@ forgets the session, and checking the box additionally runs
 Claude accounts show their real claude.ai plan usage: Switchboard asks the
 Agent SDK for the 5-hour and 7-day rate-limit windows every five minutes, using
 each account's own launch environment. This costs no tokens — the probe starts
-a session that is never given a prompt. The meter shows whichever window is
-further along, so a nearly-exhausted week cannot hide behind a quiet afternoon.
-The API is marked experimental by the SDK and may change.
+a session that is never given a prompt. The meter badge always headlines the
+5-hour window (falling back to 7-day only for a plan that doesn't report one);
+tap it open for both numbers, so a nearly-exhausted week is never hidden, just
+not the badge's headline. The bar's fill/color and the New Session picker's
+"freest account" ranking still use the worse of the two windows, so a
+nearly-exhausted week still counts against an account there even though the
+badge reads a quiet 5h number. The API is marked experimental by the SDK and
+may change.
 
 Everything else falls back to an estimate from observed token spend against the
 `budget` in `accounts.json`: Codex accounts, API-key/Bedrock/Vertex accounts

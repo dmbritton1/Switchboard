@@ -169,8 +169,14 @@ export function commandErrorText(error, sessions, openId) {
  * limits and one falling back to the local budget estimate must not be worded
  * the same, or an estimate reads as fact.
  *
- * The headline number is the worse of the two windows, matching the server's
- * `load` — a nearly-exhausted week must not hide behind a quiet 5h window.
+ * The headline number is always the 5-hour window when the plan reports one:
+ * it is the window that resets every few hours, so it is the one worth a
+ * reflex check at a glance. Weekly utilization is still visible — both windows
+ * are in `windows`, which the tap-open panel lists in full — it just does not
+ * get to replace the badge's number. (`load`, used for the bar fill/color and
+ * the New Session picker, is unrelated: it stays the worse-of-both-windows
+ * fraction the server computes, so a nearly-exhausted week still ranks that
+ * account as less free even though the badge reads 5h.)
  */
 /**
  * The account the New worktree dialog defaults to.
@@ -208,15 +214,16 @@ export function accountView(a) {
     l.fiveHour && { label: '5h', pct: l.fiveHour.utilization, resetsAt: l.fiveHour.resetsAt },
     l.sevenDay && { label: '7d', pct: l.sevenDay.utilization, resetsAt: l.sevenDay.resetsAt },
   ].filter(Boolean);
-  // windows[0] is a safe seed, not a fallback: probeLimits() now rejects rather
-  // than resolving when both windows are empty, so `limits` non-null guarantees
-  // at least one entry here.
-  const worst = windows.reduce((m, w) => (w.pct > m.pct ? w : m), windows[0]);
+  // Fall back to whatever is there (7d only) for a plan that does not report a
+  // 5h window at all. windows[0] is a safe fallback, not a guess: probeLimits()
+  // rejects rather than resolving when both windows are empty, so `limits`
+  // non-null guarantees at least one entry here.
+  const primary = windows.find((w) => w.label === '5h') ?? windows[0];
   return {
     load: a.load,
-    pct: worst.pct,
+    pct: primary.pct,
     real: true,
-    title: `${a.name} — ${worst.pct}% of the ${worst.label} limit`,
+    title: `${a.name} — ${primary.pct}% of the ${primary.label} limit`,
     budgetLine: `${a.provider} · ${l.subscription ?? 'unknown'} plan`,
     note: '',
     windows,
