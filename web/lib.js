@@ -164,21 +164,6 @@ export function commandErrorText(error, sessions, openId) {
 }
 
 /**
- * Everything the meter and the account panel need to decide *what* to say,
- * with no DOM. The two branches are the point: an account with real plan
- * limits and one falling back to the local budget estimate must not be worded
- * the same, or an estimate reads as fact.
- *
- * The headline number is always the 5-hour window when the plan reports one:
- * it is the window that resets every few hours, so it is the one worth a
- * reflex check at a glance. Weekly utilization is still visible — both windows
- * are in `windows`, which the tap-open panel lists in full — it just does not
- * get to replace the badge's number. (`load`, used for the bar fill/color and
- * the New Session picker, is unrelated: it stays the worse-of-both-windows
- * fraction the server computes, so a nearly-exhausted week still ranks that
- * account as less free even though the badge reads 5h.)
- */
-/**
  * The account the New worktree dialog defaults to.
  *
  * Not simply the lowest `load`. Since real plan limits landed, an account that
@@ -196,6 +181,21 @@ export function freestAccount(accounts) {
   )[0];
 }
 
+/**
+ * Everything the meter and the account panel need to decide *what* to say,
+ * with no DOM. The two branches are the point: an account with real plan
+ * limits and one falling back to the local budget estimate must not be worded
+ * the same, or an estimate reads as fact.
+ *
+ * The headline number is always the 5-hour window when the plan reports one:
+ * it is the window that resets every few hours, so it is the one worth a
+ * reflex check at a glance. Weekly utilization is still visible — both windows
+ * are in `windows`, which the tap-open panel lists in full — it just does not
+ * get to replace the badge's number. (`load`, used for the bar fill/color and
+ * the New Session picker, is unrelated: it stays the worse-of-both-windows
+ * fraction the server computes, so a nearly-exhausted week still ranks that
+ * account as less free even though the badge reads 5h.)
+ */
 export function accountView(a) {
   const l = a.limits;
   if (!l) {
