@@ -7,11 +7,28 @@ const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
 const MIXED = 'Selected worktrees belong to different repos — pick worktrees from one repo';
 const basename = (p) => p.split('/').filter(Boolean).pop() ?? p;
 
-/** Blocked first, then running, then finished — most recently changed first within each. */
-export function sortSessions(sessions) {
-  return [...sessions].sort(
-    (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince,
-  );
+const byBlocked = (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince;
+
+/**
+ * Grid order. `blocked` is the default and the original behavior: blocked
+ * first, then running, then finished, most recently changed first within each.
+ * `newest` is a flat recency list. `account` groups by account name and falls
+ * back to `blocked` inside each group, so grouping never costs you the
+ * blocked-first reflex within the account you are looking at.
+ */
+export function sortSessions(sessions, mode = 'blocked') {
+  const cmp = mode === 'newest'
+    ? (a, b) => b.statusSince - a.statusSince
+    : mode === 'account'
+      ? (a, b) => a.account.localeCompare(b.account) || byBlocked(a, b)
+      : byBlocked;
+  return [...sessions].sort(cmp);
+}
+
+/** Hides finished sessions when the setting asks. `stopped` is deliberately not
+ *  hidden: it carries a Resume button and unfinished work, unlike `done`. */
+export function visibleSessions(sessions, collapseDone) {
+  return collapseDone ? sessions.filter((s) => s.status !== 'done') : sessions;
 }
 
 /**

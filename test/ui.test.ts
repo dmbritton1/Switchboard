@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
+  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount,
 } from '../web/lib.js';
 
@@ -277,4 +277,46 @@ test('freestAccount falls back to load when nobody has real limits', () => {
 
 test('freestAccount picks the lowest load among accounts that all have limits', () => {
   assert.equal(freestAccount([withLimits('a', 90), withLimits('b', 12)]).name, 'b');
+});
+
+test('sortSessions defaults to blocked-first', () => {
+  const out = sortSessions([
+    session({ id: 'd', status: 'stopped' }),
+    session({ id: 'a', status: 'needs-you' }),
+  ]);
+  assert.deepEqual(out.map((s) => s.id), ['a', 'd']);
+});
+
+test('sortSessions newest ignores status and orders by statusSince', () => {
+  const out = sortSessions([
+    session({ id: 'old', status: 'needs-you', statusSince: 100 }),
+    session({ id: 'new', status: 'done', statusSince: 900 }),
+  ], 'newest');
+  assert.deepEqual(out.map((s) => s.id), ['new', 'old']);
+});
+
+test('sortSessions account groups by account, blocked-first within each', () => {
+  const out = sortSessions([
+    session({ id: 'b-done', account: 'bravo', status: 'done', statusSince: 900 }),
+    session({ id: 'a-done', account: 'alpha', status: 'done', statusSince: 900 }),
+    session({ id: 'a-block', account: 'alpha', status: 'needs-you', statusSince: 100 }),
+  ], 'account');
+  assert.deepEqual(out.map((s) => s.id), ['a-block', 'a-done', 'b-done']);
+});
+
+test('visibleSessions passes everything through when collapseDone is off', () => {
+  const list = [session({ id: 'a', status: 'done' }), session({ id: 'b', status: 'working' })];
+  assert.deepEqual(visibleSessions(list, false).map((s) => s.id), ['a', 'b']);
+});
+
+test('visibleSessions drops done sessions when collapseDone is on', () => {
+  const list = [session({ id: 'a', status: 'done' }), session({ id: 'b', status: 'working' })];
+  assert.deepEqual(visibleSessions(list, true).map((s) => s.id), ['b']);
+});
+
+test('visibleSessions never hides a stopped session', () => {
+  // `stopped` is not `done`: it has a Resume button and unfinished work behind
+  // it, so collapsing must not make it disappear.
+  const list = [session({ id: 'a', status: 'stopped' })];
+  assert.deepEqual(visibleSessions(list, true).map((s) => s.id), ['a']);
 });
