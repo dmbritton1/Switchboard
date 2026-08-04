@@ -3,7 +3,8 @@ import assert from 'node:assert';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { captureScreenshot, MAX_EDGE, simulatorServer } from '../src/agents/simulator.ts';
+import { captureScreenshot, simulatorServer } from '../src/agents/simulator.ts';
+import { MAX_EDGE } from '../src/agents/capture.ts';
 
 // A 1x1 PNG. Small enough to inline, real enough that sips has something valid
 // to open — the resize is best-effort, so this passes either way.
@@ -80,12 +81,12 @@ test('captureScreenshot refuses a device name that could smuggle a flag', async 
 test('captureScreenshot leaves no temp file behind', async (t) => {
   const dir = await scratch(t);
   const { readdir } = await import('node:fs/promises');
-  const before = (await readdir(tmpdir())).filter((f) => f.startsWith('switchboard-sim-')).length;
+  const count = async () => (await readdir(tmpdir()))
+    .filter((f) => f.startsWith('switchboard-shot-')).length;
+  const before = await count();
   await captureScreenshot('booted', await writeFakeXcrun(dir));
   await captureScreenshot('nope-not-valid!!', await writeFakeXcrun(dir));
-  const after = (await readdir(tmpdir())).filter((f) => f.startsWith('switchboard-sim-')).length;
-  // `before` counts this test's own scratch dir, which mkdtemp named the same way.
-  assert.equal(after, before, 'the capture temp file must be unlinked on both paths');
+  assert.equal(await count(), before, 'the scratch directory must be removed on both paths');
 });
 
 test('the simulator server exposes exactly the one tool Bash cannot replace', () => {

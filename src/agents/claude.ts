@@ -11,6 +11,21 @@ import type {
 // it is reused here rather than reimplemented for Claude.
 import { redactCodexText as redactSecrets } from './codex-runtime.ts';
 import { simulatorServer } from './simulator.ts';
+import { browserServer, CHROME } from './browser.ts';
+
+/**
+ * In-process, so there is no server to spawn, no port and no new dependency —
+ * the handlers run in this process and hand the model a PNG it can actually
+ * look at, which is the one thing Bash cannot do.
+ *
+ * Each is gated on the thing it drives existing: xcrun ships nowhere but macOS,
+ * and Chrome may simply not be installed. Advertising a tool that can only ever
+ * fail costs every session context to no purpose.
+ */
+const mcpServers = {
+  ...(process.platform === 'darwin' ? { simulator: simulatorServer } : {}),
+  ...(CHROME ? { browser: browserServer } : {}),
+};
 
 /**
  * One line describing a tool call. `listOptions` is off for the approval card,
@@ -315,12 +330,7 @@ export const claudeAdapter: Adapter = {
       // callback was never removed.
       env: { ...process.env, ...opts.env } as Options['env'],
       canUseTool,
-      // In-process, so there is no server to spawn, no port and no new
-      // dependency — the handler runs in this process and hands the model a PNG
-      // it can actually look at, which is the one thing Bash cannot do.
-      // Darwin-gated: xcrun exists nowhere else, and advertising a tool that can
-      // only ever fail costs every session context to no purpose.
-      ...(process.platform === 'darwin' ? { mcpServers: { simulator: simulatorServer } } : {}),
+      ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
       ...(opts.resumeId ? { resume: opts.resumeId } : {}),
     };
 
