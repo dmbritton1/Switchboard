@@ -84,6 +84,7 @@ const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
+  '.woff2': 'font/woff2',
 };
 
 /**
@@ -944,8 +945,10 @@ export function createServer(opts: {
       }
 
       const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-      // Serve only the four known assets; never join user-controlled path segments.
-      if (!['index.html', 'app.js', 'lib.js', 'style.css'].includes(file)) {
+      // Serve only the known assets; never join user-controlled path segments.
+      // The fonts sit flat in web/ rather than web/fonts/ for exactly that
+      // reason — a subdirectory would mean building a path from the URL.
+      if (!['index.html', 'app.js', 'lib.js', 'style.css', 'inter.woff2', 'garamond.woff2'].includes(file)) {
         res.writeHead(404).end('not found');
         return;
       }

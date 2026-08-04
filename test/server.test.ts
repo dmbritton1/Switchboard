@@ -480,6 +480,22 @@ test('GET / serves the app shell', async (t) => {
   assert.match(await res.text(), /<title>Switchboard<\/title>/);
 });
 
+test('the fonts are served, and the allowlist is still exact-match', async (t) => {
+  const { base } = await boot(t);
+  for (const name of ['inter.woff2', 'garamond.woff2']) {
+    const res = await fetch(`${base}/${name}`);
+    assert.equal(res.status, 200, name);
+    assert.equal(res.headers.get('content-type'), 'font/woff2');
+    // wOF2 — a real font, not an HTML error page with a font content-type.
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    assert.deepEqual([...bytes.subarray(0, 4)], [0x77, 0x4f, 0x46, 0x32]);
+  }
+  // The fonts are flat in web/ precisely so no path segment is ever joined.
+  for (const path of ['/fonts/inter.woff2', '/../package.json', '/web/inter.woff2']) {
+    assert.equal((await fetch(`${base}${path}`)).status, 404, path);
+  }
+});
+
 test('GET /events opens an SSE stream with an immediate snapshot', async (t) => {
   const { base, registry } = await boot(t);
   registry.create({
