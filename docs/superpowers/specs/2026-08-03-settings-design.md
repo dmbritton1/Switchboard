@@ -156,7 +156,7 @@ browser.
 ## The risk worth naming
 
 `notify()` dedupes with a single `seenNeedsYou` set, rebuilt on every payload.
-Adding `done` and `error` needs a seen-set per transition, and — critically —
+Adding `done` and `stopped` needs a seen-set per transition, and — critically —
 those sets must be **seeded from the first payload after each SSE connect**
 rather than starting empty.
 
