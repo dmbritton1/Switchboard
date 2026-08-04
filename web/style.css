@@ -200,14 +200,19 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #command-error:empty { display: none; }
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
   border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
-#composer { display: flex; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
+/* flex-end: the box grows upward with the message, and the buttons stay level
+   with its last line instead of stretching to its full height. */
+#composer { display: flex; align-items: flex-end; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
 #prompt-box { flex: 1; }
 /* font/line-height are not cosmetic here: an input does not inherit either one,
    so without this it lays out in the browser default (Arial 13.3px) while the
    mirror behind it uses the page font at 15px. The caret would then sit at a
    different place than the text the user can see. */
 #prompt { flex: 1; padding: .6rem; background: var(--surface); color: var(--ink);
-  border: 1px solid var(--hairline); border-radius: 8px; font: inherit; line-height: 1.4; }
+  border: 1px solid var(--hairline); border-radius: 8px; font: inherit; line-height: 1.4;
+  /* JS sets the height from scrollHeight, so the drag handle would fight it;
+     max-height caps the growth and hands the rest back to a scrollbar. */
+  resize: none; overflow-y: auto; max-height: 12rem; }
 
 /* Slash-command autocomplete, shared by the chat composer and the new-session
    prompt. Those two fields are styled differently from each other, so the

@@ -527,7 +527,7 @@ test('every branch hue has a rule in the stylesheet', async () => {
 test('an empty composer explains itself instead of silently doing nothing', async () => {
   const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
   const js = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
-  assert.match(html, /<input id="prompt"[^>]*\srequired/, '#prompt lost its required attribute');
+  assert.match(html, /<textarea id="prompt"[^>]*\srequired/, '#prompt lost its required attribute');
   assert.match(js, /function composerText\(\)[\s\S]*?reportValidity\(\)/, 'composerText no longer reports why');
   for (const [name, handler] of [
     ['submit', js.match(/\$\('#composer'\)\.onsubmit = [\s\S]*?\n\};/)?.[0]],

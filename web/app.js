@@ -1396,6 +1396,27 @@ const paintNewMirror = wireCommandMenu({
 });
 
 /**
+ * Size the composer to its content: 'auto' first so it can shrink back after a
+ * deletion, then scrollHeight. Called on input and after any programmatic write
+ * (nothing fires `input` for those).
+ */
+function growPrompt() {
+  const box = $('#prompt');
+  box.style.height = 'auto';
+  box.style.height = `${box.scrollHeight}px`;
+}
+$('#prompt').addEventListener('input', growPrompt);
+
+// Enter sends, Shift+Enter breaks the line — a textarea's default is the other
+// way round. defaultPrevented means the command menu already claimed this Enter
+// to pick a completion, and isComposing means an IME is mid-word.
+$('#prompt').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.defaultPrevented) return;
+  e.preventDefault();
+  $('#composer').requestSubmit();
+});
+
+/**
  * The message both composer buttons act on, or '' with the reason on screen.
  *
  * Both of them used to bail on an empty box with a bare `return`, which is a
@@ -1409,6 +1430,8 @@ const paintNewMirror = wireCommandMenu({
 function composerText() {
   const field = $('#prompt');
   field.value = field.value.trim();
+  // The trim can drop trailing blank lines, which the box is still tall enough for.
+  growPrompt();
   if (field.value) return field.value;
   paintMirror();
   $('#composer').reportValidity();
@@ -1420,7 +1443,7 @@ $('#composer').onsubmit = async (e) => {
   const text = composerText();
   if (!text) return;
   const result = await runSessionCommand({ cmd: 'send', id: openId, text });
-  if (result.ok) { $('#prompt').value = ''; paintMirror(); }
+  if (result.ok) { $('#prompt').value = ''; paintMirror(); growPrompt(); }
 };
 
 $('#schedule-btn').onclick = () => {
@@ -1457,7 +1480,7 @@ $('#when-dialog').addEventListener('close', async (e) => {
   const result = await postCommand({
     cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
   });
-  if (result.ok) { $('#prompt').value = ''; paintMirror(); render(); return; }
+  if (result.ok) { $('#prompt').value = ''; paintMirror(); growPrompt(); render(); return; }
   // Same pattern as #new: show the server's reason and let the user retry,
   // rather than the fire-and-forget silence most other buttons in this app get.
   // This one is a modal the user explicitly confirmed to queue something —
@@ -1490,6 +1513,8 @@ async function upload(files) {
     const box = $('#prompt');
     box.value = box.value ? `${box.value} ${path}` : path;
   }
+  paintMirror();
+  growPrompt();
   $('#prompt').focus();
 }
 
