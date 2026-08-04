@@ -11,6 +11,74 @@
      padding or content does. */
   --bar-h: 3.476rem;
 }
+
+/* ---- Theme tokens ------------------------------------------------------- */
+/* Accent, canvas and status are three independent layers composed by two
+   attributes on <html>, so all thirty-two combinations exist without any of
+   them being authored. Every value is a literal hex and not a color-mix():
+   test/palette.test.ts parses this file, and nothing in Node can resolve a
+   color-mix(), so the contrast guarantee would rest on someone remembering to
+   look. Changing any hex here means running that test. */
+
+/* --accent is the identity colour — the picker swatch, and the ring on the
+   dark canvases. --accent-deep is the button fill (white label) and the link
+   and ring colour on the light canvases. --accent-lift is the link colour on
+   the dark canvases. */
+[data-accent=coral]  { --accent: #cc785c; --accent-deep: #a15232; --accent-lift: #d38769; }
+[data-accent=amber]  { --accent: #c69239; --accent-deep: #876122; --accent-lift: #d8aa5a; }
+[data-accent=moss]   { --accent: #7a9e47; --accent-deep: #54702d; --accent-lift: #a1c76b; }
+[data-accent=teal]   { --accent: #3e9886; --accent-deep: #287163; --accent-lift: #64c4b1; }
+[data-accent=sky]    { --accent: #4689b9; --accent-deep: #32698f; --accent-lift: #6da9d5; }
+[data-accent=indigo] { --accent: #7069bf; --accent-deep: #574ebc; --accent-lift: #8f88dd; }
+[data-accent=violet] { --accent: #a86bbd; --accent-deep: #87439d; --accent-lift: #c089d2; }
+[data-accent=rose]   { --accent: #c46484; --accent-deep: #9f385a; --accent-lift: #da819e; }
+
+/* On the light canvases cards sit *darker* than the floor and menus float
+   lighter; on the dark canvases both go lighter. --well (fields) is darker
+   than --surface on all four, which is the intent recorded at the top of this
+   file. color-scheme is set so native scrollbars, form controls and the
+   <dialog> backdrop follow instead of staying dark under Cream. */
+[data-canvas=cream] {
+  color-scheme: light;
+  --canvas: #faf9f5; --surface: #efe9de; --surface-2: #fffdf8; --well: #f2ede4;
+  --hairline: #e0d8cb; --hover: #e6dfd2; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=paper] {
+  color-scheme: light;
+  --canvas: #fbfbfc; --surface: #f0f1f3; --surface-2: #ffffff; --well: #f5f6f8;
+  --hairline: #e2e4e8; --hover: #e6e8ec; --shadow: #0000001f;
+  --ink: #14151a; --body: #3a3d45; --muted: #656872;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=ink] {
+  color-scheme: dark;
+  --canvas: #181715; --surface: #211f1c; --surface-2: #2b2825; --well: #131211;
+  --hairline: #35322d; --hover: #333029; --shadow: #000000a6;
+  --ink: #faf9f5; --body: #d9d5cc; --muted: #a09d96;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+[data-canvas=void] {
+  color-scheme: dark;
+  --canvas: #0f1012; --surface: #17191c; --surface-2: #212429; --well: #0b0c0e;
+  --hairline: #2a2d33; --hover: #282c33; --shadow: #000000a6;
+  --ink: #ecedf0; --body: #c8cad0; --muted: #8b8f98;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+
 body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   font: 15px/1.4 ui-sans-serif, system-ui, sans-serif; }
 /* Not sticky: it renders directly under #bar in document order and has nothing
