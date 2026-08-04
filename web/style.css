@@ -176,34 +176,41 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 /* ---- New worktree dialog ---------------------------------------------- */
 /* Wide enough that an absolute repo path fits on one line: the whole point of
    replacing the native datalist, which clipped to the input's width. */
-/* #when-dialog (the composer's schedule picker) shares this shell rather than
-   carrying its own copy — one dialog's chrome, two dialogs, so they cannot
-   drift apart the way #when-dialog did when only its datetime input had a rule. */
-#new, #when-dialog { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--line);
-  border-radius: 14px; background: var(--card); color: var(--fg); }
-#new::backdrop, #when-dialog::backdrop { background: #000b; }
-#new form, #when-dialog form { display: grid; gap: 1.1rem; padding: 1.5rem; }
-#new h2, #when-dialog h2 { margin: 0; font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }
+/* #when-dialog (the composer's schedule picker) and #settings share this shell
+   rather than carrying their own copy — one dialog's chrome, three dialogs, so
+   they cannot drift apart the way #when-dialog did when only its datetime
+   input had a rule. */
+#new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--line);
+  border-radius: 14px; background: var(--card); color: var(--fg);
+  max-height: calc(100% - 6em); overflow-y: auto; }
+#new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #000b; }
+#new form, #when-dialog form, #settings form { display: grid; gap: 1.1rem; padding: 1.5rem; }
+#new h2, #when-dialog h2, #settings h2 { margin: 0; font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }
 .field { display: grid; gap: .4rem; }
 .field > label { color: var(--dim); font-size: .8rem; font-weight: 600;
   letter-spacing: .04em; text-transform: uppercase; }
 .hint { margin: 0; color: var(--dim); font-size: .8rem; }
 
-#new input, #new textarea, #new select, #when-dialog input, #when-dialog select {
+/* Scoped to .field, not the dialog at large: #settings also has checkboxes
+   outside .field (in .check), and a bare `input` selector would stretch
+   those to width:100% too, blowing out the checkbox layout. */
+#new input, #new textarea, #new select, #when-dialog input, #when-dialog select,
+#settings .field input, #settings select {
   width: 100%; box-sizing: border-box; padding: .55rem .7rem; background: var(--field);
   color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
   font: inherit; }
 #new textarea { resize: vertical; min-height: 4.5rem; }
 #new input[name=repo] { font-family: var(--mono); font-size: .9em; }
 #new :is(input, textarea, select):focus-visible,
-#when-dialog :is(input, select):focus-visible {
+#when-dialog :is(input, select):focus-visible,
+#settings :is(.field input, select):focus-visible {
   outline: none; border-color: var(--working); box-shadow: 0 0 0 3px #35c46a26; }
 
 /* Native select popups can't be styled, but the control can. */
 .select-wrap { position: relative; }
 .select-wrap::after { content: '▾'; position: absolute; right: .7rem; top: 50%;
   translate: 0 -50%; color: var(--dim); pointer-events: none; }
-#new select, #when-dialog select { appearance: none; padding-right: 2rem; cursor: pointer; }
+#new select, #when-dialog select, #settings select { appearance: none; padding-right: 2rem; cursor: pointer; }
 
 .combo { position: relative; }
 .combo-list { position: absolute; z-index: 1; inset-inline: 0; top: calc(100% + .3rem);
@@ -222,15 +229,21 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .combo-list mark { background: none; color: var(--working); font-weight: 700; }
 .combo-empty { padding: .5rem .55rem; color: var(--dim); font-size: .85rem; }
 
-#new menu, #when-dialog menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
-#new menu button, #when-dialog menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--line);
+#new menu, #when-dialog menu, #settings menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
+#new menu button, #when-dialog menu button, #settings menu button {
+  padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--line);
   background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
 #new menu button#create { background: var(--working); border-color: var(--working);
   color: #08210f; font-weight: 650; }
-#new menu button:focus-visible, #when-dialog menu button:focus-visible {
+#new menu button:focus-visible, #when-dialog menu button:focus-visible, #settings menu button:focus-visible {
   outline: 2px solid var(--working); outline-offset: 2px; }
-#new-error, #when-error { margin: 0; color: #e05555; font-size: .85rem; }
-#new-error:empty, #when-error:empty { display: none; }
+#new-error, #when-error, #settings-error { margin: 0; color: #e05555; font-size: .85rem; }
+#new-error:empty, #when-error:empty, #settings-error:empty { display: none; }
+
+/* ---- Settings dialog ---------------------------------------------------- */
+#settings h3 { margin: 1.2rem 0 0.4rem; font-size: 0.85rem; color: var(--dim); }
+#settings h3:first-of-type { margin-top: 0.6rem; }
+.check { display: flex; align-items: center; gap: 0.5rem; margin: 0.35rem 0; }
 
 /* ---- Header ------------------------------------------------------------ */
 /* Always mounted, and the only chrome above the view — the account row, the

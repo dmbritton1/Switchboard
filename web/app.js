@@ -1,5 +1,5 @@
 import {
-  sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
 } from './lib.js';
@@ -310,7 +310,10 @@ function renderGrid() {
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
-  const sorted = sortSessions(state.sessions);
+  const sorted = sortSessions(
+    visibleSessions(state.sessions, state.settings.collapseDone),
+    state.settings.sort,
+  );
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
   if (!state.sessions.length && !pendingCreates.length) {
@@ -1218,6 +1221,69 @@ const repoCombo = (() => {
   return { setOptions(list_) { all = list_; close(); } };
 })();
 
+function openSettings() {
+  const dialog = $('#settings');
+  const form = dialog.querySelector('form');
+  const s = state.settings;
+
+  form.autoApprove.checked = s.autoApprove;
+  form.branchPrefix.value = s.branchPrefix;
+  form.sort.value = s.sort;
+  form.collapseDone.checked = s.collapseDone;
+  form.autoRequeue.checked = s.autoRequeue;
+  for (const box of form.querySelectorAll('input[name=notifyOn]')) {
+    box.checked = s.notifyOn.includes(box.value);
+  }
+
+  // Rebuilt on every open: accounts.json can change under a running server.
+  // The "freest" option is what `account: null` means.
+  const sel = form.account;
+  const freest = document.createElement('option');
+  freest.value = '';
+  freest.textContent = 'Freest account';
+  freest.selected = s.account === null;
+  sel.replaceChildren(freest, ...state.accounts.map((a) => {
+    const o = document.createElement('option');
+    o.value = a.name;
+    o.textContent = a.name;
+    o.selected = a.name === s.account;
+    return o;
+  }));
+
+  $('#settings-error').textContent = '';
+  dialog.showModal();
+}
+
+$('#settings-btn').onclick = openSettings;
+
+$('#settings').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Same returnValue discipline as #new: Escape closes without setting one, so
+  // an unconsumed 'save' would make the next Escape re-POST the form.
+  const save = dialog.returnValue === 'save';
+  dialog.returnValue = '';
+  if (!save) return;
+
+  const form = dialog.querySelector('form');
+  const patch = {
+    autoApprove: form.autoApprove.checked,
+    account: form.account.value || null,
+    branchPrefix: form.branchPrefix.value,
+    notifyOn: [...form.querySelectorAll('input[name=notifyOn]:checked')].map((b) => b.value),
+    sort: form.sort.value,
+    collapseDone: form.collapseDone.checked,
+    autoRequeue: form.autoRequeue.checked,
+  };
+
+  const result = await postCommand({ cmd: 'settings', patch });
+  if (!result.ok) {
+    // Same as #new's retry path: show the server's reason and reopen with the
+    // user's input intact rather than dropping it into a toast.
+    $('#settings-error').textContent = commandFailure(result);
+    dialog.showModal();
+  }
+});
+
 async function openNew() {
   // reset() before the option lists are rebuilt below, so it can't clobber them:
   // a re-opened dialog otherwise still holds the previous session's repo, branch
@@ -1227,15 +1293,21 @@ async function openNew() {
   dialog.querySelector('form').reset();
   syncWhen();
 
+  // reset() has just cleared the branch field, so the prefix goes in after it.
+  $('#branch-input').value = state.settings.branchPrefix;
+
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
   const sel = document.querySelector('select[name=account]');
-  const freest = freestAccount(state.accounts);
+  // A pinned account that is no longer in accounts.json falls back to freest,
+  // rather than leaving the picker on a name that cannot be created against.
+  const pinned = state.accounts.find((a) => a.name === state.settings.account);
+  const preselect = pinned ?? freestAccount(state.accounts);
   sel.replaceChildren(...state.accounts.map((a) => {
     const o = document.createElement('option');
     o.value = a.name;
     o.textContent = a.name;
-    o.selected = a.name === freest?.name;
+    o.selected = a.name === preselect?.name;
     return o;
   }));
 
