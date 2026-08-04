@@ -939,6 +939,19 @@ function renderDiffPane(s) {
   }).catch(() => {});
 }
 
+/**
+ * Lights up one branch across the whole graph. Elements are compared by
+ * dataset rather than matched with a selector, because a branch name is
+ * arbitrary repo text and would otherwise need escaping to be safe in one.
+ */
+function traceBranch(name) {
+  const map = $('#graph-map');
+  map.classList.toggle('tracing', Boolean(name));
+  for (const el of map.querySelectorAll('[data-branch]')) {
+    el.classList.toggle('traced', Boolean(name) && el.dataset.branch === name);
+  }
+}
+
 function renderGraphPane(s) {
   const rows = $('#graph-rows');
   if (!graphCommits.length) {
@@ -955,6 +968,8 @@ function renderGraphPane(s) {
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
     row.dataset.branch = owner.get(c.h) ?? '';
+    row.onmouseenter = () => traceBranch(owner.get(c.h) ?? '');
+    row.onmouseleave = () => traceBranch('');
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);

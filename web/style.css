@@ -203,6 +203,10 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .tier-other { color: var(--stopped); }
 #graph-svg path.tier-own { stroke-width: 3; }
 #graph-svg path.tier-other { stroke-width: 2; }
+/* Tracing one branch: everything not on it recedes rather than disappears, so
+   the traced line is read in context instead of floating on its own. */
+#graph-map.tracing [data-branch]:not(.traced) { opacity: .2; }
+#graph-map.tracing .traced { opacity: 1; }
 #graph-svg path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
 #graph-svg circle { stroke: currentColor; fill: currentColor; stroke-width: 2.5; }
 /* Hollow stop = a merge: two lines arriving, the way an interchange is drawn. */
