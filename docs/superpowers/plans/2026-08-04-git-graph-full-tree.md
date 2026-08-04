@@ -425,7 +425,10 @@ In `web/app.js`, replace the body of `renderGraphPane` after the empty-state ear
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
-    if (owner.has(c.h)) row.dataset.branch = owner.get(c.h);
+    // Always set, even when empty, so it matches drawGraph's branch() helper.
+    // Task 4 dims with `[data-branch]`, an existence selector: an omitted
+    // attribute would leave trunk rows bright while their lines faded.
+    row.dataset.branch = owner.get(c.h) ?? '';
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
@@ -586,7 +589,7 @@ function traceBranch(name) {
 
 - [ ] **Step 2: Wire the handler to each row**
 
-In `renderGraphPane`, directly after the `if (owner.has(c.h)) row.dataset.branch = owner.get(c.h);` line added in Task 3, insert:
+In `renderGraphPane`, directly after the `row.dataset.branch = owner.get(c.h) ?? '';` line added in Task 3, insert:
 
 ```js
     row.onmouseenter = () => traceBranch(owner.get(c.h) ?? '');
