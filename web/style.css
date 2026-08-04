@@ -87,6 +87,14 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }
 .msg.error { color: #e05555; }
+/* A folded run of tool calls (see groupTranscript()). The run owns the rule
+   that each .msg would have drawn, so a collapsed run reads as one line. */
+.tool-run { border-bottom: 1px solid #222; }
+.tool-run > summary { padding: .5rem 0; color: var(--dim); cursor: pointer;
+  font-family: ui-monospace, monospace; font-size: .9em; }
+.tool-run > summary:hover { color: var(--fg); }
+.tool-run[open] > summary { border-bottom: 1px solid #222; }
+.tool-run > .msg { border-bottom: 0; padding-left: 1.3rem; }
 .prompt-delivery { margin-left: .25rem; color: var(--dim); font-size: .8em; font-weight: 600; }
 .prompt-delivery.queued { color: var(--dim); }
 .prompt-delivery.unsent { color: #e05555; }

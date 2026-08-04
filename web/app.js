@@ -1,7 +1,7 @@
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
-  accountView, freestAccount,
+  accountView, freestAccount, groupTranscript, toolRunLabel,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -774,6 +774,59 @@ function renderSession() {
   if (tab === 'graph') renderGraphPane(s);
 }
 
+// Tool runs the user has put into a state other than the one they'd get on
+// their own — see toolRun(). Keyed by the run's first-message index, which is
+// stable because the transcript only ever grows. Cleared on session switch.
+const toolRunOpen = new Map();
+
+function msgNode(m) {
+  const el = document.createElement('div');
+  // The status class doubles as the styling hook: a tool message with status
+  // 'error' picks up the existing .msg.error colour.
+  el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
+  // A denied `rm -rf` and a successful one used to be pixel-identical.
+  if (m.kind === 'tool') {
+    el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
+    return el;
+  }
+  el.textContent = m.text;
+  if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
+  if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
+    const delivery = document.createElement('span');
+    delivery.className = `prompt-delivery ${m.delivery}`;
+    delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
+    el.append(' ', delivery);
+  }
+  return el;
+}
+
+/**
+ * A folded run of tool calls. Native <details> rather than a class toggle and a
+ * click handler: it is the same widget, already keyboard-accessible, already
+ * announced as a disclosure by screen readers.
+ */
+function toolRun(g) {
+  const d = document.createElement('details');
+  d.className = 'tool-run';
+  const sum = document.createElement('summary');
+  sum.textContent = toolRunLabel(g.msgs);
+  d.append(sum, ...g.msgs.map(msgNode));
+
+  // A run opens itself while it is unresolved — one you are waiting on, or one
+  // that failed, is the one you want to read — and collapses once it is just
+  // history. That's the condensing; the map below is only for overriding it.
+  const auto = g.msgs.some((m) => m.status === 'running' || m.status === 'error');
+  d.open = toolRunOpen.get(g.at) ?? auto;
+  // Only a state that disagrees with `auto` is remembered, so a run the user
+  // never touched goes back to folding itself when it finishes, while one they
+  // opened by hand stays open across every re-render. The assignment above
+  // fires this once with d.open === auto, which deletes a key that isn't there.
+  d.addEventListener('toggle', () => {
+    if (d.open === auto) toolRunOpen.delete(g.at); else toolRunOpen.set(g.at, d.open);
+  });
+  return d;
+}
+
 function renderChatPane(s) {
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
@@ -784,33 +837,18 @@ function renderChatPane(s) {
   // Only cleared on an actual session switch: this re-runs on every snapshot
   // and on the 30s timer, and an unconditional clear erased upload errors
   // before they could be read.
-  if (firstOpen) $('#upload-error').textContent = '';
+  // Cleared with it: the map is keyed by transcript index, which means a
+  // different session entirely one render later.
+  if (firstOpen) { $('#upload-error').textContent = ''; toolRunOpen.clear(); }
   scrolledFor = openId;
   const nearBottom = firstOpen
     || window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 120;
 
   const t = $('#transcript');
   t.replaceChildren();
-  for (const m of s.transcript) {
-    const el = document.createElement('div');
-    // The status class doubles as the styling hook: a tool message with status
-    // 'error' picks up the existing .msg.error colour.
-    el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
-    // A denied `rm -rf` and a successful one used to be pixel-identical.
-    if (m.kind === 'tool') {
-      el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
-    } else {
-      el.textContent = m.text;
-      if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
-      if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
-        const delivery = document.createElement('span');
-        delivery.className = `prompt-delivery ${m.delivery}`;
-        delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
-        el.append(' ', delivery);
-      }
-    }
-    t.append(el);
-  }
+  t.append(...groupTranscript(s.transcript).map(
+    (g) => (g.kind === 'tools' ? toolRun(g) : msgNode(g.msg)),
+  ));
   // Scroll the whole pane — not #transcript — to the viewport bottom. The
   // composer is in normal flow *below* the transcript, so aligning the
   // transcript's end with the bottom edge pushed the input box off-screen, and

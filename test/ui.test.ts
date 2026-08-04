@@ -2,8 +2,47 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
-  freestAccount,
+  freestAccount, groupTranscript, toolRunLabel,
 } from '../web/lib.js';
+
+const tool = (name, status = 'ok') => ({ kind: 'tool', name, summary: 'x', status });
+
+test('groupTranscript folds a run of tool calls and leaves everything else alone', () => {
+  const out = groupTranscript([
+    { kind: 'user', text: 'go' },
+    tool('Read'), tool('Bash'), tool('Edit'),
+    { kind: 'text', text: 'done' },
+  ]);
+  assert.deepEqual(out.map((g) => g.kind), ['msg', 'tools', 'msg']);
+  assert.equal(out[1].at, 1);
+  assert.deepEqual(out[1].msgs.map((m) => m.name), ['Read', 'Bash', 'Edit']);
+});
+
+test('groupTranscript leaves a lone tool call inline', () => {
+  const out = groupTranscript([tool('Read'), { kind: 'text', text: 'hi' }, tool('Bash')]);
+  assert.deepEqual(out.map((g) => g.kind), ['msg', 'msg', 'msg']);
+});
+
+test('groupTranscript keys each run by its own first index', () => {
+  const out = groupTranscript([
+    tool('Read'), tool('Bash'),
+    { kind: 'text', text: 'thinking' },
+    tool('Edit'), tool('Write'),
+  ]);
+  assert.deepEqual(out.filter((g) => g.kind === 'tools').map((g) => g.at), [0, 3]);
+});
+
+test('toolRunLabel names distinct tools and calls out unresolved state', () => {
+  assert.equal(toolRunLabel([tool('Read'), tool('Read'), tool('Bash')]), '3 tool calls · Read, Bash');
+  assert.equal(
+    toolRunLabel([tool('Read'), tool('Bash', 'error'), tool('Edit', 'running')]),
+    '3 tool calls · Read, Bash, Edit · 1 failed · running',
+  );
+  assert.equal(
+    toolRunLabel([tool('A'), tool('B'), tool('C'), tool('D')]),
+    '4 tool calls · A, B, C…',
+  );
+});
 
 const session = (over = {}) => ({
   id: 'a', repo: '/r/one', branch: 'feat/a', account: 'claude-main',
