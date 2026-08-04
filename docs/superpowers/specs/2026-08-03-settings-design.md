@@ -27,7 +27,7 @@ Seven settings, grouped as the dialog groups them.
 **Notifications**
 
 - `notifyOn` — which status transitions raise a browser notification, from
-  `needs-you`, `done`, `error`. Default `['needs-you']`, today's behavior.
+  `needs-you`, `done`, `stopped`. Default `['needs-you']`, today's behavior.
 
 **Grid**
 
@@ -52,7 +52,7 @@ is a no-op.
 
 Those two facts together mean **a Codex session never produces a notification,
 ever.** It finishes, or it dies, in silence. Making the notify-on set
-configurable is what closes that hole; `done` and `error` are the only
+configurable is what closes that hole; `done` and `stopped` are the only
 transitions a Codex session has.
 
 ## What is out, and why
@@ -95,7 +95,7 @@ export type Settings = {
   autoApprove: boolean;                          // false
   account: string | null;                        // null = freest
   branchPrefix: string;                          // ''
-  notifyOn: ('needs-you' | 'done' | 'error')[];  // ['needs-you']
+  notifyOn: ('needs-you' | 'done' | 'stopped')[];  // ['needs-you']
   sort: 'blocked' | 'newest' | 'account';        // 'blocked'
   collapseDone: boolean;                         // false
   autoRequeue: boolean;                          // true

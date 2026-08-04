@@ -469,7 +469,7 @@ test('DEFAULT_SETTINGS is not shared mutable state', () => {
   // Spreading creates a shallow copy with a mutable top level, but the
   // notifyOn array is still frozen, so mutation through the copy throws.
   const copy = { ...DEFAULT_SETTINGS };
-  assert.throws(() => { copy.notifyOn.push('error'); });
+  assert.throws(() => { copy.notifyOn.push('stopped'); });
   assert.deepEqual(DEFAULT_SETTINGS.notifyOn, ['needs-you']);
 });
 

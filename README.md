@@ -161,7 +161,7 @@ preselects; `null` ranks by usage and picks the freest, and a pinned account
 that has since been removed from `accounts.json` falls back to freest the
 same way), `branchPrefix` (prefilled into the New dialog's branch field),
 `notifyOn` (which status transitions raise a browser notification, chosen
-from `needs-you`, `done`, `error`), `sort` (grid order — `blocked` puts
+from `needs-you`, `done`, `stopped`), `sort` (grid order — `blocked` puts
 blocked sessions first, then running, then finished; `newest` is flat
 recency; `account` groups by account, blocked-first within each group),
 `collapseDone` (hides finished sessions, but deliberately not `stopped`
@@ -175,7 +175,7 @@ missing settings block changes nothing.
 `notifyOn` closes a real gap: Codex sessions never enter `needs-you` (they
 run with `approvalPolicy: 'never'` and no interactive approval — see Limits
 below), so before this setting existed a Codex session produced no browser
-notification, ever. `done` and `error` are the only transitions a Codex
+notification, ever. `done` and `stopped` are the only transitions a Codex
 session has to notify on.
 
 Settings live in `state.json` alongside `sessions`, `usage`, and `queue`, and

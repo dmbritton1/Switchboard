@@ -33,7 +33,7 @@ function coerceSettings(raw: unknown): Settings {
   if (r.sort === 'blocked' || r.sort === 'newest' || r.sort === 'account') out.sort = r.sort;
   if (Array.isArray(r.notifyOn)) {
     const valid = r.notifyOn.filter(
-      (v): v is NotifyOn => v === 'needs-you' || v === 'done' || v === 'error',
+      (v): v is NotifyOn => v === 'needs-you' || v === 'done' || v === 'stopped',
     );
     // An array that is present but has nothing valid in it means "notify me
     // about nothing", which is a legitimate choice — so an empty result is

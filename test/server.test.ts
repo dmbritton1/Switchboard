@@ -1335,7 +1335,7 @@ test('parseSettingsPatch rejects an out-of-range enum', () => {
 test('parseSettingsPatch rejects a bad notifyOn member', () => {
   assert.deepEqual(
     parseSettingsPatch({ notifyOn: ['done', 'exploded'] }),
-    { error: 'notifyOn must contain only: needs-you, done, error' },
+    { error: 'notifyOn must contain only: needs-you, done, stopped' },
   );
 });
 

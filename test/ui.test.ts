@@ -345,6 +345,14 @@ test('newlyNotifiable fires again when a session re-enters a watched status', ()
   assert.deepEqual(c.fire.map((s) => s.id), ['a']);
 });
 
+test('newlyNotifiable fires for a stopped session when stopped is watched', () => {
+  // `stopped` replaced the never-reachable `error` status as a NotifyOn member
+  // (Status has no 'error' — every failure path lands on 'stopped'), so this
+  // is the transition that actually needs to notify.
+  const out = newlyNotifiable([session({ id: 'a', status: 'stopped' })], ['stopped'], new Set());
+  assert.deepEqual(out.fire.map((s) => s.id), ['a']);
+});
+
 test('newlyNotifiable tracks each status independently', () => {
   const a = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you', 'done'], new Set());
   const b = newlyNotifiable([session({ id: 'a', status: 'done' })], ['needs-you', 'done'], a.seen);

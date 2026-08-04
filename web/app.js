@@ -12,7 +12,7 @@ let panel = null;
 // Keys are `id:status`; see newlyNotifiable in lib.js.
 let seenNotified = new Set();
 
-const NOTIFY_VERB = { 'needs-you': 'needs you', done: 'finished', error: 'hit an error' };
+const NOTIFY_VERB = { 'needs-you': 'needs you', done: 'finished', stopped: 'stopped' };
 // Session whose chat view has already been auto-scrolled once; see renderChatPane().
 let scrolledFor = null;
 // Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
@@ -84,6 +84,13 @@ function notify(seed) {
   document.title = needs.length ? `(${needs.length}) Switchboard` : 'Switchboard';
   if (Notification.permission !== 'granted') return;
 
+  // `stopped` in notifyOn means a self-inflicted Stop also notifies — accepted,
+  // since the setting is off by default and its label says so. The case that
+  // actually needs guarding is a server restart: Registry.load revives every
+  // session as `stopped` (sessions.ts), which would otherwise fire once per
+  // session on every reconnect. `seed` is what prevents that: the reconnect's
+  // first payload comes through with seed=true (see es.onopen below), so
+  // newlyNotifiable seeds seenNotified from it instead of firing.
   const on = state.settings?.notifyOn ?? ['needs-you'];
   const { fire, seen } = newlyNotifiable(state.sessions, on, seenNotified, seed || document.hasFocus());
   seenNotified = seen;

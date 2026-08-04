@@ -74,22 +74,28 @@ export type Settings = {
   autoRequeue: boolean;
 };
 
-export type NotifyOn = 'needs-you' | 'done' | 'error';
+export type NotifyOn = 'needs-you' | 'done' | 'stopped';
 export type SortMode = 'blocked' | 'newest' | 'account';
 
 // Frozen because callers spread from it; an unfrozen shared default is one
 // stray mutation away from every future session inheriting it. The `: Settings`
 // annotation contextually types the literal, so `notifyOn` needs no cast.
-// notifyOn is frozen separately because Object.freeze is shallow.
+// notifyOn is frozen on its own statement, after the literal, rather than
+// inline: Object.freeze is shallow, so it has to be applied separately to
+// reach the array — and its array overload returns `readonly NotifyOn[]`,
+// which is not assignable to the mutable `NotifyOn[]` that Settings declares.
+// Freezing after assignment sidesteps that: the frozen return value is never
+// assigned anywhere, only DEFAULT_SETTINGS.notifyOn's existing NotifyOn[] type is.
 export const DEFAULT_SETTINGS: Settings = Object.freeze({
   autoApprove: false,
   account: null,
   branchPrefix: '',
-  notifyOn: Object.freeze(['needs-you'] as NotifyOn[]),
+  notifyOn: ['needs-you'],
   sort: 'blocked',
   collapseDone: false,
   autoRequeue: true,
 });
+Object.freeze(DEFAULT_SETTINGS.notifyOn);
 
 export type AdapterEvent =
   | { type: 'status'; status: Status }

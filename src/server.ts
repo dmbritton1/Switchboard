@@ -201,7 +201,7 @@ export function shouldRequeue(
 }
 
 const SORTS = ['blocked', 'newest', 'account'] as const;
-const NOTIFY = ['needs-you', 'done', 'error'] as const;
+const NOTIFY = ['needs-you', 'done', 'stopped'] as const;
 
 /**
  * Validates a settings patch before it reaches the Registry.
