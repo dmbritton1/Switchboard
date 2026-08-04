@@ -42,7 +42,7 @@ async function isRepoDirty(repo: string): Promise<boolean> {
   return stdout.trim().length > 0;
 }
 
-async function currentBranch(cwd: string): Promise<string> {
+export async function currentBranch(cwd: string): Promise<string> {
   const { stdout } = await run('git', ['branch', '--show-current'], { cwd });
   return stdout.trim();
 }

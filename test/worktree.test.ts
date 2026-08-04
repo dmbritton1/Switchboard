@@ -20,6 +20,18 @@ async function makeRepo(): Promise<string> {
   return dir;
 }
 
+// Starts from now so every commit here is dated after makeRepo's `init`.
+let testClock = Math.floor(Date.now() / 1000);
+async function commitAt(cwd: string, msg: string): Promise<void> {
+  testClock += 60;
+  const d = `${testClock} +0000`;
+  await writeFile(join(cwd, `f${testClock}.txt`), msg);
+  await run('git', ['add', '.'], { cwd });
+  await run('git', ['commit', '-m', msg], {
+    cwd, env: { ...process.env, GIT_AUTHOR_DATE: d, GIT_COMMITTER_DATE: d },
+  });
+}
+
 test('createWorktree makes a branch at the app-standard path', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));
@@ -119,4 +131,67 @@ test('commitGraph reports refs and parents for a real merge', async (t) => {
   assert.ok(graph[0].refs.includes('HEAD -> main'));
   assert.ok(graph.some((c) => c.refs.includes('side')));
   assert.deepEqual(graph.map((c) => c.row), [0, 1, 2]);
+});
+
+test('commitGraph keeps a stale branch that trunk history would starve out', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  // A branch forked early and then left alone, then trunk marches past the limit.
+  const wt = await createWorktree(repo, 'stale');
+  await commitAt(wt, 'stale work');
+  for (let i = 0; i < 10; i++) await commitAt(repo, `main ${i}`);
+
+  const graph = await commitGraph(wt, repo, 5);
+
+  // The whole bug: with one global budget this branch vanished, ref and all.
+  assert.ok(graph.some((c) => c.refs.includes('HEAD -> stale')), 'stale branch survives the limit');
+  assert.equal(graph.find((c) => c.subject === 'stale work')?.tier, 'own');
+  assert.ok(graph.some((c) => c.tier === 'trunk'), 'trunk history is still included');
+});
+
+test('commitGraph returns commits in topological order across the two calls', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'side');
+  await commitAt(wt, 'side work');
+  for (let i = 0; i < 4; i++) await commitAt(repo, `main ${i}`);
+
+  const graph = await commitGraph(wt, repo, 50);
+
+  // assignLanes depends on this, so the concatenation must preserve it:
+  // every parent present in the window appears after its child.
+  const idx = new Map(graph.map((c, i) => [c.h, i]));
+  for (const [i, c] of graph.entries()) {
+    for (const ph of c.p) {
+      if (idx.has(ph)) assert.ok(idx.get(ph)! > i, `parent ${ph} must follow child ${c.h}`);
+    }
+  }
+});
+
+test('commitGraph tiers another session branch as other', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const mine = await createWorktree(repo, 'mine');
+  const theirs = await createWorktree(repo, 'theirs');
+  await commitAt(mine, 'my work');
+  await commitAt(theirs, 'their work');
+
+  const graph = await commitGraph(mine, repo, 50);
+
+  assert.equal(graph.find((c) => c.subject === 'my work')?.tier, 'own');
+  assert.equal(graph.find((c) => c.subject === 'their work')?.tier, 'other');
+  assert.equal(graph.find((c) => c.subject === 'init')?.tier, 'trunk');
+});
+
+test('commitGraph falls back to a single walk when the base repo is detached', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await commitAt(repo, 'second');
+  const { stdout } = await run('git', ['rev-parse', 'HEAD'], { cwd: repo });
+  await run('git', ['checkout', '--detach', stdout.trim()], { cwd: repo });
+
+  const graph = await commitGraph(repo, repo, 50);
+
+  assert.ok(graph.length >= 2, 'still returns commits rather than throwing');
+  assert.ok(graph.every((c) => c.tier === 'other'), 'no trunk to split on, so nothing is tiered');
 });

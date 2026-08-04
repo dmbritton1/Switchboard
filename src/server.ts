@@ -845,7 +845,7 @@ export function createServer(opts: {
         const id = url.searchParams.get('id') ?? '';
         const session = registry.get(id);
         if (!session) { res.writeHead(404).end('[]'); return; }
-        const commits = await commitGraph(session.cwd).catch(() => []);
+        const commits = await commitGraph(session.cwd, session.repo).catch(() => []);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(commits));
         return;
