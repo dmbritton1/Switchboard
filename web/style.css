@@ -290,14 +290,28 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 
 /* ---- Commit graph ------------------------------------------------------ */
 /* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
-   interchange where two lines join. Lane colours reuse the status palette —
-   there are no status chips in this view, so nothing collides, and the app
-   keeps one set of colours instead of two. */
+   interchange where two lines join. Three tiers rather than a per-lane palette:
+   lanes are reused as branches close, so a lane colour renamed itself mid-graph
+   and said nothing about which branch you were looking at. Tier does. Weight
+   carries the ranking as well as hue, so the three stay apart when several grey
+   branches run side by side. */
 #pane-graph { --row: 34px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
-.lane0 { color: var(--error); } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
-.lane3 { color: var(--lane-a); } .lane4 { color: var(--lane-b); } .lane5 { color: var(--working); }
+/* Text tokens, not --muted/--stopped: those two are the same hex on cream and
+   ink, which would collapse trunk and other into one grey. --body and --muted
+   stay apart on all four canvases, and the palette test already measures both
+   against every surface — so the pills below inherit AA contrast for free
+   instead of needing literal greys of their own. */
+.tier-own { color: var(--done); }
+.tier-trunk { color: var(--body); }
+.tier-other { color: var(--muted); }
+#graph-svg path.tier-own { stroke-width: 3; }
+#graph-svg path.tier-other { stroke-width: 2; }
+/* Tracing one branch: everything not on it recedes rather than disappears, so
+   the traced line is read in context instead of floating on its own. */
+#graph-map.tracing [data-branch]:not(.traced) { opacity: .2; }
+#graph-map.tracing .traced { opacity: 1; }
 #graph-svg path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
 #graph-svg circle { stroke: currentColor; fill: currentColor; stroke-width: 2.5; }
 /* Hollow stop = a merge: two lines arriving, the way an interchange is drawn. */

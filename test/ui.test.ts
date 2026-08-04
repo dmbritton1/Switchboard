@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
   readTheme, ACCENTS, CANVASES,
 } from '../web/lib.js';
 
@@ -496,4 +496,84 @@ test('the inline theme script accepts exactly the names lib.js knows', async () 
   const [, canvases] = html.match(/\^\(([a-z|]+)\)\$\/\.test\(t\.canvas\)/) ?? [];
   assert.deepEqual(accents?.split('|'), [...ACCENTS]);
   assert.deepEqual(canvases?.split('|'), [...CANVASES]);
+});
+
+const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });
+
+test('attributeBranches walks each tip back to the trunk fork point', () => {
+  const owner = attributeBranches([
+    gc('f1', ['f0'], 'own', ['HEAD -> feat']),
+    gc('f0', ['t9'], 'own', []),
+    gc('b1', ['t9'], 'other', ['bugfix', 'tag: v1']),
+    gc('t9', ['t8'], 'trunk', ['main']),
+    gc('t8', [], 'trunk', []),
+  ]);
+
+  assert.equal(owner.get('f1'), 'feat');
+  assert.equal(owner.get('f0'), 'feat', 'attribution continues past the tip');
+  assert.equal(owner.get('b1'), 'bugfix', 'a tag is not a branch name');
+  assert.equal(owner.get('t9'), undefined, 'the walk stops at trunk');
+  assert.equal(owner.get('t8'), undefined);
+});
+
+test('attributeBranches gives a shared commit to the first tip that claims it', () => {
+  const owner = attributeBranches([
+    gc('a', ['s'], 'own', ['HEAD -> a-branch']),
+    gc('b', ['s'], 'other', ['b-branch']),
+    gc('s', [], 'other', []),
+  ]);
+
+  assert.equal(owner.get('a'), 'a-branch');
+  assert.equal(owner.get('b'), 'b-branch');
+  assert.equal(owner.get('s'), 'a-branch', 'claimed once, by the branch listed first');
+});
+
+test('attributeBranches keeps a merged-in branch tip owned by its own name', () => {
+  // m merges a (its own branch A) and b into B. Without seeding, walking from
+  // m (processed first — it's the child, so it comes first in topo order)
+  // would reach `a` before `a`'s own tip gets a turn, and claim it for B.
+  const owner = attributeBranches([
+    gc('m', ['a', 'b'], 'own', ['HEAD -> B']),
+    gc('a', ['r'], 'other', ['A']),
+    gc('b', ['r'], 'other', []),
+    gc('r', [], 'trunk', ['main']),
+  ]);
+
+  assert.equal(owner.get('m'), 'B');
+  assert.equal(owner.get('a'), 'A', 'the merged-in branch keeps its own tip');
+  assert.equal(owner.get('b'), 'B', 'b has no ref of its own, so it belongs to the merge');
+});
+
+test('attributeBranches tolerates a parent outside the fetched window', () => {
+  // commitGraph truncates at `limit`, so a parent hash can legitimately be
+  // absent from the array — the walk must skip it, not throw.
+  const owner = attributeBranches([
+    gc('f1', ['missing'], 'own', ['HEAD -> feat']),
+  ]);
+
+  assert.equal(owner.get('f1'), 'feat');
+});
+
+test('attributeBranches stays fast through nested diamonds in one branch (perf regression guard)', () => {
+  // Each level is a merge diamond (mi -> pi, qi; pi/qi -> m{i+1}) all inside
+  // the same branch. A same-name node is deliberately re-enterable (it's how
+  // a merged-in tip keeps its own name), so without deduping expansions per
+  // walk, m{i+1} gets queued twice by level i, m{i+2} four times, and so on —
+  // exponential in the level count. Without the `seen` set this test takes
+  // minutes; with it, well under a millisecond. Do not remove `seen`.
+  const levels = 22;
+  const commits = [];
+  for (let i = 0; i < levels; i++) {
+    commits.push(gc(`m${i}`, [`p${i}`, `q${i}`], 'own', i === 0 ? ['HEAD -> feat'] : []));
+    commits.push(gc(`p${i}`, [`m${i + 1}`], 'own', []));
+    commits.push(gc(`q${i}`, [`m${i + 1}`], 'own', []));
+  }
+  commits.push(gc(`m${levels}`, [], 'trunk', ['main']));
+
+  const start = Date.now();
+  const owner = attributeBranches(commits);
+  const elapsed = Date.now() - start;
+
+  assert.equal(owner.get('m0'), 'feat');
+  assert.ok(elapsed < 1000, `expected under 1000ms, took ${elapsed}ms`);
 });

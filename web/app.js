@@ -2,7 +2,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
   readTheme, ACCENTS, CANVASES,
 } from './lib.js';
 
@@ -115,6 +115,8 @@ function stoppedLabel(s) {
 // neither of which is a session-state event, so this view polls instead of
 // riding render().
 let graphCommits = [];
+// The branch currently hover-traced, so a poll-driven rebuild can restore it.
+let tracedBranch = '';
 
 function setPanel(next) {
   panel = panel === next ? null : next;
@@ -880,7 +882,10 @@ function openTab(id, which) {
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
   openId = id;
   tab = which;
-  if (which === 'graph') { graphCommits = []; loadGraph(); }
+  // The trace belongs to the graph being torn down here, not the next one —
+  // leaving it set re-applies a stale trace to a pointer that's nowhere near
+  // it, and can light up a same-named branch in a different session's graph.
+  if (which === 'graph') { graphCommits = []; tracedBranch = ''; loadGraph(); }
   render();
 }
 
@@ -1035,6 +1040,28 @@ function renderDiffPane(s) {
   }).catch(() => {});
 }
 
+/**
+ * Lights up one branch across the whole graph. Elements are compared by
+ * dataset rather than matched with a selector, because a branch name is
+ * arbitrary repo text and would otherwise need escaping to be safe in one.
+ *
+ * `.tracing` follows whether anything actually matched. The rows and lines are
+ * replaced on every 2s poll while `#graph-map` itself survives, so a blindly
+ * set flag would outlive the elements it dimmed and leave the whole graph
+ * faded until the pointer moved again.
+ */
+function traceBranch(name) {
+  const map = $('#graph-map');
+  tracedBranch = name;
+  let matched = false;
+  for (const el of map.querySelectorAll('[data-branch]')) {
+    const on = Boolean(name) && el.dataset.branch === name;
+    el.classList.toggle('traced', on);
+    matched ||= on;
+  }
+  map.classList.toggle('tracing', matched);
+}
+
 function renderGraphPane(s) {
   const rows = $('#graph-rows');
   if (!graphCommits.length) {
@@ -1044,16 +1071,20 @@ function renderGraphPane(s) {
     $('#graph-svg').replaceChildren();
     return;
   }
-  const width = drawGraph(graphCommits);
+  const owner = attributeBranches(graphCommits);
+  const width = drawGraph(graphCommits, owner);
   rows.replaceChildren(...graphCommits.map((c) => {
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
+    row.dataset.branch = owner.get(c.h) ?? '';
+    row.onmouseenter = () => traceBranch(owner.get(c.h) ?? '');
+    row.onmouseleave = () => traceBranch('');
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
     row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.lane));
+    for (const r of c.refs) row.append(refPill(r, c.tier));
     const subject = document.createElement('span');
     subject.className = 'subject';
     subject.textContent = c.subject;
@@ -1063,6 +1094,9 @@ function renderGraphPane(s) {
     row.append(subject, when);
     return row;
   }));
+  // The rebuild above discarded the elements carrying `.traced`; restore it so
+  // a poll landing mid-hover neither drops the trace nor strands `.tracing`.
+  traceBranch(tracedBranch);
 }
 
 // ---- Commit graph -------------------------------------------------------
@@ -1073,7 +1107,7 @@ const svgEl = (tag, attrs) => {
   return n;
 };
 
-function drawGraph(commits) {
+function drawGraph(commits, owner) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const svg = $('#graph-svg');
   const width = PAD * 2 + Math.max(0, ...commits.map((c) => c.lane)) * LANE;
@@ -1082,6 +1116,7 @@ function drawGraph(commits) {
   svg.replaceChildren();
   const x = (c) => PAD + c.lane * LANE;
   const y = (c) => ROW / 2 + c.row * ROW;
+  const branch = (c) => owner.get(c.h) ?? '';
 
   for (const c of commits) {
     for (const [i, ph] of c.p.entries()) {
@@ -1095,26 +1130,28 @@ function drawGraph(commits) {
       const d = x1 === x2
         ? `M${x1},${y1}V${y2}`
         : `M${x1},${y1}V${bend}C${x1},${y2} ${x2},${bend} ${x2},${y2}`;
-      // A merge's second parent is drawn in the parent's colour, not the child's:
+      // A merge's second parent is drawn in the parent's tier, not the child's:
       // that line belongs to the branch being merged in.
-      svg.append(svgEl('path', { d, class: `lane${(i ? p.lane : c.lane) % 6}` }));
+      const from = i ? p : c;
+      svg.append(svgEl('path', { d, class: `tier-${from.tier}`, 'data-branch': branch(from) }));
     }
   }
   for (const c of commits) {
     const head = c.refs.some((r) => r.startsWith('HEAD'));
     svg.append(svgEl('circle', {
       cx: x(c), cy: y(c), r: head ? DOT + 1.5 : DOT,
-      class: `lane${c.lane % 6}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      class: `tier-${c.tier}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      'data-branch': branch(c),
     }));
   }
   return width;
 }
 
-function refPill(raw, lane) {
+function refPill(raw, tier) {
   const tag = raw.startsWith('tag: ');
   const name = raw.replace(/^tag: /, '').replace(/^HEAD -> /, '');
   const pill = document.createElement('span');
-  pill.className = `ref lane${lane % 6}${tag ? ' tag' : ''}`
+  pill.className = `ref tier-${tier}${tag ? ' tag' : ''}`
     + (!tag && name.includes('/') ? ' remote' : '') + (raw.startsWith('HEAD') ? ' head' : '');
   // Branch and tag names come from the repo, so they go in as text, never markup.
   const label = document.createElement('span');

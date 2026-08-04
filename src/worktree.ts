@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, stat as fsStat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { currentBranch } from './merge.ts';
 
 const run = promisify(execFile);
 
@@ -28,9 +29,16 @@ export async function createWorktree(repo: string, branch: string): Promise<stri
   return path;
 }
 
+/**
+ * Which line of history a commit belongs to, for styling. Decided here rather
+ * than in the browser because it is a reachability question and git already
+ * knows the answer.
+ */
+export type Tier = 'own' | 'trunk' | 'other';
+
 export type GraphCommit = {
   h: string; p: string[]; subject: string; author: string; when: string;
-  refs: string[]; lane: number; row: number;
+  refs: string[]; lane: number; row: number; tier: Tier;
 };
 
 /** Index of a reusable lane, appending one if all are busy. */
@@ -62,24 +70,68 @@ export function assignLanes<T extends { h: string; p: string[] }>(
   });
 }
 
-/**
- * Commits across every branch, laid out for drawing. `--all` reads the whole
- * repo, so any one worktree's cwd shows the same full picture.
- */
-export async function commitGraph(cwd: string, limit = 400): Promise<GraphCommit[]> {
-  const { stdout } = await run(
-    'git',
-    ['log', '--all', '--topo-order', `-${limit}`, '--format=%H%x00%P%x00%s%x00%an%x00%ar%x00%D'],
-    { cwd },
-  );
-  const commits = stdout.split('\n').filter(Boolean).map((line) => {
+const GRAPH_FORMAT = '--format=%H%x00%P%x00%s%x00%an%x00%ar%x00%D';
+
+function parseLog(stdout: string, tier: Tier) {
+  return stdout.split('\n').filter(Boolean).map((line) => {
     const [h, p, subject, author, when, refs] = line.split('\0');
     return {
-      h, subject, author, when,
+      h, subject, author, when, tier,
       p: p ? p.split(' ') : [],
       refs: refs.split(',').map((r) => r.trim()).filter(Boolean),
     };
   });
+}
+
+/**
+ * Commits across every branch, laid out for drawing.
+ *
+ * `--all` with a single `-limit` looks like it reads the whole repo but does
+ * not: the budget is global and spent newest-first, so trunk history eats it
+ * and any branch whose tip is older than that window is dropped entirely,
+ * ref and all. Instead the budget is split — everything off-trunk, plus a
+ * bounded slice of trunk — so no branch can be starved by trunk's activity.
+ *
+ * The two results are concatenated and deliberately NOT re-sorted. They are
+ * disjoint (one set is defined as unreachable from trunk, the other only as
+ * reachable from it), and no trunk commit can have an off-trunk parent, or
+ * that parent would be reachable from trunk. So every parent still follows
+ * its child and assignLanes' topological requirement holds.
+ *
+ * Trunk is the base repo's checked-out branch — the same branch mergeWorktrees
+ * merges into — so the graph's spine and the merge target cannot drift apart.
+ */
+export async function commitGraph(
+  cwd: string, repo: string = cwd, limit = 400,
+): Promise<GraphCommit[]> {
+  const branch = await currentBranch(repo).catch(() => '');
+  // Fully qualified, never the bare name: a branch called `docs` or `src` is
+  // also a path here, and `git log docs` is a fatal ambiguity rather than a
+  // revision. --verify doubles as the unborn-branch check, routing an orphan
+  // trunk into the same single-walk fallback as a detached HEAD.
+  const trunk = branch && await run(
+    'git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd },
+  ).then(() => `refs/heads/${branch}`, () => '');
+  // Detached HEAD: there is no trunk to split on, so fall back to one walk.
+  if (!trunk) {
+    const { stdout } = await run(
+      'git', ['log', '--all', '--topo-order', `-${limit}`, GRAPH_FORMAT], { cwd },
+    );
+    return assignLanes(parseLog(stdout, 'other'));
+  }
+
+  const [off, spine, own] = await Promise.all([
+    run('git', ['log', '--all', '--not', trunk, '--topo-order', `-${limit}`, GRAPH_FORMAT], { cwd }),
+    run('git', ['log', trunk, '--topo-order', `-${limit}`, GRAPH_FORMAT], { cwd }),
+    // Commits unique to this session's branch: the boundary is the fork point,
+    // so the highlight covers the work done here, not the inherited ancestry.
+    // An unborn HEAD has none, which is a legitimate empty answer, not an error.
+    run('git', ['rev-list', 'HEAD', '--not', trunk], { cwd }).catch(() => ({ stdout: '' })),
+  ]);
+
+  const mine = new Set(own.stdout.split('\n').filter(Boolean));
+  const commits = [...parseLog(off.stdout, 'other'), ...parseLog(spine.stdout, 'trunk')];
+  for (const c of commits) if (mine.has(c.h)) c.tier = 'own';
   return assignLanes(commits);
 }
 
