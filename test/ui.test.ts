@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken,
+  readTheme, ACCENTS, CANVASES,
 } from '../web/lib.js';
 
 const tool = (name, status = 'ok') => ({ kind: 'tool', name, summary: 'x', status });
@@ -468,4 +470,30 @@ test('a newline ends the command token, for the multi-line new-session prompt', 
   assert.ok(commandMenu('/comp\nthen carry on', 5, CMDS));
   // ...and the menu is gone once the caret is down on the next line.
   assert.equal(commandMenu('/compact\nthen carry on', 12, CMDS), null);
+});
+
+test('readTheme falls back to the default for anything that is not a known pair', () => {
+  const dflt = { accent: 'coral', canvas: 'ink' };
+  assert.deepEqual(readTheme(null), dflt);
+  assert.deepEqual(readTheme(''), dflt);
+  assert.deepEqual(readTheme('{oops'), dflt);
+  assert.deepEqual(readTheme('"a string"'), dflt);
+  assert.deepEqual(readTheme('{"accent":"chartreuse","canvas":"beige"}'), dflt);
+  // Half-filled: the known half survives, the unknown half falls back.
+  assert.deepEqual(readTheme('{"canvas":"paper"}'), { accent: 'coral', canvas: 'paper' });
+});
+
+test('readTheme passes a valid pair through', () => {
+  assert.deepEqual(readTheme('{"accent":"teal","canvas":"cream"}'), { accent: 'teal', canvas: 'cream' });
+});
+
+// The inline <head> script cannot import this module — it has to run before
+// first paint and app.js is deferred — so it restates the two name lists. This
+// is the check that the two copies have not drifted.
+test('the inline theme script accepts exactly the names lib.js knows', async () => {
+  const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+  const [, accents] = html.match(/\^\(([a-z|]+)\)\$\/\.test\(t\.accent\)/) ?? [];
+  const [, canvases] = html.match(/\^\(([a-z|]+)\)\$\/\.test\(t\.canvas\)/) ?? [];
+  assert.deepEqual(accents?.split('|'), [...ACCENTS]);
+  assert.deepEqual(canvases?.split('|'), [...CANVASES]);
 });

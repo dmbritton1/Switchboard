@@ -359,3 +359,31 @@ export function commandToken(text, commands) {
   const known = commands.some((c) => c === token || c.slice(c.indexOf(':') + 1) === token);
   return known ? text.slice(0, end) : null;
 }
+
+// In picker order: eight accents around the wheel starting at coral, then the
+// canvases light-to-dark. The hexes live in web/style.css, which is what
+// test/palette.test.ts measures — these are only names.
+export const ACCENTS = Object.freeze(['coral', 'amber', 'moss', 'teal', 'sky', 'indigo', 'violet', 'rose']);
+export const CANVASES = Object.freeze(['cream', 'paper', 'ink', 'void']);
+
+const DEFAULT_THEME = Object.freeze({ accent: 'coral', canvas: 'ink' });
+
+/**
+ * The stored theme, or the default for anything that is not a known pair.
+ * localStorage is user-editable and this value is read before the stylesheet
+ * applies, so an unvalidated one paints an unstyled page. The two halves fall
+ * back independently: an unrecognised accent should not also throw away a
+ * perfectly good canvas.
+ */
+export function readTheme(raw) {
+  let stored;
+  try {
+    stored = JSON.parse(raw);
+  } catch {
+    return { ...DEFAULT_THEME };
+  }
+  return {
+    accent: ACCENTS.includes(stored?.accent) ? stored.accent : DEFAULT_THEME.accent,
+    canvas: CANVASES.includes(stored?.canvas) ? stored.canvas : DEFAULT_THEME.canvas,
+  };
+}

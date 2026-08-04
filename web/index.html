@@ -1,7 +1,22 @@
 <!doctype html>
+<html lang="en" data-accent="coral" data-canvas="ink">
 <meta charset="utf-8">
 <title>Switchboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- The shipped default is Ink + Coral, carried by the attributes above rather
+     than duplicated into :root, so a browser with JS broken still gets a
+     complete theme and this script only ever *overrides*. Inline and above the
+     stylesheet link because an external file is a second request that can lose
+     the race with first paint; this is the only inline script in the file. It
+     restates the two name lists because it cannot import lib.js — a test in
+     test/ui.test.ts asserts the copies match. -->
+<script>
+  try {
+    const t = JSON.parse(localStorage.getItem('switchboard.theme')) ?? {};
+    if (/^(coral|amber|moss|teal|sky|indigo|violet|rose)$/.test(t.accent)) document.documentElement.dataset.accent = t.accent;
+    if (/^(cream|paper|ink|void)$/.test(t.canvas)) document.documentElement.dataset.canvas = t.canvas;
+  } catch {}
+</script>
 <link rel="stylesheet" href="/style.css">
 <header id="bar">
   <span id="brand">Switchboard</span>
