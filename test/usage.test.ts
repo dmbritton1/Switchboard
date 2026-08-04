@@ -36,22 +36,6 @@ test('pace of an account with no samples is zero', () => {
   assert.equal(u.pace('never-used', 1000, 0), 0);
 });
 
-test('freestAccount picks the lowest pace, not the lowest raw spend', () => {
-  const u = new Usage();
-  u.record('big', 400, 400, 0);    // 800 of 10000 = 0.08
-  u.record('small', 100, 100, 0);  // 200 of 1000  = 0.20
-  const freest = u.freestAccount(
-    [{ name: 'big', budget: 10000 }, { name: 'small', budget: 1000 }],
-    0,
-  );
-  assert.equal(freest, 'big');
-});
-
-test('freestAccount throws when given no accounts', () => {
-  const u = new Usage();
-  assert.throws(() => u.freestAccount([], 0), /no accounts/i);
-});
-
 test('a rejected rate limit stores its reset time; allowed clears it', () => {
   const u = new Usage();
   u.noteLimit('main', 'rejected', 5 * HOUR);
@@ -157,29 +141,4 @@ test('limits are not persisted: a percentage is wrong the moment we are not runn
   // assertion this test exists for is unchanged: nothing from setLimits() is in
   // here — no utilization, no subscription, no error.
   assert.deepEqual(u.toJSON(), { samples: { main: [{ t: 0, tokens: 200 }] }, resets: {} });
-});
-
-test('freestAccount prefers a supplied load over pace', () => {
-  const u = new Usage();
-  // 'real' looks the busiest by local estimate (90% of budget) but its real plan
-  // utilization is 5%; 'est' has no real number and a 40% estimate. Ranking on
-  // pace alone would pick 'est' — which is the point: drop the `load` override
-  // from freestAccount and this test must fail.
-  u.record('real', 900, 0, 0);
-  u.record('est', 400, 0, 0);
-  const freest = u.freestAccount(
-    [{ name: 'real', budget: 1000, load: 0.05 }, { name: 'est', budget: 1000 }],
-    0,
-  );
-  assert.equal(freest, 'real');
-});
-
-test('freestAccount falls back to pace for accounts with no load', () => {
-  const u = new Usage();
-  u.record('busy', 800, 0, 0);
-  const freest = u.freestAccount(
-    [{ name: 'busy', budget: 1000 }, { name: 'quiet', budget: 1000 }],
-    0,
-  );
-  assert.equal(freest, 'quiet');
 });

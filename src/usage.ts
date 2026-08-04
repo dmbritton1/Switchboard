@@ -116,26 +116,4 @@ export class Usage {
     for (const s of list) if (s.t > cutoff) total += s.tokens;
     return total / budget;
   }
-
-  /**
-   * `load` is the caller's already-resolved fraction (real plan utilization);
-   * `pace` is the local estimate. Taking the override here rather than letting
-   * callers rank for themselves is what keeps this from disagreeing with the
-   * account picker in web/app.js, which ranks on the same server-computed number.
-   */
-  freestAccount(
-    accounts: { name: string; budget: number; load?: number }[],
-    now = Date.now(),
-  ): string {
-    if (accounts.length === 0) throw new Error('no accounts configured');
-    const load = (a: { name: string; budget: number; load?: number }) =>
-      a.load ?? this.pace(a.name, a.budget, now);
-    let best = accounts[0];
-    let bestLoad = load(best);
-    for (const a of accounts.slice(1)) {
-      const l = load(a);
-      if (l < bestLoad) { best = a; bestLoad = l; }
-    }
-    return best.name;
-  }
 }
