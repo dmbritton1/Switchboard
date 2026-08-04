@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
-  freestAccount,
+  freestAccount, newlyNotifiable,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -319,4 +319,49 @@ test('visibleSessions never hides a stopped session', () => {
   // it, so collapsing must not make it disappear.
   const list = [session({ id: 'a', status: 'stopped' })];
   assert.deepEqual(visibleSessions(list, true).map((s) => s.id), ['a']);
+});
+
+test('newlyNotifiable fires for a session entering a watched status', () => {
+  const out = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you'], new Set());
+  assert.deepEqual(out.fire.map((s) => s.id), ['a']);
+});
+
+test('newlyNotifiable ignores a status that is not being watched', () => {
+  const out = newlyNotifiable([session({ id: 'a', status: 'done' })], ['needs-you'], new Set());
+  assert.deepEqual(out.fire, []);
+});
+
+test('newlyNotifiable does not fire twice for the same session and status', () => {
+  const first = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you'], new Set());
+  const second = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you'], first.seen);
+  assert.deepEqual(second.fire, []);
+});
+
+test('newlyNotifiable fires again when a session re-enters a watched status', () => {
+  // needs-you -> working -> needs-you is a second, real interruption.
+  const a = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you'], new Set());
+  const b = newlyNotifiable([session({ id: 'a', status: 'working' })], ['needs-you'], a.seen);
+  const c = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you'], b.seen);
+  assert.deepEqual(c.fire.map((s) => s.id), ['a']);
+});
+
+test('newlyNotifiable tracks each status independently', () => {
+  const a = newlyNotifiable([session({ id: 'a', status: 'needs-you' })], ['needs-you', 'done'], new Set());
+  const b = newlyNotifiable([session({ id: 'a', status: 'done' })], ['needs-you', 'done'], a.seen);
+  assert.deepEqual(b.fire.map((s) => s.id), ['a'], 'done is a different transition than needs-you');
+});
+
+test('a seeded seen-set fires nothing, which is what a reconnect needs', () => {
+  // The reconnect defect: a full snapshot of a dozen finished sessions must
+  // not notify for any of them.
+  const list = [session({ id: 'a', status: 'done' }), session({ id: 'b', status: 'done' })];
+  const seeded = newlyNotifiable(list, ['done'], new Set(), true).seen;
+  const after = newlyNotifiable(list, ['done'], seeded);
+  assert.deepEqual(after.fire, []);
+});
+
+test('seeding returns a seen-set covering every watched session', () => {
+  const out = newlyNotifiable([session({ id: 'a', status: 'done' })], ['done'], new Set(), true);
+  assert.deepEqual(out.fire, [], 'seeding never fires');
+  assert.equal(out.seen.has('a:done'), true);
 });

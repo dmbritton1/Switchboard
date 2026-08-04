@@ -199,6 +199,29 @@ export function freestAccount(accounts) {
 }
 
 /**
+ * Which sessions just entered a status worth notifying about.
+ *
+ * Keyed `id:status` rather than by id alone, so needs-you and done are tracked
+ * independently and a session that goes needs-you -> working -> needs-you
+ * notifies twice, which is two real interruptions.
+ *
+ * `seed` exists for one reason: EventSource reconnects on its own and the
+ * server pushes a full snapshot on connect. Called with seed=true on the first
+ * payload after a connect, this fires nothing and returns a seen-set covering
+ * everything already on the board — without it, every dropped connection
+ * notifies once per finished session for work that ended hours ago.
+ *
+ * The returned set is rebuilt from the current sessions each call, so a
+ * deleted session's keys do not accumulate forever.
+ */
+export function newlyNotifiable(sessions, notifyOn, seen, seed = false) {
+  const watched = sessions.filter((s) => notifyOn.includes(s.status));
+  const next = new Set(watched.map((s) => `${s.id}:${s.status}`));
+  const fire = seed ? [] : watched.filter((s) => !seen.has(`${s.id}:${s.status}`));
+  return { fire, seen: next };
+}
+
+/**
  * Everything the meter and the account panel need to decide *what* to say,
  * with no DOM. The two branches are the point: an account with real plan
  * limits and one falling back to the local budget estimate must not be worded

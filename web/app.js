@@ -1,7 +1,7 @@
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
-  accountView, freestAccount,
+  accountView, freestAccount, newlyNotifiable,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -9,7 +9,10 @@ let openId = null;
 // Which header panel is open: null, 'queue', or an account name. Mutually
 // exclusive by construction — one variable, not one flag per panel.
 let panel = null;
-let seenNeedsYou = new Set();
+// Keys are `id:status`; see newlyNotifiable in lib.js.
+let seenNotified = new Set();
+
+const NOTIFY_VERB = { 'needs-you': 'needs you', done: 'finished', error: 'hit an error' };
 // Session whose chat view has already been auto-scrolled once; see renderChatPane().
 let scrolledFor = null;
 // Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
@@ -52,25 +55,35 @@ async function runQueueCommand(body) {
 
 // EventSource reconnects on its own, so there is no backoff code to write.
 const es = new EventSource('/events');
+// True until the first payload of a connection has been consumed. The server
+// pushes full state on connect, so that payload seeds the seen-set instead of
+// notifying for everything already on the board.
+let seeding = true;
+es.onopen = () => { seeding = true; };
 es.onmessage = (e) => {
   $('#conn').hidden = true;
   state = JSON.parse(e.data);
-  notify();
+  notify(seeding);
+  seeding = false;
   render();
 };
 // EventSource reconnects on its own; this only makes the gap visible.
 es.onerror = () => { $('#conn').hidden = false; };
 
-function notify() {
+function notify(seed) {
   const needs = state.sessions.filter((s) => s.status === 'needs-you');
+  // Deliberately not driven by notifyOn: the title counter answers "how many
+  // are blocked on me", which is not the same question as "what do I want
+  // pinged about".
   document.title = needs.length ? `(${needs.length}) Switchboard` : 'Switchboard';
-  if (document.hasFocus() || Notification.permission !== 'granted') return;
-  for (const s of needs) {
-    if (seenNeedsYou.has(s.id)) continue;
-    seenNeedsYou.add(s.id);
-    new Notification(`${s.branch} needs you`, { body: s.pending?.summary ?? '' });
+  if (Notification.permission !== 'granted') return;
+
+  const on = state.settings?.notifyOn ?? ['needs-you'];
+  const { fire, seen } = newlyNotifiable(state.sessions, on, seenNotified, seed || document.hasFocus());
+  seenNotified = seen;
+  for (const s of fire) {
+    new Notification(`${s.branch} ${NOTIFY_VERB[s.status]}`, { body: s.pending?.summary ?? '' });
   }
-  seenNeedsYou = new Set(needs.map((s) => s.id));
 }
 
 function elapsed(since) {
