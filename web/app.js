@@ -954,7 +954,7 @@ function renderGraphPane(s) {
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
-    if (owner.has(c.h)) row.dataset.branch = owner.get(c.h);
+    row.dataset.branch = owner.get(c.h) ?? '';
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
