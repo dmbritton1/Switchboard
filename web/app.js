@@ -63,6 +63,12 @@ es.onopen = () => { seeding = true; };
 es.onmessage = (e) => {
   $('#conn').hidden = true;
   state = JSON.parse(e.data);
+  // First snapshot only: state.settings (and everything else) is absent from
+  // the pre-snapshot initial `state`, so ⚙ and + New start disabled in markup
+  // to keep their handlers from reading state.settings off an object that
+  // doesn't have it yet.
+  $('#settings-btn').disabled = false;
+  $('#new-btn').disabled = false;
   notify(seeding);
   seeding = false;
   render();

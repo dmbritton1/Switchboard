@@ -181,8 +181,14 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    they cannot drift apart the way #when-dialog did when only its datetime
    input had a rule. */
 #new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--line);
-  border-radius: 14px; background: var(--card); color: var(--fg);
-  max-height: calc(100% - 6em); overflow-y: auto; }
+  border-radius: 14px; background: var(--card); color: var(--fg); }
+/* #settings alone: it has more content than #new/#when-dialog ever do (seven
+   groups of controls vs. up to five fields) and can outgrow the viewport —
+   scrollHeight 973px vs clientHeight 630px measured at a 720px-tall window.
+   Scoped here rather than the shared shell rule above so it doesn't also
+   retune #new's or #when-dialog's overflow, which neither needs nor was
+   asked for. */
+#settings { max-height: calc(100% - 6em); overflow-y: auto; }
 #new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #000b; }
 #new form, #when-dialog form, #settings form { display: grid; gap: 1.1rem; padding: 1.5rem; }
 #new h2, #when-dialog h2, #settings h2 { margin: 0; font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }

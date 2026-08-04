@@ -8,8 +8,11 @@
   <span id="conn" hidden>reconnecting…</span>
   <div id="meters"></div>
   <button id="queue-badge" type="button" hidden></button>
-  <button id="settings-btn" type="button" title="Settings" aria-label="Settings">⚙</button>
-  <button id="new-btn" type="button">+ New</button>
+  <!-- Disabled until the first SSE snapshot lands: both buttons' handlers read
+       state.settings, which is absent from the pre-snapshot initial `state`
+       (see the `let state = ...` in app.js). Re-enabled in es.onmessage. -->
+  <button id="settings-btn" type="button" title="Settings" aria-label="Settings" disabled>⚙</button>
+  <button id="new-btn" type="button" disabled>+ New</button>
 </header>
 <div id="panel" hidden></div>
 <div id="notif-bar" hidden>
