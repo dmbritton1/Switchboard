@@ -30,6 +30,8 @@ Registry and git worktrees, then into a provider adapter.
 - Codex always uses the fixed `workspace-write` sandbox and `never` approval
   policy. Do not broaden either policy or add an interactive approval path in
   Phase 1 fixes.
+- Settings must never expose the Codex sandbox mode or approval policy. The
+  `settings` command rejects unknown keys for this reason; keep it strict.
 - Treat account environment values as launch-only secrets: never persist, log,
   return over SSE, or render them.
 - Preserve the target repository's Codex configuration and instructions.

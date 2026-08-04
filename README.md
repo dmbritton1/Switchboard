@@ -61,8 +61,8 @@ There are no interactive Codex approvals.
 write every two seconds, on any other state change — so a session that runs to
 completion unattended is still on disk. Usage samples are saved alongside the
 sessions, which is why account pace survives a restart. `state.json` is
-`{ sessions, usage }`; a file from an older build (a bare session array) still
-loads, minus usage history.
+`{ sessions, usage, queue, settings }`; a file from an older build (a bare
+session array) still loads, minus usage history.
 
 ## What it does
 
@@ -150,6 +150,52 @@ Scheduled items are one-shot; there is no recurrence. A time that passes while
 Switchboard is down fires on the next start if it is less than 12 hours late
 (`GRACE_MS` in `src/schedule.ts`), and is marked `missed` if it is older than
 that. The queue lives in `state.json` alongside the sessions.
+
+## Settings
+
+The `⚙` button opens a dialog for seven preferences: `autoApprove` (new
+sessions start with auto-approve already on, instead of prompting on the
+first tool call — recorded for Codex sessions too, though their SDK has no
+interactive approval to skip), `account` (which account the New dialog
+preselects; `null` ranks by usage and picks the freest, and a pinned account
+that has since been removed from `accounts.json` falls back to freest the
+same way), `branchPrefix` (prefilled into the New dialog's branch field),
+`notifyOn` (which status transitions raise a browser notification, chosen
+from `needs-you`, `done`, `error`), `sort` (grid order — `blocked` puts
+blocked sessions first, then running, then finished; `newest` is flat
+recency; `account` groups by account, blocked-first within each group),
+`collapseDone` (hides finished sessions, but deliberately not `stopped`
+ones — those carry a Resume button and unfinished work), and `autoRequeue`
+(whether a Claude session that dies while its account is past its limit
+still gets a resume queued automatically; turning it off disables the
+auto-resume behavior described under Scheduling above). Every default
+reproduces the behavior the app had before settings existed, so an empty or
+missing settings block changes nothing.
+
+`notifyOn` closes a real gap: Codex sessions never enter `needs-you` (they
+run with `approvalPolicy: 'never'` and no interactive approval — see Limits
+below), so before this setting existed a Codex session produced no browser
+notification, ever. `done` and `error` are the only transitions a Codex
+session has to notify on.
+
+Settings live in `state.json` alongside `sessions`, `usage`, and `queue`, and
+the file is meant to be hand-editable: on load, an invalid or unknown-typed
+value falls back to its default rather than throwing, and an unrecognized
+key is dropped. The `settings` HTTP command is deliberately stricter — it
+rejects an unknown key or a wrong-typed value with a 400 — because that file
+is written only by this app, while the command is an unauthenticated
+localhost POST that now changes how agents launch; a client sending
+`sandboxMode`, for instance, should learn it was rejected rather than believe
+it took effect.
+
+Theme and notification sound are deliberately not settings. Theme was cut
+because `web/style.css` is dark-only: twelve custom properties in `:root`
+plus roughly forty more hardcoded colors past them, so a light theme means
+authoring a second palette, not wiring up a toggle. Sound was cut because
+macOS Notification Center already controls it, and better than this dialog
+could. Codex's sandbox mode (`workspace-write`) and approval policy
+(`never`) are also deliberately not settable, and must not become settable —
+see Safety boundaries in `AGENTS.md`.
 
 ## Tests
 
