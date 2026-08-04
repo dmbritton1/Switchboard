@@ -308,11 +308,30 @@ function renderGrid() {
   grid.hidden = false;
   grid.replaceChildren();
 
-  // A selected session can vanish (deleted, or gone after a restart's reload)
-  // without ever passing back through a checkbox handler, so prune here rather
-  // than trust the Set to stay in sync with `state` on its own.
-  const live = new Set(state.sessions.map((s) => s.id));
-  for (const id of selected) if (!live.has(id)) selected.delete(id);
+  const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
+  if (fetchStatus) lastStatusFetch = Date.now();
+
+  // state.settings is absent from the pre-snapshot initial `state` (see the
+  // `let state = ...` above) and setInterval(render, 30_000) keeps firing
+  // whether or not a snapshot has arrived yet — e.g. the whole time #conn
+  // shows "reconnecting…" — so these two reads default rather than throw.
+  // Duplicating DEFAULT_SETTINGS' full seven keys here isn't worth it (web/
+  // can't import from src/, and it'd just be a second copy to drift out of
+  // sync); these are the only two fields this function reads.
+  const sorted = sortSessions(
+    visibleSessions(state.sessions, state.settings?.collapseDone ?? false),
+    state.settings?.sort ?? 'blocked',
+  );
+
+  // A selected session can drop out of view — deleted, gone after a restart's
+  // reload, or simply hidden by collapseDone — without ever passing back
+  // through a checkbox handler, so prune here rather than trust the Set to
+  // stay in sync on its own. Pruning against `sorted` (what's on screen)
+  // rather than all of state.sessions matters: Merge/Push act on the whole
+  // selection, and both are irreversible, so a session hidden by
+  // collapseDone must not stay actionable after the user can no longer see it.
+  const visible = new Set(sorted.map((s) => s.id));
+  for (const id of selected) if (!visible.has(id)) selected.delete(id);
   if (selected.size) grid.append(selectionBar());
 
   // Pending creates first: they're newer than anything with a real
@@ -320,22 +339,21 @@ function renderGrid() {
   // appear the instant they close the dialog, not scroll to find it.
   for (const p of pendingCreates) grid.append(pendingCard(p));
 
-  const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
-  if (fetchStatus) lastStatusFetch = Date.now();
-
-  const sorted = sortSessions(
-    visibleSessions(state.sessions, state.settings.collapseDone),
-    state.settings.sort,
-  );
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
-  if (!state.sessions.length && !pendingCreates.length) {
+  if (!sorted.length && !pendingCreates.length) {
     const empty = document.createElement('div');
     empty.id = 'grid-empty';
     const line = document.createElement('p');
-    line.textContent = 'No sessions yet.';
+    // Everything can be hidden without being gone: collapseDone persists, so
+    // the realistic way to hit this is days later, opening Switchboard to a
+    // blank grid and reasonably concluding the sessions vanished rather than
+    // that a checkbox is filtering them out.
+    line.textContent = state.sessions.length ? 'All sessions are hidden.' : 'No sessions yet.';
     const hint = document.createElement('p');
-    hint.textContent = 'Start one with + New in the header.';
+    hint.textContent = state.sessions.length
+      ? 'Finished sessions are hidden — turn off "Hide finished sessions" in ⚙.'
+      : 'Start one with + New in the header.';
     empty.append(line, hint);
     grid.append(empty);
   }
