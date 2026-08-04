@@ -269,7 +269,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   color: var(--fg); font: inherit; font-size: .8rem; cursor: pointer; }
 .meter:hover, .meter.open { border-color: var(--done); }
 .meter .bar { width: 46px; margin: 0; flex: none; }
-#queue-badge, #new-btn { padding: .35rem .75rem; border-radius: 8px;
+/* #settings-btn gets the same neutral pill as #queue-badge, not #new-btn's
+   green: it sits next to + New as a secondary icon button, not a second
+   primary action. Without this rule it rendered as an unstyled native button
+   in an otherwise fully hand-styled dark header. */
+#queue-badge, #new-btn, #settings-btn { padding: .35rem .75rem; border-radius: 8px;
   border: 1px solid var(--line); background: var(--card); color: var(--fg);
   font: inherit; font-size: .85rem; cursor: pointer; white-space: nowrap; }
 #queue-badge.open { border-color: var(--done); }
