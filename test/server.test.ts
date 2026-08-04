@@ -515,6 +515,27 @@ test('the SSE snapshot carries the current settings', async (t) => {
   assert.equal(snap.settings.autoApprove, false);
 });
 
+test('POST /command settings applies a valid patch and rejects an invalid one before mutating', async (t) => {
+  // parseSettingsPatch and Registry.setSettings each have their own unit
+  // tests, but nothing else exercises the wiring between them: that the
+  // `settings` case reads `body.patch` (not `body` itself), and that a 400
+  // short-circuits before setSettings ever runs.
+  const { base, registry } = await boot(t);
+  const ok = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'settings', patch: { sort: 'newest' } }),
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(registry.settings().sort, 'newest');
+
+  const bad = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'settings', patch: { sandboxMode: 'danger-full-access' } }),
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(registry.settings().sort, 'newest', 'the 400 must short-circuit before setSettings runs');
+});
+
 test('POST /command with an unknown cmd is a 400', async (t) => {
   const { base } = await boot(t);
   const res = await fetch(`${base}/command`, {
