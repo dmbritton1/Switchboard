@@ -14,6 +14,9 @@ function itemToMsg(item: ThreadItem): Msg | null {
       return {
         kind: 'tool', name: 'shell', summary: item.command,
         status: item.status === 'failed' ? 'error' : 'ok',
+        // Raw here on purpose: normalizeCodex is pure and has no account env to
+        // scrub with. The caller redacts before emitting — see the loop in start().
+        ...(item.aggregated_output ? { result: item.aggregated_output } : {}),
       };
     case 'file_change':
       return {
@@ -168,7 +171,13 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
                 finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
                 break;
               }
-              emit(ev);
+              // Command output can echo the account's own environment back —
+              // `env`, a build printing its auth header — and from here it would
+              // reach state.json, the SSE snapshot and the screen. Same scrub
+              // stopped reasons already get at finish(), for the same reason.
+              emit(ev.type === 'msg' && ev.msg.kind === 'tool' && ev.msg.result
+                ? { ...ev, msg: { ...ev.msg, result: redactCodexText(ev.msg.result, runtime.env) } }
+                : ev);
             }
           }
         }

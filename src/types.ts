@@ -21,7 +21,12 @@ export type Msg =
   // id is optional: it correlates a tool call to its later result so the registry
   // can flip status running -> ok/error. The Codex adapter (Task 5) emits tool
   // messages already resolved and has no equivalent id.
-  | { kind: 'tool'; name: string; summary: string; status: 'running' | 'ok' | 'error'; id?: string }
+  // `result` is the tool's own output, redacted and truncated before it is ever
+  // stored — see truncateResult() in sessions.ts for why it cannot be unbounded.
+  | {
+    kind: 'tool'; name: string; summary: string;
+    status: 'running' | 'ok' | 'error'; id?: string; result?: string;
+  }
   | { kind: 'error'; text: string };
 
 /** One AskUserQuestion choice. `description` is the agent's own explanation of
@@ -67,7 +72,9 @@ export type AdapterEvent =
   // so a Codex account never produces this and falls back to the pace estimate.
   | { type: 'rate-limit'; status: 'allowed' | 'allowed_warning' | 'rejected'; resetsAt: number | null }
   | { type: 'vendor-session-id'; id: string }
-  | { type: 'tool-result'; id: string; ok: boolean }
+  // `text` is the raw tool output. Adapters redact account env values out of it
+  // before emitting; the registry truncates it before storing.
+  | { type: 'tool-result'; id: string; ok: boolean; text?: string }
   | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
   | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 

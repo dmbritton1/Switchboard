@@ -117,14 +117,27 @@ test('a resume id is passed to the SDK CLI', async (t) => {
   assert.deepEqual(invocation.argv.slice(-2), ['resume', 'fake-thread']);
 });
 
-test('completed SDK JSONL items normalize without retaining raw tool payloads', async (t) => {
+// Was 'normalize without retaining raw tool payloads'. Tool output is now
+// retained on purpose so the chat view can show it — so the property worth
+// pinning moved from "dropped" to "scrubbed of account credentials", which is
+// what the assertion below checks. Everything else about the shape is unchanged.
+test('completed SDK JSONL items normalize with tool output redacted', async (t) => {
   const fixture = await makeProcessFixture(t);
   const { events } = await collect(createCodexAdapter(fixture.runtime), fixture, 'basic', (all) =>
     all.some((event) => event.type === 'status' && event.status === 'done'));
 
+  const serialized = JSON.stringify(events);
+  assert.ok(!serialized.includes('never-expose-me'), 'account secret must not survive into any event');
+
   assert.deepEqual(events.filter((event) => event.type === 'msg'), [
     { type: 'msg', msg: { kind: 'text', text: 'fake response: basic' } },
-    { type: 'msg', msg: { kind: 'tool', name: 'shell', summary: 'echo shell', status: 'ok' } },
+    {
+      type: 'msg',
+      msg: {
+        kind: 'tool', name: 'shell', summary: 'echo shell', status: 'ok',
+        result: 'shell output [REDACTED]',
+      },
+    },
     { type: 'msg', msg: { kind: 'tool', name: 'edit', summary: 'fake.ts', status: 'ok' } },
     { type: 'msg', msg: { kind: 'tool', name: 'fake-tool', summary: 'fake-server.fake-tool', status: 'ok' } },
     { type: 'msg', msg: { kind: 'tool', name: 'search', summary: 'fake search', status: 'ok' } },

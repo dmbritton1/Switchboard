@@ -787,6 +787,15 @@ function msgNode(m) {
   // A denied `rm -rf` and a successful one used to be pixel-identical.
   if (m.kind === 'tool') {
     el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
+    if (m.result) {
+      // Tool output: the agent's, transitively whatever it read off disk or off
+      // the network. textContent, never innerHTML — same rule as every other
+      // untrusted string in this file.
+      const pre = document.createElement('pre');
+      pre.className = 'tool-result';
+      pre.textContent = m.result;
+      el.append(pre);
+    }
     return el;
   }
   el.textContent = m.text;

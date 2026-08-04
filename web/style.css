@@ -95,6 +95,13 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .tool-run > summary:hover { color: var(--fg); }
 .tool-run[open] > summary { border-bottom: 1px solid #222; }
 .tool-run > .msg { border-bottom: 0; padding-left: 1.3rem; }
+/* Tool output. A capped, scrollable box rather than a second disclosure nested
+   inside the run: the run is already the fold, and nesting one would cost two
+   clicks to read a single command's output. */
+.tool-result { max-height: 12em; overflow: auto; margin: .4rem 0 0;
+  padding: .4rem .6rem; border-radius: 6px; background: #191919;
+  color: var(--dim); font-size: .95em; white-space: pre-wrap; word-break: break-word; }
+.msg.error > .tool-result { color: #e8a0a0; }
 .prompt-delivery { margin-left: .25rem; color: var(--dim); font-size: .8em; font-weight: 600; }
 .prompt-delivery.queued { color: var(--dim); }
 .prompt-delivery.unsent { color: #e05555; }

@@ -6,6 +6,11 @@ import type {
   AccountLimits, Adapter, AdapterEvent, AgentHandle, ApprovalRequest, QuestionOption,
   StartOpts,
 } from '../types.ts';
+// Named for Codex only because that is where it was first needed — the function
+// itself is provider-agnostic (text in, account env in, redacted text out), so
+// it is reused here rather than reimplemented for Claude.
+import { redactCodexText as redactSecrets } from './codex-runtime.ts';
+import { simulatorServer } from './simulator.ts';
 
 /**
  * One line describing a tool call. `listOptions` is off for the approval card,
@@ -57,6 +62,20 @@ export function questionOptions(
       ...(typeof o.description === 'string' && o.description ? { description: o.description } : {}),
     }));
   return options.length ? options : null;
+}
+
+/**
+ * The text a `tool_result` block carries, flattened. The SDK sends either a
+ * plain string or a block array; non-text blocks (images) are dropped, because
+ * the transcript stores text only — see the `result` field on Msg.
+ */
+export function resultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return (content as Record<string, unknown>[])
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text as string)
+    .join('\n');
 }
 
 /** Pure: one SDK message in, zero or more normalized events out. */
@@ -124,7 +143,15 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
     if (Array.isArray(content)) {
       for (const block of content as Record<string, unknown>[]) {
         if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-          out.push({ type: 'tool-result', id: block.tool_use_id, ok: !block.is_error });
+          const text = resultText(block.content);
+          out.push({
+            type: 'tool-result',
+            id: block.tool_use_id,
+            ok: !block.is_error,
+            // Omitted rather than empty: a tool that returns nothing should leave
+            // the transcript row bare, not sprout an empty output box.
+            ...(text ? { text } : {}),
+          });
         }
       }
       return out;
@@ -288,6 +315,12 @@ export const claudeAdapter: Adapter = {
       // callback was never removed.
       env: { ...process.env, ...opts.env } as Options['env'],
       canUseTool,
+      // In-process, so there is no server to spawn, no port and no new
+      // dependency — the handler runs in this process and hands the model a PNG
+      // it can actually look at, which is the one thing Bash cannot do.
+      // Darwin-gated: xcrun exists nowhere else, and advertising a tool that can
+      // only ever fail costs every session context to no purpose.
+      ...(process.platform === 'darwin' ? { mcpServers: { simulator: simulatorServer } } : {}),
       ...(opts.resumeId ? { resume: opts.resumeId } : {}),
     };
 
@@ -298,7 +331,16 @@ export const claudeAdapter: Adapter = {
       try {
         for await (const m of q) {
           emit({ type: 'status', status: 'working' });
-          for (const e of normalizeClaude(m)) emit(e);
+          // Tool output is the one event that can echo the account's own
+          // environment back at us — an agent that runs `env`, or a build that
+          // prints its auth header, would otherwise put a live credential into
+          // state.json, the SSE snapshot and the screen. normalizeClaude stays
+          // pure and env-free, so the scrub happens here, where opts.env is.
+          for (const e of normalizeClaude(m)) {
+            emit(e.type === 'tool-result' && e.text
+              ? { ...e, text: redactSecrets(e.text, opts.env) }
+              : e);
+          }
         }
         emit({ type: 'stopped', reason: 'session ended' });
       } catch (err) {

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
-import { normalizeClaude, approvalQueue, questionOptions } from '../src/agents/claude.ts';
+import { normalizeClaude, approvalQueue, questionOptions, resultText } from '../src/agents/claude.ts';
 import type { AdapterEvent } from '../src/types.ts';
 
 const fixture = JSON.parse(
@@ -118,7 +118,7 @@ test('a tool_result block becomes a tool-result event', () => {
       content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok', is_error: false }],
     },
   } as never);
-  assert.deepEqual(events, [{ type: 'tool-result', id: 't1', ok: true }]);
+  assert.deepEqual(events, [{ type: 'tool-result', id: 't1', ok: true, text: 'ok' }]);
 });
 
 test('a failed tool_result reports ok: false', () => {
@@ -129,7 +129,43 @@ test('a failed tool_result reports ok: false', () => {
       content: [{ type: 'tool_result', tool_use_id: 't2', content: 'boom', is_error: true }],
     },
   } as never);
-  assert.deepEqual(events, [{ type: 'tool-result', id: 't2', ok: false }]);
+  assert.deepEqual(events, [{ type: 'tool-result', id: 't2', ok: false, text: 'boom' }]);
+});
+
+test('resultText flattens a block array and drops non-text blocks', () => {
+  assert.equal(resultText('plain'), 'plain');
+  assert.equal(resultText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'a\nb');
+  assert.equal(
+    resultText([{ type: 'image', source: { data: 'AAAA' } }, { type: 'text', text: 'keep' }]),
+    'keep',
+  );
+});
+
+test('resultText yields nothing for content it cannot read', () => {
+  // Drives the `...(text ? { text } : {})` branch: no output must leave the
+  // transcript row bare rather than sprout an empty output box.
+  for (const junk of [undefined, null, 42, {}, [{ type: 'image' }]]) {
+    assert.equal(resultText(junk), '');
+  }
+});
+
+test('a tool_result carrying an image block still reports no text', () => {
+  assert.deepEqual(
+    normalizeClaude({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 't10',
+          is_error: false,
+          content: [{ type: 'image', source: { type: 'base64', data: 'AAAA' } }],
+        }],
+      },
+    } as never),
+    // No `text` key at all — an image-only result is still a correlation event.
+    [{ type: 'tool-result', id: 't10', ok: true }],
+  );
 });
 
 test('an error result becomes an error msg and a stopped event', () => {
