@@ -23,6 +23,10 @@
   <span id="conn" hidden>reconnecting…</span>
   <div id="meters"></div>
   <button id="queue-badge" type="button" hidden></button>
+  <!-- .menu-wrap so the outside-click closer in app.js recognises clicks inside
+       the open menu as inside; #theme-wrap cancels that class's margin-left,
+       the same way #session-menu .menu-wrap does. Filled by renderTheme(). -->
+  <span id="theme-wrap" class="menu-wrap"></span>
   <!-- Disabled until the first SSE snapshot lands: both buttons' handlers read
        state.settings, which is absent from the pre-snapshot initial `state`
        (see the `let state = ...` in app.js). Re-enabled in es.onmessage. -->

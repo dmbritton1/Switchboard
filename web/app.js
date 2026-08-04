@@ -3,6 +3,7 @@ import {
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken,
+  readTheme, ACCENTS, CANVASES,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [], commands: [] };
@@ -263,6 +264,75 @@ function renderHeader() {
   if (panel && !body) panel = null;
   $('#panel').hidden = !body;
   $('#panel').replaceChildren(...(body ? [body] : []));
+  renderTheme();
+}
+
+/**
+ * The swatch is an element carrying its own data-accent, so it picks up that
+ * accent's --accent from the stylesheet's token block. The hexes stay in one
+ * place — a JS colour table here would be a second copy that the palette test
+ * cannot see.
+ */
+function swatch(accent) {
+  const dot = document.createElement('i');
+  dot.className = 'swatch';
+  dot.dataset.accent = accent;
+  return dot;
+}
+
+/**
+ * Deliberately not menuItem(): that one closes the menu, and here the feedback
+ * is the whole page — trying a second canvas against the same accent should not
+ * cost two clicks to reopen. Escape and any outside click still close it.
+ */
+function themeChoice(content, choose) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.onclick = (e) => { e.stopPropagation(); choose(); };
+  b.append(content);
+  return b;
+}
+
+function renderTheme() {
+  const wrap = $('#theme-wrap');
+  wrap.replaceChildren();
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `menu-btn${menuFor === 'theme' ? ' open' : ''}`;
+  btn.title = 'Theme';
+  btn.setAttribute('aria-label', 'Theme');
+  btn.append(swatch(theme.accent));
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menuFor = menuFor === 'theme' ? null : 'theme';
+    render();
+  };
+  wrap.append(btn);
+  if (menuFor !== 'theme') return;
+
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  menu.onclick = (e) => e.stopPropagation();
+
+  const row = document.createElement('div');
+  row.className = 'swatch-row';
+  for (const a of ACCENTS) {
+    const b = themeChoice(swatch(a), () => setTheme({ accent: a }));
+    b.className = `swatch-btn${theme.accent === a ? ' on' : ''}`;
+    b.title = a;
+    b.setAttribute('aria-label', a);
+    b.setAttribute('aria-pressed', String(theme.accent === a));
+    row.append(b);
+  }
+  menu.append(row);
+  for (const c of CANVASES) {
+    const b = themeChoice(CANVAS_LABEL[c], () => setTheme({ canvas: c }));
+    b.className = theme.canvas === c ? 'on' : '';
+    b.setAttribute('aria-pressed', String(theme.canvas === c));
+    menu.append(b);
+  }
+  wrap.append(menu);
 }
 
 function render() {
@@ -448,6 +518,20 @@ function actionSlot(s) {
 // The session whose ⋯ menu is open, or null. Same pattern as openId: render()
 // reads it, handlers mutate it and re-render.
 let menuFor = null;
+
+const THEME_KEY = 'switchboard.theme';
+const CANVAS_LABEL = { cream: 'Cream', paper: 'Paper', ink: 'Ink', void: 'Void' };
+// The same value the inline <head> script already applied; re-read here so the
+// picker knows what to tick without parsing the attributes back off <html>.
+let theme = readTheme(localStorage.getItem(THEME_KEY));
+
+function setTheme(patch) {
+  theme = { ...theme, ...patch };
+  document.documentElement.dataset.accent = theme.accent;
+  document.documentElement.dataset.canvas = theme.canvas;
+  localStorage.setItem(THEME_KEY, JSON.stringify(theme));
+  render();
+}
 
 function menuItem(label, onclick, extra = '') {
   const b = document.createElement('button');
