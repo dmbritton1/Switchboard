@@ -491,7 +491,9 @@ test('the fonts are served, and the allowlist is still exact-match', async (t) =
     assert.deepEqual([...bytes.subarray(0, 4)], [0x77, 0x4f, 0x46, 0x32]);
   }
   // The fonts are flat in web/ precisely so no path segment is ever joined.
-  for (const path of ['/fonts/inter.woff2', '/../package.json', '/web/inter.woff2']) {
+  // Paths use encoded separators not dots, since fetch normalizes plain /../
+  // away before the server sees it; these survive to test the allowlist guard.
+  for (const path of ['/fonts/inter.woff2', '/..%2fpackage.json', '/web%2f..%2finter.woff2']) {
     assert.equal((await fetch(`${base}${path}`)).status, 404, path);
   }
 });
