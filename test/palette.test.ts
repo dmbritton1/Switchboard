@@ -41,6 +41,15 @@ const CANVASES = ['cream', 'paper', 'ink', 'void'];
 // checks the one surface almost no text is drawn on.
 const SURFACES = ['--canvas', '--surface', '--surface-2', '--well'];
 
+// --accent itself — the raw identity colour, read only by .swatch — is never
+// measured against anything here; only --accent-deep and --accent-lift are,
+// via --accent-text/--accent-line below. Against --surface-2 on Cream, amber
+// measures 2.73. Acceptable by design: WCAG 1.4.11 exempts graphics whose
+// specific presentation is essential to the information, and a colour swatch
+// is the canonical example — you cannot darken amber to pass a contrast check
+// and still have it be amber. The part that *is* a state indicator — which
+// swatch is selected — is the .swatch-btn.on ring painted in --accent-line,
+// and that is measured at >=3:1 below.
 test('every accent stays legible on every canvas', () => {
   for (const a of ACCENTS) {
     const accent = block(`data-accent=${a}`);
@@ -76,6 +85,13 @@ test('every canvas keeps its own text and status colours legible', () => {
       const r = ratio(canvas['--canvas'], canvas[f]);
       assert.ok(r >= 4.5, `${c}: ref pill label on ${f} is ${r.toFixed(2)}`);
     }
+    // --hover itself is never measured as the floor it is — only as this one
+    // background. It is also what [aria-selected=true] rows and .menu
+    // button:hover paint over, and across all four canvases it measures 1.085
+    // to 1.361 against the surface beneath it there — nowhere near the 3:1
+    // WCAG 1.4.11 asks of a component state. Known and deliberate: closing it
+    // means retuning --hover per canvas, considered and declined as larger
+    // than this branch should carry.
     for (const [fg, bg] of [['--needs', '--warn-bg'], ['--error', '--error-bg'], ['--body', '--hover']]) {
       const r = ratio(canvas[fg], canvas[bg]);
       assert.ok(r >= 4.5, `${c}: ${fg} on ${bg} is ${r.toFixed(2)}`);

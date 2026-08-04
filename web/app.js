@@ -284,11 +284,15 @@ function swatch(accent) {
  * Deliberately not menuItem(): that one closes the menu, and here the feedback
  * is the whole page — trying a second canvas against the same accent should not
  * cost two clicks to reopen. Escape and any outside click still close it.
+ * wrap.replaceChildren() in renderTheme() below tears down the button that had
+ * focus, so `key` gives each choice a stable identity to refocus after the
+ * rebuild — otherwise a keyboard user's focus falls to <body> on every pick.
  */
-function themeChoice(content, choose) {
+function themeChoice(content, choose, key) {
   const b = document.createElement('button');
   b.type = 'button';
-  b.onclick = (e) => { e.stopPropagation(); choose(); };
+  b.dataset.choice = key;
+  b.onclick = (e) => { e.stopPropagation(); choose(); $(`#theme-wrap [data-choice="${key}"]`)?.focus(); };
   b.append(content);
   return b;
 }
@@ -318,17 +322,18 @@ function renderTheme() {
   const row = document.createElement('div');
   row.className = 'swatch-row';
   for (const a of ACCENTS) {
-    const b = themeChoice(swatch(a), () => setTheme({ accent: a }));
+    const b = themeChoice(swatch(a), () => setTheme({ accent: a }), `accent:${a}`);
     b.className = `swatch-btn${theme.accent === a ? ' on' : ''}`;
     b.title = a;
-    b.setAttribute('aria-label', a);
+    b.setAttribute('aria-label', `${a} accent`);
     b.setAttribute('aria-pressed', String(theme.accent === a));
     row.append(b);
   }
   menu.append(row);
   for (const c of CANVASES) {
-    const b = themeChoice(CANVAS_LABEL[c], () => setTheme({ canvas: c }));
+    const b = themeChoice(CANVAS_LABEL[c], () => setTheme({ canvas: c }), `canvas:${c}`);
     b.className = theme.canvas === c ? 'on' : '';
+    b.setAttribute('aria-label', `${CANVAS_LABEL[c]} canvas`);
     b.setAttribute('aria-pressed', String(theme.canvas === c));
     menu.append(b);
   }
@@ -523,13 +528,18 @@ const THEME_KEY = 'switchboard.theme';
 const CANVAS_LABEL = { cream: 'Cream', paper: 'Paper', ink: 'Ink', void: 'Void' };
 // The same value the inline <head> script already applied; re-read here so the
 // picker knows what to tick without parsing the attributes back off <html>.
-let theme = readTheme(localStorage.getItem(THEME_KEY));
+// Guarded the same way that inline script guards its own read: blocked storage
+// or a sandboxed context throws here, and this runs at module-evaluation time,
+// so an unguarded throw would take the whole app down before it ever painted.
+let theme = readTheme((() => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } })());
 
 function setTheme(patch) {
   theme = { ...theme, ...patch };
   document.documentElement.dataset.accent = theme.accent;
   document.documentElement.dataset.canvas = theme.canvas;
-  localStorage.setItem(THEME_KEY, JSON.stringify(theme));
+  // A write failure must not skip the attributes above or the render() below —
+  // the theme still applies for the session, it just won't persist.
+  try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch {}
   render();
 }
 
@@ -850,6 +860,8 @@ function approval(s) {
 
 function resumeButton(s) {
   const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'ghost';
   b.textContent = `Resume (${stoppedLabel(s)})`;
   b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'resume', id: s.id }); };
   return b;

@@ -158,13 +158,18 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
   background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px;
   padding: .7rem 1rem; cursor: default; }
 .selection-label { color: var(--muted); font-size: .9em; margin-right: .2rem; }
-#selection-bar button { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
+#selection-bar button:not(.ghost) { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--accent-deep); border-color: var(--accent-deep); color: #ffffff;
   font: inherit; font-weight: 650; cursor: pointer; }
 #selection-bar button:disabled { background: var(--well); border-color: var(--hairline); color: var(--muted);
   cursor: not-allowed; }
-#selection-bar button.ghost { background: var(--surface-2); border-color: var(--hairline); color: var(--ink);
-  font-weight: 500; }
+/* The secondary-button face, standalone rather than scoped to #selection-bar,
+   so any button elsewhere (resumeButton() in app.js is the other user) can
+   share it instead of duplicating the declarations. :not(.ghost) above keeps
+   the primary face from winning on specificity when both would otherwise
+   match a button in the selection bar. */
+.ghost { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 500; cursor: pointer; }
 #selection-status { flex-basis: 100%; margin: 0; color: var(--muted); font-size: .85em; }
 #transcript { max-width: 60rem; }
 .msg { padding: .5rem 0; border-bottom: 1px solid var(--hairline); white-space: pre-wrap; }
@@ -227,9 +232,13 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
    the glyphs as the message gets longer. */
 .cmd-mirror .cmd { color: var(--accent-text); }
 
+/* --surface-2, not --surface: this is a floating popup, same as .combo-list
+   and .menu below, and on the light canvases --surface is *darker* than the
+   page while --surface-2 is lighter — all three popups have to share the same
+   floor or this one alone reads as recessed instead of floating. */
 .cmd-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + .4rem); z-index: 5;
   max-height: 15rem; overflow-y: auto; margin: 0; padding: .3rem; list-style: none;
-  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 8px;
   box-shadow: 0 8px 24px var(--shadow); }
 .cmd-menu li { padding: .35rem .5rem; border-radius: 6px; font-family: var(--mono);
   font-size: .9em; color: var(--ink); cursor: pointer; white-space: nowrap;
@@ -433,6 +442,11 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
   padding: 4rem 1rem; color: var(--muted); text-align: center;
   font: 500 28px/1.2 var(--display); letter-spacing: -.3px; }
+/* #grid-empty holds two <p>s — a headline and a ~60-character hint sentence
+   (see renderGrid() in app.js) — and the rule above was written for one line
+   of display type. Without this the hint inherits 28px display serif too and
+   dominates the message instead of supporting it. */
+#grid-empty > p:last-child { font: 400 14px/1.5 var(--sans); }
 
 /* ---- Scheduling queue --------------------------------------------------- */
 .queue-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
