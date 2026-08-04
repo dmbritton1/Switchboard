@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignLanes, commitGraph, createWorktree, worktreeStatus } from '../src/worktree.ts';
@@ -181,6 +181,36 @@ test('commitGraph tiers another session branch as other', async (t) => {
   assert.equal(graph.find((c) => c.subject === 'my work')?.tier, 'own');
   assert.equal(graph.find((c) => c.subject === 'their work')?.tier, 'other');
   assert.equal(graph.find((c) => c.subject === 'init')?.tier, 'trunk');
+});
+
+test('commitGraph survives a branch name that is also a path', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  // A bare branch name is ambiguous when a same-named path exists at repo
+  // root: `git log docs` is `fatal: ambiguous argument 'docs'` rather than a
+  // revision. This repo layout has top-level docs/, src/, web/, test/, scripts/.
+  await run('git', ['checkout', '-b', 'docs'], { cwd: repo });
+  await mkdir(join(repo, 'docs'));
+  await writeFile(join(repo, 'docs', 'note.txt'), 'hi\n');
+  await run('git', ['add', '.'], { cwd: repo });
+  await run('git', ['commit', '-m', 'add docs dir'], { cwd: repo });
+
+  const graph = await commitGraph(repo, repo, 50);
+
+  assert.ok(graph.length >= 2, 'commits come back instead of the ambiguous-argument rejection being swallowed');
+});
+
+test('commitGraph falls back when trunk is an unborn branch', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await commitAt(repo, 'second');
+  // An orphan branch has no commit yet, so `refs/heads/fresh` does not resolve
+  // — the same shape as detached HEAD: no trunk to split the budget on.
+  await run('git', ['checkout', '--orphan', 'fresh'], { cwd: repo });
+
+  const graph = await commitGraph(repo, repo, 50);
+
+  assert.ok(graph.length >= 2, 'still returns the existing commits rather than throwing');
 });
 
 test('commitGraph falls back to a single walk when the base repo is detached', async (t) => {

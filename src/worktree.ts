@@ -104,7 +104,14 @@ function parseLog(stdout: string, tier: Tier) {
 export async function commitGraph(
   cwd: string, repo: string = cwd, limit = 400,
 ): Promise<GraphCommit[]> {
-  const trunk = await currentBranch(repo).catch(() => '');
+  const branch = await currentBranch(repo).catch(() => '');
+  // Fully qualified, never the bare name: a branch called `docs` or `src` is
+  // also a path here, and `git log docs` is a fatal ambiguity rather than a
+  // revision. --verify doubles as the unborn-branch check, routing an orphan
+  // trunk into the same single-walk fallback as a detached HEAD.
+  const trunk = branch && await run(
+    'git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd },
+  ).then(() => `refs/heads/${branch}`, () => '');
   // Detached HEAD: there is no trunk to split on, so fall back to one walk.
   if (!trunk) {
     const { stdout } = await run(

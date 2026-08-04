@@ -786,7 +786,10 @@ function openTab(id, which) {
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
   openId = id;
   tab = which;
-  if (which === 'graph') { graphCommits = []; loadGraph(); }
+  // The trace belongs to the graph being torn down here, not the next one —
+  // leaving it set re-applies a stale trace to a pointer that's nowhere near
+  // it, and can light up a same-named branch in a different session's graph.
+  if (which === 'graph') { graphCommits = []; tracedBranch = ''; loadGraph(); }
   render();
 }
 

@@ -156,9 +156,11 @@ first-claimer-wins rule `assignLanes` already applies to lanes
 (`src/worktree.ts:57`), so neither file gains a new idiom.
 
 Each commit row and each SVG element gets a `data-branch` attribute. On
-`mouseenter` of a row, the graph container's `data-trace` is set to that branch
-name; CSS attribute selectors bring matching paths, circles, and the branch's
-tip pill to full strength and drop everything else back. `mouseleave` clears it.
+`mouseenter` of a row, `traceBranch(name)` walks `#graph-map`'s `[data-branch]`
+elements and toggles a `.traced` class by comparing `el.dataset.branch === name`
+directly, rather than setting a container-level attribute and matching it with
+a CSS attribute selector — a branch name is arbitrary repo text and would need
+escaping to be safe inside a selector. `mouseleave` clears it the same way.
 
 This composes with tier styling rather than replacing it, and it means a branch
 scrolled away from its tip can still be identified on demand.

@@ -369,21 +369,46 @@ export function commandToken(text, commands) {
  * already applies to lanes — and the walk stops at trunk, which has its own
  * tier and needs no tracing.
  */
+function branchNames(c) {
+  return c.refs
+    .filter((r) => !r.startsWith('tag: '))
+    .map((r) => r.replace(/^HEAD -> /, ''))
+    .filter((r) => r !== 'HEAD');
+}
+
 export function attributeBranches(commits) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const owner = new Map();
+  // Seed each ref-bearing commit with its own name before any walk runs. A
+  // merge's walk reaches every ancestor of both parents, including another
+  // branch's tip (the merged-in branch's own history) — without a seed, that
+  // walk would run first (it's the child, so it's earlier in topo order) and
+  // claim the tip for itself before the tip ever gets to claim its own name.
   for (const c of commits) {
-    const names = c.refs
-      .filter((r) => !r.startsWith('tag: '))
-      .map((r) => r.replace(/^HEAD -> /, ''))
-      .filter((r) => r !== 'HEAD');
+    if (c.tier === 'trunk') continue;
+    const names = branchNames(c);
+    if (names.length && !owner.has(c.h)) owner.set(c.h, names[0]);
+  }
+  for (const c of commits) {
+    const names = branchNames(c);
     for (const name of names) {
       const queue = [c.h];
+      const seen = new Set();
       while (queue.length) {
         const h = queue.shift();
         const cur = at.get(h);
-        // Missing parent (outside the window), already claimed, or trunk.
-        if (!cur || owner.has(h) || cur.tier === 'trunk') continue;
+        // Missing parent (outside the window) or trunk, which has its own tier.
+        if (!cur || cur.tier === 'trunk') continue;
+        // Claimed by a different name: another branch's tip, which the seed
+        // pass pre-claimed for itself — stop rather than swallow its history.
+        const claimed = owner.get(h);
+        if (claimed !== undefined && claimed !== name) continue;
+        // Expanded already. The guard above deliberately lets a same-name node
+        // through, so without this a node reachable by two paths inside one
+        // branch re-expands its whole ancestry each time — exponential on
+        // nested merges, in a function that reruns every 2s poll.
+        if (seen.has(h)) continue;
+        seen.add(h);
         owner.set(h, name);
         queue.push(...cur.p);
       }

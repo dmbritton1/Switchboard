@@ -229,6 +229,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .ref.head { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px currentColor; }
 .ref.remote { background: none; box-shadow: inset 0 0 0 1px var(--line); }
 .ref.remote > span { color: var(--dim); }
+/* A colour that reads fine as a 2px stroke fails contrast as a background
+   behind 0.68rem uppercase text, so pills lift their fill rather than dim the
+   line: #111 on #666 is 3.29:1, under the 4.5:1 this text size needs. */
+.ref.tier-trunk { background: #9aa0a8; }
+.ref.tier-other { background: #7f858c; }
 #graph-empty { color: var(--dim); }
 
 /* ---- New worktree dialog ---------------------------------------------- */
