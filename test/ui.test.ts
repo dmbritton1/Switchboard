@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
 } from '../web/lib.js';
 
 const tool = (name, status = 'ok') => ({ kind: 'tool', name, summary: 'x', status });
@@ -468,4 +468,34 @@ test('a newline ends the command token, for the multi-line new-session prompt', 
   assert.ok(commandMenu('/comp\nthen carry on', 5, CMDS));
   // ...and the menu is gone once the caret is down on the next line.
   assert.equal(commandMenu('/compact\nthen carry on', 12, CMDS), null);
+});
+
+const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });
+
+test('attributeBranches walks each tip back to the trunk fork point', () => {
+  const owner = attributeBranches([
+    gc('f1', ['f0'], 'own', ['HEAD -> feat']),
+    gc('f0', ['t9'], 'own', []),
+    gc('b1', ['t9'], 'other', ['bugfix', 'tag: v1']),
+    gc('t9', ['t8'], 'trunk', ['main']),
+    gc('t8', [], 'trunk', []),
+  ]);
+
+  assert.equal(owner.get('f1'), 'feat');
+  assert.equal(owner.get('f0'), 'feat', 'attribution continues past the tip');
+  assert.equal(owner.get('b1'), 'bugfix', 'a tag is not a branch name');
+  assert.equal(owner.get('t9'), undefined, 'the walk stops at trunk');
+  assert.equal(owner.get('t8'), undefined);
+});
+
+test('attributeBranches gives a shared commit to the first tip that claims it', () => {
+  const owner = attributeBranches([
+    gc('a', ['s'], 'own', ['HEAD -> a-branch']),
+    gc('b', ['s'], 'other', ['b-branch']),
+    gc('s', [], 'other', []),
+  ]);
+
+  assert.equal(owner.get('a'), 'a-branch');
+  assert.equal(owner.get('b'), 'b-branch');
+  assert.equal(owner.get('s'), 'a-branch', 'claimed once, by the branch listed first');
 });

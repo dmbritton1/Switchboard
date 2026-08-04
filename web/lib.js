@@ -359,3 +359,35 @@ export function commandToken(text, commands) {
   const known = commands.some((c) => c === token || c.slice(c.indexOf(':') + 1) === token);
   return known ? text.slice(0, end) : null;
 }
+
+/**
+ * Maps each commit to the branch whose line it sits on, for hover-tracing.
+ *
+ * git only reports a ref at a branch's tip, so every commit below it is
+ * anonymous. Walking back from each tip recovers the rest. The first tip to
+ * claim a commit keeps it — the same first-claimer-wins rule assignLanes
+ * already applies to lanes — and the walk stops at trunk, which has its own
+ * tier and needs no tracing.
+ */
+export function attributeBranches(commits) {
+  const at = new Map(commits.map((c) => [c.h, c]));
+  const owner = new Map();
+  for (const c of commits) {
+    const names = c.refs
+      .filter((r) => !r.startsWith('tag: '))
+      .map((r) => r.replace(/^HEAD -> /, ''))
+      .filter((r) => r !== 'HEAD');
+    for (const name of names) {
+      const queue = [c.h];
+      while (queue.length) {
+        const h = queue.shift();
+        const cur = at.get(h);
+        // Missing parent (outside the window), already claimed, or trunk.
+        if (!cur || owner.has(h) || cur.tier === 'trunk') continue;
+        owner.set(h, name);
+        queue.push(...cur.p);
+      }
+    }
+  }
+  return owner;
+}
