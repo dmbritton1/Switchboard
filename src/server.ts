@@ -320,6 +320,7 @@ export function createServer(opts: {
     return {
       sessions: registry.all(),
       queue: scheduler.all(),
+      settings: registry.settings(),
       accounts: accounts.map((a) => {
         const { limits, error } = usage.getLimits(a.name);
         return {

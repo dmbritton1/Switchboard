@@ -502,6 +502,14 @@ test('GET /events opens an SSE stream with an immediate snapshot', async (t) => 
   }
 });
 
+test('the SSE snapshot carries the current settings', async (t) => {
+  const { base, registry } = await boot(t);
+  registry.setSettings({ sort: 'newest' });
+  const snap = await firstSnapshot(base);
+  assert.equal(snap.settings.sort, 'newest');
+  assert.equal(snap.settings.autoApprove, false);
+});
+
 test('POST /command with an unknown cmd is a 400', async (t) => {
   const { base } = await boot(t);
   const res = await fetch(`${base}/command`, {
