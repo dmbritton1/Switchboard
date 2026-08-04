@@ -1,9 +1,4 @@
 :root {
-  color-scheme: dark;
-  --bg: #111; --card: #1c1c1c; --fg: #eee; --dim: #888;
-  --working: #35c46a; --needs: #d98324; --done: #4a8fe7; --stopped: #666;
-  /* Fields read as wells recessed into the card, so they sit darker than it. */
-  --field: #141414; --line: #2e2e2e;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   /* #bar's real rendered height (measured, not assumed) — anything else that
      sticks below it (#selection-bar, the session view's sticky chrome) reads
@@ -79,16 +74,16 @@
   --lane-a: #22b3a4; --lane-b: #9d7bff;
 }
 
-body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
+body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
   font: 15px/1.4 ui-sans-serif, system-ui, sans-serif; }
 /* Not sticky: it renders directly under #bar in document order and has nothing
    to stick to a second time. */
 #notif-bar { display: flex; align-items: center;
-  flex-wrap: wrap; gap: .8rem; background: #2a1f0f; border: 1px solid #4a3316;
-  color: #e8c48a; border-radius: 10px; padding: .6rem 1rem; margin-bottom: 1rem;
+  flex-wrap: wrap; gap: .8rem; background: var(--warn-bg); border: 1px solid var(--warn-line);
+  color: var(--needs); border-radius: 10px; padding: .6rem 1rem; margin-bottom: 1rem;
   font-size: .9em; }
 #notif-bar button { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--needs);
-  background: var(--needs); color: #1a1000; font: inherit; font-weight: 650; cursor: pointer;
+  background: var(--needs); color: var(--canvas); font: inherit; font-weight: 650; cursor: pointer;
   white-space: nowrap; }
 /* The `hidden` attribute only sets `display: none` from the UA sheet, so any
    author rule with a `display` beats it — `#grid { display: grid }` below kept
@@ -99,24 +94,24 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    `display` next. */
 [hidden] { display: none !important; }
 #grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-.card { background: var(--card); border-radius: 14px; padding: 1rem; cursor: pointer;
+.card { background: var(--surface); border-radius: 14px; padding: 1rem; cursor: pointer;
   border: 1px solid transparent; }
 .card.needs-you { border-color: var(--needs); }
 /* Placeholder for a worktree still being created (see pendingCard() in
    app.js): dashed border marks it as "not real yet" at a glance, and it
    isn't clickable like a real card, so no pointer cursor. */
-.card.pending { cursor: default; border-style: dashed; border-color: var(--line); opacity: .8; }
+.card.pending { cursor: default; border-style: dashed; border-color: var(--hairline); opacity: .8; }
 .status { font-weight: 600; text-transform: lowercase; }
 .status.working { color: var(--working); }
 .status.needs-you { color: var(--needs); }
 .status.done { color: var(--done); }
 .status.stopped { color: var(--stopped); }
-.status.pending { color: var(--dim); animation: pulse 1.4s ease-in-out infinite; }
+.status.pending { color: var(--muted); animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .status.pending { animation: none; } }
 .branch { font-weight: 700; margin: .4rem 0; word-break: break-word; }
-.meta, .wt { color: var(--dim); font-size: .9em; }
-.bar { height: 5px; border-radius: 3px; background: #333; overflow: hidden; margin: .4rem 0; }
+.meta, .wt { color: var(--muted); font-size: .9em; }
+.bar { height: 5px; border-radius: 3px; background: var(--hairline); overflow: hidden; margin: .4rem 0; }
 .bar > i { display: block; height: 100%; background: var(--working); }
 .bar.over > i { background: var(--needs); }
 .approval { margin-top: .6rem; display: flex; flex-wrap: wrap; gap: .4rem; align-items: stretch; }
@@ -125,11 +120,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    UA button styling — a light grey face leaves the dimmed caption unreadable on
    a dark card. Uncaptioned Allow/Deny inherit the same face, just narrower. */
 .approval button { text-align: left; white-space: normal; flex: 0 1 auto; max-width: 22rem;
-  padding: .4rem .7rem; border-radius: 8px; border: 1px solid var(--line);
-  background: var(--field); color: var(--fg); font: inherit; cursor: pointer; }
+  padding: .4rem .7rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--well); color: var(--ink); font: inherit; cursor: pointer; }
 .approval button:hover { border-color: var(--needs); }
 .approval .wt { flex: 1 0 100%; }
-.opt-desc { display: block; margin-top: .2rem; font-size: .85em; color: var(--dim);
+.opt-desc { display: block; margin-top: .2rem; font-size: .85em; color: var(--muted);
   font-weight: 400; }
 
 /* ---- Selection / merge / push ------------------------------------------ */
@@ -139,43 +134,43 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 .card-head .select { cursor: pointer; line-height: 0; }
 #selection-bar { grid-column: 1 / -1; position: sticky; top: var(--bar-h); z-index: 2;
   display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
-  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px;
   padding: .7rem 1rem; cursor: default; }
-.selection-label { color: var(--dim); font-size: .9em; margin-right: .2rem; }
-#selection-bar button { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--line);
-  background: var(--working); border-color: var(--working); color: #08210f;
+.selection-label { color: var(--muted); font-size: .9em; margin-right: .2rem; }
+#selection-bar button { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--accent-deep); border-color: var(--accent-deep); color: #ffffff;
   font: inherit; font-weight: 650; cursor: pointer; }
-#selection-bar button:disabled { background: #2a2a2a; border-color: var(--line); color: var(--dim);
+#selection-bar button:disabled { background: var(--well); border-color: var(--hairline); color: var(--muted);
   cursor: not-allowed; }
-#selection-bar button.ghost { background: #232323; border-color: var(--line); color: var(--fg);
+#selection-bar button.ghost { background: var(--surface-2); border-color: var(--hairline); color: var(--ink);
   font-weight: 500; }
-#selection-status { flex-basis: 100%; margin: 0; color: var(--dim); font-size: .85em; }
+#selection-status { flex-basis: 100%; margin: 0; color: var(--muted); font-size: .85em; }
 #transcript { max-width: 60rem; }
-.msg { padding: .5rem 0; border-bottom: 1px solid #222; white-space: pre-wrap; }
-.msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
+.msg { padding: .5rem 0; border-bottom: 1px solid var(--hairline); white-space: pre-wrap; }
+.msg.tool { color: var(--muted); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }
-.msg.error { color: #e05555; }
+.msg.error { color: var(--error); }
 /* A folded run of tool calls (see groupTranscript()). The run owns the rule
    that each .msg would have drawn, so a collapsed run reads as one line. */
-.tool-run { border-bottom: 1px solid #222; }
-.tool-run > summary { padding: .5rem 0; color: var(--dim); cursor: pointer;
+.tool-run { border-bottom: 1px solid var(--hairline); }
+.tool-run > summary { padding: .5rem 0; color: var(--muted); cursor: pointer;
   font-family: ui-monospace, monospace; font-size: .9em; }
-.tool-run > summary:hover { color: var(--fg); }
-.tool-run[open] > summary { border-bottom: 1px solid #222; }
+.tool-run > summary:hover { color: var(--ink); }
+.tool-run[open] > summary { border-bottom: 1px solid var(--hairline); }
 .tool-run > .msg { border-bottom: 0; padding-left: 1.3rem; }
 /* Tool output. A capped, scrollable box rather than a second disclosure nested
    inside the run: the run is already the fold, and nesting one would cost two
    clicks to read a single command's output. */
 .tool-result { max-height: 12em; overflow: auto; margin: .4rem 0 0;
-  padding: .4rem .6rem; border-radius: 6px; background: #191919;
-  color: var(--dim); font-size: .95em; white-space: pre-wrap; word-break: break-word; }
-.msg.error > .tool-result { color: #e8a0a0; }
-.prompt-delivery { margin-left: .25rem; color: var(--dim); font-size: .8em; font-weight: 600; }
-.prompt-delivery.queued { color: var(--dim); }
-.prompt-delivery.unsent { color: #e05555; }
+  padding: .4rem .6rem; border-radius: 6px; background: var(--well);
+  color: var(--muted); font-size: .95em; white-space: pre-wrap; word-break: break-word; }
+.msg.error > .tool-result { color: var(--error); }
+.prompt-delivery { margin-left: .25rem; color: var(--muted); font-size: .8em; font-weight: 600; }
+.prompt-delivery.queued { color: var(--muted); }
+.prompt-delivery.unsent { color: var(--error); }
 #command-error { display: flex; align-items: center; gap: .6rem; max-width: 60rem;
-  margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid #5a2626; border-radius: 10px;
-  background: #2a1414; color: #ffb4b4; font-size: .9em; }
+  margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid var(--error-line); border-radius: 10px;
+  background: var(--error-bg); color: var(--error); font-size: .9em; }
 #command-error:empty { display: none; }
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
   border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
@@ -185,8 +180,8 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    so without this it lays out in the browser default (Arial 13.3px) while the
    mirror behind it uses the page font at 15px. The caret would then sit at a
    different place than the text the user can see. */
-#prompt { flex: 1; padding: .6rem; background: var(--card); color: var(--fg);
-  border: 1px solid #333; border-radius: 8px; font: inherit; line-height: 1.4; }
+#prompt { flex: 1; padding: .6rem; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px; font: inherit; line-height: 1.4; }
 
 /* Slash-command autocomplete, shared by the chat composer and the new-session
    prompt. Those two fields are styled differently from each other, so the
@@ -195,34 +190,41 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    of them wrong drifts the caret away from the glyphs the user can see. */
 .cmd-box { position: relative; display: flex; }
 .cmd-mirror { position: absolute; inset: 0; box-sizing: border-box; overflow: hidden;
-  color: var(--fg); pointer-events: none; border-style: solid; border-color: transparent; }
+  color: var(--ink); pointer-events: none; border-style: solid; border-color: transparent; }
 /* Only while a command is actually highlighted: the rest of the time the field
    paints its own text, and the selection wart below never applies. */
-.cmd-box.mirroring > .cmd-field { color: transparent; caret-color: var(--fg); }
+.cmd-box.mirroring > .cmd-field { color: transparent; caret-color: var(--ink); }
 /* Translucent, so the mirror's text stays readable through a selection that is
-   painted on the (now transparent) field above it. */
+   painted on the (now transparent) field above it. var(--done) is opaque and
+   would hide the text, and no token in the [data-canvas] blocks carries an
+   alpha, so this stays a literal instead of a token.
+   ponytail: fixed blue regardless of canvas/accent — revisit with a --select
+   token per canvas if this ever reads wrong on Cream. */
 .cmd-box.mirroring > .cmd-field::selection { background: rgba(74, 143, 231, .35); }
 /* Colour only. Any weight or spacing change here makes the mirrored text a
    different width from the field's own layout, and the caret drifts away from
    the glyphs as the message gets longer. */
-.cmd-mirror .cmd { color: var(--done); }
+.cmd-mirror .cmd { color: var(--accent-text); }
 
 .cmd-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + .4rem); z-index: 5;
   max-height: 15rem; overflow-y: auto; margin: 0; padding: .3rem; list-style: none;
-  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
+  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
+  box-shadow: 0 8px 24px var(--shadow); }
 .cmd-menu li { padding: .35rem .5rem; border-radius: 6px; font-family: var(--mono);
-  font-size: .9em; color: var(--fg); cursor: pointer; white-space: nowrap;
+  font-size: .9em; color: var(--ink); cursor: pointer; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; }
-.cmd-menu li[aria-selected="true"] { background: #2a3a52; color: #cfe3ff; }
-.cmd-menu li .ns { color: var(--dim); }
+.cmd-menu li[aria-selected="true"] { background: var(--hover); color: var(--ink); }
+.cmd-menu li .ns { color: var(--muted); }
+/* Same reason as .combo-list's selected-row override below: --hover reads
+   too light for --muted, so the selected row steps up to --body. */
+.cmd-menu li[aria-selected="true"] .ns { color: var(--body); }
 #attach { display: grid; place-content: center; padding: 0 .7rem; cursor: pointer;
-  background: var(--card); border: 1px solid #333; border-radius: 8px; }
-#attach:hover { border-color: var(--working); }
+  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px; }
+#attach:hover { border-color: var(--accent-line); }
 /* Drop target feedback: without it, a drag over the transcript looks inert and
    the user cannot tell whether releasing will do anything. */
-#pane-chat.dropping { outline: 2px dashed var(--working); outline-offset: 6px; border-radius: 8px; }
-#upload-error { margin: .5rem 0 0; color: #e05555; font-size: .85rem; max-width: 60rem; }
+#pane-chat.dropping { outline: 2px dashed var(--accent-line); outline-offset: 6px; border-radius: 8px; }
+#upload-error { margin: .5rem 0 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
 
 /* ---- Session view ------------------------------------------------------ */
@@ -238,20 +240,20 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    (4) but above the transcript's static content, so a long scroll shows
    transcript text sliding *under* this, not through it. */
 #session-sticky { position: sticky; top: var(--bar-h); z-index: 1;
-  background: var(--bg); }
+  background: var(--canvas); }
 #session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
 #session h2 { margin: 0; font-size: 1.05rem; font-weight: 700; word-break: break-word; }
 #session-stopped-reason { flex-basis: 100%; margin: -.4rem 0 0 3.9rem; }
 #session-menu { margin-left: auto; position: relative; }
 #session-menu .menu-wrap { margin-left: 0; }
-#back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--line);
-  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; }
 #tabs { display: flex; gap: .2rem; margin: .9rem 0 1rem;
-  border-bottom: 1px solid var(--line); }
+  border-bottom: 1px solid var(--hairline); }
 #tabs button { padding: .45rem .9rem; border: 0; border-bottom: 2px solid transparent;
-  background: none; color: var(--dim); font: inherit; cursor: pointer; }
-#tabs button:hover { color: var(--fg); }
-#tabs button[aria-selected=true] { color: var(--fg); border-bottom-color: var(--working); }
+  background: none; color: var(--muted); font: inherit; cursor: pointer; }
+#tabs button:hover { color: var(--ink); }
+#tabs button[aria-selected=true] { color: var(--ink); border-bottom-color: var(--accent-line); }
 #session-action:empty { display: none; }
 #session-action { max-width: 60rem; margin-bottom: 1rem; }
 #pane-diff { max-width: 60rem; }
@@ -264,31 +266,31 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #pane-graph { --row: 34px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
-.lane0 { color: #e0574a; } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
-.lane3 { color: #22b3a4; } .lane4 { color: #9d7bff; } .lane5 { color: var(--working); }
+.lane0 { color: var(--error); } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
+.lane3 { color: var(--lane-a); } .lane4 { color: var(--lane-b); } .lane5 { color: var(--working); }
 #graph-svg path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
 #graph-svg circle { stroke: currentColor; fill: currentColor; stroke-width: 2.5; }
 /* Hollow stop = a merge: two lines arriving, the way an interchange is drawn. */
-#graph-svg circle.merge { fill: var(--bg); }
+#graph-svg circle.merge { fill: var(--canvas); }
 #graph-svg circle.head { stroke-width: 3; }
 .commit { height: var(--row); display: flex; align-items: center; gap: .7rem;
   padding: 0 .6rem; border-radius: 6px; white-space: nowrap; }
-.commit:hover { background: var(--card); }
-.commit .hash { color: var(--dim); font-family: var(--mono); font-size: .78rem; flex: none; }
+.commit:hover { background: var(--surface); }
+.commit .hash { color: var(--muted); font-family: var(--mono); font-size: .78rem; flex: none; }
 .commit .subject { overflow: hidden; text-overflow: ellipsis; font-size: .9em; }
-.commit .when { margin-left: auto; padding-left: 1rem; color: var(--dim);
+.commit .when { margin-left: auto; padding-left: 1rem; color: var(--muted);
   font-size: .8rem; flex: none; }
 /* Branches move, tags don't — so branch pills are rounded and tag pills are cut
    square. HEAD gets the double ring an interchange station gets on a real map. */
 .ref { flex: none; font-size: .68rem; font-weight: 700; letter-spacing: .06em;
   text-transform: uppercase; padding: .2rem .45rem; border-radius: 999px;
   background: currentColor; }
-.ref > span { color: #111; }
+.ref > span { color: var(--canvas); }
 .ref.tag { border-radius: 4px; }
-.ref.head { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px currentColor; }
-.ref.remote { background: none; box-shadow: inset 0 0 0 1px var(--line); }
-.ref.remote > span { color: var(--dim); }
-#graph-empty { color: var(--dim); }
+.ref.head { box-shadow: 0 0 0 2px var(--canvas), 0 0 0 4px currentColor; }
+.ref.remote { background: none; box-shadow: inset 0 0 0 1px var(--hairline); }
+.ref.remote > span { color: var(--muted); }
+#graph-empty { color: var(--muted); }
 
 /* ---- New worktree dialog ---------------------------------------------- */
 /* Wide enough that an absolute repo path fits on one line: the whole point of
@@ -297,8 +299,8 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    rather than carrying their own copy — one dialog's chrome, three dialogs, so
    they cannot drift apart the way #when-dialog did when only its datetime
    input had a rule. */
-#new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--line);
-  border-radius: 14px; background: var(--card); color: var(--fg); }
+#new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--hairline);
+  border-radius: 14px; background: var(--surface); color: var(--ink); }
 /* #settings alone: it has more content than #new/#when-dialog ever do (seven
    groups of controls vs. up to five fields) and can outgrow the viewport —
    scrollHeight 973px vs clientHeight 630px measured at a 720px-tall window.
@@ -306,65 +308,72 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    retune #new's or #when-dialog's overflow, which neither needs nor was
    asked for. */
 #settings { max-height: calc(100% - 6em); overflow-y: auto; }
-#new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #000b; }
+#new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #0007; }
 #new form, #when-dialog form, #settings form { display: grid; gap: 1.1rem; padding: 1.5rem; }
 #new h2, #when-dialog h2, #settings h2 { margin: 0; font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }
 .field { display: grid; gap: .4rem; }
-.field > label { color: var(--dim); font-size: .8rem; font-weight: 600;
+.field > label { color: var(--muted); font-size: .8rem; font-weight: 600;
   letter-spacing: .04em; text-transform: uppercase; }
-.hint { margin: 0; color: var(--dim); font-size: .8rem; }
+.hint { margin: 0; color: var(--muted); font-size: .8rem; }
 
 /* Scoped to .field, not the dialog at large: #settings also has checkboxes
    outside .field (in .check), and a bare `input` selector would stretch
    those to width:100% too, blowing out the checkbox layout. */
 #new input, #new textarea, #new select, #when-dialog input, #when-dialog select,
 #settings .field input, #settings select {
-  width: 100%; box-sizing: border-box; padding: .55rem .7rem; background: var(--field);
-  color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  width: 100%; box-sizing: border-box; padding: .55rem .7rem; background: var(--well);
+  color: var(--ink); border: 1px solid var(--hairline); border-radius: 8px;
   font: inherit; }
 #new textarea { resize: vertical; min-height: 4.5rem; }
 #new input[name=repo] { font-family: var(--mono); font-size: .9em; }
 #new :is(input, textarea, select):focus-visible,
 #when-dialog :is(input, select):focus-visible,
 #settings :is(.field input, select):focus-visible {
-  outline: none; border-color: var(--working); box-shadow: 0 0 0 3px #35c46a26; }
+  outline: none; border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--surface-2), 0 0 0 4px var(--accent-line); }
 
 /* Native select popups can't be styled, but the control can. */
 .select-wrap { position: relative; }
 .select-wrap::after { content: '▾'; position: absolute; right: .7rem; top: 50%;
-  translate: 0 -50%; color: var(--dim); pointer-events: none; }
+  translate: 0 -50%; color: var(--muted); pointer-events: none; }
 #new select, #when-dialog select, #settings select { appearance: none; padding-right: 2rem; cursor: pointer; }
 
 .combo { position: relative; }
 .combo-list { position: absolute; z-index: 1; inset-inline: 0; top: calc(100% + .3rem);
   margin: 0; padding: .25rem; list-style: none; max-height: 15rem; overflow-y: auto;
-  background: #1f1f1f; border: 1px solid var(--line); border-radius: 10px;
-  box-shadow: 0 12px 28px #000a; }
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 10px;
+  box-shadow: 0 12px 28px var(--shadow); }
 .combo-list:empty { display: none; }
 .combo-list li { padding: .4rem .55rem; border-radius: 6px; cursor: pointer;
   display: grid; gap: .1rem; }
-.combo-list li[aria-selected=true] { background: #2b2b2b; }
+.combo-list li[aria-selected=true] { background: var(--hover); }
 .combo-list .repo-name { font-weight: 600; }
 /* The tail of a path is what identifies a repo; the head is context, so it can
    truncate. Mono keeps the segments scannable. */
-.combo-list .repo-path { color: var(--dim); font-family: var(--mono); font-size: .78rem;
+.combo-list .repo-path { color: var(--muted); font-family: var(--mono); font-size: .78rem;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.combo-list mark { background: none; color: var(--working); font-weight: 700; }
-.combo-empty { padding: .5rem .55rem; color: var(--dim); font-size: .85rem; }
+/* The selected row sits on --hover, not --surface-2 — --muted and
+   --accent-text both drop under 4.5:1 there on some canvases, so the
+   selected row's foreground text steps up to --body, which clears 4.5:1 on
+   --hover everywhere (already asserted by test/palette.test.ts). */
+.combo-list li[aria-selected=true] .repo-path { color: var(--body); }
+.combo-list mark { background: none; color: var(--accent-text); font-weight: 700; }
+.combo-list li[aria-selected=true] mark { color: var(--body); }
+.combo-empty { padding: .5rem .55rem; color: var(--muted); font-size: .85rem; }
 
 #new menu, #when-dialog menu, #settings menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
 #new menu button, #when-dialog menu button, #settings menu button {
-  padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--line);
-  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
-#new menu button#create { background: var(--working); border-color: var(--working);
-  color: #08210f; font-weight: 650; }
+  padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
+#new menu button#create { background: var(--accent-deep); border-color: var(--accent-deep);
+  color: #ffffff; font-weight: 650; }
 #new menu button:focus-visible, #when-dialog menu button:focus-visible, #settings menu button:focus-visible {
-  outline: 2px solid var(--working); outline-offset: 2px; }
-#new-error, #when-error, #settings-error { margin: 0; color: #e05555; font-size: .85rem; }
+  outline: 2px solid var(--accent-line); outline-offset: 2px; }
+#new-error, #when-error, #settings-error { margin: 0; color: var(--error); font-size: .85rem; }
 #new-error:empty, #when-error:empty, #settings-error:empty { display: none; }
 
 /* ---- Settings dialog ---------------------------------------------------- */
-#settings h3 { margin: 1.2rem 0 0.4rem; font-size: 0.85rem; color: var(--dim); }
+#settings h3 { margin: 1.2rem 0 0.4rem; font-size: 0.85rem; color: var(--muted); }
 #settings h3:first-of-type { margin-top: 0.6rem; }
 .check { display: flex; align-items: center; gap: 0.5rem; margin: 0.35rem 0; }
 
@@ -375,87 +384,87 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
    margins cancel body's padding so the bar spans the window. */
 #bar { position: sticky; top: 0; z-index: 4; display: flex; align-items: center;
   gap: .8rem; flex-wrap: wrap; margin: -1.5rem -1.5rem 1rem; padding: .7rem 1.5rem;
-  background: var(--bg); border-bottom: 1px solid var(--line); }
+  background: var(--canvas); border-bottom: 1px solid var(--hairline); }
 #brand { font-weight: 700; letter-spacing: -.01em; }
 /* EventSource retries silently, so a frozen grid and an idle one are otherwise
    pixel-identical. */
 #conn { color: var(--needs); font-size: .85em; }
 #meters { display: flex; gap: .5rem; flex-wrap: wrap; margin-left: auto; }
 .meter { display: flex; align-items: center; gap: .45rem; padding: .3rem .6rem;
-  border: 1px solid var(--line); border-radius: 999px; background: var(--card);
-  color: var(--fg); font: inherit; font-size: .8rem; cursor: pointer; }
-.meter:hover, .meter.open { border-color: var(--done); }
+  border: 1px solid var(--hairline); border-radius: 999px; background: var(--surface);
+  color: var(--ink); font: inherit; font-size: .8rem; cursor: pointer; }
+.meter:hover, .meter.open { border-color: var(--accent-line); }
 .meter .bar { width: 46px; margin: 0; flex: none; }
 /* #settings-btn gets the same neutral pill as #queue-badge, not #new-btn's
-   green: it sits next to + New as a secondary icon button, not a second
+   accent: it sits next to + New as a secondary icon button, not a second
    primary action. Without this rule it rendered as an unstyled native button
-   in an otherwise fully hand-styled dark header. */
+   in an otherwise fully hand-styled header. */
 #queue-badge, #new-btn, #settings-btn { padding: .35rem .75rem; border-radius: 8px;
-  border: 1px solid var(--line); background: var(--card); color: var(--fg);
+  border: 1px solid var(--hairline); background: var(--surface); color: var(--ink);
   font: inherit; font-size: .85rem; cursor: pointer; white-space: nowrap; }
-#queue-badge.open { border-color: var(--done); }
-#new-btn { background: var(--working); border-color: var(--working);
-  color: #08210f; font-weight: 650; }
-#panel { background: var(--card); border: 1px solid var(--line);
+#queue-badge.open { border-color: var(--accent-line); }
+#new-btn { background: var(--accent-deep); border-color: var(--accent-deep);
+  color: #ffffff; font-weight: 650; }
+#panel { background: var(--surface); border: 1px solid var(--hairline);
   border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
 #panel h3 { margin: 0 0 .6rem; font-size: .95rem; font-weight: 700; }
 #panel .meta { margin: .2rem 0; }
 #grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
-  padding: 4rem 1rem; color: var(--dim); text-align: center; }
+  padding: 4rem 1rem; color: var(--muted); text-align: center; }
 
 /* ---- Scheduling queue --------------------------------------------------- */
 .queue-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
-  gap: .7rem; padding: .4rem 0; border-top: 1px solid var(--line); }
+  gap: .7rem; padding: .4rem 0; border-top: 1px solid var(--hairline); }
 .queue-row:first-of-type { border-top: 0; }
-.queue-when { color: var(--dim); font-size: .85em; white-space: nowrap; }
+.queue-when { color: var(--muted); font-size: .85em; white-space: nowrap; }
 .queue-what { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .queue-del { padding: .1rem .4rem; border: 0; border-radius: 6px; background: none;
-  color: var(--dim); font: inherit; cursor: pointer; }
-.queue-del:hover { color: #e05555; }
+  color: var(--muted); font: inherit; cursor: pointer; }
+.queue-del:hover { color: var(--error); }
 .queue-why { grid-column: 1 / -1; margin: 0 0 .2rem; color: var(--needs); font-size: .8rem; }
 .queue-error { display: flex; align-items: center; gap: .6rem; margin: .6rem 0 0;
-  padding-top: .6rem; border-top: 1px solid #5a2626; color: #ffb4b4; font-size: .85rem; }
+  padding-top: .6rem; border-top: 1px solid var(--error-line); color: var(--error); font-size: .85rem; }
 
 /* ---- Overflow menu ----------------------------------------------------- */
 .card { position: relative; }
 .menu-wrap { margin-left: auto; }
 .menu-btn { padding: .1rem .45rem; border: 1px solid transparent; border-radius: 6px;
-  background: none; color: var(--dim); font: inherit; line-height: 1; cursor: pointer; }
-.menu-btn:hover, .menu-btn.open { color: var(--fg); border-color: var(--line); }
+  background: none; color: var(--muted); font: inherit; line-height: 1; cursor: pointer; }
+.menu-btn:hover, .menu-btn.open { color: var(--ink); border-color: var(--hairline); }
 .menu { position: absolute; z-index: 5; top: 1.9rem; right: 0; min-width: 13rem;
-  display: grid; padding: .25rem; background: #1f1f1f; border: 1px solid var(--line);
-  border-radius: 10px; box-shadow: 0 12px 28px #000a; }
+  display: grid; padding: .25rem; background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 10px; box-shadow: 0 12px 28px var(--shadow); }
 .menu button, .menu label { display: flex; align-items: center; gap: .5rem; width: 100%;
   padding: .4rem .55rem; border: 0; border-radius: 6px; background: none;
-  color: var(--fg); font: inherit; font-size: .9em; text-align: left; cursor: pointer; }
-.menu button:hover, .menu label:hover { background: #2b2b2b; }
-.menu .danger { color: #e05555; }
+  color: var(--ink); font: inherit; font-size: .9em; text-align: left; cursor: pointer; }
+.menu button:hover, .menu label:hover { background: var(--hover); }
+.menu .danger { color: var(--error); }
 .menu label:has(:disabled) { opacity: .45; cursor: not-allowed; }
 .waiting { margin: .6rem 0 0; color: var(--needs); font-size: .9em; }
-.stopped-detail { margin: .6rem 0 0; color: var(--dim); font-size: .85em; }
-.stopped-detail span { color: var(--dim); }
+.stopped-detail { margin: .6rem 0 0; color: var(--muted); font-size: .85em; }
+.stopped-detail span { color: var(--muted); }
 
 /* ---- Delete dialog ----------------------------------------------------- */
-#del { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--line);
-  border-radius: 14px; background: var(--card); color: var(--fg); }
-#del::backdrop { background: #000b; }
+#del { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--hairline);
+  border-radius: 14px; background: var(--surface); color: var(--ink); }
+#del::backdrop { background: #0007; }
 #del form { display: grid; gap: .9rem; padding: 1.4rem; }
 #del h2 { margin: 0; font-size: 1.05rem; font-weight: 700; }
 #del-branch { margin: 0; font-weight: 700; word-break: break-word; }
 .del-wt { display: flex; align-items: center; gap: .5rem; cursor: pointer; }
 #del menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
-#del menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--line);
-  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
-#del menu button#del-go { background: #7a2626; border-color: #a33; color: #ffdede;
+#del menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
+#del menu button#del-go { background: var(--error); border-color: var(--error); color: var(--canvas);
   font-weight: 650; }
 
 /* ---- Inline interrupt -------------------------------------------------- */
 #interrupt { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
   max-width: 60rem; margin-bottom: 1rem; padding: .6rem 1rem; border-radius: 10px;
-  background: #2a1f0f; border: 1px solid #4a3316; color: #e8c48a; font-size: .9em; }
+  background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--needs); font-size: .9em; }
 #interrupt span { flex: 1 1 20rem; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 #interrupt button { padding: .3rem .7rem; border-radius: 7px; border: 1px solid var(--needs);
   background: none; color: var(--needs); font: inherit; cursor: pointer; white-space: nowrap; }
-#interrupt button:hover { background: var(--needs); color: #1a1000; }
-#interrupt button.more { border-color: transparent; color: var(--dim); }
+#interrupt button:hover { background: var(--needs); color: var(--canvas); }
+#interrupt button.more { border-color: transparent; color: var(--muted); }
