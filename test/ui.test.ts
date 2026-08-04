@@ -520,6 +520,24 @@ test('every branch hue has a rule in the stylesheet', async () => {
   assert.doesNotMatch(css, new RegExp(`\\.hue-${HUES} \\{`), `.hue-${HUES} is unreachable`);
 });
 
+// The ⏱ button did nothing at all on an empty composer, which reads as a dead
+// button. Both halves of the fix are load-bearing: `required` is what produces
+// the message, and composerText() is what routes both buttons through it. A DOM
+// harness for one click is more machinery than the check is worth.
+test('an empty composer explains itself instead of silently doing nothing', async () => {
+  const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+  const js = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+  assert.match(html, /<textarea id="prompt"[^>]*\srequired/, '#prompt lost its required attribute');
+  assert.match(js, /function composerText\(\)[\s\S]*?reportValidity\(\)/, 'composerText no longer reports why');
+  for (const [name, handler] of [
+    ['submit', js.match(/\$\('#composer'\)\.onsubmit = [\s\S]*?\n\};/)?.[0]],
+    ['schedule', js.match(/\$\('#schedule-btn'\)\.onclick = [\s\S]*?\n\};/)?.[0]],
+  ]) {
+    assert.ok(handler, `could not find the ${name} handler`);
+    assert.match(handler, /composerText\(\)/, `the ${name} handler bypasses composerText`);
+  }
+});
+
 const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });
 
 test('attributeBranches walks each tip back to the trunk fork point', () => {
