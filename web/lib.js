@@ -404,6 +404,24 @@ function branchNames(c) {
     .filter((r) => r !== 'HEAD');
 }
 
+/**
+ * A hue slot per branch name — the index of a `.hue-N` rule in the stylesheet,
+ * which is where the actual colours live.
+ *
+ * Keyed on the name and not the lane: lanes are recycled as branches close, so
+ * a lane colour renamed itself mid-graph and said nothing about which branch
+ * you were looking at. Assigned by sorted position rather than by hashing the
+ * name, which collides — five branches drew in three colours on the first repo
+ * this was tried against. Sorting gives the first HUES branches a colour each;
+ * past that they wrap, which hover-to-trace separates. The cost is that adding
+ * a branch shifts the colours of the names sorting after it.
+ */
+export const HUES = 5;
+
+export function branchHues(names) {
+  return new Map([...new Set(names)].sort().map((name, i) => [name, i % HUES]));
+}
+
 export function attributeBranches(commits) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const owner = new Map();

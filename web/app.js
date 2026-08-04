@@ -2,7 +2,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES,
 } from './lib.js';
 
@@ -1062,8 +1062,19 @@ function traceBranch(name) {
   map.classList.toggle('tracing', matched);
 }
 
+/** `hue-N` for a branch, or nothing for trunk, which stays the neutral spine. */
+const hueClass = (hues, name) => (hues.has(name) ? ` hue-${hues.get(name)}` : '');
+
 function renderGraphPane(s) {
   const rows = $('#graph-rows');
+  // Delegated to the map, so a line or a dot traces exactly the way its row
+  // does — the graph is the part people point at. Assignment, not
+  // addEventListener: this runs on every 2s poll and must not stack up.
+  // Leaving a [data-branch] for the gaps between rows clears the trace, which
+  // is why there is no separate per-row mouseleave.
+  const map = $('#graph-map');
+  map.onmouseover = (e) => traceBranch(e.target.closest('[data-branch]')?.dataset.branch ?? '');
+  map.onmouseleave = () => traceBranch('');
   if (!graphCommits.length) {
     rows.replaceChildren(Object.assign(document.createElement('p'), {
       id: 'graph-empty', textContent: 'No commits yet.',
@@ -1072,19 +1083,19 @@ function renderGraphPane(s) {
     return;
   }
   const owner = attributeBranches(graphCommits);
-  const width = drawGraph(graphCommits, owner);
+  const hues = branchHues(owner.values());
+  const width = drawGraph(graphCommits, owner, hues);
   rows.replaceChildren(...graphCommits.map((c) => {
+    const branch = owner.get(c.h) ?? '';
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
-    row.dataset.branch = owner.get(c.h) ?? '';
-    row.onmouseenter = () => traceBranch(owner.get(c.h) ?? '');
-    row.onmouseleave = () => traceBranch('');
+    row.dataset.branch = branch;
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
     row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.tier));
+    for (const r of c.refs) row.append(refPill(r, c.tier, hueClass(hues, branch)));
     const subject = document.createElement('span');
     subject.className = 'subject';
     subject.textContent = c.subject;
@@ -1107,7 +1118,7 @@ const svgEl = (tag, attrs) => {
   return n;
 };
 
-function drawGraph(commits, owner) {
+function drawGraph(commits, owner, hues) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const svg = $('#graph-svg');
   const width = PAD * 2 + Math.max(0, ...commits.map((c) => c.lane)) * LANE;
@@ -1133,25 +1144,37 @@ function drawGraph(commits, owner) {
       // A merge's second parent is drawn in the parent's tier, not the child's:
       // that line belongs to the branch being merged in.
       const from = i ? p : c;
-      svg.append(svgEl('path', { d, class: `tier-${from.tier}`, 'data-branch': branch(from) }));
+      const name = branch(from);
+      // Two paths, one line: `.hit` is a transparent 14px-wide stroke carrying
+      // the hover, because a 2.5px vertical line spaced 24px from the next one
+      // is a target you miss more often than you hit. Drawn first so the real
+      // line paints over it.
+      svg.append(
+        svgEl('path', { d, class: 'hit', 'data-branch': name }),
+        svgEl('path', { d, class: `tier-${from.tier}${hueClass(hues, name)}`, 'data-branch': name }),
+      );
     }
   }
   for (const c of commits) {
     const head = c.refs.some((r) => r.startsWith('HEAD'));
     svg.append(svgEl('circle', {
       cx: x(c), cy: y(c), r: head ? DOT + 1.5 : DOT,
-      class: `tier-${c.tier}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      class: `tier-${c.tier}${hueClass(hues, branch(c))}`
+        + `${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
       'data-branch': branch(c),
     }));
   }
   return width;
 }
 
-function refPill(raw, tier) {
+// The pill takes its row's hue, not its own name's: a tag, or a second branch
+// sitting on the same tip, belongs to the line it is pinned to and should read
+// as part of it rather than introducing a colour that appears nowhere else.
+function refPill(raw, tier, hue) {
   const tag = raw.startsWith('tag: ');
   const name = raw.replace(/^tag: /, '').replace(/^HEAD -> /, '');
   const pill = document.createElement('span');
-  pill.className = `ref tier-${tier}${tag ? ' tag' : ''}`
+  pill.className = `ref tier-${tier}${hue}${tag ? ' tag' : ''}`
     + (!tag && name.includes('/') ? ' remote' : '') + (raw.startsWith('HEAD') ? ' head' : '');
   // Branch and tag names come from the repo, so they go in as text, never markup.
   const label = document.createElement('span');

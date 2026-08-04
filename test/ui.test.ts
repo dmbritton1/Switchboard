@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues, HUES,
   readTheme, ACCENTS, CANVASES,
 } from '../web/lib.js';
 
@@ -496,6 +496,28 @@ test('the inline theme script accepts exactly the names lib.js knows', async () 
   const [, canvases] = html.match(/\^\(([a-z|]+)\)\$\/\.test\(t\.canvas\)/) ?? [];
   assert.deepEqual(accents?.split('|'), [...ACCENTS]);
   assert.deepEqual(canvases?.split('|'), [...CANVASES]);
+});
+
+test('branchHues gives each of the first HUES branches a colour of its own', () => {
+  const hues = branchHues(['perf-cache', 'main', 'spike-wasm', 'docs-rewrite', 'bugfix']);
+  assert.equal(hues.size, HUES);
+  assert.equal(new Set(hues.values()).size, HUES, 'two branches drew in the same colour');
+});
+
+test('branchHues dedupes and wraps past the palette', () => {
+  // Repeats are what it is actually fed: one name per commit, not per branch.
+  assert.deepEqual(branchHues(['b', 'a', 'b']), new Map([['a', 0], ['b', 1]]));
+  const wrapped = branchHues(Array.from({ length: HUES + 2 }, (_, i) => `b${i}`));
+  assert.equal(wrapped.get(`b${HUES}`), 0, 'the HUES+1th branch wraps to the first colour');
+  for (const hue of wrapped.values()) assert.ok(hue >= 0 && hue < HUES, `${hue} is off-palette`);
+});
+
+// The colours live in the stylesheet, so a hue the JS can emit without a rule
+// to match paints nothing and the line inherits whatever is above it.
+test('every branch hue has a rule in the stylesheet', async () => {
+  const css = await readFile(new URL('../web/style.css', import.meta.url), 'utf8');
+  for (let i = 0; i < HUES; i++) assert.match(css, new RegExp(`\\.hue-${i} \\{`), `no .hue-${i}`);
+  assert.doesNotMatch(css, new RegExp(`\\.hue-${HUES} \\{`), `.hue-${HUES} is unreachable`);
 });
 
 const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });

@@ -290,24 +290,37 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 
 /* ---- Commit graph ------------------------------------------------------ */
 /* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
-   interchange where two lines join. Three tiers rather than a per-lane palette:
-   lanes are reused as branches close, so a lane colour renamed itself mid-graph
-   and said nothing about which branch you were looking at. Tier does. Weight
-   carries the ranking as well as hue, so the three stay apart when several grey
-   branches run side by side. */
+   interchange where two lines join. Colour is per branch *name*, not per lane —
+   lanes are recycled as branches close, so a lane colour renamed itself
+   mid-graph and said nothing about which branch you were looking at. Weight
+   carries the tier ranking on top of hue, so the checked-out branch still
+   stands out among branches that happen to share its colour. */
 #pane-graph { --row: 34px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
-/* Text tokens, not --muted/--stopped: those two are the same hex on cream and
-   ink, which would collapse trunk and other into one grey. --body and --muted
-   stay apart on all four canvases, and the palette test already measures both
-   against every surface — so the pills below inherit AA contrast for free
-   instead of needing literal greys of their own. */
+/* Tier is the fallback colour, for a commit whose own tip fell outside the
+   fetched window and so has no branch name to take a hue from. --body/--muted
+   rather than --muted/--stopped: that pair is the same hex on cream and ink
+   and would collapse two tiers into one grey. */
 .tier-own { color: var(--done); }
 .tier-trunk { color: var(--body); }
 .tier-other { color: var(--muted); }
+/* Hue is per branch and outranks tier by source order — same specificity, so
+   these five must stay below the three above. Trunk is deliberately left out:
+   the spine reads as the thing the coloured branches leave and rejoin. Five
+   tokens the .ref pills are already contrast-checked against (see
+   test/palette.test.ts), so a pill's label stays legible on any of them. */
+.hue-0 { color: var(--lane-a); }
+.hue-1 { color: var(--lane-b); }
+.hue-2 { color: var(--done); }
+.hue-3 { color: var(--working); }
+.hue-4 { color: var(--needs); }
 #graph-svg path.tier-own { stroke-width: 3; }
 #graph-svg path.tier-other { stroke-width: 2; }
+/* The hover target for each line: invisible, but far wider than the line it
+   shadows. pointer-events is explicit because a transparent stroke is not
+   reliably "painted" for hit-testing. */
+#graph-svg path.hit { stroke: transparent; stroke-width: 14; pointer-events: stroke; }
 /* Tracing one branch: everything not on it recedes rather than disappears, so
    the traced line is read in context instead of floating on its own. */
 #graph-map.tracing [data-branch]:not(.traced) { opacity: .2; }
