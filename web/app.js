@@ -1395,17 +1395,36 @@ const paintNewMirror = wireCommandMenu({
   menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
 });
 
+/**
+ * The message both composer buttons act on, or '' with the reason on screen.
+ *
+ * Both of them used to bail on an empty box with a bare `return`, which is a
+ * control that looks enabled and does nothing — the reported bug was ⏱, but
+ * Send had it too, so the check lives here once rather than at each caller.
+ * `required` on the field (see index.html) covers Send's empty case natively;
+ * trimming here first makes a whitespace-only message fail it as well, and
+ * reportValidity() gets ⏱ the same bubble even though type=button skips
+ * validation.
+ */
+function composerText() {
+  const field = $('#prompt');
+  field.value = field.value.trim();
+  if (field.value) return field.value;
+  paintMirror();
+  $('#composer').reportValidity();
+  return '';
+}
+
 $('#composer').onsubmit = async (e) => {
   e.preventDefault();
-  const text = $('#prompt').value.trim();
+  const text = composerText();
   if (!text) return;
   const result = await runSessionCommand({ cmd: 'send', id: openId, text });
   if (result.ok) { $('#prompt').value = ''; paintMirror(); }
 };
 
 $('#schedule-btn').onclick = () => {
-  const text = $('#prompt').value.trim();
-  if (!text) return;
+  if (!composerText()) return;
   const dialog = $('#when-dialog');
   // Same reason as openNew(): without this, a dialog reopened after an earlier
   // "When usage resets" pick still shows that choice (and the datetime field
