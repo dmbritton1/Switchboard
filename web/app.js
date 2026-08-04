@@ -114,6 +114,8 @@ function stoppedLabel(s) {
 // neither of which is a session-state event, so this view polls instead of
 // riding render().
 let graphCommits = [];
+// The branch currently hover-traced, so a poll-driven rebuild can restore it.
+let tracedBranch = '';
 
 function setPanel(next) {
   panel = panel === next ? null : next;
@@ -943,13 +945,22 @@ function renderDiffPane(s) {
  * Lights up one branch across the whole graph. Elements are compared by
  * dataset rather than matched with a selector, because a branch name is
  * arbitrary repo text and would otherwise need escaping to be safe in one.
+ *
+ * `.tracing` follows whether anything actually matched. The rows and lines are
+ * replaced on every 2s poll while `#graph-map` itself survives, so a blindly
+ * set flag would outlive the elements it dimmed and leave the whole graph
+ * faded until the pointer moved again.
  */
 function traceBranch(name) {
   const map = $('#graph-map');
-  map.classList.toggle('tracing', Boolean(name));
+  tracedBranch = name;
+  let matched = false;
   for (const el of map.querySelectorAll('[data-branch]')) {
-    el.classList.toggle('traced', Boolean(name) && el.dataset.branch === name);
+    const on = Boolean(name) && el.dataset.branch === name;
+    el.classList.toggle('traced', on);
+    matched ||= on;
   }
+  map.classList.toggle('tracing', matched);
 }
 
 function renderGraphPane(s) {
@@ -984,6 +995,9 @@ function renderGraphPane(s) {
     row.append(subject, when);
     return row;
   }));
+  // The rebuild above discarded the elements carrying `.traced`; restore it so
+  // a poll landing mid-hover neither drops the trace nor strands `.tracing`.
+  traceBranch(tracedBranch);
 }
 
 // ---- Commit graph -------------------------------------------------------
