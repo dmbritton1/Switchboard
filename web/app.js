@@ -2,7 +2,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken,
+  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [], commands: [] };
@@ -948,16 +948,18 @@ function renderGraphPane(s) {
     $('#graph-svg').replaceChildren();
     return;
   }
-  const width = drawGraph(graphCommits);
+  const owner = attributeBranches(graphCommits);
+  const width = drawGraph(graphCommits, owner);
   rows.replaceChildren(...graphCommits.map((c) => {
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
+    if (owner.has(c.h)) row.dataset.branch = owner.get(c.h);
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
     row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.lane));
+    for (const r of c.refs) row.append(refPill(r, c.tier));
     const subject = document.createElement('span');
     subject.className = 'subject';
     subject.textContent = c.subject;
@@ -977,7 +979,7 @@ const svgEl = (tag, attrs) => {
   return n;
 };
 
-function drawGraph(commits) {
+function drawGraph(commits, owner) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const svg = $('#graph-svg');
   const width = PAD * 2 + Math.max(0, ...commits.map((c) => c.lane)) * LANE;
@@ -986,6 +988,7 @@ function drawGraph(commits) {
   svg.replaceChildren();
   const x = (c) => PAD + c.lane * LANE;
   const y = (c) => ROW / 2 + c.row * ROW;
+  const branch = (c) => owner.get(c.h) ?? '';
 
   for (const c of commits) {
     for (const [i, ph] of c.p.entries()) {
@@ -999,26 +1002,28 @@ function drawGraph(commits) {
       const d = x1 === x2
         ? `M${x1},${y1}V${y2}`
         : `M${x1},${y1}V${bend}C${x1},${y2} ${x2},${bend} ${x2},${y2}`;
-      // A merge's second parent is drawn in the parent's colour, not the child's:
+      // A merge's second parent is drawn in the parent's tier, not the child's:
       // that line belongs to the branch being merged in.
-      svg.append(svgEl('path', { d, class: `lane${(i ? p.lane : c.lane) % 6}` }));
+      const from = i ? p : c;
+      svg.append(svgEl('path', { d, class: `tier-${from.tier}`, 'data-branch': branch(from) }));
     }
   }
   for (const c of commits) {
     const head = c.refs.some((r) => r.startsWith('HEAD'));
     svg.append(svgEl('circle', {
       cx: x(c), cy: y(c), r: head ? DOT + 1.5 : DOT,
-      class: `lane${c.lane % 6}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      class: `tier-${c.tier}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      'data-branch': branch(c),
     }));
   }
   return width;
 }
 
-function refPill(raw, lane) {
+function refPill(raw, tier) {
   const tag = raw.startsWith('tag: ');
   const name = raw.replace(/^tag: /, '').replace(/^HEAD -> /, '');
   const pill = document.createElement('span');
-  pill.className = `ref lane${lane % 6}${tag ? ' tag' : ''}`
+  pill.className = `ref tier-${tier}${tag ? ' tag' : ''}`
     + (!tag && name.includes('/') ? ' remote' : '') + (raw.startsWith('HEAD') ? ' head' : '');
   // Branch and tag names come from the repo, so they go in as text, never markup.
   const label = document.createElement('span');

@@ -190,14 +190,19 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 
 /* ---- Commit graph ------------------------------------------------------ */
 /* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
-   interchange where two lines join. Lane colours reuse the status palette —
-   there are no status chips in this view, so nothing collides, and the app
-   keeps one set of colours instead of two. */
+   interchange where two lines join. Three tiers rather than a per-lane palette:
+   lanes are reused as branches close, so a lane colour renamed itself mid-graph
+   and said nothing about which branch you were looking at. Tier does. Weight
+   carries the ranking as well as hue, so the three stay apart when several grey
+   branches run side by side. */
 #pane-graph { --row: 34px; }
 #graph-map { position: relative; }
 #graph-svg { position: absolute; top: 0; left: 0; overflow: visible; }
-.lane0 { color: #e0574a; } .lane1 { color: var(--done); } .lane2 { color: var(--needs); }
-.lane3 { color: #22b3a4; } .lane4 { color: #9d7bff; } .lane5 { color: var(--working); }
+.tier-own { color: var(--done); }
+.tier-trunk { color: var(--dim); }
+.tier-other { color: var(--stopped); }
+#graph-svg path.tier-own { stroke-width: 3; }
+#graph-svg path.tier-other { stroke-width: 2; }
 #graph-svg path { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; }
 #graph-svg circle { stroke: currentColor; fill: currentColor; stroke-width: 2.5; }
 /* Hollow stop = a merge: two lines arriving, the way an interchange is drawn. */
