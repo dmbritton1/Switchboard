@@ -1,10 +1,31 @@
+/* Copernicus and StyreneB are licensed and unavailable. EB Garamond takes the
+   display role at weight 500 — not 400, which is too light on screen for the
+   weight Copernicus carries — and Inter takes body and UI. Both are Latin
+   subsets already, so no unicode-range. */
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/garamond.woff2') format('woff2');
+  font-weight: 400 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/inter.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --display: 'EB Garamond', Georgia, 'Times New Roman', serif;
+  --sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
   /* #bar's real rendered height (measured, not assumed) — anything else that
      sticks below it (#selection-bar, the session view's sticky chrome) reads
      this instead of hard-coding a number that would drift the moment #bar's
      padding or content does. */
-  --bar-h: 3.476rem;
+  --bar-h: 4.093rem;
 }
 
 /* ---- Theme tokens ------------------------------------------------------- */
@@ -74,13 +95,13 @@
   --lane-a: #22b3a4; --lane-b: #9d7bff;
 }
 
-body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
-  font: 15px/1.4 ui-sans-serif, system-ui, sans-serif; }
+body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
+  font: 16px/1.5 var(--sans); }
 /* Not sticky: it renders directly under #bar in document order and has nothing
    to stick to a second time. */
 #notif-bar { display: flex; align-items: center;
   flex-wrap: wrap; gap: .8rem; background: var(--warn-bg); border: 1px solid var(--warn-line);
-  color: var(--needs); border-radius: 10px; padding: .6rem 1rem; margin-bottom: 1rem;
+  color: var(--needs); border-radius: 12px; padding: .6rem 1rem; margin-bottom: 1rem;
   font-size: .9em; }
 #notif-bar button { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--needs);
   background: var(--needs); color: var(--canvas); font: inherit; font-weight: 650; cursor: pointer;
@@ -93,8 +114,8 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
    `#pane-*` panes), which is the same bug waiting on whichever one gets a
    `display` next. */
 [hidden] { display: none !important; }
-#grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-.card { background: var(--surface); border-radius: 14px; padding: 1rem; cursor: pointer;
+#grid { display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.card { background: var(--surface); border-radius: 12px; padding: 1.5rem; cursor: pointer;
   border: 1px solid transparent; }
 .card.needs-you { border-color: var(--needs); }
 /* Placeholder for a worktree still being created (see pendingCard() in
@@ -109,8 +130,8 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 .status.pending { color: var(--muted); animation: pulse 1.4s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .status.pending { animation: none; } }
-.branch { font-weight: 700; margin: .4rem 0; word-break: break-word; }
-.meta, .wt { color: var(--muted); font-size: .9em; }
+.branch { font: 500 18px/1.3 var(--display); letter-spacing: -.02em; margin: .4rem 0; word-break: break-word; }
+.meta, .wt { color: var(--muted); font-size: 14px; }
 .bar { height: 5px; border-radius: 3px; background: var(--hairline); overflow: hidden; margin: .4rem 0; }
 .bar > i { display: block; height: 100%; background: var(--working); }
 .bar.over > i { background: var(--needs); }
@@ -169,7 +190,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 .prompt-delivery.queued { color: var(--muted); }
 .prompt-delivery.unsent { color: var(--error); }
 #command-error { display: flex; align-items: center; gap: .6rem; max-width: 60rem;
-  margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid var(--error-line); border-radius: 10px;
+  margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid var(--error-line); border-radius: 12px;
   background: var(--error-bg); color: var(--error); font-size: .9em; }
 #command-error:empty { display: none; }
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
@@ -242,7 +263,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 #session-sticky { position: sticky; top: var(--bar-h); z-index: 1;
   background: var(--canvas); }
 #session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
-#session h2 { margin: 0; font-size: 1.05rem; font-weight: 700; word-break: break-word; }
+#session h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; word-break: break-word; }
 #session-stopped-reason { flex-basis: 100%; margin: -.4rem 0 0 3.9rem; }
 #session-menu { margin-left: auto; position: relative; }
 #session-menu .menu-wrap { margin-left: 0; }
@@ -300,7 +321,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
    they cannot drift apart the way #when-dialog did when only its datetime
    input had a rule. */
 #new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--hairline);
-  border-radius: 14px; background: var(--surface); color: var(--ink); }
+  border-radius: 16px; background: var(--surface); color: var(--ink); }
 /* #settings alone: it has more content than #new/#when-dialog ever do (seven
    groups of controls vs. up to five fields) and can outgrow the viewport —
    scrollHeight 973px vs clientHeight 630px measured at a 720px-tall window.
@@ -310,11 +331,11 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 #settings { max-height: calc(100% - 6em); overflow-y: auto; }
 #new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #0007; }
 #new form, #when-dialog form, #settings form { display: grid; gap: 1.1rem; padding: 1.5rem; }
-#new h2, #when-dialog h2, #settings h2 { margin: 0; font-size: 1.05rem; font-weight: 700; letter-spacing: -.01em; }
+#new h2, #when-dialog h2, #settings h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
 .field { display: grid; gap: .4rem; }
-.field > label { color: var(--muted); font-size: .8rem; font-weight: 600;
-  letter-spacing: .04em; text-transform: uppercase; }
-.hint { margin: 0; color: var(--muted); font-size: .8rem; }
+.field > label { color: var(--muted); font-size: 12px; font-weight: 500;
+  letter-spacing: 1.5px; text-transform: uppercase; }
+.hint { margin: 0; color: var(--muted); font-size: 14px; }
 
 /* Scoped to .field, not the dialog at large: #settings also has checkboxes
    outside .field (in .check), and a bare `input` selector would stretch
@@ -341,7 +362,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 .combo { position: relative; }
 .combo-list { position: absolute; z-index: 1; inset-inline: 0; top: calc(100% + .3rem);
   margin: 0; padding: .25rem; list-style: none; max-height: 15rem; overflow-y: auto;
-  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 10px;
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 12px;
   box-shadow: 0 12px 28px var(--shadow); }
 .combo-list:empty { display: none; }
 .combo-list li { padding: .4rem .55rem; border-radius: 6px; cursor: pointer;
@@ -383,9 +404,9 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
    conditional bands that shove the grid down under the cursor. Negative
    margins cancel body's padding so the bar spans the window. */
 #bar { position: sticky; top: 0; z-index: 4; display: flex; align-items: center;
-  gap: .8rem; flex-wrap: wrap; margin: -1.5rem -1.5rem 1rem; padding: .7rem 1.5rem;
+  gap: .8rem; flex-wrap: wrap; margin: -2rem -2rem 1.5rem; padding: .9rem 2rem;
   background: var(--canvas); border-bottom: 1px solid var(--hairline); }
-#brand { font-weight: 700; letter-spacing: -.01em; }
+#brand { font: 500 20px/1 var(--display); letter-spacing: -.02em; }
 /* EventSource retries silently, so a frozen grid and an idle one are otherwise
    pixel-identical. */
 #conn { color: var(--needs); font-size: .85em; }
@@ -401,16 +422,17 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
    in an otherwise fully hand-styled header. */
 #queue-badge, #new-btn, #settings-btn { padding: .35rem .75rem; border-radius: 8px;
   border: 1px solid var(--hairline); background: var(--surface); color: var(--ink);
-  font: inherit; font-size: .85rem; cursor: pointer; white-space: nowrap; }
+  font: inherit; font-size: 15px; cursor: pointer; white-space: nowrap; }
 #queue-badge.open { border-color: var(--accent-line); }
 #new-btn { background: var(--accent-deep); border-color: var(--accent-deep);
   color: #ffffff; font-weight: 650; }
 #panel { background: var(--surface); border: 1px solid var(--hairline);
   border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
-#panel h3 { margin: 0 0 .6rem; font-size: .95rem; font-weight: 700; }
+#panel h3 { margin: 0 0 .6rem; font: 500 18px/1.3 var(--display); letter-spacing: -.02em; }
 #panel .meta { margin: .2rem 0; }
 #grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
-  padding: 4rem 1rem; color: var(--muted); text-align: center; }
+  padding: 4rem 1rem; color: var(--muted); text-align: center;
+  font: 500 28px/1.2 var(--display); letter-spacing: -.3px; }
 
 /* ---- Scheduling queue --------------------------------------------------- */
 .queue-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
@@ -433,7 +455,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 .menu-btn:hover, .menu-btn.open { color: var(--ink); border-color: var(--hairline); }
 .menu { position: absolute; z-index: 5; top: 1.9rem; right: 0; min-width: 13rem;
   display: grid; padding: .25rem; background: var(--surface-2); border: 1px solid var(--hairline);
-  border-radius: 10px; box-shadow: 0 12px 28px var(--shadow); }
+  border-radius: 12px; box-shadow: 0 12px 28px var(--shadow); }
 .menu button, .menu label { display: flex; align-items: center; gap: .5rem; width: 100%;
   padding: .4rem .55rem; border: 0; border-radius: 6px; background: none;
   color: var(--ink); font: inherit; font-size: .9em; text-align: left; cursor: pointer; }
@@ -446,10 +468,10 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 
 /* ---- Delete dialog ----------------------------------------------------- */
 #del { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--hairline);
-  border-radius: 14px; background: var(--surface); color: var(--ink); }
+  border-radius: 16px; background: var(--surface); color: var(--ink); }
 #del::backdrop { background: #0007; }
 #del form { display: grid; gap: .9rem; padding: 1.4rem; }
-#del h2 { margin: 0; font-size: 1.05rem; font-weight: 700; }
+#del h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
 #del-branch { margin: 0; font-weight: 700; word-break: break-word; }
 .del-wt { display: flex; align-items: center; gap: .5rem; cursor: pointer; }
 #del menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
@@ -460,7 +482,7 @@ body { margin: 0; padding: 1.5rem; background: var(--canvas); color: var(--ink);
 
 /* ---- Inline interrupt -------------------------------------------------- */
 #interrupt { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
-  max-width: 60rem; margin-bottom: 1rem; padding: .6rem 1rem; border-radius: 10px;
+  max-width: 60rem; margin-bottom: 1rem; padding: .6rem 1rem; border-radius: 12px;
   background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--needs); font-size: .9em; }
 #interrupt span { flex: 1 1 20rem; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
