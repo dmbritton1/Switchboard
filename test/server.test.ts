@@ -1234,24 +1234,46 @@ test('a queued send whose target went stopped by fire time is dispatched as a re
 
 test('a self-inflicted stop during a limit window is requeued', () => {
   const now = 1000;
-  assert.equal(shouldRequeue(true, now + 3600_000, now), true);
+  assert.equal(shouldRequeue(true, now + 3600_000, now, true), true);
 });
 
 test('a stop we caused is never requeued', () => {
   // Stop and Delete both drop the handle before calling stop(), so `dead` is
   // falsy on the resulting event. Pressing Stop must not resurrect the session.
   const now = 1000;
-  assert.equal(shouldRequeue(false, now + 3600_000, now), false);
+  assert.equal(shouldRequeue(false, now + 3600_000, now, true), false);
 });
 
 test('a stop with no known limit is not requeued', () => {
   const now = 1000;
-  assert.equal(shouldRequeue(true, null, now), false);
+  assert.equal(shouldRequeue(true, null, now, true), false);
 });
 
 test('a stop after the window already rolled is not requeued', () => {
   const now = 1000;
-  assert.equal(shouldRequeue(true, now - 1, now), false);
+  assert.equal(shouldRequeue(true, now - 1, now, true), false);
+});
+
+test('shouldRequeue returns false when autoRequeue is off', () => {
+  const now = Date.now();
+  // Every other condition is satisfied; only the setting says no.
+  assert.equal(shouldRequeue(true, now + 3600_000, now, false), false);
+});
+
+test('a created session inherits autoApprove from settings', async (t) => {
+  // bootCodex rather than boot: a real `create` runs createWorktree, which
+  // needs an actual git repo, and bootCodex is the fixture in this file that
+  // builds one (plus the fake codex binary, so nothing real is spawned).
+  const fixture = await bootCodex(t);
+  fixture.registry.setSettings({ autoApprove: true });
+  const { id } = await fixture.create('auto-on');
+  assert.equal(fixture.registry.get(id)!.auto, true);
+});
+
+test('a created session is not auto-approved by default', async (t) => {
+  const fixture = await bootCodex(t);
+  const { id } = await fixture.create('auto-off');
+  assert.equal(fixture.registry.get(id)!.auto, false);
 });
 
 // ---- parseSettingsPatch ---------------------------------------------------

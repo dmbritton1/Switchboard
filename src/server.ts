@@ -186,15 +186,18 @@ function toCommand(a: Action): Record<string, unknown> {
  * when the agent ended on its own, because both the stop and delete commands
  * remove the handle before calling stop(). `resetAt` is Usage's stored reset
  * time; a non-null value in the future is exactly "this account is past its
- * limit right now".
+ * limit right now". `enabled` is the `autoRequeue` setting.
  *
  * ponytail: this will occasionally requeue a session that died of something
  * unrelated during a limit window. Accepted on purpose — the item is visible in
  * the queue strip and one click deletes it, whereas every tighter test means
- * matching on provider error text, which is the brittleness this avoids.
+ * matching on provider error text, which is the brittleness this avoids. The
+ * `enabled` flag is the escape hatch for anyone who finds that trade wrong.
  */
-export function shouldRequeue(agentDied: boolean, resetAt: number | null, now: number): boolean {
-  return agentDied && resetAt !== null && resetAt > now;
+export function shouldRequeue(
+  agentDied: boolean, resetAt: number | null, now: number, enabled: boolean,
+): boolean {
+  return enabled && agentDied && resetAt !== null && resetAt > now;
 }
 
 const SORTS = ['blocked', 'newest', 'account'] as const;
@@ -390,7 +393,9 @@ export function createServer(opts: {
         registry.apply(sessionId, safeEvent);
         // Before stop(), for the same reason apply() is: stop() re-enters this
         // callback, and by then `dead` is gone and the requeue would be skipped.
-        if (shouldRequeue(Boolean(dead), usage.resetAt(account.name), Date.now())) {
+        if (shouldRequeue(
+          Boolean(dead), usage.resetAt(account.name), Date.now(), registry.settings().autoRequeue,
+        )) {
           scheduler.add(
             { kind: 'reset', account: account.name },
             { kind: 'resume', sessionId, prompt: 'continue' },
@@ -522,6 +527,10 @@ export function createServer(opts: {
         const promptId = registry.appendPrompt(
           session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
         );
+        // Before launch, not after: launch() reads the flag back out of the
+        // registry (see the `auto` local in launch), so setting it here means
+        // the agent starts auto-approving rather than prompting once first.
+        if (registry.settings().autoApprove) registry.setAuto(session.id, true);
         const launchError = launch(session.id, account, prepared.adapter, cwd, prompt, undefined, promptId);
         if (launchError) return { status: 500, json: launchError };
         return { status: 200, json: { id: session.id } };
