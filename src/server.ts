@@ -319,8 +319,22 @@ export function createServer(opts: {
   const { registry, usage, scheduler, accounts, prepare = prepareProvider } = opts;
   const handles = new Map<string, AgentHandle>();
 
+  /**
+   * Slash commands the CLI reported, for the composer's autocomplete.
+   *
+   * Machine-wide rather than per-session: the same user plugins resolve for
+   * every session, so one list is both correct and far cheaper than a copy in
+   * each transcript — snapshot() serializes all of this on every agent message.
+   *
+   * ponytail: learned from whichever session starts first and held in memory, not
+   * persisted. A restart forgets it until the next session sends its init, a
+   * second or two later. Persist it in state.json if that gap ever annoys.
+   */
+  let slashCommands: string[] = [];
+
   function snapshot() {
     return {
+      commands: slashCommands,
       sessions: registry.all(),
       queue: scheduler.all(),
       settings: registry.settings(),
@@ -376,6 +390,15 @@ export function createServer(opts: {
         // is why a Codex session never auto-requeues below.
         if (safeEvent.type === 'rate-limit') {
           usage.noteLimit(account.name, safeEvent.status, safeEvent.resetsAt);
+        }
+        // Not a session fact, so it never reaches the registry — but the browser
+        // only learns anything through a snapshot, so a change has to push one.
+        if (safeEvent.type === 'slash-commands') {
+          if (safeEvent.commands.join('\n') !== slashCommands.join('\n')) {
+            slashCommands = safeEvent.commands;
+            registry.touch();
+          }
+          return;
         }
         if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map

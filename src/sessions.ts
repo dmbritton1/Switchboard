@@ -43,6 +43,29 @@ function coerceSettings(raw: unknown): Settings {
   return out;
 }
 
+/**
+ * Longest tool output kept. Not a display choice — a storage one: every
+ * transcript is serialized whole into the SSE snapshot on every agent message
+ * (see snapshot() in server.ts) and rewritten to state.json on every save, so
+ * one `cat` of a large file would otherwise be re-sent hundreds of times and
+ * persisted forever.
+ */
+export const MAX_RESULT = 2000;
+
+/**
+ * Tool output as stored. Keeps the *tail*: a command that failed explains itself
+ * at the end, and failures are what the output is being read for. The dropped
+ * count is stated rather than left as a bare ellipsis, so a truncated result is
+ * never mistaken for the whole story.
+ *
+ * ponytail: one flat cap for every tool. A per-tool policy (head for Read, tail
+ * for Bash) is a table to maintain for a case nobody has hit yet.
+ */
+export function truncateResult(text: string): string {
+  if (text.length <= MAX_RESULT) return text;
+  return `[${text.length - MAX_RESULT} earlier characters not shown]\n${text.slice(-MAX_RESULT)}`;
+}
+
 export class Registry {
   #sessions = new Map<string, Session>();
   #subs = new Set<() => void>();
@@ -131,7 +154,12 @@ export class Registry {
         if (!s.pending) this.#setStatus(s, e.status);
         break;
       case 'msg':
-        s.transcript.push(e.msg);
+        // Codex delivers tool output on the message itself (it has no separate
+        // result event), so the cap has to apply on this path too — this and the
+        // 'tool-result' branch below are the only two ways output is ever stored.
+        s.transcript.push(e.msg.kind === 'tool' && e.msg.result
+          ? { ...e.msg, result: truncateResult(e.msg.result) }
+          : e.msg);
         break;
       case 'approval':
         s.pending = e.request;
@@ -152,6 +180,9 @@ export class Registry {
         // decisions, not failures, and neither should render as a red card.
         if (msg && msg.kind === 'tool') {
           msg.status = e.ok || msg.name === 'AskUserQuestion' ? 'ok' : 'error';
+          // An answered question's "result" is the SDK's own denial boilerplate,
+          // not output worth reading — the chosen label already shows on the card.
+          if (e.text && msg.name !== 'AskUserQuestion') msg.result = truncateResult(e.text);
         }
         break;
       }

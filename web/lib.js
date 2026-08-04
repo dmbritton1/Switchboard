@@ -121,6 +121,44 @@ export function selectionState(sessions, selected) {
   };
 }
 
+/**
+ * The transcript with consecutive tool messages folded into one collapsible
+ * run, so a stretch of Read/Bash/Edit chatter costs one line instead of twenty.
+ * Everything else passes through as `{ kind: 'msg', msg }`, and a run of one is
+ * demoted back to a plain message — wrapping a single line in a disclosure
+ * widget trades noise for noise.
+ *
+ * `at` is the index of the run's first message. The transcript is append-only,
+ * so that index is a stable key for "did the user expand this run?" across the
+ * full rebuild render() does on every SSE snapshot.
+ */
+export function groupTranscript(transcript) {
+  const out = [];
+  for (const [i, msg] of transcript.entries()) {
+    const last = out.at(-1);
+    if (msg.kind !== 'tool') out.push({ kind: 'msg', msg });
+    else if (last?.kind === 'tools') last.msgs.push(msg);
+    else out.push({ kind: 'tools', at: i, msgs: [msg] });
+  }
+  return out.map((g) => (g.kind === 'tools' && g.msgs.length === 1
+    ? { kind: 'msg', msg: g.msgs[0] }
+    : g));
+}
+
+/**
+ * The one line a collapsed run shows. Tool names, not summaries: the summaries
+ * are the thing being hidden, and the names are what tells you whether the run
+ * was reading around or rewriting your files. Unresolved state (running, failed)
+ * is on the label because that is what decides whether it is worth opening.
+ */
+export function toolRunLabel(msgs) {
+  const names = [...new Set(msgs.map((m) => m.name))];
+  const failed = msgs.filter((m) => m.status === 'error').length;
+  return `${msgs.length} tool calls · ${names.slice(0, 3).join(', ')}${names.length > 3 ? '…' : ''}`
+    + (failed ? ` · ${failed} failed` : '')
+    + (msgs.some((m) => m.status === 'running') ? ' · running' : '');
+}
+
 export const CODEX_FAILURE_LABEL = Object.freeze({
   codex_platform_unsupported: 'Unsupported platform',
   codex_binary_missing: 'Codex executable missing',
@@ -268,4 +306,56 @@ export function accountView(a) {
     note: '',
     windows,
   };
+}
+
+/**
+ * The command token at the start of `text`, or -1 if there isn't one. Ends at
+ * any whitespace, not just a space: the new-session prompt is a textarea, where
+ * the command is the first line and a newline ends it just as surely.
+ */
+function tokenEnd(text) {
+  if (!text.startsWith('/')) return -1;
+  const ws = text.search(/\s/);
+  return ws === -1 ? text.length : ws;
+}
+
+/** Where a name sorts for `query`: whole-name prefix, bare-name prefix, or substring. */
+function rank(name, query) {
+  const lower = name.toLowerCase();
+  // Commands are listed namespaced ("ponytail:ponytail-help") but typing the
+  // bare name works too, so "help" has to reach past the plugin prefix.
+  const bare = lower.slice(lower.indexOf(':') + 1);
+  if (lower.startsWith(query)) return 0;
+  if (bare.startsWith(query)) return 1;
+  return lower.includes(query) ? 2 : 3;
+}
+
+/**
+ * What the composer's command menu should show, or null for "no menu".
+ *
+ * The menu belongs to the first token only: once the caret is past it the user
+ * is writing arguments, and a list of commands is just in the way.
+ */
+export function commandMenu(text, caret, commands, limit = 8) {
+  const end = tokenEnd(text);
+  if (end === -1 || caret > end) return null;
+  const query = text.slice(1, end).toLowerCase();
+  const matches = commands
+    .filter((c) => rank(c, query) < 3)
+    .sort((a, b) => rank(a, query) - rank(b, query) || a.localeCompare(b))
+    .slice(0, limit);
+  return matches.length ? { query, matches } : null;
+}
+
+/**
+ * The leading command if it is one the agent will actually recognise, else null.
+ * This is what gets coloured — highlighting an unknown token would promise the
+ * user something that is about to be sent as plain text.
+ */
+export function commandToken(text, commands) {
+  const end = tokenEnd(text);
+  if (end === -1) return null;
+  const token = text.slice(1, end);
+  const known = commands.some((c) => c === token || c.slice(c.indexOf(':') + 1) === token);
+  return known ? text.slice(0, end) : null;
 }

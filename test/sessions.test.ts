@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Registry } from '../src/sessions.ts';
+import { Registry, MAX_RESULT, truncateResult } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
 import { DEFAULT_SETTINGS } from '../src/types.ts';
@@ -282,6 +282,61 @@ test('an answered question is not marked failed by its deny-carried tool result'
   });
   reg.apply(id, { type: 'tool-result', id: 'q1', ok: false });
   assert.equal((reg.get(id)!.transcript[0] as { status: string }).status, 'ok');
+});
+
+test('a tool-result stores the output on the tool message', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'Bash', summary: 'ls', status: 'running', id: 't1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 't1', ok: true, text: 'a.ts\nb.ts' });
+  assert.deepEqual(reg.get(id)!.transcript[0], {
+    kind: 'tool', name: 'Bash', summary: 'ls', status: 'ok', id: 't1', result: 'a.ts\nb.ts',
+  });
+});
+
+test('an answered question stores no result', () => {
+  // Its tool_result is the SDK's deny boilerplate, not output worth reading.
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'AskUserQuestion', summary: 'TS or Py?', status: 'running', id: 'q1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 'q1', ok: false, text: 'The user did not answer' });
+  assert.equal((reg.get(id)!.transcript[0] as { result?: string }).result, undefined);
+});
+
+test('oversized tool output is capped before it can be stored', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'Bash', summary: 'cat big', status: 'running', id: 't2' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 't2', ok: true, text: `${'x'.repeat(50_000)}TAIL` });
+  const { result } = reg.get(id)!.transcript[0] as { result: string };
+  assert.ok(result.length < MAX_RESULT + 100, `stored ${result.length} chars`);
+  assert.ok(result.endsWith('TAIL'), 'keeps the tail, where a failure explains itself');
+  assert.match(result, /^\[48004 earlier characters not shown\]/);
+});
+
+test('Codex output arriving on the message itself is capped too', () => {
+  // Codex has no separate result event, so this is the other storage path.
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: {
+      kind: 'tool', name: 'shell', summary: 'build', status: 'ok',
+      result: 'y'.repeat(50_000),
+    },
+  });
+  const { result } = reg.get(id)!.transcript[0] as { result: string };
+  assert.ok(result.length < MAX_RESULT + 100, `stored ${result.length} chars`);
+});
+
+test('truncateResult leaves output that already fits completely alone', () => {
+  assert.equal(truncateResult('short'), 'short');
+  assert.equal(truncateResult('x'.repeat(MAX_RESULT)), 'x'.repeat(MAX_RESULT));
 });
 
 test('concurrent saves all resolve and leave valid, parseable state', async (t) => {

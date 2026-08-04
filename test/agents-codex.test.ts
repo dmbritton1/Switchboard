@@ -35,7 +35,13 @@ test('a completed command_execution becomes an ok tool msg', () => {
         aggregated_output: '...', exit_code: 0, status: 'completed',
       },
     } as never),
-    [{ type: 'msg', msg: { kind: 'tool', name: 'shell', summary: 'ls -la', status: 'ok' } }],
+    // normalizeCodex is pure and has no account env, so output comes through raw
+    // here; the adapter's event loop redacts it before it is ever emitted (see
+    // the redaction assertion in agents-codex-process.test.ts).
+    [{
+      type: 'msg',
+      msg: { kind: 'tool', name: 'shell', summary: 'ls -la', status: 'ok', result: '...' },
+    }],
   );
 });
 

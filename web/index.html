@@ -38,7 +38,14 @@
     <div id="transcript"></div>
     <form id="composer">
       <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
-      <input id="prompt" placeholder="Message…" autocomplete="off">
+      <div id="prompt-box" class="cmd-box">
+        <!-- Paints the command in colour underneath the real input, which cannot
+             style part of its own value. Hidden from AT: it duplicates the input. -->
+        <div id="prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
+        <input id="prompt" class="cmd-field" placeholder="Message…" autocomplete="off"
+               role="combobox" aria-expanded="false" aria-controls="cmd-menu">
+        <ul id="cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+      </div>
       <button id="schedule-btn" type="button" title="Schedule this message">⏱</button>
       <button>Send</button>
     </form>
@@ -90,8 +97,13 @@
     </div>
     <div class="field">
       <label for="prompt-input">First prompt</label>
-      <textarea id="prompt-input" name="prompt" required rows="3"
-                placeholder="What should the agent do?"></textarea>
+      <div id="new-prompt-box" class="cmd-box">
+        <div id="new-prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
+        <textarea id="prompt-input" class="cmd-field" name="prompt" required rows="3"
+                  placeholder="What should the agent do?"
+                  role="combobox" aria-expanded="false" aria-controls="new-cmd-menu"></textarea>
+        <ul id="new-cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+      </div>
     </div>
     <p id="new-error"></p>
     <!-- formnovalidate: without it, Cancel is still a type=submit button inside
