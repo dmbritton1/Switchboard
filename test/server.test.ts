@@ -12,7 +12,7 @@ import { Scheduler } from '../src/schedule.ts';
 import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
-import type { Adapter, AdapterEvent } from '../src/types.ts';
+import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 
 const run = promisify(execFile);
 
@@ -68,13 +68,18 @@ async function boot(
  * emit callback in src/server.ts — the wiring that calls `usage.noteLimit()`
  * and `shouldRequeue()` — without spawning a real Claude/Codex subprocess.
  * `start()` captures the emit callback so the test can fire events into it
- * whenever it likes; `stop()` emits `stopped` itself, matching the real
- * adapters (both re-enter the emit callback from their own stop()).
+ * whenever it likes, and records the `opts` it was called with in `starts`
+ * so a test can assert on what launch() actually passed (e.g. `auto`) rather
+ * than just the registry's end state. `stop()` emits `stopped` itself,
+ * matching the real adapters (both re-enter the emit callback from their
+ * own stop()).
  */
-function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void } {
+function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; starts: StartOpts[] } {
   let cb: ((e: AdapterEvent) => void) | null = null;
+  const starts: StartOpts[] = [];
   const adapter: Adapter = {
-    start(_opts, emit) {
+    start(opts, emit) {
+      starts.push(opts);
       cb = emit;
       return {
         send() {},
@@ -84,7 +89,7 @@ function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void } {
       };
     },
   };
-  return { adapter, emit: (e) => cb?.(e) };
+  return { adapter, emit: (e) => cb?.(e), starts };
 }
 
 /** The snapshot the browser actually receives: /events pushes it on connect. */
@@ -1274,6 +1279,33 @@ test('a created session is not auto-approved by default', async (t) => {
   const fixture = await bootCodex(t);
   const { id } = await fixture.create('auto-off');
   assert.equal(fixture.registry.get(id)!.auto, false);
+});
+
+// The two tests above only check the registry's end state, which is `auto:
+// true` regardless of whether `setAuto()` runs before or after `launch()` in
+// `case 'create'` — it's called unconditionally and synchronously either way,
+// so swapping those two lines would regress behavior (a resumed prompt asks
+// for approval once before the toggle takes effect) without failing them.
+// This test asserts on what `adapter.start()` was actually called with:
+// launch() reads `auto` off the registry at call time and hands it to
+// start(), so proving start() received `auto: true` IS the ordering
+// assertion. It fails if `setAuto()` moves after `launch()`. Ordering here is
+// load-bearing — do not "simplify" this back into an end-state check.
+test('setAuto runs before launch, so start() itself receives auto: true', async (t) => {
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  registry.setSettings({ autoApprove: true });
+  const res = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'auto-order', account: 'claude-main', prompt: 'hi' }),
+  });
+  assert.equal(res.status, 200);
+
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].auto, true);
 });
 
 // ---- parseSettingsPatch ---------------------------------------------------
