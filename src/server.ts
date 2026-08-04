@@ -16,7 +16,8 @@ import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
 import type {
-  AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, Session, Trigger,
+  AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, CodexFailureCode, NotifyOn, Session,
+  Settings, SortMode, Trigger,
 } from './types.ts';
 
 const run = promisify(execFile);
@@ -194,6 +195,62 @@ function toCommand(a: Action): Record<string, unknown> {
  */
 export function shouldRequeue(agentDied: boolean, resetAt: number | null, now: number): boolean {
   return agentDied && resetAt !== null && resetAt > now;
+}
+
+const SORTS = ['blocked', 'newest', 'account'] as const;
+const NOTIFY = ['needs-you', 'done', 'error'] as const;
+
+/**
+ * Validates a settings patch before it reaches the Registry.
+ *
+ * Strict where `coerceSettings` (sessions.ts) is tolerant, and deliberately so:
+ * that one reads a file this app wrote, while this reads an unauthenticated
+ * localhost POST that now changes how agents launch. An unknown key here is an
+ * error rather than a silent drop, so a client sending `sandboxMode` learns it
+ * was ignored instead of believing it took effect.
+ */
+export function parseSettingsPatch(body: unknown): { patch: Partial<Settings> } | { error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'patch must be an object' };
+  }
+  const patch: Partial<Settings> = {};
+  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+    switch (key) {
+      case 'autoApprove': case 'collapseDone': case 'autoRequeue':
+        if (typeof value !== 'boolean') return { error: `${key} must be a boolean` };
+        patch[key] = value;
+        break;
+      case 'branchPrefix':
+        if (typeof value !== 'string') return { error: 'branchPrefix must be a string' };
+        patch.branchPrefix = value;
+        break;
+      case 'account':
+        // Not checked against the account list: an account can be removed from
+        // accounts.json while a stale pin names it, and rejecting the patch
+        // would make settings unsavable until the user noticed. The New dialog
+        // falls back to freest when the pinned name is not in the list.
+        if (value !== null && typeof value !== 'string') {
+          return { error: 'account must be a string or null' };
+        }
+        patch.account = value;
+        break;
+      case 'sort':
+        if (!SORTS.includes(value as SortMode)) {
+          return { error: `sort must be one of: ${SORTS.join(', ')}` };
+        }
+        patch.sort = value as SortMode;
+        break;
+      case 'notifyOn':
+        if (!Array.isArray(value) || value.some((v) => !NOTIFY.includes(v as NotifyOn))) {
+          return { error: `notifyOn must contain only: ${NOTIFY.join(', ')}` };
+        }
+        patch.notifyOn = value as NotifyOn[];
+        break;
+      default:
+        return { error: `unknown setting: ${key}` };
+    }
+  }
+  return { patch };
 }
 
 /**
@@ -611,6 +668,13 @@ export function createServer(opts: {
 
       case 'unschedule': {
         scheduler.remove(String(body.itemId));
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'settings': {
+        const parsed = parseSettingsPatch(body.patch);
+        if ('error' in parsed) return { status: 400, json: { error: parsed.error } };
+        registry.setSettings(parsed.patch);
         return { status: 200, json: { ok: true } };
       }
 

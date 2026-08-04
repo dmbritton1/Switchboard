@@ -9,7 +9,7 @@ import { request as httpRequest } from 'node:http';
 import { Registry } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
-import { createServer, refreshLimits, accountLoad, shouldRequeue } from '../src/server.ts';
+import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch } from '../src/server.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 import type { Adapter, AdapterEvent } from '../src/types.ts';
@@ -1244,6 +1244,42 @@ test('a stop with no known limit is not requeued', () => {
 test('a stop after the window already rolled is not requeued', () => {
   const now = 1000;
   assert.equal(shouldRequeue(true, now - 1, now), false);
+});
+
+// ---- parseSettingsPatch ---------------------------------------------------
+
+test('parseSettingsPatch accepts a valid partial', () => {
+  const out = parseSettingsPatch({ autoApprove: true, sort: 'newest' });
+  assert.deepEqual(out, { patch: { autoApprove: true, sort: 'newest' } });
+});
+
+test('parseSettingsPatch accepts an empty patch', () => {
+  assert.deepEqual(parseSettingsPatch({}), { patch: {} });
+});
+
+test('parseSettingsPatch rejects an unknown key', () => {
+  const out = parseSettingsPatch({ sandboxMode: 'danger-full-access' });
+  assert.deepEqual(out, { error: 'unknown setting: sandboxMode' });
+});
+
+test('parseSettingsPatch rejects a wrong type', () => {
+  assert.deepEqual(parseSettingsPatch({ autoApprove: 'yes' }), { error: 'autoApprove must be a boolean' });
+});
+
+test('parseSettingsPatch rejects an out-of-range enum', () => {
+  assert.deepEqual(parseSettingsPatch({ sort: 'sideways' }), { error: 'sort must be one of: blocked, newest, account' });
+});
+
+test('parseSettingsPatch rejects a bad notifyOn member', () => {
+  assert.deepEqual(
+    parseSettingsPatch({ notifyOn: ['done', 'exploded'] }),
+    { error: 'notifyOn must contain only: needs-you, done, error' },
+  );
+});
+
+test('parseSettingsPatch rejects a non-object body', () => {
+  assert.deepEqual(parseSettingsPatch(null), { error: 'patch must be an object' });
+  assert.deepEqual(parseSettingsPatch([1]), { error: 'patch must be an object' });
 });
 
 // ---- auto-requeue wiring --------------------------------------------------
