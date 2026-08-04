@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
-import type { AdapterEvent, CodexFailureCode, PromptDelivery, Session } from './types.ts';
+import type { AdapterEvent, CodexFailureCode, NotifyOn, PromptDelivery, Session, Settings } from './types.ts';
+import { DEFAULT_SETTINGS } from './types.ts';
 import type { Usage } from './usage.ts';
 import type { Scheduler } from './schedule.ts';
 
@@ -9,6 +10,37 @@ type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | '
 function unsentMessage(count: number): string {
   const noun = count === 1 ? 'prompt was' : 'prompts were';
   return `${count} queued ${noun} not sent. Resend ${count === 1 ? 'it' : 'them'} manually if still needed.`;
+}
+
+/**
+ * Coerces a parsed `settings` value into a real Settings, key by key.
+ *
+ * state.json is hand-editable and can also be written by a newer build than
+ * the one reading it, so every key is validated individually and a bad one
+ * falls back to its default rather than poisoning the whole block. Unknown
+ * keys are dropped by construction: the output is built from the defaults, not
+ * spread from the input.
+ */
+function coerceSettings(raw: unknown): Settings {
+  const out = { ...DEFAULT_SETTINGS, notifyOn: [...DEFAULT_SETTINGS.notifyOn] };
+  if (!raw || typeof raw !== 'object') return out;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.autoApprove === 'boolean') out.autoApprove = r.autoApprove;
+  if (typeof r.collapseDone === 'boolean') out.collapseDone = r.collapseDone;
+  if (typeof r.autoRequeue === 'boolean') out.autoRequeue = r.autoRequeue;
+  if (typeof r.branchPrefix === 'string') out.branchPrefix = r.branchPrefix;
+  if (r.account === null || typeof r.account === 'string') out.account = r.account;
+  if (r.sort === 'blocked' || r.sort === 'newest' || r.sort === 'account') out.sort = r.sort;
+  if (Array.isArray(r.notifyOn)) {
+    const valid = r.notifyOn.filter(
+      (v): v is NotifyOn => v === 'needs-you' || v === 'done' || v === 'error',
+    );
+    // An array that is present but has nothing valid in it means "notify me
+    // about nothing", which is a legitimate choice — so an empty result is
+    // kept, unlike a non-array which is a shape error and falls back.
+    out.notifyOn = valid;
+  }
+  return out;
 }
 
 export class Registry {
@@ -27,6 +59,9 @@ export class Registry {
   // Chains every save() behind the previous one so concurrent callers never
   // run writeFile/rename on the same temp path at once. See save() below.
   #saveChain: Promise<void> = Promise.resolve();
+  // notifyOn is copied explicitly: a spread is shallow, and sharing the frozen
+  // default array means any future in-place mutation throws instead of writing.
+  #settings: Settings = { ...DEFAULT_SETTINGS, notifyOn: [...DEFAULT_SETTINGS.notifyOn] };
 
   constructor(path: string, usage?: Usage, scheduler?: Scheduler) {
     this.#path = path;
@@ -186,6 +221,19 @@ export class Registry {
     this.#notify();
   }
 
+  settings(): Settings {
+    return this.#settings;
+  }
+
+  /** Merges a partial over the current settings. A merge rather than a replace
+   *  so a client that knows about six settings cannot silently reset a seventh
+   *  it has never heard of. Validation belongs to the caller — the server's
+   *  `settings` command rejects a bad patch before it reaches here. */
+  setSettings(patch: Partial<Settings>): void {
+    this.#settings = { ...this.#settings, ...patch };
+    this.#notify();
+  }
+
   subscribe(fn: () => void): () => void {
     this.#subs.add(fn);
     return () => this.#subs.delete(fn);
@@ -233,6 +281,7 @@ export class Registry {
       sessions: this.all(),
       usage: this.#usage?.toJSON() ?? {},
       queue: this.#scheduler?.toJSON() ?? [],
+      settings: this.#settings,
     };
     await writeFile(tmpPath, JSON.stringify(state, null, 2));
     await rename(tmpPath, this.#path);
@@ -253,6 +302,9 @@ export class Registry {
         // Absent in any state.json written before scheduling existed; restore()
         // drops a non-array, so the missing key needs no special case here.
         scheduler?.restore((parsed as { queue?: unknown }).queue);
+        // Absent in any state.json written before settings existed;
+        // coerceSettings returns the defaults for a missing or junk value.
+        reg.#settings = coerceSettings((parsed as { settings?: unknown }).settings);
       }
       // state.json is hand-editable, so treat it as untrusted: a `sessions` value
       // that is a string would otherwise be iterated character by character into

@@ -472,3 +472,63 @@ test('DEFAULT_SETTINGS is not shared mutable state', () => {
   assert.throws(() => { copy.notifyOn.push('error'); });
   assert.deepEqual(DEFAULT_SETTINGS.notifyOn, ['needs-you']);
 });
+
+test('a fresh registry starts with the default settings', () => {
+  const reg = new Registry('/dev/null');
+  assert.deepEqual(reg.settings(), DEFAULT_SETTINGS);
+});
+
+test('setSettings merges a partial and notifies subscribers', () => {
+  const reg = new Registry('/dev/null');
+  let calls = 0;
+  reg.subscribe(() => { calls++; });
+  reg.setSettings({ autoApprove: true });
+  assert.equal(reg.settings().autoApprove, true);
+  // Untouched keys keep their defaults — it is a merge, not a replace.
+  assert.equal(reg.settings().autoRequeue, true);
+  assert.equal(calls, 1);
+});
+
+test('settings survive a save/load round trip', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const reg = new Registry(path);
+  reg.setSettings({ autoApprove: true, sort: 'newest', notifyOn: ['needs-you', 'done'] });
+  await reg.save();
+
+  const back = await Registry.load(path);
+  assert.equal(back.settings().autoApprove, true);
+  assert.equal(back.settings().sort, 'newest');
+  assert.deepEqual(back.settings().notifyOn, ['needs-you', 'done']);
+});
+
+test('a state.json with no settings key loads the defaults', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-legacy-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {}, queue: [] }));
+
+  const reg = await Registry.load(path);
+  assert.deepEqual(reg.settings(), DEFAULT_SETTINGS);
+});
+
+test('a stored settings block with junk keys and wrong types loads the defaults for them', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-junk-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  // state.json is hand-editable, and a downgrade can leave keys a newer build
+  // wrote. Neither may corrupt the loaded shape.
+  await writeFile(path, JSON.stringify({
+    sessions: [],
+    settings: { autoApprove: 'yes', sort: 'sideways', notifyOn: 'done', fromTheFuture: 1, collapseDone: true },
+  }));
+
+  const reg = await Registry.load(path);
+  const s = reg.settings();
+  assert.equal(s.autoApprove, false, 'a non-boolean falls back to the default');
+  assert.equal(s.sort, 'blocked', 'an unknown enum value falls back to the default');
+  assert.deepEqual(s.notifyOn, ['needs-you'], 'a non-array falls back to the default');
+  assert.equal(s.collapseDone, true, 'a valid key still loads');
+  assert.equal('fromTheFuture' in s, false, 'an unknown key is dropped');
+});
