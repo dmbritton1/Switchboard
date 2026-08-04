@@ -72,6 +72,10 @@ export type AdapterEvent =
   // so a Codex account never produces this and falls back to the pace estimate.
   | { type: 'rate-limit'; status: 'allowed' | 'allowed_warning' | 'rejected'; resetsAt: number | null }
   | { type: 'vendor-session-id'; id: string }
+  // Claude only, and about the machine rather than the session: the CLI resolves
+  // the same user plugins for every session, so the server keeps one list off to
+  // the side instead of copying it into each transcript.
+  | { type: 'slash-commands'; commands: string[] }
   // `text` is the raw tool output. Adapters redact account env values out of it
   // before emitting; the registry truncates it before storing.
   | { type: 'tool-result'; id: string; ok: boolean; text?: string }

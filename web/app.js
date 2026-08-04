@@ -1,10 +1,10 @@
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
-  accountView, freestAccount, groupTranscript, toolRunLabel,
+  accountView, freestAccount, groupTranscript, toolRunLabel, commandMenu, commandToken,
 } from './lib.js';
 
-let state = { sessions: [], accounts: [] };
+let state = { sessions: [], accounts: [], commands: [] };
 let openId = null;
 // Which header panel is open: null, 'queue', or an account name. Mutually
 // exclusive by construction — one variable, not one flag per panel.
@@ -1037,12 +1037,166 @@ function triggerFor(when, at) {
     : { kind: 'at', time: new Date(at).getTime() };
 }
 
+/**
+ * Slash-command autocomplete for one text field.
+ *
+ * Written as a factory because there are two of these — the chat composer and
+ * the new-session first prompt — and they are styled differently, sit in
+ * different containers, and hold independent open/highlight state. Returns the
+ * repaint, which callers need after they clear the field programmatically
+ * (nothing fires `input` for that).
+ */
+function wireCommandMenu({ field, box, mirror, menu, ids }) {
+  // Matches currently offered, and which one is highlighted. Empty means closed,
+  // so every handler below can test one thing.
+  let matches = [];
+  let index = 0;
+
+  function close() {
+    matches = [];
+    menu.hidden = true;
+    menu.replaceChildren();
+    field.setAttribute('aria-expanded', 'false');
+    field.removeAttribute('aria-activedescendant');
+  }
+
+  /**
+   * Copy the field's own text metrics onto the mirror.
+   *
+   * Read from the live computed style rather than restated in CSS: these two
+   * fields have different padding and different box-sizing, and an <input> does
+   * not even inherit the page font. Any mismatch shows up as the caret sitting
+   * somewhere other than the glyphs.
+   */
+  function matchMetrics() {
+    const cs = getComputedStyle(field);
+    for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight',
+      'letterSpacing', 'textIndent', 'paddingTop', 'paddingRight', 'paddingBottom',
+      'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+      'borderLeftWidth', 'wordSpacing']) mirror.style[p] = cs[p];
+    // An <input> computes to `normal`, which would collapse runs of spaces and
+    // wrap where the field does not. A textarea's own value ('pre-wrap') is
+    // already right.
+    mirror.style.whiteSpace = field.tagName === 'INPUT' ? 'pre' : cs.whiteSpace;
+    mirror.style.overflowWrap = cs.overflowWrap;
+  }
+
+  /** Repaint the coloured copy of the command that sits behind the field. */
+  function paint() {
+    const cmd = commandToken(field.value, state.commands ?? []);
+    // The class is what makes the field's own text transparent, so it goes on
+    // only while there is something underneath worth seeing.
+    box.classList.toggle('mirroring', Boolean(cmd));
+    if (!cmd) { mirror.replaceChildren(); return; }
+    matchMetrics();
+    const span = document.createElement('span');
+    span.className = 'cmd';
+    span.textContent = cmd;
+    mirror.replaceChildren(span, document.createTextNode(field.value.slice(cmd.length)));
+    mirror.scrollLeft = field.scrollLeft;
+    mirror.scrollTop = field.scrollTop;
+  }
+
+  function highlight() {
+    [...menu.children].forEach((li, i) => li.setAttribute('aria-selected', String(i === index)));
+    field.setAttribute('aria-activedescendant', `${ids}-${index}`);
+    menu.children[index]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function apply(name) {
+    // Whitespace, not just a space: in the textarea the command can be its own
+    // line, and the rest of the prompt has to survive selecting one.
+    const ws = field.value.search(/\s/);
+    const rest = ws === -1 ? ' ' : field.value.slice(ws);
+    field.value = `/${name}${rest}`;
+    const caret = name.length + 2;
+    field.setSelectionRange(caret, caret);
+    close();
+    paint();
+    field.focus();
+  }
+
+  function render() {
+    const found = commandMenu(field.value, field.selectionStart ?? 0, state.commands ?? []);
+    if (!found) { close(); return; }
+    // Only reset the highlight when the list itself changed; re-rendering for a
+    // caret move must not throw away an arrow-key selection.
+    if (found.matches.join('\n') !== matches.join('\n')) index = 0;
+    matches = found.matches;
+
+    menu.replaceChildren(...matches.map((name, i) => {
+      const li = document.createElement('li');
+      li.id = `${ids}-${i}`;
+      li.setAttribute('role', 'option');
+      const colon = name.indexOf(':');
+      if (colon === -1) li.textContent = `/${name}`;
+      else {
+        const ns = document.createElement('span');
+        ns.className = 'ns';
+        ns.textContent = `/${name.slice(0, colon + 1)}`;
+        li.append(ns, name.slice(colon + 1));
+      }
+      // mousedown, not click: preventDefault here keeps focus in the field, so
+      // the menu never has to race its own blur handler.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); apply(name); });
+      return li;
+    }));
+    menu.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    highlight();
+  }
+
+  // 'input' covers typing and paste; the other two catch a caret move that
+  // changes whether the menu still belongs on screen.
+  for (const evt of ['input', 'click', 'keyup']) {
+    field.addEventListener(evt, () => { render(); paint(); });
+  }
+  field.addEventListener('scroll', () => {
+    mirror.scrollLeft = field.scrollLeft;
+    mirror.scrollTop = field.scrollTop;
+  });
+  field.addEventListener('blur', close);
+
+  field.addEventListener('keydown', (e) => {
+    if (!matches.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      index = (index + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+      highlight();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      // Enter picks the command rather than submitting a half-typed one — and in
+      // the textarea, rather than breaking the line. Submitting happens on the
+      // next Enter, once the menu has closed.
+      e.preventDefault();
+      apply(matches[index]);
+    } else if (e.key === 'Escape') {
+      // The dialog would otherwise take this as "close me" while the user was
+      // only dismissing the menu.
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+
+  return paint;
+}
+
+const paintMirror = wireCommandMenu({
+  field: $('#prompt'), box: $('#prompt-box'), mirror: $('#prompt-mirror'),
+  menu: $('#cmd-menu'), ids: 'cmd-opt',
+});
+
+const paintNewMirror = wireCommandMenu({
+  field: $('#prompt-input'), box: $('#new-prompt-box'), mirror: $('#new-prompt-mirror'),
+  menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
+});
+
 $('#composer').onsubmit = async (e) => {
   e.preventDefault();
   const text = $('#prompt').value.trim();
   if (!text) return;
   const result = await runSessionCommand({ cmd: 'send', id: openId, text });
-  if (result.ok) $('#prompt').value = '';
+  if (result.ok) { $('#prompt').value = ''; paintMirror(); }
 };
 
 $('#schedule-btn').onclick = () => {
@@ -1080,7 +1234,7 @@ $('#when-dialog').addEventListener('close', async (e) => {
   const result = await postCommand({
     cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
   });
-  if (result.ok) { $('#prompt').value = ''; render(); return; }
+  if (result.ok) { $('#prompt').value = ''; paintMirror(); render(); return; }
   // Same pattern as #new: show the server's reason and let the user retry,
   // rather than the fire-and-forget silence most other buttons in this app get.
   // This one is a modal the user explicitly confirmed to queue something —
@@ -1259,6 +1413,9 @@ async function openNew() {
   // place it is ever set — see there.)
   const dialog = $('#new');
   dialog.querySelector('form').reset();
+  // reset() fires no 'input' event, so the mirror would keep painting the
+  // command from the last time this dialog was open over an empty field.
+  paintNewMirror();
   syncWhen();
 
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));

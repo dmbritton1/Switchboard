@@ -320,3 +320,21 @@ test('draining the approval queue settles every queued request, not just the hea
   assert.equal(passes, 3, 'all three must be resolved, and the loop must then stop');
   assert.deepEqual(settled, ['a1:allow', 'a2:allow', 'a3:allow']);
 });
+
+test('init reports the CLI slash commands, and only when there are some', () => {
+  const init = { type: 'system', subtype: 'init', session_id: 's1' };
+  const withCommands = normalizeClaude({
+    ...init, slash_commands: ['compact', 'ponytail:ponytail', 7],
+  } as never);
+  // The junk entry is dropped rather than shipped to the browser as a menu item.
+  assert.deepEqual(withCommands, [
+    { type: 'vendor-session-id', id: 's1' },
+    { type: 'slash-commands', commands: ['compact', 'ponytail:ponytail'] },
+  ]);
+
+  // An init without the field, or with nothing usable in it, must not announce an
+  // empty list — that would blank a menu the previous session had filled in.
+  for (const absent of [init, { ...init, slash_commands: [] }, { ...init, slash_commands: 'nope' }]) {
+    assert.deepEqual(normalizeClaude(absent as never), [{ type: 'vendor-session-id', id: 's1' }]);
+  }
+});

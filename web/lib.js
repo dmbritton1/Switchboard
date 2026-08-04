@@ -267,3 +267,55 @@ export function accountView(a) {
     windows,
   };
 }
+
+/**
+ * The command token at the start of `text`, or -1 if there isn't one. Ends at
+ * any whitespace, not just a space: the new-session prompt is a textarea, where
+ * the command is the first line and a newline ends it just as surely.
+ */
+function tokenEnd(text) {
+  if (!text.startsWith('/')) return -1;
+  const ws = text.search(/\s/);
+  return ws === -1 ? text.length : ws;
+}
+
+/** Where a name sorts for `query`: whole-name prefix, bare-name prefix, or substring. */
+function rank(name, query) {
+  const lower = name.toLowerCase();
+  // Commands are listed namespaced ("ponytail:ponytail-help") but typing the
+  // bare name works too, so "help" has to reach past the plugin prefix.
+  const bare = lower.slice(lower.indexOf(':') + 1);
+  if (lower.startsWith(query)) return 0;
+  if (bare.startsWith(query)) return 1;
+  return lower.includes(query) ? 2 : 3;
+}
+
+/**
+ * What the composer's command menu should show, or null for "no menu".
+ *
+ * The menu belongs to the first token only: once the caret is past it the user
+ * is writing arguments, and a list of commands is just in the way.
+ */
+export function commandMenu(text, caret, commands, limit = 8) {
+  const end = tokenEnd(text);
+  if (end === -1 || caret > end) return null;
+  const query = text.slice(1, end).toLowerCase();
+  const matches = commands
+    .filter((c) => rank(c, query) < 3)
+    .sort((a, b) => rank(a, query) - rank(b, query) || a.localeCompare(b))
+    .slice(0, limit);
+  return matches.length ? { query, matches } : null;
+}
+
+/**
+ * The leading command if it is one the agent will actually recognise, else null.
+ * This is what gets coloured — highlighting an unknown token would promise the
+ * user something that is about to be sent as plain text.
+ */
+export function commandToken(text, commands) {
+  const end = tokenEnd(text);
+  if (end === -1) return null;
+  const token = text.slice(1, end);
+  const known = commands.some((c) => c === token || c.slice(c.indexOf(':') + 1) === token);
+  return known ? text.slice(0, end) : null;
+}

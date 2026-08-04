@@ -112,8 +112,42 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
   border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
 #composer { display: flex; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
+#prompt-box { flex: 1; }
+/* font/line-height are not cosmetic here: an input does not inherit either one,
+   so without this it lays out in the browser default (Arial 13.3px) while the
+   mirror behind it uses the page font at 15px. The caret would then sit at a
+   different place than the text the user can see. */
 #prompt { flex: 1; padding: .6rem; background: var(--card); color: var(--fg);
-  border: 1px solid #333; border-radius: 8px; }
+  border: 1px solid #333; border-radius: 8px; font: inherit; line-height: 1.4; }
+
+/* Slash-command autocomplete, shared by the chat composer and the new-session
+   prompt. Those two fields are styled differently from each other, so the
+   mirror's metrics — font, padding, border width, wrapping — are copied from
+   whichever field it wraps at paint time rather than restated here. Getting one
+   of them wrong drifts the caret away from the glyphs the user can see. */
+.cmd-box { position: relative; display: flex; }
+.cmd-mirror { position: absolute; inset: 0; box-sizing: border-box; overflow: hidden;
+  color: var(--fg); pointer-events: none; border-style: solid; border-color: transparent; }
+/* Only while a command is actually highlighted: the rest of the time the field
+   paints its own text, and the selection wart below never applies. */
+.cmd-box.mirroring > .cmd-field { color: transparent; caret-color: var(--fg); }
+/* Translucent, so the mirror's text stays readable through a selection that is
+   painted on the (now transparent) field above it. */
+.cmd-box.mirroring > .cmd-field::selection { background: rgba(74, 143, 231, .35); }
+/* Colour only. Any weight or spacing change here makes the mirrored text a
+   different width from the field's own layout, and the caret drifts away from
+   the glyphs as the message gets longer. */
+.cmd-mirror .cmd { color: var(--done); }
+
+.cmd-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + .4rem); z-index: 5;
+  max-height: 15rem; overflow-y: auto; margin: 0; padding: .3rem; list-style: none;
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .5); }
+.cmd-menu li { padding: .35rem .5rem; border-radius: 6px; font-family: var(--mono);
+  font-size: .9em; color: var(--fg); cursor: pointer; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.cmd-menu li[aria-selected="true"] { background: #2a3a52; color: #cfe3ff; }
+.cmd-menu li .ns { color: var(--dim); }
 #attach { display: grid; place-content: center; padding: 0 .7rem; cursor: pointer;
   background: var(--card); border: 1px solid #333; border-radius: 8px; }
 #attach:hover { border-color: var(--working); }

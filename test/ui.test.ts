@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
   sortSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
-  freestAccount, groupTranscript, toolRunLabel,
+  freestAccount, groupTranscript, toolRunLabel, commandMenu, commandToken,
 } from '../web/lib.js';
 
 const tool = (name, status = 'ok') => ({ kind: 'tool', name, summary: 'x', status });
@@ -316,4 +316,60 @@ test('freestAccount falls back to load when nobody has real limits', () => {
 
 test('freestAccount picks the lowest load among accounts that all have limits', () => {
   assert.equal(freestAccount([withLimits('a', 90), withLimits('b', 12)]).name, 'b');
+});
+
+const CMDS = [
+  'ponytail:ponytail', 'ponytail:ponytail-help', 'ponytail:ponytail-review',
+  'superpowers:brainstorming', 'compact', 'clear',
+];
+
+test('the command menu opens on a bare slash and lists everything', () => {
+  const menu = commandMenu('/', 1, CMDS);
+  assert.equal(menu.query, '');
+  assert.deepEqual(menu.matches.length, CMDS.length);
+});
+
+test('the command menu reaches past the plugin prefix', () => {
+  // "help" appears nowhere in "ponytail:" — matching only the namespaced string
+  // start would find nothing, which is how it feels to type a command you know
+  // the name of but not the plugin.
+  const menu = commandMenu('/help', 5, CMDS);
+  assert.deepEqual(menu.matches, ['ponytail:ponytail-help']);
+});
+
+test('a whole-name prefix outranks a bare-name prefix', () => {
+  const menu = commandMenu('/pony', 5, CMDS);
+  assert.equal(menu.matches[0], 'ponytail:ponytail');
+});
+
+test('the command menu closes once the caret is into the arguments', () => {
+  // The token is still a command, but the user is writing its argument now.
+  assert.equal(commandMenu('/ponytail ultra', 15, CMDS), null);
+  // ...and comes back if they go back to edit the command itself.
+  assert.ok(commandMenu('/ponytail ultra', 5, CMDS));
+});
+
+test('the command menu stays shut for ordinary messages', () => {
+  assert.equal(commandMenu('fix the tests', 5, CMDS), null);
+  assert.equal(commandMenu('what about a/b?', 15, CMDS), null);
+  assert.equal(commandMenu('/nosuchthing', 12, CMDS), null);
+});
+
+test('only a command the agent will recognise gets coloured', () => {
+  assert.equal(commandToken('/ponytail:ponytail-help', CMDS), '/ponytail:ponytail-help');
+  // The bare form expands too (verified against the SDK), so it colours too.
+  assert.equal(commandToken('/ponytail-help extra args', CMDS), '/ponytail-help');
+  // Half-typed and unknown tokens stay plain: colour would promise an expansion
+  // that is not going to happen.
+  assert.equal(commandToken('/ponyt', CMDS), null);
+  assert.equal(commandToken('/nope', CMDS), null);
+  assert.equal(commandToken('hello', CMDS), null);
+});
+
+test('a newline ends the command token, for the multi-line new-session prompt', () => {
+  // The first prompt box is a textarea, so the command is usually its own line.
+  assert.equal(commandToken('/compact\nthen carry on', CMDS), '/compact');
+  assert.ok(commandMenu('/comp\nthen carry on', 5, CMDS));
+  // ...and the menu is gone once the caret is down on the next line.
+  assert.equal(commandMenu('/compact\nthen carry on', 12, CMDS), null);
 });

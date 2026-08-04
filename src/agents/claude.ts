@@ -106,6 +106,14 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
   // that's the one meant to report session identity.
   if (m.type === 'system' && m.subtype === 'init' && 'session_id' in m && m.session_id) {
     out.push({ type: 'vendor-session-id', id: m.session_id as string });
+    // The init message is the only place the CLI says which slash commands it
+    // resolved — plugins included. Reading it here costs nothing: the message
+    // already arrives, and no other part of the system can know the answer.
+    const commands = (m as { slash_commands?: unknown }).slash_commands;
+    if (Array.isArray(commands)) {
+      const names = commands.filter((c): c is string => typeof c === 'string');
+      if (names.length) out.push({ type: 'slash-commands', commands: names });
+    }
     return out;
   }
 
