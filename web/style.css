@@ -325,10 +325,26 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 /* Inside the shell now, so no margin of its own — the shell's gap spaces it
    off the field, and :empty collapses it (and that gap) when nothing is
    attached. */
-#thumbs { display: flex; flex-wrap: wrap; gap: .4rem; padding: .15rem .25rem 0; }
+#thumbs { display: flex; flex-wrap: wrap; gap: .5rem; padding: .35rem .25rem .15rem; }
 #thumbs:empty { display: none; }
-#thumbs img { height: 3rem; width: 3rem; object-fit: cover;
+/* The × sits half outside the chip, so the row needs headroom for it — hence
+   the extra top padding above rather than a margin on each chip. */
+.chip { position: relative; display: flex; }
+.chip img { height: 3rem; width: 3rem; object-fit: cover;
   border: 1px solid var(--hairline); border-radius: 6px; }
+/* Non-image uploads have nothing to preview, so the filename is the chip. */
+/* Same 3rem box as a thumbnail, so a row mixing the two lines up. */
+.chip-name { display: grid; align-content: center; box-sizing: border-box;
+  height: 3rem; max-width: 12rem; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; padding: 0 .55rem; border: 1px solid var(--hairline);
+  border-radius: 6px; background: var(--well); color: var(--body);
+  font-family: var(--mono); font-size: .8rem; }
+.chip-x { position: absolute; top: -.35rem; right: -.35rem; display: grid;
+  place-content: center; width: 1.1rem; height: 1.1rem; padding: 0;
+  border: 1px solid var(--hairline); border-radius: 999px; background: var(--surface-2);
+  color: var(--body); font: inherit; font-size: .85rem; line-height: 1; cursor: pointer; }
+.chip-x:hover { border-color: var(--error); color: var(--error); }
+.chip-x:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
 #upload-error { margin: .5rem 0 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
 
