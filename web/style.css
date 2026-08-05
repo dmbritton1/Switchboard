@@ -200,19 +200,36 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #command-error:empty { display: none; }
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
   border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
-/* flex-end: the box grows upward with the message, and the buttons stay level
-   with its last line instead of stretching to its full height. */
-#composer { display: flex; align-items: flex-end; gap: .5rem; margin-top: 1rem; max-width: 60rem; }
+#composer { margin-top: 1rem; max-width: 60rem; }
+/* The shell carries the border, fill and radius the field used to own, so
+   attachments, the field and the controls read as one object. No overflow
+   clipping: #cmd-menu is absolutely positioned above the field and would be
+   cut off by it. */
+#composer-shell { display: flex; flex-direction: column; gap: .4rem;
+  padding: .5rem .6rem; background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 16px; }
+/* The field inside is borderless, so the shell has to show focus for it — and
+   focus-within, not :focus, because the focus can be on either of the buttons
+   inside just as legitimately. */
+#composer-shell:focus-within { border-color: var(--accent-line);
+  box-shadow: 0 0 0 1px var(--accent-line); }
 #prompt-box { flex: 1; }
 /* font/line-height are not cosmetic here: an input does not inherit either one,
    so without this it lays out in the browser default (Arial 13.3px) while the
    mirror behind it uses the page font at 15px. The caret would then sit at a
-   different place than the text the user can see. */
-#prompt { flex: 1; padding: .6rem; background: var(--surface); color: var(--ink);
-  border: 1px solid var(--hairline); border-radius: 8px; font: inherit; line-height: 1.4;
+   different place than the text the user can see.
+   The border and background are the shell's job now; matchMetrics() in app.js
+   reads padding and border width off the live computed style, so the mirror
+   follows this without restating it. */
+#prompt { flex: 1; padding: .35rem .25rem; background: none; color: var(--ink);
+  border: 0; font: inherit; line-height: 1.4;
   /* JS sets the height from scrollHeight, so the drag handle would fight it;
      max-height caps the growth and hands the rest back to a scrollbar. */
   resize: none; overflow-y: auto; max-height: 12rem; }
+/* Suppressed, not dropped: focusing the field lights the shell's ring above,
+   which is the same indicator drawn one level out. An inner outline on a
+   borderless field inside a ringed box reads as two competing rings. */
+#prompt:focus-visible { outline: none; }
 
 /* Slash-command autocomplete, shared by the chat composer and the new-session
    prompt. Those two fields are styled differently from each other, so the
@@ -253,24 +270,45 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 /* Same reason as .combo-list's selected-row override below: --hover reads
    too light for --muted, so the selected row steps up to --body. */
 .cmd-menu li[aria-selected="true"] .ns { color: var(--body); }
-#attach { display: grid; place-content: center; padding: 0 .7rem; cursor: pointer;
-  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px; }
-#attach:hover { border-color: var(--accent-line); }
+/* Control row along the bottom of the shell. #attach takes the auto margin
+   rather than the right-hand group taking a margin-left: #composer-dots is
+   `hidden` most of the time, and a margin on the group's first child would
+   move with it. */
+#composer-tools { display: flex; align-items: center; gap: .3rem; }
+#attach { margin-right: auto; }
+/* Ghost icon buttons: no chrome of their own, since the shell around them is
+   already a bordered box. Anything drawn here reads as a box inside a box.
+   Both carry stroke icons rather than emoji — an emoji ignores `color`, so a
+   paperclip glyph stayed full-colour next to a muted clock and neither
+   matched the arrow in #send-btn. */
+#attach, #schedule-btn { display: grid; place-content: center; flex-shrink: 0;
+  width: 2.1rem; height: 2.1rem; padding: 0; border: 0; border-radius: 8px;
+  background: none; color: var(--muted); cursor: pointer; }
+#attach:hover, #schedule-btn:hover { background: var(--hover); color: var(--ink); }
 
 /* Circular icon button: an arrow while idle, a square while working. The
    icon markup itself lives in updateComposerButton() (app.js) — this only
    sizes and colours the button shell, which stays the same for both states. */
 #send-btn { display: grid; place-content: center; flex-shrink: 0;
-  width: 2.6rem; height: 2.6rem; padding: 0; border-radius: 999px;
+  width: 2.1rem; height: 2.1rem; padding: 0; border-radius: 999px;
   border: 1px solid var(--accent-deep); background: var(--accent-deep);
   color: #ffffff; cursor: pointer; }
 #send-btn:hover { opacity: .9; }
+/* None of the three had a focus style before: the shell's focus-within ring
+   fires for all of them, which says "the composer has focus" but not which
+   control, so each keeps its own ring for keyboard users. */
+#schedule-btn:focus-visible, #send-btn:focus-visible,
+#attach:has(input:focus-visible) {
+  outline: 2px solid var(--accent-line); outline-offset: 2px; }
+/* Sized to nothing rather than display:none — see the note in index.html. The
+   ring above is drawn on the label, which is what the user can actually see. */
+#attach input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 
 /* Three-dot "working" indicator, next to the send/stop button while the open
    session's status is 'working' (see renderSession() in app.js). Same
    prefers-reduced-motion guard as .status.pending above — a bouncing dot is
    exactly the motion that guard exists for. */
-.dots { display: inline-flex; align-items: center; gap: .25rem; height: 2.6rem; }
+.dots { display: inline-flex; align-items: center; gap: .25rem; height: 2.1rem; padding: 0 .3rem; }
 .dots[hidden] { display: none; }
 .dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--muted);
   animation: dot-bounce 1.2s ease-in-out infinite; }
@@ -284,9 +322,12 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 /* Drop target feedback: without it, a drag over the transcript looks inert and
    the user cannot tell whether releasing will do anything. */
 #pane-chat.dropping { outline: 2px dashed var(--accent-line); outline-offset: 6px; border-radius: 8px; }
-#thumbs { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: 1rem; max-width: 60rem; }
+/* Inside the shell now, so no margin of its own — the shell's gap spaces it
+   off the field, and :empty collapses it (and that gap) when nothing is
+   attached. */
+#thumbs { display: flex; flex-wrap: wrap; gap: .4rem; padding: .15rem .25rem 0; }
 #thumbs:empty { display: none; }
-#thumbs img { height: 3.5rem; width: 3.5rem; object-fit: cover;
+#thumbs img { height: 3rem; width: 3rem; object-fit: cover;
   border: 1px solid var(--hairline); border-radius: 6px; }
 #upload-error { margin: .5rem 0 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }

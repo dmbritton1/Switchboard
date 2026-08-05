@@ -55,36 +55,51 @@
 
   <div id="pane-chat">
     <div id="transcript"></div>
-    <!-- Thumbnails of images attached to the message being composed. Empty
-         (and display:none) until an upload lands; cleared once it is sent. -->
-    <div id="thumbs"></div>
     <form id="composer">
-      <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
-      <div id="prompt-box" class="cmd-box">
-        <!-- Paints the command in colour underneath the real input, which cannot
-             style part of its own value. Hidden from AT: it duplicates the input. -->
-        <div id="prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
-        <!-- textarea, not input: an input scrolls sideways and shows only the tail
-             of a long message. rows=1 keeps it one line until the text needs more.
-             required: both composer buttons bail on an empty message, so without
-             it they are dead controls that look enabled. This makes Send say so
-             natively, and #schedule-btn borrows the same check — see app.js. -->
-        <textarea id="prompt" class="cmd-field" placeholder="Message…" rows="1" required
-                  autocomplete="off" role="combobox" aria-expanded="false"
-                  aria-controls="cmd-menu"></textarea>
-        <ul id="cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+      <!-- One bordered shell holding attachments, the field and the controls, so
+           the composer reads as a single object instead of four styled parts
+           sitting next to each other. The border and focus ring live here; the
+           textarea inside is borderless. -->
+      <div id="composer-shell">
+        <!-- Thumbnails of images attached to the message being composed. Empty
+             (and display:none) until an upload lands; cleared once it is sent. -->
+        <div id="thumbs"></div>
+        <div id="prompt-box" class="cmd-box">
+          <!-- Paints the command in colour underneath the real input, which cannot
+               style part of its own value. Hidden from AT: it duplicates the input. -->
+          <div id="prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
+          <!-- textarea, not input: an input scrolls sideways and shows only the tail
+               of a long message. rows=1 keeps it one line until the text needs more.
+               required: both composer buttons bail on an empty message, so without
+               it they are dead controls that look enabled. This makes Send say so
+               natively, and #schedule-btn borrows the same check — see app.js. -->
+          <textarea id="prompt" class="cmd-field" placeholder="Message…" rows="1" required
+                    autocomplete="off" role="combobox" aria-expanded="false"
+                    aria-controls="cmd-menu"></textarea>
+          <ul id="cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+        </div>
+        <div id="composer-tools">
+          <!-- The file input is hidden in CSS rather than with [hidden]: a
+               display:none input cannot take focus, which left the attach
+               control out of the tab order entirely. -->
+          <label id="attach" title="Attach files" aria-label="Attach files">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            <input type="file" multiple></label>
+          <!-- Shown only while the open session's status is 'working' — see
+               updateComposerButton() in app.js, which also fills #send-btn. -->
+          <div id="composer-dots" class="dots" hidden aria-hidden="true"><span></span><span></span><span></span></div>
+          <button id="schedule-btn" type="button" title="Schedule this message" aria-label="Schedule this message">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+          </button>
+          <!-- Content (icon + label) is set entirely by updateComposerButton():
+               an arrow that submits while idle, a square that stops while
+               working. Starts as the idle/arrow state so there's no flash of an
+               empty button before the first render fills it in. -->
+          <button id="send-btn" type="submit" title="Send message" aria-label="Send message">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+          </button>
+        </div>
       </div>
-      <button id="schedule-btn" type="button" title="Schedule this message">⏱</button>
-      <!-- Shown only while the open session's status is 'working' — see
-           updateComposerButton() in app.js, which also fills #send-btn. -->
-      <div id="composer-dots" class="dots" hidden aria-hidden="true"><span></span><span></span><span></span></div>
-      <!-- Content (icon + label) is set entirely by updateComposerButton():
-           an arrow that submits while idle, a square that stops while
-           working. Starts as the idle/arrow state so there's no flash of an
-           empty button before the first render fills it in. -->
-      <button id="send-btn" type="submit" title="Send message" aria-label="Send message">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
-      </button>
     </form>
     <p id="upload-error"></p>
   </div>
