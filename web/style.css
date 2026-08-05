@@ -26,6 +26,10 @@
      this instead of hard-coding a number that would drift the moment #bar's
      padding or content does. */
   --bar-h: 4.093rem;
+  /* #sidebar's fixed width — wide enough for "Chat/Diff/Graph", a branch chip
+     and an account meter without wrapping every label, narrow enough to leave
+     the transcript's existing 60rem column room to breathe beside it. */
+  --sidebar-w: 13.5rem;
 }
 
 /* ---- Theme tokens ------------------------------------------------------- */
@@ -473,34 +477,65 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #upload-error:empty { display: none; }
 
 /* ---- Session view ------------------------------------------------------ */
-/* Only the cross-session interrupt band and the one action slot (Allow/Deny,
-   Stop, Resume) stick below #bar — not the title bar and tabs above them. Those
-   two are what a long, auto-scrolled-to-bottom transcript would otherwise bury
-   several screens up; the title and tabs are not needed while reading the
-   bottom of a transcript you already opened, and sticking the whole stack ate
-   most of a short (~400px-tall) viewport in testing. They're grouped in one
-   #session-sticky wrapper, rather than each sticking independently, because
-   sibling sticky elements pinned to the same `top` stack on top of each other
-   instead of below one another. Opaque background and a z-index below #bar's
-   (4) but above the transcript's static content, so a long scroll shows
-   transcript text sliding *under* this, not through it. */
-#session-sticky { position: sticky; top: var(--bar-h); z-index: 1;
-  background: var(--canvas); }
-#session > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
-#session h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; word-break: break-word; }
-#session-stopped-reason { flex-basis: 100%; margin: -.4rem 0 0 3.9rem; }
+/* #session-main takes the width #sidebar reserves via margin-left, so body's
+   own 2rem edge padding reads as the gap between the two — no separate gap
+   value to keep in sync with it. */
+#session-main { margin-left: var(--sidebar-w); }
+#session-main > header { display: flex; align-items: center; gap: .8rem; flex-wrap: wrap; }
+#session-main h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; word-break: break-word; }
+#session-stopped-reason { flex-basis: 100%; margin: -.4rem 0 0 0; }
 #session-menu { margin-left: auto; position: relative; }
 #session-menu .menu-wrap { margin-left: 0; }
-#back { padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
+
+/* Fixed, not sticky: sticky is bounded by #session's own box and by scroll
+   position within it, which is exactly the "scrolls out of reach" behavior
+   this replaces — see the comment on #sidebar in index.html. overflow-y:auto
+   is the escape hatch for a short viewport with many other sessions listed;
+   everything above #sidebar-switch is short enough in practice to never need
+   it. z-index sits below #bar's (4) and above the transcript's static content. */
+#sidebar { position: fixed; top: var(--bar-h); left: 0; bottom: 0; z-index: 1;
+  width: var(--sidebar-w); overflow-y: auto; box-sizing: border-box;
+  padding: 1.2rem 1rem 1.5rem; display: flex; flex-direction: column; gap: 1rem;
+  background: var(--canvas); border-right: 1px solid var(--hairline); }
+#back { align-self: flex-start; padding: .4rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; }
-#tabs { display: flex; gap: .2rem; margin: .9rem 0 1rem;
-  border-bottom: 1px solid var(--hairline); }
-#tabs button { padding: .45rem .9rem; border: 0; border-bottom: 2px solid transparent;
-  background: none; color: var(--muted); font: inherit; cursor: pointer; }
-#tabs button:hover { color: var(--ink); }
-#tabs button[aria-selected=true] { color: var(--ink); border-bottom-color: var(--accent-line); }
+
+#sidebar-chip { display: flex; align-items: center; gap: .5rem;
+  font: 500 15px/1.3 var(--display); word-break: break-word; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--stopped); }
+.status-dot.working { background: var(--working); }
+.status-dot.needs-you { background: var(--needs); }
+.status-dot.done { background: var(--done); }
+
+#tabs { display: flex; flex-direction: column; gap: .1rem; }
+#tabs button { padding: .45rem .6rem; border: 0; border-left: 2px solid transparent; border-radius: 7px;
+  background: none; color: var(--muted); font: inherit; text-align: left; cursor: pointer; }
+#tabs button:hover { color: var(--ink); background: var(--hover); }
+#tabs button[aria-selected=true] { color: var(--ink); background: var(--well); border-left-color: var(--accent-line); }
+
+#sidebar-diffstat { margin: 0; }
+#sidebar-diffstat:empty { display: none; }
+
+#session-sticky { display: flex; flex-direction: column; gap: .6rem; }
 #session-action:empty { display: none; }
-#session-action { max-width: 60rem; margin-bottom: 1rem; }
+#session-action { margin: 0; }
+
+#sidebar-account .meter { width: 100%; justify-content: space-between; }
+
+.sidebar-label { margin: 0; color: var(--muted); font-size: .75rem; font-weight: 650;
+  text-transform: uppercase; letter-spacing: .04em; }
+#sidebar-switch { display: flex; flex-direction: column; gap: .1rem; margin-top: .4rem; }
+.switch-row { display: flex; align-items: center; gap: .5rem; width: 100%; padding: .35rem .5rem;
+  border: 0; border-radius: 7px; background: none; color: var(--ink); font: inherit; font-size: .85rem;
+  text-align: left; cursor: pointer; }
+.switch-row:hover { background: var(--hover); }
+.switch-branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A divider between groups, skipping the first one: `+` only matches a
+   .sidebar-group that *follows* another .sidebar-group, so #back (not one)
+   needs no special-casing to stay undivided from #sidebar-chip after it. */
+.sidebar-group + .sidebar-group { border-top: 1px solid var(--hairline); padding-top: .9rem; }
+
 #pane-diff { max-width: 60rem; }
 
 /* ---- Commit graph ------------------------------------------------------ */
@@ -737,13 +772,15 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
   font-weight: 650; }
 
 /* ---- Inline interrupt -------------------------------------------------- */
-#interrupt { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
-  max-width: 60rem; margin-bottom: 1rem; padding: .6rem 1rem; border-radius: 12px;
-  background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--needs); font-size: .9em; }
-#interrupt span { flex: 1 1 20rem; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-#interrupt button { padding: .3rem .7rem; border-radius: 7px; border: 1px solid var(--needs);
-  background: none; color: var(--needs); font: inherit; cursor: pointer; white-space: nowrap; }
+/* Column, not row: this now lives in #sidebar's ~13.5rem column rather than
+   the transcript's ~60rem one, so the row layout that used to ellipsis a long
+   summary onto one line just wraps it instead. */
+#interrupt { display: flex; flex-direction: column; align-items: stretch; gap: .5rem;
+  padding: .6rem .7rem; border-radius: 10px;
+  background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--needs); font-size: .85em; }
+#interrupt span { white-space: normal; }
+#interrupt button { padding: .3rem .6rem; border-radius: 7px; border: 1px solid var(--needs);
+  background: none; color: var(--needs); font: inherit; cursor: pointer; }
 #interrupt button:hover { background: var(--needs); color: var(--canvas); }
 #interrupt button.more { border-color: transparent; color: var(--muted); }
 
