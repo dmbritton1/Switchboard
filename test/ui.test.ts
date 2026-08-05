@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues, HUES,
+  groupTranscript, toolRunLabel, resultMeta, commandMenu, commandToken, attributeBranches, branchHues, HUES,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from '../web/lib.js';
 
@@ -47,6 +47,19 @@ test('groupTranscript keys each run by its own first index', () => {
     tool('Edit'), tool('Write'),
   ]);
   assert.deepEqual(out.filter((g) => g.kind === 'tools').map((g) => g.at), [0, 3]);
+});
+
+test('resultMeta measures long output and inlines a short one-liner', () => {
+  assert.deepEqual(resultMeta('a\nb\nc'), { label: '3 lines', fold: true });
+  // Trailing newlines are how the output ended, not an extra line of it.
+  assert.deepEqual(resultMeta('a\nb\n\n'), { label: '2 lines', fold: true });
+  assert.deepEqual(resultMeta('clean'), { label: 'clean', fold: false },
+    'a short one-liner reads on the call line rather than behind a click');
+  assert.deepEqual(resultMeta('x'.repeat(81)), { label: '1 line', fold: true },
+    'one very long line is still a wall, so it folds');
+  // A running call has no output yet, and an empty result is not worth a row.
+  assert.deepEqual(resultMeta(undefined), { label: '', fold: false });
+  assert.deepEqual(resultMeta('\n'), { label: '', fold: false });
 });
 
 test('toolRunLabel names distinct tools and calls out unresolved state', () => {

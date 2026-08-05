@@ -160,6 +160,23 @@ export function toolRunLabel(msgs) {
 }
 
 /**
+ * How a resolved tool call presents its output: `label` goes on the call's one
+ * line, `fold` says whether the full text is worth hiding behind a disclosure.
+ *
+ * Long output is measured, not shown — the size is what tells you whether
+ * opening it is worth it. A short single-line result is exempt: it is already
+ * its own best summary, and folding it would cost a click to reveal less than
+ * the click did.
+ */
+export function resultMeta(result) {
+  const text = (result ?? '').replace(/\n+$/, '');
+  if (!text) return { label: '', fold: false };
+  const lines = text.split('\n');
+  if (lines.length === 1 && text.length <= 80) return { label: text, fold: false };
+  return { label: `${lines.length} line${lines.length === 1 ? '' : 's'}`, fold: true };
+}
+
+/**
  * The message that actually reaches the agent: what the user typed, then the
  * paths of whatever they attached, one per line.
  *

@@ -2,7 +2,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues,
+  groupTranscript, toolRunLabel, resultMeta, commandMenu, commandToken, attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from './lib.js';
 
@@ -929,25 +929,46 @@ function renderSession() {
 // stable because the transcript only ever grows. Cleared on session switch.
 const toolRunOpen = new Map();
 
-function msgNode(m) {
-  const el = document.createElement('div');
+/**
+ * One tool call, always on one line. The result is measured onto that line (see
+ * resultMeta) and folded behind it, so a run of eight resolved calls reads as
+ * eight lines instead of eight walls of output. A failure opens itself: that is
+ * the one whose text you actually wanted, and its siblings are not.
+ */
+function toolNode(m) {
+  const { label, fold } = resultMeta(m.result);
+  // A denied `rm -rf` and a successful one used to be pixel-identical.
+  const line = `${m.name}: ${m.summary}`
+    + (m.status === 'running' ? '' : ` · ${m.status}`)
+    + (label ? ` · ${label}` : '');
   // The status class doubles as the styling hook: a tool message with status
   // 'error' picks up the existing .msg.error colour.
-  el.className = m.kind === 'tool' ? `msg tool ${m.status}` : `msg ${m.kind}`;
-  // A denied `rm -rf` and a successful one used to be pixel-identical.
-  if (m.kind === 'tool') {
-    el.textContent = `${m.name}: ${m.summary}${m.status === 'running' ? '' : ` · ${m.status}`}`;
-    if (m.result) {
-      // Tool output: the agent's, transitively whatever it read off disk or off
-      // the network. textContent, never innerHTML — same rule as every other
-      // untrusted string in this file.
-      const pre = document.createElement('pre');
-      pre.className = 'tool-result';
-      pre.textContent = m.result;
-      el.append(pre);
-    }
+  const cls = `msg tool ${m.status}`;
+  if (!fold) {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = line;
     return el;
   }
+  const d = document.createElement('details');
+  d.className = cls;
+  d.open = m.status === 'error';
+  const sum = document.createElement('summary');
+  sum.textContent = line;
+  // Tool output: the agent's, transitively whatever it read off disk or off
+  // the network. textContent, never innerHTML — same rule as every other
+  // untrusted string in this file.
+  const pre = document.createElement('pre');
+  pre.className = 'tool-result';
+  pre.textContent = m.result;
+  d.append(sum, pre);
+  return d;
+}
+
+function msgNode(m) {
+  if (m.kind === 'tool') return toolNode(m);
+  const el = document.createElement('div');
+  el.className = `msg ${m.kind}`;
   el.textContent = m.text;
   if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
   if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
@@ -971,10 +992,12 @@ function toolRun(g) {
   sum.textContent = toolRunLabel(g.msgs);
   d.append(sum, ...g.msgs.map(msgNode));
 
-  // A run opens itself while it is unresolved — one you are waiting on, or one
-  // that failed, is the one you want to read — and collapses once it is just
-  // history. That's the condensing; the map below is only for overriding it.
-  const auto = g.msgs.some((m) => m.status === 'running' || m.status === 'error');
+  // A run opens itself only while you are waiting on it, and collapses once it
+  // is history. Failures used to open the run too, which meant one bad call
+  // unfolded every good one beside it; now the failing call opens itself (see
+  // toolNode) and the run's label still carries the "· N failed" that tells you
+  // to look. That's the condensing; the map below is only for overriding it.
+  const auto = g.msgs.some((m) => m.status === 'running');
   d.open = toolRunOpen.get(g.at) ?? auto;
   // Only a state that disagrees with `auto` is remembered, so a run the user
   // never touched goes back to folding itself when it finishes, while one they
