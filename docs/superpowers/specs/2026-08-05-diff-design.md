@@ -61,16 +61,30 @@ Three git calls, run together:
 
 2. `git diff HEAD --patch --no-color --no-ext-diff -- . ':!uploads'`
 
-   Split on `/^diff --git /m` and matched back to the numstat rows by path.
+   Split on `/^diff --git /m` and zipped to the numstat rows **by position**.
+   Both commands walk the same diff queue with the same pathspec and the same
+   options, so the two lists are the same files in the same order — including
+   binary files, which appear in both, and mode-only changes, which appear in
+   both as `0 0`. Position avoids parsing a path back out of a patch header,
+   which git may quote.
+
+   As a cheap guard against that assumption ever breaking, a chunk is only
+   attached to its row when the chunk text contains the row's path. A mismatch
+   yields an empty patch body under a correct header rather than the wrong
+   file's diff under it. Both commands run under `-c core.quotePath=false` so
+   the check is not defeated by a non-ASCII path.
+
    `--no-color` because the server may inherit a user's `color.ui = always`;
    `--no-ext-diff` because a repo-configured external differ would return
    something that is not a unified diff at all.
 
-   Matching by path rather than by position is deliberate. Both commands walk
-   the same tree with the same pathspec and should agree, but numstat is the
-   record that decides what exists; a patch chunk that matches no row is
-   dropped, and a row with no chunk renders as a header with no body rather
-   than throwing.
+   The chunk's own first line and its `index` / `---` / `+++` lines are
+   stripped: the summary already names the file. `old mode`, `new file mode`,
+   `rename from/to` and the `Binary files … differ` notice are kept.
+
+   This is the one call whose output can be large, so it carries an explicit
+   `maxBuffer` and, if it still fails, degrades to empty patch bodies — the
+   file list keeps working.
 
 3. `git ls-files --others --exclude-standard -z -- . ':(exclude)uploads'`
 
@@ -93,8 +107,8 @@ Three git calls, run together:
 
 **Truncation.** A patch body longer than 2000 lines is cut there and marked
 `truncated: true`. A single generated-file change would otherwise put megabytes
-through a route that is polled every two seconds. The counts stay accurate;
-only the body is cut.
+through a route the open pane polls every `STATUS_THROTTLE_MS` (4s). The counts
+stay accurate; only the body is cut.
 
 **Ordering.** Tracked files in git's order, then untracked. Git's order is
 stable across polls, which is what matters for a pane that re-renders while
@@ -127,7 +141,13 @@ and the Set is updated on `toggle`.
 **Re-render is skipped when the new payload is byte-identical to the last one.**
 The pane polls; the diff usually has not changed between two polls; replacing
 the DOM anyway resets the scroll position of a pane the user is reading. The
-comparison is on the raw response text, before parse.
+comparison is on the raw response text, before parse. It is cleared on session
+switch alongside the expansion Set.
+
+Both `diffSummary(file)` (the summary text, including the rename form) and
+`patchLineClass(line)` (added / removed / hunk) are pure and live in
+`web/lib.js`, which is where this codebase keeps browser logic that can be
+tested offline.
 
 Empty result → "No uncommitted changes." Binary file → "Binary file" in place
 of the body. Truncated file → a "… truncated" line at the end of the body.
@@ -150,8 +170,11 @@ an untracked file, a binary file, and a file under `uploads/`. Asserts:
 
 Rename and truncation get one case each.
 
-`test/server.test.ts` — `/diff` returns `[]` and `404` for an unknown id, and a
-file list for a known one.
+`test/server.test.ts` — `/diff` returns `[]` and `404` for an unknown id, a file
+list for a known one, and `403` behind the Host guard like every other route.
+
+`test/ui.test.ts` — `diffSummary` for the plain, rename, and binary forms;
+`patchLineClass` for added, removed, hunk, and context lines.
 
 Tests stay offline and use temporary directories, per the repo's test isolation
 rule.
