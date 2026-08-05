@@ -1204,6 +1204,12 @@ function fileBlock(f) {
   body.className = 'patch';
   if (f.binary) {
     body.textContent = 'Binary file';
+  } else if (!f.patch) {
+    // Reachable by design, not just a fetch error: worktreeDiff() degrades to an
+    // empty patch when the patch call exceeds its maxBuffer, and the same
+    // happens for a path git had to quote. Either way a blank box explains
+    // nothing, so say so instead of rendering empty padding.
+    body.textContent = 'Patch unavailable';
   } else {
     const line = (text, cls) => {
       const span = document.createElement('span');
@@ -1213,7 +1219,7 @@ function fileBlock(f) {
       span.textContent = `${text}\n`;
       return span;
     };
-    const lines = f.patch ? f.patch.split('\n').map((l) => line(l, patchLineClass(l))) : [];
+    const lines = f.patch.split('\n').map((l) => line(l, patchLineClass(l)));
     // Appended as its own element rather than pushed into the text, so a body
     // line that happens to read "… truncated" cannot impersonate the marker.
     if (f.truncated) lines.push(line('… truncated', 'hunk'));
@@ -1236,8 +1242,12 @@ function renderDiffPane(s) {
     // not changed between two polls, and replacing the DOM anyway would reset
     // the scroll position of a pane the user is reading, every 4 seconds.
     if (text === lastDiffText) return;
-    lastDiffText = text;
     const files = JSON.parse(text);
+    // Only cached once parsed: caching first let a bad body (a non-JSON error
+    // page) win the identity check forever after, since JSON.parse's throw
+    // landed in the empty .catch below and every retry of that same response
+    // short-circuited before ever trying again.
+    lastDiffText = text;
     if (!files.length) {
       const p = document.createElement('p');
       p.className = 'meta';

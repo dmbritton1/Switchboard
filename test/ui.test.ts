@@ -8,6 +8,20 @@ import {
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from '../web/lib.js';
 
+// Nothing else in `npm test` ever loads app.js as code — the DOM it wants is
+// out of scope for a plain test run — so a renamed or dropped lib.js export
+// would only surface as a blank page in the browser. This catches that one
+// realistic failure without a DOM harness: import lib.js for real and check
+// every name app.js's import block asks it for is actually there.
+test('every name app.js imports from lib.js is actually exported', async () => {
+  const appJs = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+  const block = appJs.match(/^import \{([\s\S]*?)\} from '\.\/lib\.js';/m)?.[1];
+  assert.ok(block, 'could not find the lib.js import block in app.js');
+  const names = block.split(',').map((n) => n.trim()).filter(Boolean);
+  const lib = await import('../web/lib.js');
+  for (const name of names) assert.ok(name in lib, `app.js imports ${name}, which lib.js does not export`);
+});
+
 test('composeMessage appends attachment paths, and stands alone without text', () => {
   assert.equal(composeMessage('look at this', ['uploads/a.png']), 'look at this\nuploads/a.png');
   // An image with no covering text is a message on its own.
