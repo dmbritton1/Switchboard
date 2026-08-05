@@ -279,6 +279,17 @@ test('worktreeDiff sums to the same totals worktreeStatus reports', async (t) =>
   await writeFile(join(repo, 'a.txt'), 'two\n');            // -1 line, +0
   await writeFile(join(repo, 'new.txt'), 'x\ny\nz\n');      // +3
 
+  // A *tracked* file under uploads/: an agent that `git add -A`'d the tree can
+  // commit one, and worktreeStatus()'s numstat call had no pathspec excluding
+  // uploads/ while its porcelain call and worktreeDiff (both pathspec'd) did —
+  // this file's edit would count here but be invisible to worktreeDiff, so the
+  // two totals split instead of matching.
+  await mkdir(join(repo, 'uploads'), { recursive: true });
+  await writeFile(join(repo, 'uploads', 'tracked.txt'), 'one\n');
+  await run('git', ['add', 'uploads/tracked.txt'], { cwd: repo });
+  await run('git', ['commit', '-m', 'track an upload'], { cwd: repo });
+  await writeFile(join(repo, 'uploads', 'tracked.txt'), 'one\ntwo\n'); // +1, excluded from both totals
+
   const [files, status] = await Promise.all([worktreeDiff(repo), worktreeStatus(repo)]);
   const sum = (k: 'added' | 'removed') => files.reduce((n, f) => n + f[k], 0);
 

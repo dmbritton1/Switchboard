@@ -135,15 +135,47 @@ export async function commitGraph(
   return assignLanes(commits);
 }
 
+/**
+ * Read one untracked file the way `worktreeStatus()` and `worktreeDiff()` both
+ * need to: `null` for anything to skip, `'binary'` for anything to count as a
+ * binary file, otherwise its text and line count. Shared so the two callers'
+ * rules for "skip" and "binary" cannot drift apart the way the pathspecs did
+ * (see the `--numstat` fix above) — one divergence there is the reason this
+ * scan is a single function instead of two copies of it.
+ */
+async function readUntracked(
+  cwd: string, rel: string,
+): Promise<{ text: string; lines: number } | 'binary' | null> {
+  let buf: Buffer;
+  try {
+    // Size-check first: this runs in the long-lived server process on every
+    // /status poll, and an agent that downloaded a dataset into its worktree
+    // would otherwise have it read into memory whole. 2MB of text is ~50k lines;
+    // anything past that is generated, and undercounting it beats the spike.
+    const { size } = await fsStat(join(cwd, rel));
+    if (size === 0 || size > 2_000_000) return null;
+    buf = await readFile(join(cwd, rel));
+  } catch {
+    return null; // Vanished or unreadable between ls-files and here.
+  }
+  // git's own binary heuristic: a NUL byte near the start. Binary files have no
+  // meaningful line count, and numstat skips them for the same reason.
+  if (buf.subarray(0, 8000).includes(0)) return 'binary';
+  const text = buf.toString('utf8');
+  // A file with no trailing newline still ends in a line.
+  const lines = text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+  return { text, lines };
+}
+
 export async function worktreeStatus(cwd: string): Promise<{
   branch: string; added: number; removed: number; dirty: boolean;
 }> {
   const [branch, stat, porcelain, others] = await Promise.all([
     run('git', ['branch', '--show-current'], { cwd }),
-    run('git', ['diff', 'HEAD', '--numstat'], { cwd }),
-    // `uploads/` is excluded from both: /upload drops pasted and attached files
+    // `uploads/` is excluded from all three: /upload drops pasted and attached files
     // there for the agent to read, and counting a screenshot as +N added lines
     // made the card's progress indicator report work nobody did.
+    run('git', ['diff', 'HEAD', '--numstat', '--', '.', ':!uploads'], { cwd }),
     run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd }),
     run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
   ]);
@@ -163,24 +195,8 @@ export async function worktreeStatus(cwd: string): Promise<{
   // would, but without touching the index.
   for (const rel of others.stdout.split('\0')) {
     if (!rel) continue;
-    let buf: Buffer;
-    try {
-      // Size-check first: this runs in the long-lived server process on every
-      // /status poll, and an agent that downloaded a dataset into its worktree
-      // would otherwise have it read into memory whole. 2MB of text is ~50k lines;
-      // anything past that is generated, and undercounting it beats the spike.
-      const { size } = await fsStat(join(cwd, rel));
-      if (size === 0 || size > 2_000_000) continue;
-      buf = await readFile(join(cwd, rel));
-    } catch {
-      continue; // Vanished or unreadable between ls-files and here.
-    }
-    // git's own binary heuristic: a NUL byte near the start. Binary files have no
-    // meaningful line count, and numstat skips them for the same reason.
-    if (buf.subarray(0, 8000).includes(0)) continue;
-    const text = buf.toString('utf8');
-    // A file with no trailing newline still ends in a line.
-    added += text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+    const r = await readUntracked(cwd, rel);
+    if (r && r !== 'binary') added += r.lines;
   }
 
   return {
@@ -206,8 +222,8 @@ const MAX_PATCH_LINES = 2000;
 
 /**
  * A patch chunk's own header lines. The pane's summary already names the file,
- * so `index`/`---`/`+++` are noise — but `old mode`, `new file mode`,
- * `rename from/to` and `Binary files … differ` are not, and stay.
+ * so `index`/`---`/`+++` are noise — but `old mode`, `new file mode` and
+ * `rename from/to` are not, and stay.
  */
 const NOISE = /^(index |--- |\+\+\+ )/;
 
@@ -238,7 +254,10 @@ function parseNumstat(stdout: string): Omit<FileDiff, 'patch' | 'truncated'>[] {
   const parts = stdout.split('\0');
   const rows: Omit<FileDiff, 'patch' | 'truncated'>[] = [];
   for (let i = 0; i < parts.length; i++) {
-    const [a, r, p] = parts[i].split('\t');
+    // A tab can appear in a filename, so the path is everything past the second
+    // tab, not a third split field — a plain 3-way split truncated it there.
+    const [a, r, ...rest] = parts[i].split('\t');
+    const p = rest.length ? rest.join('\t') : undefined;
     if (p === undefined) continue; // trailing empty element, not a record
     // Binary files report `-` for both counts; a byte count is not a line count.
     const binary = a === '-';
@@ -295,27 +314,14 @@ export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
   // staging them with `git add -N`; this does the same and builds the body too.
   for (const rel of others.stdout.split('\0')) {
     if (!rel) continue;
-    let buf: Buffer;
-    try {
-      // Size-check first: this runs in the long-lived server process, and an
-      // agent that downloaded a dataset into its worktree should not have it
-      // read into memory whole.
-      const { size } = await fsStat(join(cwd, rel));
-      if (size === 0 || size > 2_000_000) continue;
-      buf = await readFile(join(cwd, rel));
-    } catch {
-      continue; // Vanished or unreadable between ls-files and here.
-    }
-    // git's own binary heuristic: a NUL byte near the start.
-    if (buf.subarray(0, 8000).includes(0)) {
+    const r = await readUntracked(cwd, rel);
+    if (r === null) continue;
+    if (r === 'binary') {
       files.push({ path: rel, added: 0, removed: 0, binary: true, patch: '', truncated: false });
       continue;
     }
-    const text = buf.toString('utf8');
-    const lines = text.split('\n');
-    // A file with no trailing newline still ends in a line.
-    const n = lines.length - (text.endsWith('\n') ? 1 : 0);
-    const body = `@@ -0,0 +1,${n} @@\n${lines.slice(0, n).map((l) => `+${l}`).join('\n')}`;
+    const { text, lines: n } = r;
+    const body = `@@ -0,0 +1,${n} @@\n${text.split('\n').slice(0, n).map((l) => `+${l}`).join('\n')}`;
     files.push({ path: rel, added: n, removed: 0, binary: false, ...cap(body) });
   }
 
