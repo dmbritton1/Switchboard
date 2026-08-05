@@ -5,8 +5,14 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues, HUES,
-  readTheme, ACCENTS, CANVASES,
+  readTheme, ACCENTS, CANVASES, pastedName,
 } from '../web/lib.js';
+
+test('pastedName keeps same-millisecond pastes from overwriting each other', () => {
+  const names = [0, 1].map((i) => pastedName('image.png', 1700, i));
+  assert.deepEqual(names, ['paste-1700-0-image.png', 'paste-1700-1-image.png']);
+  assert.equal(pastedName('', 1700, 0), 'paste-1700-0-image.png');
+});
 
 const tool = (name, status = 'ok') => ({ kind: 'tool', name, summary: 'x', status });
 

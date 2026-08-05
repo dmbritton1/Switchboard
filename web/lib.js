@@ -159,6 +159,13 @@ export function toolRunLabel(msgs) {
     + (msgs.some((m) => m.status === 'running') ? ' · running' : '');
 }
 
+// Every pasted screenshot arrives named "image.png", and the upload route
+// overwrites by name — so two pastes in one message would collide and both
+// paths in the prompt would point at the second image. Stamp them unique.
+export function pastedName(name, at = Date.now(), i = 0) {
+  return `paste-${at}-${i}-${name || 'image.png'}`;
+}
+
 export const CODEX_FAILURE_LABEL = Object.freeze({
   codex_platform_unsupported: 'Unsupported platform',
   codex_binary_missing: 'Codex executable missing',
