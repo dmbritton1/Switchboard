@@ -397,13 +397,19 @@ export function commandToken(text, commands) {
   return known ? text.slice(0, end) : null;
 }
 
-// In picker order: eight accents around the wheel starting at coral, then the
-// canvases light-to-dark. The hexes live in web/style.css, which is what
-// test/palette.test.ts measures — these are only names.
-export const ACCENTS = Object.freeze(['coral', 'amber', 'moss', 'teal', 'sky', 'indigo', 'violet', 'rose']);
-export const CANVASES = Object.freeze(['cream', 'paper', 'ink', 'void']);
+// In picker order: ten accents by ascending OKLCH hue, starting near coral,
+// then the twelve canvases — six light families, then their six dark twins.
+// The hexes live in web/style.css, which is what test/palette.test.ts
+// measures — these are only names.
+export const ACCENTS = Object.freeze([
+  'clay', 'coral', 'ochre', 'moss', 'fern', 'teal', 'slate', 'indigo', 'plum', 'mulberry',
+]);
+export const CANVASES = Object.freeze([
+  'cream', 'linen', 'shell', 'mist', 'porcelain', 'bone',
+  'obsidian', 'umber', 'ember', 'pine', 'midnight', 'graphite',
+]);
 
-const DEFAULT_THEME = Object.freeze({ accent: 'coral', canvas: 'ink' });
+const DEFAULT_THEME = Object.freeze({ accent: 'coral', canvas: 'obsidian' });
 
 /**
  * The stored theme, or the default for anything that is not a known pair.
