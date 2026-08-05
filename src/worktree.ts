@@ -141,8 +141,11 @@ export async function worktreeStatus(cwd: string): Promise<{
   const [branch, stat, porcelain, others] = await Promise.all([
     run('git', ['branch', '--show-current'], { cwd }),
     run('git', ['diff', 'HEAD', '--numstat'], { cwd }),
-    run('git', ['status', '--porcelain'], { cwd }),
-    run('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd }),
+    // `uploads/` is excluded from both: /upload drops pasted and attached files
+    // there for the agent to read, and counting a screenshot as +N added lines
+    // made the card's progress indicator report work nobody did.
+    run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
   ]);
 
   let added = 0;

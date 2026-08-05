@@ -92,6 +92,17 @@ test('worktreeStatus counts untracked files, which git diff cannot see', async (
   assert.equal(s.removed, 0);
 });
 
+test('worktreeStatus ignores uploads/, which is conversation input, not work', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/up');
+
+  await mkdir(join(wt, 'uploads'), { recursive: true });
+  await writeFile(join(wt, 'uploads', 'paste-1-image.png'), 'a\nb\nc\n');
+
+  assert.deepEqual(await worktreeStatus(wt), { branch: 'feat/up', added: 0, removed: 0, dirty: false });
+});
+
 test('assignLanes reuses a lane once a branch has merged back', () => {
   //   D   merge of B and C
   //   |\
