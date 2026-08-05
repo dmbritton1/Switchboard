@@ -277,7 +277,11 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .ghost { padding: .45rem .8rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--surface-2); color: var(--ink); font: inherit; font-weight: 500; cursor: pointer; }
 #selection-status { flex-basis: 100%; margin: 0; color: var(--muted); font-size: .85em; }
-#transcript { max-width: 60rem; }
+/* Centered rather than left-hugging #session's full width: on a wide window
+   the transcript used to sit flush against the left edge with the rest of
+   the screen empty beside it. #composer below gets the same treatment so the
+   message box stays under the text it's replying to. */
+#transcript { max-width: 60rem; margin-inline: auto; }
 .msg { padding: .5rem 0; border-bottom: 1px solid var(--hairline); white-space: pre-wrap; }
 .msg.tool { color: var(--muted); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }
@@ -319,7 +323,7 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #command-error:empty { display: none; }
 #command-error button, .queue-error button { padding: .25rem .55rem; border: 1px solid currentColor;
   border-radius: 6px; background: none; color: inherit; font: inherit; cursor: pointer; }
-#composer { margin-top: 1rem; max-width: 60rem; }
+#composer { margin-top: 1rem; max-width: 60rem; margin-inline: auto; }
 /* The shell carries the border, fill and radius the field used to own, so
    attachments, the field and the controls read as one object. No overflow
    clipping: #cmd-menu is absolutely positioned above the field and would be
@@ -464,7 +468,8 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
   color: var(--body); font: inherit; font-size: .85rem; line-height: 1; cursor: pointer; }
 .chip-x:hover { border-color: var(--error); color: var(--error); }
 .chip-x:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
-#upload-error { margin: .5rem 0 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
+/* Centered with #composer, which it reports on and sits directly below. */
+#upload-error { margin: .5rem auto 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
 
 /* ---- Session view ------------------------------------------------------ */
