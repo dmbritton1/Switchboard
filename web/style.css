@@ -304,6 +304,15 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .prompt-delivery { margin-left: .25rem; color: var(--muted); font-size: .8em; font-weight: 600; }
 .prompt-delivery.queued { color: var(--muted); }
 .prompt-delivery.unsent { color: var(--error); }
+/* A long pasted prompt (see promptFold() in lib.js), folded the same way a
+   tool result is: visible head in the summary, the rest revealed by hand. */
+.msg.user > summary { cursor: pointer; }
+.msg.user > summary:hover { color: var(--ink); }
+.prompt-fold-hint { margin-left: .4rem; color: var(--muted); font-size: .8em; font-weight: 600; }
+/* The hint reads "More" only while there is more to reveal — once open, the
+   text below it is that "more", so the label would be pointing at itself. */
+.msg.user[open] > summary .prompt-fold-hint { display: none; }
+.msg.user > .prompt-more { display: block; }
 #command-error { display: flex; align-items: center; gap: .6rem; max-width: 60rem;
   margin: 0 0 1rem; padding: .6rem 1rem; border: 1px solid var(--error-line); border-radius: 12px;
   background: var(--error-bg); color: var(--error); font-size: .9em; }

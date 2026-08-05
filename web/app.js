@@ -2,7 +2,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, resultMeta, commandMenu, commandToken, attributeBranches, branchHues,
+  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from './lib.js';
 
@@ -977,18 +977,52 @@ function toolNode(m) {
   return d;
 }
 
-function msgNode(m) {
-  if (m.kind === 'tool') return toolNode(m);
-  const el = document.createElement('div');
-  el.className = `msg ${m.kind}`;
-  el.textContent = m.text;
-  if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
-  if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
+/**
+ * A user prompt. Short ones are a plain line, same as every other message. A
+ * long one — a pasted spec, a stack trace, a wall of logs — folds behind a
+ * disclosure the same way a big tool result does (see toolNode): the visible
+ * head stays on the line, the rest opens on purpose. `<details>` rather than
+ * a class toggle for the same reason it's used there — free keyboard access
+ * and screen-reader semantics for something that's otherwise plain markup.
+ */
+function userNode(m) {
+  const fold = promptFold(m.text);
+  const el = document.createElement(fold ? 'details' : 'div');
+  el.className = 'msg user';
+  if (m.id) el.dataset.promptId = m.id;
+  // Where the delivery badge (see below) lands: inside the summary when
+  // folded, so it stays visible whether or not the rest is open; the element
+  // itself otherwise.
+  let head = el;
+  if (fold) {
+    head = document.createElement('summary');
+    head.textContent = fold.head;
+    const hint = document.createElement('span');
+    hint.className = 'prompt-fold-hint';
+    hint.textContent = 'More';
+    head.append(hint);
+    const rest = document.createElement('span');
+    rest.className = 'prompt-more';
+    rest.textContent = fold.rest;
+    el.append(head, rest);
+  } else {
+    el.textContent = m.text;
+  }
+  if (m.delivery === 'queued' || m.delivery === 'unsent') {
     const delivery = document.createElement('span');
     delivery.className = `prompt-delivery ${m.delivery}`;
     delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
-    el.append(' ', delivery);
+    head.append(' ', delivery);
   }
+  return el;
+}
+
+function msgNode(m) {
+  if (m.kind === 'tool') return toolNode(m);
+  if (m.kind === 'user') return userNode(m);
+  const el = document.createElement('div');
+  el.className = `msg ${m.kind}`;
+  el.textContent = m.text;
   return el;
 }
 

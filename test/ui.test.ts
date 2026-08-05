@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
-  groupTranscript, toolRunLabel, resultMeta, commandMenu, commandToken, attributeBranches, branchHues, HUES,
+  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues, HUES,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from '../web/lib.js';
 
@@ -60,6 +60,37 @@ test('resultMeta measures long output and inlines a short one-liner', () => {
   // A running call has no output yet, and an empty result is not worth a row.
   assert.deepEqual(resultMeta(undefined), { label: '', fold: false });
   assert.deepEqual(resultMeta('\n'), { label: '', fold: false });
+});
+
+test('promptFold leaves a short prompt alone', () => {
+  assert.equal(promptFold('run the tests'), null);
+  assert.equal(promptFold('line one\nline two\nline three'), null,
+    'a handful of short lines still reads fine in full');
+});
+
+test('promptFold cuts a many-line prompt at a line boundary', () => {
+  const lines = Array.from({ length: 9 }, (_, i) => `line ${i}`);
+  const fold = promptFold(lines.join('\n'));
+  assert.equal(fold.head, lines.slice(0, 6).join('\n'));
+  assert.equal(fold.rest, `\n${lines.slice(6).join('\n')}`);
+  assert.equal(fold.head + fold.rest, lines.join('\n'),
+    'the two halves must reassemble the exact original text');
+});
+
+test('promptFold cuts a long single-line prompt on a word boundary', () => {
+  const text = `${'word '.repeat(150)}tail`;
+  const fold = promptFold(text);
+  assert.ok(fold, 'well past the character cap, so it folds despite being one line');
+  assert.ok(fold.head.length <= 600);
+  assert.ok(!fold.head.endsWith('wor'), 'cut lands on a space, not mid-word');
+  assert.equal(fold.head + fold.rest, text);
+});
+
+test('promptFold falls back to a hard cut with no nearby word boundary', () => {
+  const text = 'x'.repeat(1000);
+  const fold = promptFold(text);
+  assert.equal(fold.head.length, 600);
+  assert.equal(fold.head + fold.rest, text);
 });
 
 test('toolRunLabel names distinct tools and calls out unresolved state', () => {
