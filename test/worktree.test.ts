@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignLanes, commitGraph, createWorktree, worktreeStatus } from '../src/worktree.ts';
+import { assignLanes, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
 
 const run = promisify(execFile);
 
@@ -235,4 +235,85 @@ test('commitGraph falls back to a single walk when the base repo is detached', a
 
   assert.ok(graph.length >= 2, 'still returns commits rather than throwing');
   assert.ok(graph.every((c) => c.tier === 'other'), 'no trunk to split on, so nothing is tiered');
+});
+
+test('worktreeDiff reports modified, untracked and binary files, and skips uploads/', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  await writeFile(join(repo, 'a.txt'), 'one\ntwo\nthree\n');       // tracked, +1
+  await writeFile(join(repo, 'new.txt'), 'alpha\nbeta\n');          // untracked, +2
+  await writeFile(join(repo, 'blob.bin'), Buffer.from([1, 0, 2]));  // untracked, binary
+  await mkdir(join(repo, 'uploads'), { recursive: true });
+  await writeFile(join(repo, 'uploads', 'shot.png'), 'pretend png\n');
+
+  const files = await worktreeDiff(repo);
+  const by = Object.fromEntries(files.map((f) => [f.path, f]));
+
+  assert.deepEqual(Object.keys(by).sort(), ['a.txt', 'blob.bin', 'new.txt']);
+
+  assert.equal(by['a.txt'].added, 1);
+  assert.equal(by['a.txt'].removed, 0);
+  assert.match(by['a.txt'].patch, /^@@ /m);
+  assert.match(by['a.txt'].patch, /^\+three$/m);
+  // The `diff --git` line and the index/---/+++ noise are stripped: the summary
+  // in the pane already names the file.
+  assert.doesNotMatch(by['a.txt'].patch, /diff --git|^index |^\+\+\+ |^--- /m);
+
+  // Untracked files are invisible to `git diff HEAD`, so they are synthesized.
+  assert.equal(by['new.txt'].added, 2);
+  assert.equal(by['new.txt'].removed, 0);
+  assert.equal(by['new.txt'].patch, '@@ -0,0 +1,2 @@\n+alpha\n+beta');
+
+  assert.equal(by['blob.bin'].binary, true);
+  assert.equal(by['blob.bin'].patch, '');
+  assert.equal(by['blob.bin'].added, 0);
+});
+
+// The pane's per-file numbers sit inches from the sidebar's totals. If the two
+// ever disagree it reads as a bug, so they are held to the same range here.
+test('worktreeDiff sums to the same totals worktreeStatus reports', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  await writeFile(join(repo, 'a.txt'), 'two\n');            // -1 line, +0
+  await writeFile(join(repo, 'new.txt'), 'x\ny\nz\n');      // +3
+
+  const [files, status] = await Promise.all([worktreeDiff(repo), worktreeStatus(repo)]);
+  const sum = (k: 'added' | 'removed') => files.reduce((n, f) => n + f[k], 0);
+
+  assert.equal(sum('added'), status.added);
+  assert.equal(sum('removed'), status.removed);
+});
+
+test('worktreeDiff carries the old path through a rename', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  await run('git', ['mv', 'a.txt', 'b.txt'], { cwd: repo });
+
+  const files = await worktreeDiff(repo);
+  assert.equal(files.length, 1);
+  assert.equal(files[0].path, 'b.txt');
+  assert.equal(files[0].old, 'a.txt');
+});
+
+test('worktreeDiff caps a huge patch body and says so', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  const big = Array.from({ length: 2500 }, (_, i) => `line ${i}`).join('\n');
+  await writeFile(join(repo, 'gen.txt'), `${big}\n`);
+
+  const [file] = await worktreeDiff(repo);
+  assert.equal(file.truncated, true);
+  assert.equal(file.patch.split('\n').length, 2000);
+  assert.equal(file.added, 2500, 'the counts stay honest even when the body is cut');
+});
+
+test('worktreeDiff on a clean worktree is an empty list, not a throw', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+
+  assert.deepEqual(await worktreeDiff(repo), []);
 });

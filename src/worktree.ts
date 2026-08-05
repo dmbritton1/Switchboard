@@ -190,3 +190,134 @@ export async function worktreeStatus(cwd: string): Promise<{
     dirty: porcelain.stdout.trim().length > 0,
   };
 }
+
+export type FileDiff = {
+  path: string;
+  old?: string;
+  added: number;
+  removed: number;
+  binary: boolean;
+  patch: string;
+  truncated: boolean;
+};
+
+/** A body longer than this is cut; see the truncation note in the diff spec. */
+const MAX_PATCH_LINES = 2000;
+
+/**
+ * A patch chunk's own header lines. The pane's summary already names the file,
+ * so `index`/`---`/`+++` are noise — but `old mode`, `new file mode`,
+ * `rename from/to` and `Binary files … differ` are not, and stay.
+ */
+const NOISE = /^(index |--- |\+\+\+ )/;
+
+/** Chunk text as it should be rendered: header line dropped, noise filtered. */
+function patchBody(chunk: string): string {
+  return chunk
+    .split('\n')
+    .slice(1) // the remainder of the `diff --git a/x b/y` line this was split on
+    .filter((l) => !NOISE.test(l))
+    .join('\n')
+    .replace(/\n+$/, '');
+}
+
+function cap(patch: string): { patch: string; truncated: boolean } {
+  const lines = patch.split('\n');
+  if (lines.length <= MAX_PATCH_LINES) return { patch, truncated: false };
+  return { patch: lines.slice(0, MAX_PATCH_LINES).join('\n'), truncated: true };
+}
+
+/**
+ * `git diff --numstat -z` records. The `-z` form exists because a path may
+ * contain a space, a quote or a newline, and the default form escapes those
+ * into a quoted string that then has to be unquoted. Its layout is
+ * `added \t removed \t path NUL`, except for a rename, which leaves the path
+ * field empty and follows with `old NUL new NUL`.
+ */
+function parseNumstat(stdout: string): Omit<FileDiff, 'patch' | 'truncated'>[] {
+  const parts = stdout.split('\0');
+  const rows: Omit<FileDiff, 'patch' | 'truncated'>[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const [a, r, p] = parts[i].split('\t');
+    if (p === undefined) continue; // trailing empty element, not a record
+    // Binary files report `-` for both counts; a byte count is not a line count.
+    const binary = a === '-';
+    const row = { added: binary ? 0 : Number(a), removed: binary ? 0 : Number(r), binary };
+    if (p === '') rows.push({ ...row, old: parts[++i], path: parts[++i] });
+    else rows.push({ ...row, path: p });
+  }
+  return rows;
+}
+
+/**
+ * Every uncommitted change in the worktree, file by file.
+ *
+ * The range and the pathspec are `worktreeStatus()`'s, deliberately: the pane's
+ * per-file numbers and the sidebar's `+N −M` are read inches apart, and a pane
+ * that measured a different range would look like a bug rather than a feature.
+ */
+export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
+  const SPEC = ['--', '.', ':!uploads'];
+  const [numstat, patch, others] = await Promise.all([
+    // quotePath=false keeps a non-ASCII path readable in the patch headers, which
+    // is what the sanity check below matches against.
+    run('git', ['-c', 'core.quotePath=false', 'diff', 'HEAD', '--numstat', '-z', ...SPEC], { cwd }),
+    // The one call whose output can be large. A generated file blows past
+    // execFile's 1MB default maxBuffer and rejects with ENOBUFS, so raise it —
+    // and if it still fails, fall back to no bodies rather than losing the list.
+    run(
+      'git',
+      ['-c', 'core.quotePath=false', 'diff', 'HEAD', '--patch', '--no-color', '--no-ext-diff', ...SPEC],
+      { cwd, maxBuffer: 32 * 1024 * 1024 },
+    ).catch(() => ({ stdout: '' })),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
+  ]);
+
+  const rows = parseNumstat(numstat.stdout);
+  // Zipped by position, not by path: both commands walk the same diff queue with
+  // the same pathspec, so they list the same files in the same order — binary
+  // files and mode-only changes included. That beats parsing a path back out of
+  // a header git may have quoted. The `includes` is the guard on that assumption:
+  // if the orders ever diverge, a file shows an empty body rather than somebody
+  // else's diff.
+  const chunks = patch.stdout.split(/^diff --git /m).slice(1);
+  const files: FileDiff[] = rows.map((row, i) => {
+    const chunk = chunks[i];
+    if (row.binary || !chunk || !chunk.includes(row.path)) {
+      return { ...row, patch: '', truncated: false };
+    }
+    return { ...row, ...cap(patchBody(chunk)) };
+  });
+
+  // `git diff HEAD` cannot see untracked files, and leaving them out would show
+  // `+0 −0` for the commonest first prompt there is — one telling the agent to
+  // *create* files. worktreeStatus() counts their lines directly rather than
+  // staging them with `git add -N`; this does the same and builds the body too.
+  for (const rel of others.stdout.split('\0')) {
+    if (!rel) continue;
+    let buf: Buffer;
+    try {
+      // Size-check first: this runs in the long-lived server process, and an
+      // agent that downloaded a dataset into its worktree should not have it
+      // read into memory whole.
+      const { size } = await fsStat(join(cwd, rel));
+      if (size === 0 || size > 2_000_000) continue;
+      buf = await readFile(join(cwd, rel));
+    } catch {
+      continue; // Vanished or unreadable between ls-files and here.
+    }
+    // git's own binary heuristic: a NUL byte near the start.
+    if (buf.subarray(0, 8000).includes(0)) {
+      files.push({ path: rel, added: 0, removed: 0, binary: true, patch: '', truncated: false });
+      continue;
+    }
+    const text = buf.toString('utf8');
+    const lines = text.split('\n');
+    // A file with no trailing newline still ends in a line.
+    const n = lines.length - (text.endsWith('\n') ? 1 : 0);
+    const body = `@@ -0,0 +1,${n} @@\n${lines.slice(0, n).map((l) => `+${l}`).join('\n')}`;
+    files.push({ path: rel, added: n, removed: 0, binary: false, ...cap(body) });
+  }
+
+  return files;
+}
