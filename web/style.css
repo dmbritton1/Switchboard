@@ -184,10 +184,14 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .tool-run > summary:hover { color: var(--ink); }
 .tool-run[open] > summary { border-bottom: 1px solid var(--hairline); }
 .tool-run > .msg { border-bottom: 0; padding-left: 1.3rem; }
-/* Tool output. A capped, scrollable box rather than a second disclosure nested
-   inside the run: the run is already the fold, and nesting one would cost two
-   clicks to read a single command's output. */
-.tool-result { max-height: 12em; overflow: auto; margin: .4rem 0 0;
+/* A tool call is one line, with its own output folded behind it (see toolNode).
+   The summary carries that whole line, so it needs the run summary's affordance. */
+.msg.tool > summary { cursor: pointer; }
+.msg.tool > summary:hover { color: var(--ink); }
+/* Tool output, revealed by its own call's disclosure. No max-height: the server
+   already caps this at MAX_RESULT (sessions.ts), so a scroll region here would
+   be a second scrollbar inside the transcript guarding nothing. */
+.tool-result { margin: .4rem 0 0;
   padding: .4rem .6rem; border-radius: 6px; background: var(--well);
   color: var(--muted); font-size: .95em; white-space: pre-wrap; word-break: break-word; }
 .msg.error > .tool-result { color: var(--error); }
