@@ -176,6 +176,41 @@ export function resultMeta(result) {
   return { label: `${lines.length} line${lines.length === 1 ? '' : 's'}`, fold: true };
 }
 
+// A prompt this many lines, or this many characters, is long enough that
+// showing it in full pushes every reply below it off screen — a pasted spec
+// or stack trace reads as "prompt, prompt, prompt, then finally the agent
+// says something." Chosen to comfortably fit a short paragraph or two, the
+// common case, while still catching anything meant to be read by scrolling.
+const PROMPT_FOLD_LINES = 6;
+const PROMPT_FOLD_CHARS = 600;
+
+/**
+ * Where to fold a long user prompt, or null if it is short enough to show in
+ * full. `head` and `rest` always concatenate back to the original text
+ * exactly — no ellipsis or other marker is spliced in — so the visible part
+ * is never gibberish and the full prompt is still exactly what was sent, not
+ * a lossy reconstruction of it.
+ *
+ * A prompt with real line breaks (the common paste) folds at a line boundary,
+ * which keeps whole paragraphs intact on each side. One with no line breaks
+ * to speak of (or absurdly long ones) instead folds near the character cap,
+ * on the nearest word boundary so the visible edge doesn't end mid-word.
+ */
+export function promptFold(text) {
+  const lines = text.split('\n');
+  if (lines.length <= PROMPT_FOLD_LINES && text.length <= PROMPT_FOLD_CHARS) return null;
+  if (lines.length > PROMPT_FOLD_LINES) {
+    return {
+      head: lines.slice(0, PROMPT_FOLD_LINES).join('\n'),
+      rest: `\n${lines.slice(PROMPT_FOLD_LINES).join('\n')}`,
+    };
+  }
+  let cut = text.lastIndexOf(' ', PROMPT_FOLD_CHARS);
+  // No space anywhere near the cap (one very long token) — just cut on it.
+  if (cut < PROMPT_FOLD_CHARS * 0.5) cut = PROMPT_FOLD_CHARS;
+  return { head: text.slice(0, cut), rest: text.slice(cut) };
+}
+
 /**
  * The message that actually reaches the agent: what the user typed, then the
  * paths of whatever they attached, one per line.
