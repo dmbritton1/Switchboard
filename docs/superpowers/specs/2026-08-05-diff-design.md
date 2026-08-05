@@ -51,8 +51,8 @@ Three git calls, run together:
    Authoritative source for paths and counts. `-z` because a repo may contain a
    path with a space, a quote, or a newline in it, and the non-`-z` form escapes
    those into a quoted string that then has to be unquoted. The `-z` record
-   format is `added \t removed \0 path \0`, except for renames, which emit
-   `added \t removed \0 old \0 new \0` — the rename case is detected by the
+   format is `added \t removed \t path \0`, except for renames, which emit
+   `added \t removed \t \0 old \0 new \0` — the rename case is detected by the
    empty path field, exactly as git documents it.
 
    Binary files report `-` for both counts. They become `binary: true`,
