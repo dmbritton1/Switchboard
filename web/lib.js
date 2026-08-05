@@ -540,3 +540,24 @@ export function attributeBranches(commits) {
   }
   return owner;
 }
+
+/**
+ * The one-line label for a file in the Diff pane. Binary files get a word
+ * rather than `+0 −0`: git refuses to count their lines and so does this, and
+ * a pair of zeroes would read as "nothing changed".
+ */
+export function diffSummary(file) {
+  const name = file.old ? `${file.old} → ${file.path}` : file.path;
+  return file.binary ? `${name} · binary` : `${name} · +${file.added} −${file.removed}`;
+}
+
+/**
+ * Which class one line of a unified patch body wears. The `---`/`+++` file
+ * headers are stripped server-side, so a leading `+` here is always content.
+ */
+export function patchLineClass(line) {
+  if (line.startsWith('@@')) return 'hunk';
+  if (line.startsWith('+')) return 'add';
+  if (line.startsWith('-')) return 'del';
+  return '';
+}

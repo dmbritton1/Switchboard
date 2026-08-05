@@ -5,7 +5,7 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues, HUES,
-  readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from '../web/lib.js';
 
 test('composeMessage appends attachment paths, and stands alone without text', () => {
@@ -674,4 +674,29 @@ test('attributeBranches stays fast through nested diamonds in one branch (perf r
 
   assert.equal(owner.get('m0'), 'feat');
   assert.ok(elapsed < 1000, `expected under 1000ms, took ${elapsed}ms`);
+});
+
+const fileDiff = (over = {}) => ({
+  path: 'src/a.ts', added: 3, removed: 1, binary: false, patch: '', truncated: false, ...over,
+});
+
+test('diffSummary names the file and its line counts, and spells out a rename', () => {
+  assert.equal(diffSummary(fileDiff()), 'src/a.ts · +3 −1');
+  assert.equal(
+    diffSummary(fileDiff({ old: 'src/old.ts', path: 'src/new.ts', added: 0, removed: 0 })),
+    'src/old.ts → src/new.ts · +0 −0',
+  );
+  // A byte count is not a line count, so a binary file says so instead of "+0 −0".
+  assert.equal(diffSummary(fileDiff({ path: 'logo.png', binary: true })), 'logo.png · binary');
+});
+
+test('patchLineClass tells the four kinds of patch line apart', () => {
+  assert.equal(patchLineClass('+added'), 'add');
+  assert.equal(patchLineClass('-removed'), 'del');
+  assert.equal(patchLineClass('@@ -1,2 +1,3 @@'), 'hunk');
+  assert.equal(patchLineClass(' context'), '');
+  assert.equal(patchLineClass(''), '', 'a blank context line is still context');
+  // `---`/`+++` are stripped server-side, but a *body* line of dashes is real
+  // content and must not be mistaken for a header.
+  assert.equal(patchLineClass('+++ this is content'), 'add');
 });
