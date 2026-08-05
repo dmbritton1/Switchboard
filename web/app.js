@@ -384,6 +384,27 @@ const STATUS_THROTTLE_MS = 4000;
 // renderDiffPane() to bypass the throttle just this once. See openTab().
 let forceDiffFetch = false;
 
+// Cached "+N −M · dirty/clean" for #sidebar-diffstat. A separate poll from
+// renderDiffPane()'s, deliberately not sharing its throttle state: that one
+// only fetches while Diff is the open tab, and this line is visible on all
+// three, so it needs to keep polling on Chat and Graph too. The minor overlap
+// while Diff is open (two /status calls landing close together) is cheaper
+// than teaching renderDiffPane() to also feed a consumer it doesn't know about.
+let sidebarDiffFor = null;
+let sidebarDiffText = '';
+
+function pollSidebarDiff() {
+  if (!openId) return;
+  const id = openId;
+  fetch(`/status?id=${id}`).then((r) => r.json()).then((d) => {
+    if (openId !== id) return; // switched or closed while the request was in flight
+    sidebarDiffFor = id;
+    sidebarDiffText = d ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}` : '';
+    $('#sidebar-diffstat').textContent = sidebarDiffText;
+  }).catch(() => {});
+}
+setInterval(pollSidebarDiff, STATUS_THROTTLE_MS);
+
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#session').hidden = true;
@@ -892,6 +913,9 @@ function openTab(id, which) {
   // is the one case where the pane would otherwise sit empty for up to
   // STATUS_THROTTLE_MS with nothing on screen yet.
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
+  // A session switch should show *that* session's numbers immediately, not
+  // whatever the previous one's poll last wrote into the cache.
+  const switching = id !== openId;
   openId = id;
   tab = which;
   // The trace belongs to the graph being torn down here, not the next one —
@@ -899,9 +923,64 @@ function openTab(id, which) {
   // it, and can light up a same-named branch in a different session's graph.
   if (which === 'graph') { graphCommits = []; tracedBranch = ''; loadGraph(); }
   render();
+  if (switching) { sidebarDiffFor = null; sidebarDiffText = ''; pollSidebarDiff(); }
 }
 
 const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
+
+/**
+ * Branch + status dot, shown in the sidebar so it's readable even once
+ * #session-title has scrolled out of #session-main above it.
+ */
+function renderSidebarChip(s) {
+  const chip = $('#sidebar-chip');
+  chip.replaceChildren();
+  const dot = document.createElement('span');
+  dot.className = `status-dot ${s.status}`;
+  const label = document.createElement('span');
+  label.textContent = s.branch;
+  chip.append(dot, label);
+  chip.title = `${s.branch} · ${s.status}`;
+}
+
+/**
+ * The account meter for this one session, reusing accountMeter() verbatim —
+ * same click-to-open-panel behavior as the header's #meters row, just scoped
+ * to the account this session is actually spending against.
+ */
+function renderSidebarAccount(s) {
+  const account = state.accounts.find((a) => a.name === s.account);
+  $('#sidebar-account').replaceChildren(...(account ? [accountMeter(account)] : []));
+}
+
+function switchRow(other) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'switch-row';
+  const dot = document.createElement('span');
+  dot.className = `status-dot ${other.status}`;
+  const label = document.createElement('span');
+  label.className = 'switch-branch';
+  label.textContent = other.branch;
+  b.append(dot, label);
+  b.title = `${other.branch} · ${other.status}`;
+  b.onclick = () => openTab(other.id, 'chat');
+  return b;
+}
+
+/**
+ * Every other session, one line each, so switching between a few worktrees
+ * never means dropping back to the grid first. Same order the grid itself
+ * uses, so "top of the list" means the same thing in both places.
+ */
+function renderSidebarSwitch(current) {
+  const others = sortSessions(
+    visibleSessions(state.sessions.filter((x) => x.id !== current.id), state.settings?.collapseDone ?? false),
+    state.settings?.sort ?? 'blocked',
+  );
+  $('#sidebar-switch').replaceChildren(...others.map(switchRow));
+  $('#sidebar-switch-wrap').hidden = !others.length;
+}
 
 function renderSession() {
   const s = state.sessions.find((x) => x.id === openId);
@@ -914,6 +993,16 @@ function renderSession() {
   stoppedReason.textContent = stoppedReason.hidden ? '' : s.stoppedReason;
   $('#session-menu').replaceChildren(overflowMenu(s));
   updateComposerButton(s);
+
+  renderSidebarChip(s);
+  // Synced from the cache rather than fetched here: pollSidebarDiff() already
+  // writes the DOM directly on its own interval, so a plain render() (an SSE
+  // snapshot, the 30s timer) doesn't need to trigger a fetch of its own — it
+  // only needs to make sure a session switch doesn't show the previous
+  // session's leftover number for the instant before the next poll lands.
+  $('#sidebar-diffstat').textContent = sidebarDiffFor === s.id ? sidebarDiffText : '';
+  renderSidebarAccount(s);
+  renderSidebarSwitch(s);
 
   const slot = actionSlot(s);
   $('#session-action').replaceChildren(...(slot ? [slot] : []));
