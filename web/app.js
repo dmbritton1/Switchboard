@@ -3,7 +3,7 @@ import {
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues,
-  readTheme, ACCENTS, CANVASES, pastedName,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [], commands: [] };
@@ -1433,7 +1433,10 @@ function composerText() {
   field.value = field.value.trim();
   // The trim can drop trailing blank lines, which the box is still tall enough for.
   growPrompt();
-  if (field.value) return field.value;
+  // Attachments count as a message on their own: the paths are what the agent
+  // acts on, and an image with no covering text is a normal thing to send.
+  const text = composeMessage(field.value, attached.map((a) => a.path));
+  if (text) return text;
   paintMirror();
   $('#composer').reportValidity();
   return '';
@@ -1494,7 +1497,9 @@ $('#when-dialog').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!ok || !openId) return;
 
-  const text = $('#prompt').value.trim();
+  // Same composition as Send: a scheduled message carries its attachment paths
+  // too, and the files are already on disk waiting for fire time.
+  const text = composeMessage($('#prompt').value, attached.map((a) => a.path));
   if (!text) return;
   // Always schedule a `send`, even for a session that is stopped right now: the
   // headline use of this feature is "send this tonight" against a session
@@ -1517,15 +1522,71 @@ $('#when-dialog').addEventListener('close', async (e) => {
   dialog.showModal();
 });
 
-// Uploads go straight to disk in the session's worktree and come back as a
-// relative path, which is appended to the prompt box. The agent then opens it
-// like any other file in the repo — no adapter or transcript change needed.
-// Object URLs are revoked here rather than left to GC: the strip is cleared on
-// every send and every session switch, so they would accumulate for the life of
-// the tab.
+/**
+ * Files uploaded for the message being composed: `{ path, name, url }`, where
+ * url is an object URL for images and null for everything else.
+ *
+ * Uploads go straight to disk in the session's worktree and come back as a
+ * relative path. That path is held here rather than typed into the box —
+ * composeMessage() appends it at send time — so the only thing the user sees
+ * is a chip they can remove, and the agent still opens the file by path with
+ * no adapter or transcript change.
+ */
+let attached = [];
+
+/** Object URLs are revoked rather than left to GC: the strip is cleared on
+ *  every send, so they would otherwise accumulate for the life of the tab. */
 function clearThumbs() {
-  for (const img of $('#thumbs').children) URL.revokeObjectURL(img.src);
-  $('#thumbs').replaceChildren();
+  for (const a of attached) if (a.url) URL.revokeObjectURL(a.url);
+  attached = [];
+  renderAttached();
+}
+
+function detach(path) {
+  const i = attached.findIndex((a) => a.path === path);
+  if (i < 0) return;
+  if (attached[i].url) URL.revokeObjectURL(attached[i].url);
+  attached.splice(i, 1);
+  // ponytail: the file stays on disk in the worktree — there is no delete
+  // route, and `delete` with "remove worktree" takes the whole directory
+  // anyway. Add one if orphaned uploads ever pile up somewhere visible.
+  renderAttached();
+}
+
+function renderAttached() {
+  const strip = $('#thumbs');
+  strip.replaceChildren(...attached.map((a) => {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    if (a.url) {
+      const img = new Image();
+      img.src = a.url;
+      img.alt = a.name;
+      chip.append(img);
+    } else {
+      // No preview to show, but the attachment still has to be visible and
+      // removable — otherwise a non-image upload leaves no trace at all now
+      // that the path is out of the box.
+      const label = document.createElement('span');
+      label.className = 'chip-name';
+      label.textContent = a.name;
+      chip.append(label);
+    }
+    chip.title = a.path;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'chip-x';
+    x.textContent = '×';
+    x.title = `Remove ${a.name}`;
+    x.setAttribute('aria-label', `Remove ${a.name}`);
+    x.onclick = () => detach(a.path);
+    chip.append(x);
+    return chip;
+  }));
+  // The field is `required` so an empty Send explains itself natively, but an
+  // image on its own is a legitimate message ("look at this"), and native
+  // validation would block the submit before onsubmit could add the path.
+  $('#prompt').required = attached.length === 0;
 }
 
 async function upload(files) {
@@ -1546,20 +1607,12 @@ async function upload(files) {
       $('#upload-error').textContent = `could not attach ${file.name}: ${err.message}`;
       return;
     }
-    const box = $('#prompt');
-    box.value = box.value ? `${box.value} ${path}` : path;
-    // Preview only what a preview means something for: the browser renders the
-    // local File, so this costs no second fetch of what was just uploaded.
-    if (file.type.startsWith('image/')) {
-      const img = new Image();
-      img.src = URL.createObjectURL(file);
-      img.alt = path;
-      img.title = path;
-      $('#thumbs').append(img);
-    }
+    // The browser previews the local File, so a thumbnail costs no second
+    // fetch of what was just uploaded.
+    const url = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
+    attached.push({ path, name: file.name, url });
   }
-  paintMirror();
-  growPrompt();
+  renderAttached();
   $('#prompt').focus();
 }
 

@@ -5,8 +5,16 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues, HUES,
-  readTheme, ACCENTS, CANVASES, pastedName,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
 } from '../web/lib.js';
+
+test('composeMessage appends attachment paths, and stands alone without text', () => {
+  assert.equal(composeMessage('look at this', ['uploads/a.png']), 'look at this\nuploads/a.png');
+  // An image with no covering text is a message on its own.
+  assert.equal(composeMessage('  ', ['uploads/a.png', 'uploads/b.png']), 'uploads/a.png\nuploads/b.png');
+  assert.equal(composeMessage('just text', []), 'just text');
+  assert.equal(composeMessage('   ', []), '', 'an empty composer stays empty so Send can refuse it');
+});
 
 test('pastedName keeps same-millisecond pastes from overwriting each other', () => {
   const names = [0, 1].map((i) => pastedName('image.png', 1700, i));

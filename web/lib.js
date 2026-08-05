@@ -159,6 +159,19 @@ export function toolRunLabel(msgs) {
     + (msgs.some((m) => m.status === 'running') ? ' · running' : '');
 }
 
+/**
+ * The message that actually reaches the agent: what the user typed, then the
+ * paths of whatever they attached, one per line.
+ *
+ * The paths ride in the text because no adapter accepts attachments — see
+ * docs/superpowers/specs/2026-07-30-file-upload-design.md. They are appended
+ * at send time instead of being typed into the box, so the composer can show a
+ * removable chip rather than a path the user has to delete by hand.
+ */
+export function composeMessage(text, paths) {
+  return [text.trim(), ...paths].filter(Boolean).join('\n');
+}
+
 // Every pasted screenshot arrives named "image.png", and the upload route
 // overwrites by name — so two pastes in one message would collide and both
 // paths in the prompt would point at the second image. Stamp them unique.
