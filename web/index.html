@@ -55,6 +55,9 @@
 
   <div id="pane-chat">
     <div id="transcript"></div>
+    <!-- Thumbnails of images attached to the message being composed. Empty
+         (and display:none) until an upload lands; cleared once it is sent. -->
+    <div id="thumbs"></div>
     <form id="composer">
       <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
       <div id="prompt-box" class="cmd-box">

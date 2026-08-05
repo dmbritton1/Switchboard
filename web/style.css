@@ -259,6 +259,10 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 /* Drop target feedback: without it, a drag over the transcript looks inert and
    the user cannot tell whether releasing will do anything. */
 #pane-chat.dropping { outline: 2px dashed var(--accent-line); outline-offset: 6px; border-radius: 8px; }
+#thumbs { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: 1rem; max-width: 60rem; }
+#thumbs:empty { display: none; }
+#thumbs img { height: 3.5rem; width: 3.5rem; object-fit: cover;
+  border: 1px solid var(--hairline); border-radius: 6px; }
 #upload-error { margin: .5rem 0 0; color: var(--error); font-size: .85rem; max-width: 60rem; }
 #upload-error:empty { display: none; }
 

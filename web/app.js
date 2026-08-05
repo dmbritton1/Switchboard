@@ -3,7 +3,7 @@ import {
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, commandMenu, commandToken, attributeBranches, branchHues,
-  readTheme, ACCENTS, CANVASES,
+  readTheme, ACCENTS, CANVASES, pastedName,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [], commands: [] };
@@ -1443,7 +1443,7 @@ $('#composer').onsubmit = async (e) => {
   const text = composerText();
   if (!text) return;
   const result = await runSessionCommand({ cmd: 'send', id: openId, text });
-  if (result.ok) { $('#prompt').value = ''; paintMirror(); growPrompt(); }
+  if (result.ok) { $('#prompt').value = ''; clearThumbs(); paintMirror(); growPrompt(); }
 };
 
 $('#schedule-btn').onclick = () => {
@@ -1480,7 +1480,7 @@ $('#when-dialog').addEventListener('close', async (e) => {
   const result = await postCommand({
     cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
   });
-  if (result.ok) { $('#prompt').value = ''; paintMirror(); growPrompt(); render(); return; }
+  if (result.ok) { $('#prompt').value = ''; clearThumbs(); paintMirror(); growPrompt(); render(); return; }
   // Same pattern as #new: show the server's reason and let the user retry,
   // rather than the fire-and-forget silence most other buttons in this app get.
   // This one is a modal the user explicitly confirmed to queue something —
@@ -1492,6 +1492,14 @@ $('#when-dialog').addEventListener('close', async (e) => {
 // Uploads go straight to disk in the session's worktree and come back as a
 // relative path, which is appended to the prompt box. The agent then opens it
 // like any other file in the repo — no adapter or transcript change needed.
+// Object URLs are revoked here rather than left to GC: the strip is cleared on
+// every send and every session switch, so they would accumulate for the life of
+// the tab.
+function clearThumbs() {
+  for (const img of $('#thumbs').children) URL.revokeObjectURL(img.src);
+  $('#thumbs').replaceChildren();
+}
+
 async function upload(files) {
   if (!openId || !files.length) return;
   $('#upload-error').textContent = '';
@@ -1512,6 +1520,15 @@ async function upload(files) {
     }
     const box = $('#prompt');
     box.value = box.value ? `${box.value} ${path}` : path;
+    // Preview only what a preview means something for: the browser renders the
+    // local File, so this costs no second fetch of what was just uploaded.
+    if (file.type.startsWith('image/')) {
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      img.alt = path;
+      img.title = path;
+      $('#thumbs').append(img);
+    }
   }
   paintMirror();
   growPrompt();
@@ -1540,6 +1557,16 @@ chat.addEventListener('drop', (e) => {
   e.preventDefault();
   chat.classList.remove('dropping');
   upload(e.dataTransfer.files);
+});
+
+// Pasting a screenshot into the composer takes the same path as a drop. The
+// event is left alone when the clipboard holds no files, so pasting text still
+// lands in the textarea normally.
+chat.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files ?? [])];
+  if (!files.length) return;
+  e.preventDefault();
+  upload(files.map((f, i) => new File([f], pastedName(f.name, Date.now(), i), { type: f.type })));
 });
 
 // A styled combobox standing in for the native <datalist>, which is an OS widget:
