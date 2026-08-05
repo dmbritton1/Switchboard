@@ -3,7 +3,7 @@ import {
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   accountView, freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
-  readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [], commands: [] };
@@ -923,7 +923,13 @@ function openTab(id, which) {
   // it, and can light up a same-named branch in a different session's graph.
   if (which === 'graph') { graphCommits = []; tracedBranch = ''; loadGraph(); }
   render();
-  if (switching) { sidebarDiffFor = null; sidebarDiffText = ''; pollSidebarDiff(); }
+  // The expansion set and the payload cache both belong to the session being
+  // left. Carried over, the cache would suppress the first render of the new
+  // session's diff whenever the two happened to be byte-identical.
+  if (switching) {
+    sidebarDiffFor = null; sidebarDiffText = ''; diffOpen.clear(); lastDiffText = '';
+    pollSidebarDiff();
+  }
 }
 
 const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
@@ -1176,26 +1182,70 @@ function renderChatPane(s) {
   if (nearBottom) $('#pane-chat').scrollIntoView({ block: 'end' });
 }
 
-// The named slot for the diff spec. /status returns only the totals today, so
-// that is what this shows — a real file-by-file diff needs a server route and
-// is spec'd separately.
+// Expanded files in the Diff pane, by path. Held here rather than in the DOM
+// because the pane is rebuilt whenever the payload changes, which would drop
+// the <details> open flags with it. Cleared on session switch by openTab().
+const diffOpen = new Set();
+// Raw text of the last /diff response, for the identity check in renderDiffPane.
+let lastDiffText = '';
+
+function fileBlock(f) {
+  const el = document.createElement('details');
+  el.className = 'file-diff';
+  el.open = diffOpen.has(f.path);
+  // <details> rather than a button and a hidden div: the browser already owns
+  // the toggle, the keyboard interaction and the aria-expanded state.
+  el.ontoggle = () => (el.open ? diffOpen.add(f.path) : diffOpen.delete(f.path));
+
+  const summary = document.createElement('summary');
+  summary.textContent = diffSummary(f);
+
+  const body = document.createElement('pre');
+  body.className = 'patch';
+  if (f.binary) {
+    body.textContent = 'Binary file';
+  } else {
+    const line = (text, cls) => {
+      const span = document.createElement('span');
+      // textContent, never innerHTML: a patch body is arbitrary repo text and
+      // this is the one place it reaches the page.
+      span.className = cls;
+      span.textContent = `${text}\n`;
+      return span;
+    };
+    const lines = f.patch ? f.patch.split('\n').map((l) => line(l, patchLineClass(l))) : [];
+    // Appended as its own element rather than pushed into the text, so a body
+    // line that happens to read "… truncated" cannot impersonate the marker.
+    if (f.truncated) lines.push(line('… truncated', 'hunk'));
+    body.replaceChildren(...lines);
+  }
+
+  el.append(summary, body);
+  return el;
+}
+
 function renderDiffPane(s) {
   const due = forceDiffFetch || Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   forceDiffFetch = false;
   if (!due) return;
   lastStatusFetch = Date.now();
   const pane = $('#pane-diff');
-  fetch(`/status?id=${s.id}`).then((r) => r.json()).then((d) => {
+  fetch(`/diff?id=${s.id}`).then((r) => r.text()).then((text) => {
     if (openId !== s.id || tab !== 'diff') return;
-    const p = document.createElement('p');
-    p.className = 'meta';
-    p.textContent = d
-      ? `${d.branch} · +${d.added} −${d.removed} · ${d.dirty ? 'uncommitted changes' : 'clean'}`
-      : 'No worktree status available.';
-    const note = document.createElement('p');
-    note.className = 'meta';
-    note.textContent = 'File-by-file diff is not implemented yet.';
-    pane.replaceChildren(p, note);
+    // Compared before parsing, and skipped when identical: the diff usually has
+    // not changed between two polls, and replacing the DOM anyway would reset
+    // the scroll position of a pane the user is reading, every 4 seconds.
+    if (text === lastDiffText) return;
+    lastDiffText = text;
+    const files = JSON.parse(text);
+    if (!files.length) {
+      const p = document.createElement('p');
+      p.className = 'meta';
+      p.textContent = 'No uncommitted changes.';
+      pane.replaceChildren(p);
+      return;
+    }
+    pane.replaceChildren(...files.map(fileBlock));
   }).catch(() => {});
 }
 

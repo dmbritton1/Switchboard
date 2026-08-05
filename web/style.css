@@ -538,6 +538,18 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 
 #pane-diff { max-width: 60rem; }
 
+.file-diff { border-top: 1px solid var(--hairline); }
+.file-diff summary { padding: .45rem .1rem; color: var(--body); font-family: var(--mono);
+  font-size: .78rem; cursor: pointer; }
+.file-diff summary:hover { color: var(--ink); }
+.file-diff[open] summary { color: var(--ink); }
+.patch { margin: 0 0 .7rem; padding: .55rem .7rem; border-radius: 7px; background: var(--well);
+  font-family: var(--mono); font-size: .75rem; line-height: 1.5;
+  white-space: pre; overflow-x: auto; }
+.patch .add { color: var(--working); }
+.patch .del { color: var(--error); }
+.patch .hunk { color: var(--muted); }
+
 /* ---- Commit graph ------------------------------------------------------ */
 /* Read as a transit map: a branch is a line, a commit is a stop, a merge is the
    interchange where two lines join. Colour is per branch *name*, not per lane —
