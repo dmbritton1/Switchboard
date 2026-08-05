@@ -30,65 +30,171 @@
 
 /* ---- Theme tokens ------------------------------------------------------- */
 /* Accent, canvas and status are three independent layers composed by two
-   attributes on <html>, so all thirty-two combinations exist without any of
-   them being authored. Every value is a literal hex and not a color-mix():
+   attributes on <html>, so all combinations exist without any of them being
+   authored. Every value is a literal hex and not a color-mix():
    test/palette.test.ts parses this file, and nothing in Node can resolve a
    color-mix(), so the contrast guarantee would rest on someone remembering to
-   look. Changing any hex here means running that test. */
+   look. Changing any hex here means running that test.
+
+   All ten accents and all twelve canvases are *derived*, not picked: each
+   accent holds one lightness and one chroma in OKLCH and only rotates hue
+   (an accent's --accent is its OKLCH-measured brand hue at L 0.658, C 0.113);
+   each canvas family rotates the hue of the same cream/obsidian lightness
+   ladder. See docs/superpowers/plans (or ask) for the derivation script if
+   these ever need re-deriving for a new hue. */
 
 /* --accent is the identity colour — the picker swatch, and the ring on the
    dark canvases. --accent-deep is the button fill (white label) and the link
-   and ring colour on the light canvases. --accent-lift is the link colour on
-   the dark canvases. */
-[data-accent=coral]  { --accent: #cc785c; --accent-deep: #a15232; --accent-lift: #d38769; }
-[data-accent=amber]  { --accent: #c69239; --accent-deep: #876122; --accent-lift: #d8aa5a; }
-[data-accent=moss]   { --accent: #7a9e47; --accent-deep: #54702d; --accent-lift: #a1c76b; }
-[data-accent=teal]   { --accent: #3e9886; --accent-deep: #287163; --accent-lift: #64c4b1; }
-[data-accent=sky]    { --accent: #4689b9; --accent-deep: #32698f; --accent-lift: #6da9d5; }
-[data-accent=indigo] { --accent: #7069bf; --accent-deep: #574ebc; --accent-lift: #8f88dd; }
-[data-accent=violet] { --accent: #a86bbd; --accent-deep: #87439d; --accent-lift: #c089d2; }
-[data-accent=rose]   { --accent: #c46484; --accent-deep: #9f385a; --accent-lift: #da819e; }
+   and ring colour on the light canvases: it is *not* the accent's OKLCH
+   "active" step verbatim, because that step alone clears white-text AA but
+   not the 4.5:1 this app also asks of --surface/--well (which sit darker
+   than --canvas on every light family) — --accent-deep is darkened a little
+   further than the source doc's "active" until both hold. --accent-lift is
+   the link colour on the dark canvases, taken straight from the source's
+   "on-dark" step, which already clears both AA checks with room to spare. */
+[data-accent=clay]     { --accent: #cc7573; --accent-deep: #a2504f; --accent-lift: #f19d9a; }
+[data-accent=coral]    { --accent: #cc785c; --accent-deep: #a25237; --accent-lift: #f1a085; }
+[data-accent=ochre]    { --accent: #be8439; --accent-deep: #935c00; --accent-lift: #e3ab69; }
+[data-accent=moss]     { --accent: #8c9a4d; --accent-deep: #626e1f; --accent-lift: #b2c079; }
+[data-accent=fern]     { --accent: #61a374; --accent-deep: #337549; --accent-lift: #8cc89b; }
+[data-accent=teal]     { --accent: #49a494; --accent-deep: #087667; --accent-lift: #78c9b9; }
+[data-accent=slate]    { --accent: #529bc3; --accent-deep: #226f95; --accent-lift: #7ec1e8; }
+[data-accent=indigo]   { --accent: #7c8ecf; --accent-deep: #5565a3; --accent-lift: #a3b4f3; }
+[data-accent=plum]     { --accent: #a081c4; --accent-deep: #7a5b9b; --accent-lift: #c5a8e8; }
+[data-accent=mulberry] { --accent: #c176a1; --accent-deep: #98517b; --accent-lift: #e69ec6; }
 
 /* On the light canvases cards sit *darker* than the floor and menus float
-   lighter; on the dark canvases both go lighter. --well (fields) is darker
-   than --surface on all four, which is the intent recorded at the top of this
-   file. color-scheme is set so native scrollbars, form controls and the
-   <dialog> backdrop follow instead of staying dark under Cream. */
+   lighter; on the dark canvases both go lighter. --well (fields) is one step
+   *softer* than --surface's card step on the light families, and one step
+   *recessed* below the floor on the dark families (that recess is where each
+   dark family also gets its --well: this is the token the source doc calls
+   surface-inset). --hover is the strongest step in either direction — the
+   family's most saturated card tone — used for pressed/hover fills.
+   color-scheme is set so native scrollbars, form controls and the <dialog>
+   backdrop follow instead of staying dark under a light floor.
+
+   Text is global across the six light families (ink/body/muted never
+   re-theme there — carried over unchanged from the original Cream) but
+   *per-family* across the six dark families, each solved so muted text still
+   clears 4.5:1 against that family's lightest (most-elevated) surface.
+   Status colours (working/needs/done/stopped/error, the warn/error fills,
+   the two branch-graph lane hues) stay hue-fixed within each mode, same as
+   before — they are deliberately not part of either derivation. */
 [data-canvas=cream] {
   color-scheme: light;
-  --canvas: #faf9f5; --surface: #efe9de; --surface-2: #fffdf8; --well: #f2ede4;
-  --hairline: #e0d8cb; --hover: #e6dfd2; --shadow: #0000001f;
+  --canvas: #faf9f5; --surface: #efe9de; --surface-2: #fefdf8; --well: #f5f0e8;
+  --hairline: #e6dfd8; --hover: #e8e0d2; --shadow: #0000001f;
   --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
   --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
   --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
   --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
   --lane-a: #197e74; --lane-b: #6b4bcc;
 }
-[data-canvas=paper] {
+[data-canvas=linen] {
   color-scheme: light;
-  --canvas: #fbfbfc; --surface: #f0f1f3; --surface-2: #ffffff; --well: #f5f6f8;
-  --hairline: #e2e4e8; --hover: #e6e8ec; --shadow: #0000001f;
-  --ink: #14151a; --body: #3a3d45; --muted: #656872;
+  --canvas: #fcf8f3; --surface: #f4e8d9; --surface-2: #fffcf9; --well: #f8efe4;
+  --hairline: #e8dfd4; --hover: #eedecc; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
   --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
   --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
   --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
   --lane-a: #197e74; --lane-b: #6b4bcc;
 }
-[data-canvas=ink] {
+[data-canvas=shell] {
+  color-scheme: light;
+  --canvas: #fdf8f7; --surface: #f4e6e4; --surface-2: #fffdfc; --well: #f9eeed;
+  --hairline: #e8dddc; --hover: #efdcda; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=mist] {
+  color-scheme: light;
+  --canvas: #f6faf8; --surface: #e2ede6; --surface-2: #f9fffc; --well: #ebf3ee;
+  --hairline: #dbe3de; --hover: #d7e5dc; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=porcelain] {
+  color-scheme: light;
+  --canvas: #f7f9fc; --surface: #e5eaf2; --surface-2: #fcfdff; --well: #edf1f7;
+  --hairline: #dde1e6; --hover: #dbe2eb; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=bone] {
+  color-scheme: light;
+  --canvas: #f9f9f8; --surface: #ebeae6; --surface-2: #fdfdfc; --well: #f1f1ee;
+  --hairline: #e1e0dd; --hover: #e2e1dc; --shadow: #0000001f;
+  --ink: #141413; --body: #3d3d3a; --muted: #6a6862;
+  --accent-line: var(--accent-deep); --accent-text: var(--accent-deep);
+  --working: #2c754a; --needs: #99580c; --done: #2a6aae; --stopped: #6a6862; --error: #b3261e;
+  --warn-bg: #fdf3e0; --warn-line: #e8c98d; --error-bg: #fdeceb; --error-line: #f0b5b0;
+  --lane-a: #197e74; --lane-b: #6b4bcc;
+}
+[data-canvas=obsidian] {
   color-scheme: dark;
-  --canvas: #181715; --surface: #211f1c; --surface-2: #2b2825; --well: #131211;
-  --hairline: #35322d; --hover: #333029; --shadow: #000000a6;
-  --ink: #faf9f5; --body: #d9d5cc; --muted: #a09d96;
+  --canvas: #181715; --surface: #1f1e1b; --surface-2: #252320; --well: #0f0e0c;
+  --hairline: #2d2b28; --hover: #2d2b27; --shadow: #000000a6;
+  --ink: #faf9f6; --body: #c4c2bc; --muted: #8f8a81;
   --accent-line: var(--accent); --accent-text: var(--accent-lift);
   --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
   --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
   --lane-a: #22b3a4; --lane-b: #9d7bff;
 }
-[data-canvas=void] {
+[data-canvas=umber] {
   color-scheme: dark;
-  --canvas: #0f1012; --surface: #17191c; --surface-2: #212429; --well: #0b0c0e;
-  --hairline: #2a2d33; --hover: #282c33; --shadow: #000000a6;
-  --ink: #ecedf0; --body: #c8cad0; --muted: #8b8f98;
+  --canvas: #1b1612; --surface: #231d17; --surface-2: #29221b; --well: #120d0a;
+  --hairline: #322a23; --hover: #322922; --shadow: #000000a6;
+  --ink: #fbf9f6; --body: #c7c1bb; --muted: #938980;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+[data-canvas=ember] {
+  color-scheme: dark;
+  --canvas: #1b1615; --surface: #231c1b; --surface-2: #292120; --well: #120d0d;
+  --hairline: #322928; --hover: #322827; --shadow: #000000a6;
+  --ink: #fcf8f8; --body: #cac0bf; --muted: #978786;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+[data-canvas=pine] {
+  color-scheme: dark;
+  --canvas: #141816; --surface: #1a201c; --surface-2: #1e2521; --well: #0b0f0d;
+  --hairline: #262e29; --hover: #252d28; --shadow: #000000a6;
+  --ink: #f6faf7; --body: #bcc4bf; --muted: #828e86;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+[data-canvas=midnight] {
+  color-scheme: dark;
+  --canvas: #14171c; --surface: #1a1e25; --surface-2: #1e242b; --well: #0b0f13;
+  --hairline: #262c34; --hover: #252c34; --shadow: #000000a6;
+  --ink: #f7fafc; --body: #bec3c9; --muted: #848c96;
+  --accent-line: var(--accent); --accent-text: var(--accent-lift);
+  --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
+  --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
+  --lane-a: #22b3a4; --lane-b: #9d7bff;
+}
+[data-canvas=graphite] {
+  color-scheme: dark;
+  --canvas: #171716; --surface: #1f1e1d; --surface-2: #242322; --well: #0f0e0d;
+  --hairline: #2c2b2a; --hover: #2c2b29; --shadow: #000000a6;
+  --ink: #f9f8f8; --body: #c3c1bf; --muted: #8c8b87;
   --accent-line: var(--accent); --accent-text: var(--accent-lift);
   --working: #4fc27f; --needs: #e2953c; --done: #6aa9f0; --stopped: #a09d96; --error: #f08a80;
   --warn-bg: #2a1f0f; --warn-line: #4a3316; --error-bg: #2a1414; --error-line: #5a2626;
@@ -635,8 +741,12 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #theme-wrap > .menu-btn { padding: .35rem .5rem; }
 .swatch { display: block; width: 14px; height: 14px; border-radius: 999px;
   background: var(--accent); box-shadow: inset 0 0 0 1px #00000026; }
-.swatch-row { display: flex; gap: .2rem; padding: .3rem .25rem .45rem;
+.swatch-row { display: flex; flex-wrap: wrap; gap: .2rem; padding: .3rem .25rem .45rem;
   border-bottom: 1px solid var(--hairline); margin-bottom: .25rem; }
+/* Canvas choices are grouped light-then-dark (see CANVASES in lib.js); this
+   marks the seam between the two groups without a second menu or a click. */
+.menu-group-label { padding: .5rem .55rem .15rem; color: var(--muted); font-size: .72rem;
+  font-weight: 600; letter-spacing: .04em; text-transform: uppercase; cursor: default; }
 .swatch-btn { display: grid; place-items: center; padding: .3rem; border: 1px solid transparent;
   border-radius: 999px; background: none; cursor: pointer; }
 .swatch-btn.on { border-color: var(--accent-line); }

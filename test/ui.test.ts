@@ -500,14 +500,14 @@ test('a newline ends the command token, for the multi-line new-session prompt', 
 });
 
 test('readTheme falls back to the default for anything that is not a known pair', () => {
-  const dflt = { accent: 'coral', canvas: 'ink' };
+  const dflt = { accent: 'coral', canvas: 'obsidian' };
   assert.deepEqual(readTheme(null), dflt);
   assert.deepEqual(readTheme(''), dflt);
   assert.deepEqual(readTheme('{oops'), dflt);
   assert.deepEqual(readTheme('"a string"'), dflt);
   assert.deepEqual(readTheme('{"accent":"chartreuse","canvas":"beige"}'), dflt);
   // Half-filled: the known half survives, the unknown half falls back.
-  assert.deepEqual(readTheme('{"canvas":"paper"}'), { accent: 'coral', canvas: 'paper' });
+  assert.deepEqual(readTheme('{"canvas":"linen"}'), { accent: 'coral', canvas: 'linen' });
 });
 
 test('readTheme passes a valid pair through', () => {

@@ -34,8 +34,11 @@ function ratio(a: string, b: string): number {
 const deref = (value: string, accent: Record<string, string>): string =>
   value.startsWith('var(') ? accent[value.slice(4, -1)] : value;
 
-const ACCENTS = ['coral', 'amber', 'moss', 'teal', 'sky', 'indigo', 'violet', 'rose'];
-const CANVASES = ['cream', 'paper', 'ink', 'void'];
+const ACCENTS = ['clay', 'coral', 'ochre', 'moss', 'fern', 'teal', 'slate', 'indigo', 'plum', 'mulberry'];
+const CANVASES = [
+  'cream', 'linen', 'shell', 'mist', 'porcelain', 'bone',
+  'obsidian', 'umber', 'ember', 'pine', 'midnight', 'graphite',
+];
 // Every floor text can land on. On the light canvases --surface is *darker*
 // than --canvas (cards sit down, menus float up), so checking --canvas alone
 // checks the one surface almost no text is drawn on.
@@ -43,11 +46,11 @@ const SURFACES = ['--canvas', '--surface', '--surface-2', '--well'];
 
 // --accent itself — the raw identity colour, read only by .swatch — is never
 // measured against anything here; only --accent-deep and --accent-lift are,
-// via --accent-text/--accent-line below. Against --surface-2 on Cream, amber
-// measures 2.73. Acceptable by design: WCAG 1.4.11 exempts graphics whose
+// via --accent-text/--accent-line below. Against --surface-2 on Cream, fern
+// measures 2.95. Acceptable by design: WCAG 1.4.11 exempts graphics whose
 // specific presentation is essential to the information, and a colour swatch
-// is the canonical example — you cannot darken amber to pass a contrast check
-// and still have it be amber. The part that *is* a state indicator — which
+// is the canonical example — you cannot darken fern to pass a contrast check
+// and still have it be fern. The part that *is* a state indicator — which
 // swatch is selected — is the .swatch-btn.on ring painted in --accent-line,
 // and that is measured at >=3:1 below.
 test('every accent stays legible on every canvas', () => {

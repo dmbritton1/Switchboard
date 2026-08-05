@@ -332,13 +332,19 @@ function renderTheme() {
     row.append(b);
   }
   menu.append(row);
-  for (const c of CANVASES) {
+  CANVASES.forEach((c, i) => {
+    if (i === DARK_CANVAS_START) {
+      const label = document.createElement('div');
+      label.className = 'menu-group-label';
+      label.textContent = 'Dark';
+      menu.append(label);
+    }
     const b = themeChoice(CANVAS_LABEL[c], () => setTheme({ canvas: c }), `canvas:${c}`);
     b.className = theme.canvas === c ? 'on' : '';
     b.setAttribute('aria-label', `${CANVAS_LABEL[c]} canvas`);
     b.setAttribute('aria-pressed', String(theme.canvas === c));
     menu.append(b);
-  }
+  });
   wrap.append(menu);
 }
 
@@ -527,7 +533,13 @@ function actionSlot(s) {
 let menuFor = null;
 
 const THEME_KEY = 'switchboard.theme';
-const CANVAS_LABEL = { cream: 'Cream', paper: 'Paper', ink: 'Ink', void: 'Void' };
+const CANVAS_LABEL = {
+  cream: 'Cream', linen: 'Linen', shell: 'Shell', mist: 'Mist', porcelain: 'Porcelain', bone: 'Bone',
+  obsidian: 'Obsidian', umber: 'Umber', ember: 'Ember', pine: 'Pine', midnight: 'Midnight', graphite: 'Graphite',
+};
+// CANVASES is light-then-dark (see lib.js); this is where the picker below
+// breaks the flat list into the two groups instead of one long column.
+const DARK_CANVAS_START = CANVASES.findIndex((c) => c === 'obsidian');
 // The same value the inline <head> script already applied; re-read here so the
 // picker knows what to tick without parsing the attributes back off <html>.
 // Guarded the same way that inline script guards its own read: blocked storage
