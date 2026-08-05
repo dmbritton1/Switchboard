@@ -1530,3 +1530,43 @@ test('the snapshot carries limits, limitsError and load per account', async (t) 
   assert.equal(codex.load, 0.4);
 
 });
+
+test('GET /diff returns the worktree changes file by file', async (t) => {
+  const { base, registry } = await boot(t);
+  const dir = await mkdtemp(join(tmpdir(), 'sb-repo-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await run('git', ['init', '-b', 'main'], { cwd: dir });
+  await run('git', ['config', 'user.email', 't@t.t'], { cwd: dir });
+  await run('git', ['config', 'user.name', 'T'], { cwd: dir });
+  await writeFile(join(dir, 'a.txt'), 'one\n');
+  await run('git', ['add', '.'], { cwd: dir });
+  await run('git', ['commit', '-m', 'init'], { cwd: dir });
+  await writeFile(join(dir, 'a.txt'), 'one\ntwo\n');
+
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: dir,
+    cwd: dir, branch: 'main', title: 't',
+  });
+
+  const res = await fetch(`${base}/diff?id=${s.id}`);
+  assert.equal(res.status, 200);
+  const files = await res.json();
+  assert.equal(files.length, 1);
+  assert.equal(files[0].path, 'a.txt');
+  assert.equal(files[0].added, 1);
+  assert.match(files[0].patch, /^\+two$/m);
+});
+
+test('GET /diff for an unknown session is a 404, not a crash', async (t) => {
+  const { base } = await boot(t);
+  const res = await fetch(`${base}/diff?id=nope`);
+  assert.equal(res.status, 404);
+});
+
+test('GET /diff is behind the Host guard like every other route', async (t) => {
+  const { base } = await boot(t);
+  const res = await rawRequest(new URL(`${base}/diff?id=nope`), {
+    method: 'GET', headers: { Host: 'evil.example' },
+  });
+  assert.equal(res.status, 403);
+});
