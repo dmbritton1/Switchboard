@@ -901,6 +901,7 @@ function renderSession() {
   stoppedReason.hidden = !(s.status === 'stopped' && s.provider === 'codex' && s.stoppedCode && s.stoppedReason);
   stoppedReason.textContent = stoppedReason.hidden ? '' : s.stoppedReason;
   $('#session-menu').replaceChildren(overflowMenu(s));
+  updateComposerButton(s);
 
   const slot = actionSlot(s);
   $('#session-action').replaceChildren(...(slot ? [slot] : []));
@@ -1436,6 +1437,33 @@ function composerText() {
   paintMirror();
   $('#composer').reportValidity();
   return '';
+}
+
+const SEND_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>';
+const STOP_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+
+/**
+ * #send-btn doubles as Send and Stop: an arrow that submits the form while
+ * the session is idle, a square that aborts the run while it's 'working'.
+ * Called from renderSession() on every snapshot, so it stays in step with
+ * the same s.status that drives actionSlot()'s separate, session-level Stop
+ * button (#session-action) — this one is scoped to the composer instead.
+ *
+ * type is flipped along with the icon: 'button' while working keeps a click
+ * from also submitting the form (the onclick below issues 'stop' directly),
+ * 'submit' while idle hands it back to #composer's onsubmit. Enter in the
+ * field still calls requestSubmit() either way, so a message typed mid-turn
+ * still sends (the server queues it) even though the button itself reads Stop.
+ */
+function updateComposerButton(s) {
+  const btn = $('#send-btn');
+  const working = s.status === 'working';
+  btn.innerHTML = working ? STOP_ICON : SEND_ICON;
+  btn.title = working ? 'Stop' : 'Send message';
+  btn.setAttribute('aria-label', working ? 'Stop' : 'Send message');
+  btn.type = working ? 'button' : 'submit';
+  btn.onclick = working ? async () => { await runSessionCommand({ cmd: 'stop', id: s.id }); } : null;
+  $('#composer-dots').hidden = !working;
 }
 
 $('#composer').onsubmit = async (e) => {

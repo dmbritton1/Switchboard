@@ -72,7 +72,16 @@
         <ul id="cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
       </div>
       <button id="schedule-btn" type="button" title="Schedule this message">⏱</button>
-      <button>Send</button>
+      <!-- Shown only while the open session's status is 'working' — see
+           updateComposerButton() in app.js, which also fills #send-btn. -->
+      <div id="composer-dots" class="dots" hidden aria-hidden="true"><span></span><span></span><span></span></div>
+      <!-- Content (icon + label) is set entirely by updateComposerButton():
+           an arrow that submits while idle, a square that stops while
+           working. Starts as the idle/arrow state so there's no flash of an
+           empty button before the first render fills it in. -->
+      <button id="send-btn" type="submit" title="Send message" aria-label="Send message">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+      </button>
     </form>
     <p id="upload-error"></p>
   </div>
