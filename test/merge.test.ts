@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorktree } from '../src/worktree.ts';
@@ -51,6 +51,40 @@ test('mergeWorktrees commits outstanding changes in the worktree before merging'
   assert.equal(await readFile(join(repo, 'c.txt'), 'utf8'), 'uncommitted\n');
   const { stdout } = await run('git', ['status', '--porcelain'], { cwd: wt });
   assert.equal(stdout.trim(), '', 'the worktree itself should be clean after the auto-commit');
+});
+
+test('mergeWorktrees leaves uploads/ out of the commit and out of the merge target', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/shots');
+  await writeFile(join(wt, 'd.txt'), 'real work\n');
+  await mkdir(join(wt, 'uploads'), { recursive: true });
+  await writeFile(join(wt, 'uploads', 'paste-1-image.png'), 'bytes\n');
+
+  const result = await mergeWorktrees(repo, [{ cwd: wt, branch: 'feat/shots' }]);
+
+  assert.equal(result.ok, true);
+  assert.equal(await readFile(join(repo, 'd.txt'), 'utf8'), 'real work\n');
+  await assert.rejects(access(join(repo, 'uploads', 'paste-1-image.png')),
+    'a pasted screenshot must not land in the merge target');
+  // Still readable by the agent in its own worktree — excluded from the commit,
+  // not deleted.
+  await access(join(wt, 'uploads', 'paste-1-image.png'));
+});
+
+test('mergeWorktrees merges a worktree whose only change is an upload', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/only-shots');
+  await run('git', ['commit', '--allow-empty', '-m', 'work'], { cwd: wt });
+  await mkdir(join(wt, 'uploads'), { recursive: true });
+  await writeFile(join(wt, 'uploads', 'paste-2-image.png'), 'bytes\n');
+
+  // Without uploads/ excluded from isDirty too, this asks git to commit and
+  // gets "nothing to commit" back, failing the whole merge.
+  const result = await mergeWorktrees(repo, [{ cwd: wt, branch: 'feat/only-shots' }]);
+
+  assert.equal(result.ok, true, result.ok ? '' : result.error);
 });
 
 test('mergeWorktrees merges multiple branches in order', async (t) => {
