@@ -8,7 +8,7 @@ import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { Scheduler, type Ctx } from './schedule.ts';
-import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
+import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
@@ -849,6 +849,17 @@ export function createServer(opts: {
         const commits = await commitGraph(session.cwd, session.repo).catch(() => []);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(commits));
+        return;
+      }
+
+      // Same rule as /graph: keyed by session id, never a path from the client.
+      if (url.pathname === '/diff') {
+        const id = url.searchParams.get('id') ?? '';
+        const session = registry.get(id);
+        if (!session) { res.writeHead(404).end('[]'); return; }
+        const files = await worktreeDiff(session.cwd).catch(() => []);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(files));
         return;
       }
 

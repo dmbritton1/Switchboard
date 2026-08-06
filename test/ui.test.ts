@@ -5,8 +5,22 @@ import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel, accountView,
   freestAccount, newlyNotifiable,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues, HUES,
-  readTheme, ACCENTS, CANVASES, pastedName, composeMessage,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from '../web/lib.js';
+
+// Nothing else in `npm test` ever loads app.js as code — the DOM it wants is
+// out of scope for a plain test run — so a renamed or dropped lib.js export
+// would only surface as a blank page in the browser. This catches that one
+// realistic failure without a DOM harness: import lib.js for real and check
+// every name app.js's import block asks it for is actually there.
+test('every name app.js imports from lib.js is actually exported', async () => {
+  const appJs = await readFile(new URL('../web/app.js', import.meta.url), 'utf8');
+  const block = appJs.match(/^import \{([\s\S]*?)\} from '\.\/lib\.js';/m)?.[1];
+  assert.ok(block, 'could not find the lib.js import block in app.js');
+  const names = block.split(',').map((n) => n.trim()).filter(Boolean);
+  const lib = await import('../web/lib.js');
+  for (const name of names) assert.ok(name in lib, `app.js imports ${name}, which lib.js does not export`);
+});
 
 test('composeMessage appends attachment paths, and stands alone without text', () => {
   assert.equal(composeMessage('look at this', ['uploads/a.png']), 'look at this\nuploads/a.png');
@@ -674,4 +688,29 @@ test('attributeBranches stays fast through nested diamonds in one branch (perf r
 
   assert.equal(owner.get('m0'), 'feat');
   assert.ok(elapsed < 1000, `expected under 1000ms, took ${elapsed}ms`);
+});
+
+const fileDiff = (over = {}) => ({
+  path: 'src/a.ts', added: 3, removed: 1, binary: false, patch: '', truncated: false, ...over,
+});
+
+test('diffSummary names the file and its line counts, and spells out a rename', () => {
+  assert.equal(diffSummary(fileDiff()), 'src/a.ts · +3 −1');
+  assert.equal(
+    diffSummary(fileDiff({ old: 'src/old.ts', path: 'src/new.ts', added: 0, removed: 0 })),
+    'src/old.ts → src/new.ts · +0 −0',
+  );
+  // A byte count is not a line count, so a binary file says so instead of "+0 −0".
+  assert.equal(diffSummary(fileDiff({ path: 'logo.png', binary: true })), 'logo.png · binary');
+});
+
+test('patchLineClass tells the four kinds of patch line apart', () => {
+  assert.equal(patchLineClass('+added'), 'add');
+  assert.equal(patchLineClass('-removed'), 'del');
+  assert.equal(patchLineClass('@@ -1,2 +1,3 @@'), 'hunk');
+  assert.equal(patchLineClass(' context'), '');
+  assert.equal(patchLineClass(''), '', 'a blank context line is still context');
+  // `---`/`+++` are stripped server-side, but a *body* line of dashes is real
+  // content and must not be mistaken for a header.
+  assert.equal(patchLineClass('+++ this is content'), 'add');
 });
