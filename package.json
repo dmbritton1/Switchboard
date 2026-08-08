@@ -5,6 +5,7 @@
   "private": true,
   "engines": { "node": ">=22.18" },
   "scripts": {
+    "evaluate:codex-app-server": "node scripts/codex-app-server-probe.ts",
     "start": "node src/server.ts",
     "test": "node --test test/*.test.ts"
   },
