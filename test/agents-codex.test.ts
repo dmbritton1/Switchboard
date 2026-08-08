@@ -282,7 +282,7 @@ test('an unknown future item reports only its type during development', (t) => {
 // in one field, two, or all three — produces a total other than 10 or 5 and fails
 // this assertion. Do not "fix" a failure here by summing the fields in; that is
 // the regression this test exists to catch.
-test('turn.completed reports usage and sets done', () => {
+test('turn.completed reports every SDK usage field and sets done', () => {
   assert.deepEqual(
     normalizeCodex({
       type: 'turn.completed',
@@ -292,7 +292,14 @@ test('turn.completed reports usage and sets done', () => {
       },
     } as never),
     [
-      { type: 'usage', inputTokens: 10, outputTokens: 5 },
+      {
+        type: 'usage',
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedInputTokens: 3,
+        cacheWriteInputTokens: 7,
+        reasoningOutputTokens: 2,
+      },
       { type: 'status', status: 'done' },
     ],
   );

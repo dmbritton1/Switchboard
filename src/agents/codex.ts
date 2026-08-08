@@ -127,6 +127,9 @@ export function normalizeCodex(
           // comments — flagged for a future reader rather than silently folded in.
           inputTokens: e.usage.input_tokens,
           outputTokens: e.usage.output_tokens,
+          cachedInputTokens: e.usage.cached_input_tokens,
+          cacheWriteInputTokens: e.usage.cache_write_input_tokens,
+          reasoningOutputTokens: e.usage.reasoning_output_tokens,
         },
         { type: 'status', status: 'done' },
       ];

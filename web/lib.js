@@ -173,6 +173,24 @@ export function codexSettingsSummary(settings) {
   return values.join(' · ');
 }
 
+export function usageLines(usage) {
+  if (!usage) return [];
+  const lines = [
+    `input: ${usage.inputTokens}`,
+    `output: ${usage.outputTokens}`,
+  ];
+  if (usage.cachedInputTokens !== undefined) {
+    lines.push(`cached input: ${usage.cachedInputTokens}`);
+  }
+  if (usage.cacheWriteInputTokens !== undefined) {
+    lines.push(`cache write input: ${usage.cacheWriteInputTokens}`);
+  }
+  if (usage.reasoningOutputTokens !== undefined) {
+    lines.push(`reasoning output: ${usage.reasoningOutputTokens}`);
+  }
+  return lines;
+}
+
 /** Browser-local attachment lifecycle state, deliberately independent of DOM. */
 export function createAttachmentController() {
   return {

@@ -10,7 +10,7 @@ import {
   beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
-  codexSettingsFromForm, codexSettingsSummary,
+  codexSettingsFromForm, codexSettingsSummary, usageLines,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -30,6 +30,19 @@ test('Codex settings form preserves inherited values and explicit disabled netwo
 test('Codex settings summary distinguishes inherited and explicit disabled network access', () => {
   assert.equal(codexSettingsSummary(undefined), 'Inherit');
   assert.equal(codexSettingsSummary({ networkAccessEnabled: false }), 'Network: Disabled');
+});
+
+test('usageLines shows basic and full SDK-backed usage exactly', () => {
+  assert.deepEqual(usageLines(null), []);
+  assert.deepEqual(usageLines({ inputTokens: 10, outputTokens: 5 }), [
+    'input: 10', 'output: 5',
+  ]);
+  assert.deepEqual(usageLines({
+    inputTokens: 10, outputTokens: 5,
+    cachedInputTokens: 3, cacheWriteInputTokens: 7, reasoningOutputTokens: 2,
+  }), [
+    'input: 10', 'output: 5', 'cached input: 3', 'cache write input: 7', 'reasoning output: 2',
+  ]);
 });
 
 test('sortSessions orders needs-you, working, done, stopped', () => {

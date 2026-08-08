@@ -62,6 +62,7 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 }
 
 type CodexFixture = Awaited<ReturnType<typeof boot>> & {
+  usage: Usage;
   repo: string;
   bin: string;
   statePath: string;
@@ -123,7 +124,7 @@ process.exit(result.status ?? 1);
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${port}`;
   return {
-    base, registry, repo, bin, statePath,
+    base, registry, usage, repo, bin, statePath,
     async command(body) {
       const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
       return { status: response.status, data: await response.json() };
@@ -152,6 +153,19 @@ process.exit(result.status ?? 1);
     },
   };
 }
+
+test('Codex account pace records only input and output totals', async (t) => {
+  const fixture = await bootCodex(t);
+  const calls: Array<[string, number, number]> = [];
+  fixture.usage.record = (account, inputTokens, outputTokens) => {
+    calls.push([account, inputTokens, outputTokens]);
+  };
+
+  const created = await fixture.create('usage');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+
+  assert.deepEqual(calls, [['codex', 11, 5]]);
+});
 
 test('Codex preflight failure creates neither a session nor a worktree', async (t) => {
   const fixture = await bootCodex(t, { bin: join(tmpdir(), 'definitely-missing-codex') });

@@ -69,6 +69,11 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   font-weight: 500; }
 #selection-status { flex-basis: 100%; margin: 0; color: var(--dim); font-size: .85em; }
 #transcript { max-width: 60rem; }
+.last-usage { margin: .5rem 0; padding: .45rem .65rem; border: 1px solid var(--line);
+  border-radius: 7px; color: var(--dim); font: .82rem/1.45 var(--mono); }
+.last-usage summary { cursor: pointer; color: var(--fg); font-family: ui-sans-serif, system-ui, sans-serif;
+  font-weight: 650; }
+.last-usage > div { margin-top: .15rem; }
 .msg { padding: .5rem 0; border-bottom: 1px solid #222; white-space: pre-wrap; }
 .msg.tool { color: var(--dim); font-family: ui-monospace, monospace; font-size: .9em; }
 .msg.user { color: var(--done); }

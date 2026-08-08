@@ -3,7 +3,7 @@ import { readFile, writeFile, rename } from 'node:fs/promises';
 import { MAX_CODEX_DETAIL_TOTAL_BYTES } from './agents/codex-detail.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
 import type {
-  AdapterEvent, CodexFailureCode, CodexThreadSettings, PromptDelivery, PublicMsg, PublicSession, Session, ToolMsg, UpsertMsg,
+  AdapterEvent, CodexFailureCode, CodexThreadSettings, PromptDelivery, PublicMsg, PublicSession, Session, ToolMsg, TurnUsage, UpsertMsg,
 } from './types.ts';
 import type { Usage } from './usage.ts';
 
@@ -34,6 +34,19 @@ function safeAttachmentNames(value: unknown): string[] {
     && !name.includes('\0'));
 }
 
+function storedTurnUsage(value: unknown): TurnUsage | null {
+  if (!value || typeof value !== 'object') return null;
+  const usage = value as Partial<TurnUsage>;
+  if (!Number.isFinite(usage.inputTokens) || !Number.isFinite(usage.outputTokens)) return null;
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    ...(Number.isFinite(usage.cachedInputTokens) ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+    ...(Number.isFinite(usage.cacheWriteInputTokens) ? { cacheWriteInputTokens: usage.cacheWriteInputTokens } : {}),
+    ...(Number.isFinite(usage.reasoningOutputTokens) ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
+  };
+}
+
 export class Registry {
   #sessions = new Map<string, Session>();
   #subs = new Set<() => void>();
@@ -62,6 +75,7 @@ export class Registry {
       vendorSessionId: null,
       status: 'working',
       auto: false,
+      lastUsage: null,
       transcript: [],
       pending: null,
       stoppedReason: null,
@@ -86,6 +100,7 @@ export class Registry {
   publicSessions(): PublicSession[] {
     return this.all().map((session) => ({
       ...session,
+      lastUsage: session.lastUsage ? { ...session.lastUsage } : null,
       pending: session.pending ? { ...session.pending } : null,
       transcript: session.transcript.map((message): PublicMsg => {
         if (message.kind !== 'tool') {
@@ -208,7 +223,14 @@ export class Registry {
         this.#setStatus(s, 'stopped');
         break;
       case 'usage':
-        break; // handled by the caller, which owns the Usage instance
+        s.lastUsage = {
+          inputTokens: e.inputTokens,
+          outputTokens: e.outputTokens,
+          ...(e.cachedInputTokens !== undefined ? { cachedInputTokens: e.cachedInputTokens } : {}),
+          ...(e.cacheWriteInputTokens !== undefined ? { cacheWriteInputTokens: e.cacheWriteInputTokens } : {}),
+          ...(e.reasoningOutputTokens !== undefined ? { reasoningOutputTokens: e.reasoningOutputTokens } : {}),
+        };
+        break;
     }
     this.#notify();
   }
@@ -430,6 +452,7 @@ export class Registry {
           // Predates the auto toggle in any state.json written before it existed,
           // and `undefined` would render as an indeterminate checkbox.
           auto: s.auto ?? false,
+          lastUsage: storedTurnUsage(s.lastUsage),
         });
       }
       reg.#seedDetailRevisions();

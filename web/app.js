@@ -9,7 +9,7 @@ import {
   beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
-  codexSettingsFromForm, codexSettingsSummary,
+  codexSettingsFromForm, codexSettingsSummary, usageLines,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -752,6 +752,20 @@ function renderChatPane(s) {
 
   const t = $('#transcript');
   t.replaceChildren();
+  const lines = usageLines(s.lastUsage);
+  if (lines.length) {
+    const details = document.createElement('details');
+    details.className = 'last-usage';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Last turn';
+    details.append(summary);
+    for (const line of lines) {
+      const value = document.createElement('div');
+      value.textContent = line;
+      details.append(value);
+    }
+    t.append(details);
+  }
   for (const m of s.transcript) {
     const view = transcriptView(m);
     const el = document.createElement('div');

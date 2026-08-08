@@ -50,6 +50,20 @@ test('a new session starts working with an empty transcript', () => {
   assert.equal(s.status, 'working');
   assert.deepEqual(s.transcript, []);
   assert.equal(s.pending, null);
+  assert.equal(s.lastUsage, null);
+});
+
+test('usage events replace a session’s SDK-backed last-turn usage', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'usage', inputTokens: 10, outputTokens: 5,
+    cachedInputTokens: 3, cacheWriteInputTokens: 7, reasoningOutputTokens: 2,
+  });
+
+  assert.deepEqual(reg.get(id)!.lastUsage, {
+    inputTokens: 10, outputTokens: 5,
+    cachedInputTokens: 3, cacheWriteInputTokens: 7, reasoningOutputTokens: 2,
+  });
 });
 
 test('Codex settings persist only explicit values and legacy sessions inherit them', async (t) => {
@@ -435,6 +449,7 @@ test('a pre-usage state.json (a bare session array) still loads', async (t) => {
   assert.equal(loaded.title, 'old title');
   assert.equal(loaded.status, 'stopped');
   assert.deepEqual(loaded.transcript, [{ kind: 'text', text: 'hello' }]);
+  assert.equal(loaded.lastUsage, null);
   assert.equal(usage.pace('main', 1000), 0, 'no usage history to restore, but no crash');
 });
 

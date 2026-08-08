@@ -94,6 +94,14 @@ export type AppendMsg = Exclude<Msg, ToolMsg | ReasoningMsg | TodoMsg> | AppendT
 
 export type ApprovalRequest = { id: string; tool: string; summary: string };
 
+export type TurnUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
+  reasoningOutputTokens?: number;
+};
+
 export type Session = {
   id: string;
   provider: 'claude' | 'codex';
@@ -108,6 +116,7 @@ export type Session = {
    *  their SDK has no interactive approval to skip (see codex.ts approvalPolicy). */
   auto: boolean;
   codexSettings?: CodexThreadSettings;
+  lastUsage: TurnUsage | null;
   transcript: Msg[];
   pending: ApprovalRequest | null;
   stoppedReason: string | null;
@@ -126,7 +135,7 @@ export type AdapterEvent =
   | { type: 'upsert-msg'; msg: UpsertMsg }
   | { type: 'approval'; request: ApprovalRequest }
   | { type: 'approval-resolved' }
-  | { type: 'usage'; inputTokens: number; outputTokens: number }
+  | ({ type: 'usage' } & TurnUsage)
   | { type: 'vendor-session-id'; id: string }
   | { type: 'tool-result'; id: string; ok: boolean }
   | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }

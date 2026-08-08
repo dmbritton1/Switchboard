@@ -220,7 +220,11 @@ export function createServer(opts: {
     try {
       const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
-        if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
+        if (safeEvent.type === 'usage') {
+          // Optional Codex breakdowns are informational subsets, not account pace.
+          const { inputTokens, outputTokens } = safeEvent;
+          usage.record(account.name, inputTokens, outputTokens);
+        }
         if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
       // A `stopped` session is terminal in the registry, so a handle left in the map
       // is a lie: `send` returned 200, the still-running subprocess burned tokens on
