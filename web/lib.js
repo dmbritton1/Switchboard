@@ -144,6 +144,100 @@ export function settleSendState(text, attachments, result) {
   return result.ok ? { text: '', attachments: [] } : { text, attachments };
 }
 
+/** Detach browser-live FileList entries before the input is reset. */
+export function snapshotFiles(iterable) {
+  return Array.from(iterable ?? []);
+}
+
+/** Browser-local attachment lifecycle state, deliberately independent of DOM. */
+export function createAttachmentController() {
+  return {
+    sessionId: null,
+    generation: 0,
+    pendingAttachments: [],
+    uploadsInFlight: 0,
+    sendInFlight: false,
+    uploadError: '',
+  };
+}
+
+export function changeAttachmentSession(controller, sessionId) {
+  if (controller.sessionId === sessionId) return false;
+  controller.sessionId = sessionId;
+  controller.generation++;
+  controller.pendingAttachments = [];
+  controller.uploadsInFlight = 0;
+  controller.sendInFlight = false;
+  controller.uploadError = '';
+  return true;
+}
+
+function currentAttachmentOperation(controller, operation) {
+  return Boolean(operation
+    && !operation.finished
+    && operation.sessionId === controller.sessionId
+    && operation.generation === controller.generation);
+}
+
+export function beginAttachmentUpload(controller) {
+  if (!controller.sessionId || controller.sendInFlight) return null;
+  controller.uploadsInFlight++;
+  controller.uploadError = '';
+  return {
+    sessionId: controller.sessionId,
+    generation: controller.generation,
+    finished: false,
+  };
+}
+
+export function addUploadedAttachment(controller, operation, attachment) {
+  if (!currentAttachmentOperation(controller, operation)) return false;
+  controller.pendingAttachments = addAttachment(controller.pendingAttachments, attachment);
+  return true;
+}
+
+export function finishAttachmentUpload(controller, operation, error = '') {
+  if (!operation || operation.finished) return false;
+  const current = currentAttachmentOperation(controller, operation);
+  operation.finished = true;
+  if (!current) return false;
+  controller.uploadsInFlight = Math.max(0, controller.uploadsInFlight - 1);
+  if (error) controller.uploadError = error;
+  return true;
+}
+
+export function dismissAttachmentUploadError(controller) {
+  controller.uploadError = '';
+}
+
+export function attachmentComposerBusy(controller) {
+  return controller.uploadsInFlight > 0 || controller.sendInFlight;
+}
+
+export function beginAttachmentSend(controller, text) {
+  if (!controller.sessionId || attachmentComposerBusy(controller)) return null;
+  controller.sendInFlight = true;
+  return {
+    sessionId: controller.sessionId,
+    generation: controller.generation,
+    text,
+    attachments: controller.pendingAttachments,
+    finished: false,
+  };
+}
+
+export function completeAttachmentSend(controller, operation, result) {
+  if (!currentAttachmentOperation(controller, operation)) {
+    if (operation) operation.finished = true;
+    return { applied: false, text: null };
+  }
+  operation.finished = true;
+  controller.sendInFlight = false;
+  const settled = settleSendState(operation.text, operation.attachments, result);
+  controller.pendingAttachments = settled.attachments;
+  return { applied: true, text: settled.text };
+}
+
 /**
  * The text for the retained session error, or '' when there is none.
  *

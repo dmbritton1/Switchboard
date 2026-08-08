@@ -34,7 +34,9 @@
     <div id="transcript"></div>
     <div id="attachments" aria-live="polite"></div>
     <form id="composer">
-      <label id="attach" title="Attach files">📎<input type="file" multiple hidden></label>
+      <button id="attach" type="button" aria-controls="attach-input">📎 Attach</button>
+      <input id="attach-input" class="visually-hidden" type="file" multiple tabindex="-1"
+             aria-label="Choose files to attach" aria-describedby="attachments">
       <input id="prompt" placeholder="Message…" autocomplete="off"><button type="submit">Send</button>
     </form>
     <p id="upload-error"></p>

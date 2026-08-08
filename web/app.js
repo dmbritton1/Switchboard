@@ -4,7 +4,11 @@ import {
   transcriptView, requestOnce, fetchToolDetail,
   createDetailController, changeDetailSession, setDetailExpanded,
   detailControllerView, storeToolDetail, storeToolDetailError, invalidateToolDetail,
-  addAttachment, removeAttachment, sendPayload, settleSendState,
+  removeAttachment, sendPayload,
+  snapshotFiles, createAttachmentController, changeAttachmentSession,
+  beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
+  dismissAttachmentUploadError, attachmentComposerBusy,
+  beginAttachmentSend, completeAttachmentSend,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -32,9 +36,7 @@ let queueCommandError = '';
 // Uploads belong to the open composer, never to the global SSE snapshot. A
 // genuine navigation boundary clears them; re-rendering the same session does
 // not, so a working agent cannot shake chips loose on every streamed event.
-let pendingAttachments = [];
-let uploadsInFlight = 0;
-let sendInFlight = false;
+const attachmentController = createAttachmentController();
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -43,12 +45,8 @@ function setOpenSession(id) {
   // Closing and reopening the same session is still a real transition because
   // Back first moves the controller through null. Resetting scrolledFor here
   // restores the first-open jump to the latest transcript message.
-  if (changeDetailSession(detailController, id)) {
-    scrolledFor = null;
-    pendingAttachments = [];
-    clearUploadError();
-    renderPendingAttachments();
-  }
+  if (changeDetailSession(detailController, id)) scrolledFor = null;
+  if (changeAttachmentSession(attachmentController, id)) renderAttachmentComposer();
   openId = id;
 }
 
@@ -992,42 +990,36 @@ document.addEventListener('keydown', (e) => {
 
 $('#composer').onsubmit = async (e) => {
   e.preventDefault();
-  if (!openId || uploadsInFlight || sendInFlight) return;
-  const sessionId = openId;
   const draft = $('#prompt').value;
   const text = draft.trim();
   if (!text) return;
-  const submittedAttachments = pendingAttachments;
-  sendInFlight = true;
-  updateComposerBusy();
-  try {
-    const result = await runSessionCommand(sendPayload(sessionId, text, submittedAttachments));
-    // A response for the session the operator just left must not erase the new
-    // session's draft. setOpenSession() has already reset its attachment state.
-    if (openId !== sessionId) return;
-    const settled = settleSendState(draft, submittedAttachments, result);
-    $('#prompt').value = settled.text;
-    pendingAttachments = settled.attachments;
-    renderPendingAttachments();
-  } finally {
-    sendInFlight = false;
-    updateComposerBusy();
-  }
+  const operation = beginAttachmentSend(attachmentController, draft);
+  if (!operation) return;
+  renderAttachmentComposer();
+  const result = await runSessionCommand(
+    sendPayload(operation.sessionId, text, operation.attachments),
+  );
+  // A response for the session the operator just left must not erase the new
+  // session's draft or unlock another session's in-flight send.
+  const completion = completeAttachmentSend(attachmentController, operation, result);
+  if (completion.applied) $('#prompt').value = completion.text;
+  renderAttachmentComposer();
 };
 
 function updateComposerBusy() {
-  $('#composer button[type="submit"]').disabled = uploadsInFlight > 0 || sendInFlight;
-  $('#prompt').readOnly = sendInFlight;
-  $('#attach input').disabled = sendInFlight;
+  $('#composer button[type="submit"]').disabled = attachmentComposerBusy(attachmentController);
+  $('#prompt').readOnly = attachmentController.sendInFlight;
+  $('#attach').disabled = attachmentController.sendInFlight;
+  $('#attach-input').disabled = attachmentController.sendInFlight;
   for (const remove of document.querySelectorAll('.attachment-chip button')) {
-    remove.disabled = sendInFlight;
+    remove.disabled = attachmentController.sendInFlight;
   }
 }
 
 function renderPendingAttachments() {
   const box = $('#attachments');
   box.replaceChildren();
-  for (const attachment of pendingAttachments) {
+  for (const attachment of attachmentController.pendingAttachments) {
     const chip = document.createElement('span');
     chip.className = 'attachment-chip';
 
@@ -1037,10 +1029,13 @@ function renderPendingAttachments() {
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.textContent = '×';
-    remove.disabled = sendInFlight;
+    remove.disabled = attachmentController.sendInFlight;
     remove.setAttribute('aria-label', `Remove ${attachment.name}`);
     remove.onclick = () => {
-      pendingAttachments = removeAttachment(pendingAttachments, attachment.path);
+      attachmentController.pendingAttachments = removeAttachment(
+        attachmentController.pendingAttachments,
+        attachment.path,
+      );
       renderPendingAttachments();
     };
     chip.append(name, remove);
@@ -1048,63 +1043,72 @@ function renderPendingAttachments() {
   }
 }
 
-function clearUploadError() {
-  $('#upload-error').replaceChildren();
-}
-
-function showUploadError(message) {
+function renderUploadError() {
   const box = $('#upload-error');
+  box.replaceChildren();
+  if (!attachmentController.uploadError) return;
   const text = document.createElement('span');
-  text.textContent = message;
+  text.textContent = attachmentController.uploadError;
   const dismiss = document.createElement('button');
   dismiss.type = 'button';
   dismiss.textContent = 'Dismiss';
-  dismiss.onclick = clearUploadError;
-  box.replaceChildren(text, dismiss);
+  dismiss.onclick = () => {
+    dismissAttachmentUploadError(attachmentController);
+    renderUploadError();
+  };
+  box.append(text, dismiss);
+}
+
+function renderAttachmentComposer() {
+  renderPendingAttachments();
+  renderUploadError();
+  updateComposerBusy();
 }
 
 // Uploads go straight to the open session's worktree. The server-issued
 // relative path stays in browser state for the eventual command; the operator
 // sees a compact filename chip and can remove it before sending.
 async function upload(files) {
-  if (!openId || !files.length || sendInFlight) return;
-  const sessionId = openId;
-  uploadsInFlight++;
-  updateComposerBusy();
-  clearUploadError();
+  if (!files.length) return;
+  const operation = beginAttachmentUpload(attachmentController);
+  if (!operation) return;
+  renderAttachmentComposer();
+  let failure = '';
   try {
     for (const file of files) {
       let path;
       try {
-        const res = await fetch(`/upload?id=${sessionId}&name=${encodeURIComponent(file.name)}`, {
+        const res = await fetch(`/upload?id=${operation.sessionId}&name=${encodeURIComponent(file.name)}`, {
           method: 'POST',
           body: file,
         });
         if (!res.ok) throw new Error((await res.json()).error ?? res.status);
         ({ path } = await res.json());
       } catch (err) {
-        // Surfaced, not swallowed: a silently dropped upload turns into the
-        // user sending a path that does not exist and the agent reporting confusion.
-        if (openId === sessionId) {
-          showUploadError(`could not attach ${file.name}: ${err.message}`);
-        }
+        failure = `could not attach ${file.name}: ${err.message}`;
         return;
       }
-      if (openId !== sessionId) return;
-      pendingAttachments = addAttachment(pendingAttachments, { name: file.name, path });
+      if (!addUploadedAttachment(
+        attachmentController,
+        operation,
+        { name: file.name, path },
+      )) return;
       renderPendingAttachments();
     }
-    if (openId === sessionId) $('#prompt').focus();
+    if (attachmentController.sessionId === operation.sessionId) $('#prompt').focus();
   } finally {
-    uploadsInFlight--;
-    updateComposerBusy();
+    finishAttachmentUpload(attachmentController, operation, failure);
+    renderAttachmentComposer();
   }
 }
 
-$('#attach input').onchange = (e) => {
-  upload(e.target.files);
-  // Cleared so picking the same file twice in a row still fires `change`.
+$('#attach').onclick = () => $('#attach-input').click();
+$('#attach-input').onchange = (e) => {
+  // FileList is live: capture every File before resetting the input, or the
+  // asynchronous upload sees an empty collection in some browsers.
+  const files = snapshotFiles(e.target.files);
   e.target.value = '';
+  upload(files);
 };
 
 // Bound to the chat pane, not the whole session view: a file dropped on the

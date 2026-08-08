@@ -6,6 +6,10 @@ import {
   fetchToolDetail, createDetailController, changeDetailSession, setDetailExpanded,
   detailControllerView, storeToolDetail, storeToolDetailError, invalidateToolDetail,
   addAttachment, removeAttachment, sendPayload, settleSendState,
+  snapshotFiles, createAttachmentController, changeAttachmentSession,
+  beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
+  dismissAttachmentUploadError, attachmentComposerBusy,
+  beginAttachmentSend, completeAttachmentSend,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
@@ -279,6 +283,121 @@ test('settleSendState retains the retry draft after failure and clears it after 
   assert.deepEqual(settleSendState('inspect it', attachments, { ok: true }), {
     text: '', attachments: [],
   });
+});
+
+test('snapshotFiles detaches every selected file from a live multi-file collection', () => {
+  const first = { name: 'screen.png' };
+  const second = { name: 'notes.txt' };
+  const backing = [first, second];
+  const liveFiles = { [Symbol.iterator]: () => backing[Symbol.iterator]() };
+
+  const snapshot = snapshotFiles(liveFiles);
+  backing.length = 0; // assigning input.value = '' empties a browser FileList live
+
+  assert.deepEqual(snapshot, [first, second]);
+});
+
+test('attachment session transition preserves same-session SSE state and resets a real switch', () => {
+  const controller = createAttachmentController();
+  assert.equal(changeAttachmentSession(controller, 's1'), true);
+  controller.pendingAttachments = [{ name: 'screen.png', path: 'uploads/screen.png' }];
+  controller.uploadError = 'could not attach screen.png';
+
+  assert.equal(changeAttachmentSession(controller, 's1'), false, 'an SSE render is not navigation');
+  assert.equal(controller.pendingAttachments.length, 1);
+  assert.equal(controller.uploadError, 'could not attach screen.png');
+
+  assert.equal(changeAttachmentSession(controller, 's2'), true);
+  assert.deepEqual(controller.pendingAttachments, []);
+  assert.equal(controller.uploadError, '');
+  assert.equal(attachmentComposerBusy(controller), false);
+});
+
+test('a stale upload completion cannot add a chip or error to the next session', () => {
+  const controller = createAttachmentController();
+  changeAttachmentSession(controller, 's1');
+  const upload = beginAttachmentUpload(controller);
+  changeAttachmentSession(controller, 's2');
+  const currentUpload = beginAttachmentUpload(controller);
+
+  assert.equal(addUploadedAttachment(controller, upload, {
+    name: 'secret.png', path: 'uploads/secret.png',
+  }), false);
+  assert.equal(finishAttachmentUpload(controller, upload, 'old session failed'), false);
+  assert.deepEqual(controller.pendingAttachments, []);
+  assert.equal(controller.uploadError, '');
+  assert.equal(controller.uploadsInFlight, 1, 'stale completion does not decrement new work');
+  finishAttachmentUpload(controller, currentUpload);
+});
+
+test('concurrent uploads keep the composer busy until the last current operation settles', () => {
+  const controller = createAttachmentController();
+  changeAttachmentSession(controller, 's1');
+  const first = beginAttachmentUpload(controller);
+  const second = beginAttachmentUpload(controller);
+  assert.equal(controller.uploadsInFlight, 2);
+  assert.equal(attachmentComposerBusy(controller), true);
+
+  assert.equal(finishAttachmentUpload(controller, first), true);
+  assert.equal(controller.uploadsInFlight, 1);
+  assert.equal(attachmentComposerBusy(controller), true, 'Send must stay disabled');
+  assert.equal(beginAttachmentSend(controller, 'too early'), null);
+
+  assert.equal(finishAttachmentUpload(controller, second), true);
+  assert.equal(controller.uploadsInFlight, 0);
+  assert.equal(attachmentComposerBusy(controller), false);
+});
+
+test('attachment send completion retains failure state, clears success, and ignores stale responses', () => {
+  const controller = createAttachmentController();
+  changeAttachmentSession(controller, 's1');
+  controller.pendingAttachments = [{ name: 'screen.png', path: 'uploads/screen.png' }];
+
+  const failed = beginAttachmentSend(controller, 'inspect it');
+  assert.ok(failed);
+  assert.equal(completeAttachmentSend(controller, failed, { ok: false }).text, 'inspect it');
+  assert.equal(controller.pendingAttachments.length, 1);
+  assert.equal(controller.sendInFlight, false);
+
+  const succeeded = beginAttachmentSend(controller, 'retry it');
+  assert.deepEqual(completeAttachmentSend(controller, succeeded, { ok: true }), {
+    applied: true, text: '',
+  });
+  assert.deepEqual(controller.pendingAttachments, []);
+
+  controller.pendingAttachments = [{ name: 'new.txt', path: 'uploads/new.txt' }];
+  const stale = beginAttachmentSend(controller, 'old draft');
+  changeAttachmentSession(controller, 's2');
+  controller.pendingAttachments = [{ name: 'next.txt', path: 'uploads/next.txt' }];
+  const current = beginAttachmentSend(controller, 'new draft');
+  assert.deepEqual(completeAttachmentSend(controller, stale, { ok: true }), {
+    applied: false, text: null,
+  });
+  assert.deepEqual(controller.pendingAttachments, [
+    { name: 'next.txt', path: 'uploads/next.txt' },
+  ]);
+  assert.equal(controller.sendInFlight, true, 'stale response cannot unlock the current send');
+  completeAttachmentSend(controller, current, { ok: false });
+});
+
+test('upload errors survive same-session updates and clear on retry, dismiss, or navigation', () => {
+  const controller = createAttachmentController();
+  changeAttachmentSession(controller, 's1');
+  const failed = beginAttachmentUpload(controller);
+  finishAttachmentUpload(controller, failed, 'could not attach screen.png');
+  changeAttachmentSession(controller, 's1');
+  assert.equal(controller.uploadError, 'could not attach screen.png');
+
+  const retry = beginAttachmentUpload(controller);
+  assert.equal(controller.uploadError, '', 'retry start clears the retained error');
+  finishAttachmentUpload(controller, retry, 'failed again');
+  dismissAttachmentUploadError(controller);
+  assert.equal(controller.uploadError, '');
+
+  const finalFailure = beginAttachmentUpload(controller);
+  finishAttachmentUpload(controller, finalFailure, 'failed before switch');
+  changeAttachmentSession(controller, 's2');
+  assert.equal(controller.uploadError, '');
 });
 
 test('detailKey cannot collide across session and item identifier boundaries', () => {
