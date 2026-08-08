@@ -200,6 +200,9 @@ vendor-thread continuity are not proven. Production therefore remains SDK-only;
 the hybrid and replacement paths are rejected pending a future approved
 transport plan. See
 [`docs/superpowers/reports/2026-08-01-codex-app-server-decision.md`](docs/superpowers/reports/2026-08-01-codex-app-server-decision.md).
+Its lifecycle, approval, MCP-elicitation, and crash-evidence fields are `false`
+because this no-turn evaluation did not start a thread or turn: they are
+unmeasured, not failed live round trips.
 This completes 100% of the approved two-phase specification and the design's
 estimated 90–95% of the desired local Codex worker experience; it is not parity
 with every Codex app, cloud, connector, collaboration, or external-session

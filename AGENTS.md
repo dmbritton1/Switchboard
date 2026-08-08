@@ -35,7 +35,11 @@ Registry and git worktrees, then into a provider adapter.
 - Preserve the target repository's Codex configuration and instructions.
 - Keep `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'` as
   mandatory overrides. Per-session Codex settings may be explicit or omitted
-  (omitted means inherit), but they must never expose or weaken either policy.
+  (omitted means inherit), may change only while a session is stopped, and must
+  never expose or weaken either policy.
+- Codex lifecycle items occupy one stable row from `running` through terminal
+  `ok` or `error`. Reasoning summaries and todo status are separate entries;
+  do not persist or expose raw reasoning.
 - Tool detail is redacted before Registry admission, bounded to 32 KiB per item
   and 2 MiB globally, evicted least-recently-updated, omitted from SSE, and
   read lazily only by session/item ID. Do not persist or expose raw reasoning
