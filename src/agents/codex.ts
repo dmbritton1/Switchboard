@@ -3,7 +3,7 @@ import type { Input, ThreadEvent, ThreadItem } from '@openai/codex-sdk';
 import { safeCodexDetail } from './codex-detail.ts';
 import { redactCodexText } from './codex-runtime.ts';
 import type { PreparedCodexRuntime } from './codex-runtime.ts';
-import { revalidateAgentPrompt } from '../prompt-input.ts';
+import { snapshotCodexPrompt } from '../prompt-input.ts';
 import type {
   Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, StartOpts, ToolMsg,
 } from '../types.ts';
@@ -236,23 +236,27 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
           // rebuilt. If validation fails, finish() can still mark this prompt
           // unsent, and no stale absolute path reaches the SDK.
           const queued = queue[0];
-          const prompt = await revalidateAgentPrompt(opts.cwd, queued.prompt);
-          if (stopped || queue[0] !== queued) return;
-          queue.shift();
-          if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'sent' });
-          const { events } = await thread.runStreamed(codexPromptInput(prompt), {
-            signal: abortController.signal,
-          });
-          for await (const e of events) {
-            if (stopped) break;
-            if (e.type === 'turn.started') turnStarted = true;
-            for (const ev of normalizeCodex(e, runtime.env)) {
-              if (ev.type === 'stopped') {
-                finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
-                break;
+          const prepared = await snapshotCodexPrompt(opts.cwd, queued.prompt);
+          try {
+            if (stopped || queue[0] !== queued) return;
+            queue.shift();
+            if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'sent' });
+            const { events } = await thread.runStreamed(codexPromptInput(prepared.prompt), {
+              signal: abortController.signal,
+            });
+            for await (const e of events) {
+              if (stopped) break;
+              if (e.type === 'turn.started') turnStarted = true;
+              for (const ev of normalizeCodex(e, runtime.env)) {
+                if (ev.type === 'stopped') {
+                  finish(ev.reason, ev.code ?? (turnStarted ? 'codex_stream_failed' : opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed'));
+                  break;
+                }
+                emit(ev);
               }
-              emit(ev);
             }
+          } finally {
+            await prepared.cleanup();
           }
         }
       } catch (err) {

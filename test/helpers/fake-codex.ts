@@ -56,11 +56,13 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { prompt += chunk; });
 process.stdin.on('end', () => {
   if (process.env.FAKE_CODEX_LOG) {
+    const imagePaths = args.flatMap((arg, index) => arg === '--image' ? [args[index + 1]] : []);
     appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({
       argv: args,
       prompt,
       cwd,
       codexHome: process.env.CODEX_HOME ?? null,
+      imageBytes: imagePaths.map((path) => require('node:fs').readFileSync(path).toString('hex')),
     }) + '\\n');
   }
   const emit = (event) => process.stdout.write(JSON.stringify(event) + '\\n');
@@ -132,8 +134,10 @@ process.stdin.on('end', () => {
     process.exitCode = 7;
     return;
   }
-  if (prompt === 'rich-lifecycle') {
-    const lifecycleSecret = process.env.FAKE_CODEX_SECRET ?? '';
+  if (prompt === 'rich-lifecycle' || prompt === 'ordinary-env-rich-lifecycle') {
+    const lifecycleSecret = prompt === 'ordinary-env-rich-lifecycle'
+      ? process.env.WORKSPACE_LABEL ?? ''
+      : process.env.FAKE_CODEX_SECRET ?? '';
     emit({ type: 'item.started', item: {
       id: 'rich-command', type: 'command_execution', command: 'npm test ' + lifecycleSecret,
       aggregated_output: '', status: 'in_progress',

@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { chmod, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -72,6 +72,17 @@ test('resolveAgentPrompt keeps ordinary files as files', async (t) => {
   const prompt = await resolveAgentPrompt(fixture.cwd, 'Read this', ['notes.txt']);
 
   assert.equal(prompt.attachments[0].kind, 'file');
+});
+
+test('resolveAgentPrompt keeps a random upload path private from the attachment label', async (t) => {
+  const fixture = await promptFixture(t);
+  const stored = '.switchboard-upload-0123456789abcdef0123456789abcdef-customer-notes.txt';
+  await writeFile(join(fixture.cwd, stored), 'plain text');
+
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'Read this', [stored]);
+
+  assert.equal(prompt.attachments[0].name, 'customer-notes.txt');
+  assert.equal(prompt.attachments[0].relativePath, stored, 'the adapter still receives the real relative path');
 });
 
 test('resolveAgentPrompt accepts an omitted attachment list as empty', async (t) => {
@@ -196,6 +207,37 @@ test('revalidateAgentPrompt rejects a parent swapped outside after resolution', 
   await assert.rejects(revalidate(fixture.cwd, prompt), {
     message: 'Attachment paths must stay inside the worktree.',
   });
+});
+
+test('Codex image snapshots keep the verified bytes after the worktree leaf is swapped', async (t) => {
+  const fixture = await promptFixture(t);
+  const submitted = join(fixture.cwd, 'uploads', 'screen.png');
+  const outside = join(fixture.root, 'outside.png');
+  await Promise.all([
+    writeFile(submitted, PNG_BYTES),
+    writeFile(outside, Buffer.concat([PNG_BYTES, Buffer.from('outside')])),
+  ]);
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'Inspect it', ['uploads/screen.png']);
+  const snapshot = (promptInput as {
+    snapshotCodexPrompt?: (
+      cwd: string, prompt: AgentPrompt,
+    ) => Promise<{ prompt: AgentPrompt; cleanup(): Promise<void> }>;
+  }).snapshotCodexPrompt;
+
+  assert.ok(snapshot, 'the Codex adapter needs a verified-byte snapshot boundary');
+  const prepared = await snapshot(fixture.cwd, prompt);
+  const snapshotPath = prepared.prompt.attachments[0].absolutePath;
+  assert.notEqual(snapshotPath, await realpath(submitted));
+  assert.equal((await stat(snapshotPath)).mode & 0o077, 0, 'snapshot bytes must not be group/world accessible');
+
+  await rm(submitted);
+  await symlink(outside, submitted);
+  assert.deepEqual(await readFile(snapshotPath), PNG_BYTES,
+    'SDK input must remain the exact bytes verified inside the worktree');
+
+  await prepared.cleanup();
+  await prepared.cleanup();
+  await assert.rejects(stat(snapshotPath), 'snapshot cleanup is idempotent and removes the private file');
 });
 
 test('resolveAgentPrompt rejects directories', async (t) => {

@@ -42,11 +42,15 @@ const accounts = [
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
 
-async function boot(t: { after: (fn: () => void) => void }, registryOptions?: RegistryOptions) {
+async function boot(
+  t: { after: (fn: () => void) => void },
+  registryOptions?: RegistryOptions,
+  serverHooks: { beforeUploadWrite?: (target: string) => Promise<void> } = {},
+) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'), undefined, registryOptions);
   const usage = new Usage();
-  const server = createServer({ registry, usage, accounts });
+  const server = createServer({ registry, usage, accounts, ...serverHooks } as Parameters<typeof createServer>[0]);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
@@ -70,8 +74,16 @@ type CodexFixture = Awaited<ReturnType<typeof boot>> & {
   create(prompt: string): Promise<{ id: string }>;
   waitForSession(id: string, predicate: (session: NonNullable<ReturnType<Registry['get']>>) => boolean): Promise<void>;
   worktrees(): Promise<string>;
-  invocations(): Promise<Array<{ argv: string[]; prompt: string; cwd: string; codexHome: string | null }>>;
+  invocations(): Promise<Array<{
+    argv: string[]; prompt: string; cwd: string; codexHome: string | null; imageBytes: string[];
+  }>>;
   calls(): Promise<string[][]>;
+  preflightGate?: {
+    enable: string;
+    started: string;
+    release: string;
+    count(): Promise<number>;
+  };
 };
 
 async function bootCodex(
@@ -80,6 +92,7 @@ async function bootCodex(
     bin?: string;
     env?: Record<string, string>;
     resolvePrompt?: typeof resolveAgentPrompt;
+    gatedPreflight?: boolean;
   } = {},
 ): Promise<CodexFixture> {
   const dir = await mkdtemp(join(tmpdir(), 'sb-codex-server-'));
@@ -87,6 +100,14 @@ async function bootCodex(
   const log = join(dir, 'fake-codex.jsonl');
   const callLog = join(dir, 'fake-codex-calls.jsonl');
   const codexHome = join(dir, 'codex-home');
+  const preflightGate = options.gatedPreflight ? {
+    enable: join(dir, 'preflight-enabled'),
+    started: join(dir, 'preflight-started.log'),
+    release: join(dir, 'preflight-release'),
+    async count() {
+      return readFile(this.started, 'utf8').then((text) => text.split('\n').filter(Boolean).length, () => 0);
+    },
+  } : undefined;
   await run('git', ['init', '-b', 'main', repo]);
   await run('git', ['config', 'user.email', 't@t.t'], { cwd: repo });
   await run('git', ['config', 'user.name', 'T'], { cwd: repo });
@@ -98,8 +119,16 @@ async function bootCodex(
   const bin = options.bin ?? join(dir, 'recording-codex');
   if (fakeBin) {
     await writeFile(bin, `#!/usr/bin/env node
-const { appendFileSync } = require('node:fs');
+const { appendFileSync, existsSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
+if (process.argv.includes('--version')
+  && process.env.FAKE_CODEX_PREFLIGHT_ENABLE
+  && existsSync(process.env.FAKE_CODEX_PREFLIGHT_ENABLE)) {
+  appendFileSync(process.env.FAKE_CODEX_PREFLIGHT_STARTED, 'started\\n');
+  while (!existsSync(process.env.FAKE_CODEX_PREFLIGHT_RELEASE)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
 appendFileSync(process.env.FAKE_CODEX_CALL_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
 const result = spawnSync(${JSON.stringify(fakeBin)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });
 if (result.error) throw result.error;
@@ -113,7 +142,15 @@ process.exit(result.status ?? 1);
   const account = {
     name: 'codex', provider: 'codex' as const, budget: 1000,
     bin,
-    env: { FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome, ...options.env },
+    env: {
+      FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome,
+      ...(preflightGate ? {
+        FAKE_CODEX_PREFLIGHT_ENABLE: preflightGate.enable,
+        FAKE_CODEX_PREFLIGHT_STARTED: preflightGate.started,
+        FAKE_CODEX_PREFLIGHT_RELEASE: preflightGate.release,
+      } : {}),
+      ...options.env,
+    },
   };
   const server = createServer({
     registry, usage, accounts: [account],
@@ -124,7 +161,7 @@ process.exit(result.status ?? 1);
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${port}`;
   return {
-    base, registry, usage, repo, bin, statePath,
+    base, registry, usage, repo, bin, statePath, ...(preflightGate ? { preflightGate } : {}),
     async command(body) {
       const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
       return { status: response.status, data: await response.json() };
@@ -145,7 +182,9 @@ process.exit(result.status ?? 1);
     },
     async invocations() {
       return (await readFile(log, 'utf8')).split('\n').filter(Boolean)
-        .map((line) => JSON.parse(line) as { argv: string[]; prompt: string; cwd: string; codexHome: string | null });
+        .map((line) => JSON.parse(line) as {
+          argv: string[]; prompt: string; cwd: string; codexHome: string | null; imageBytes: string[];
+        });
     },
     async calls() {
       return (await readFile(callLog, 'utf8')).split('\n').filter(Boolean)
@@ -180,6 +219,32 @@ test('Codex preflight failure creates neither a session nor a worktree', async (
   assert.equal(response.data.code, 'codex_binary_missing');
   assert.deepEqual(fixture.registry.all(), []);
   assert.equal(await fixture.worktrees(), before);
+});
+
+test('Codex create preflight errors redact long ordinary launch-environment values', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-preflight-redaction-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = join(dir, 'bad-version-codex');
+  await writeFile(bin, `#!/usr/bin/env node
+if (process.argv.includes('--version')) {
+  process.stdout.write('workspace customer-internal-42 has no readable version\\n');
+  process.exit(0);
+}
+process.exit(2);
+`);
+  await chmod(bin, 0o755);
+  const fixture = await bootCodex(t, {
+    bin, env: { WORKSPACE_LABEL: 'customer-internal-42' },
+  });
+
+  const response = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'redacted-preflight', prompt: 'hello',
+  });
+
+  assert.equal(response.status, 400);
+  assert.ok(!JSON.stringify(response.data).includes('customer-internal-42'));
+  assert.match(response.data.error, /workspace \[REDACTED\]/);
+  assert.deepEqual(fixture.registry.all(), []);
 });
 
 test('a successful Codex create finishes with the fake executable', async (t) => {
@@ -300,8 +365,13 @@ test('Codex send validates attachments, persists only names, and resumes without
 
   const [, attachmentInvocation] = await fixture.invocations();
   assert.equal(attachmentInvocation.prompt, 'Review these\nAttached file: uploads/notes.txt');
-  assert.deepEqual(attachmentInvocation.argv.flatMap((arg, index, argv) =>
-    arg === '--image' ? [argv[index + 1]] : []), [await realpath(imagePath)]);
+  const [snapshotPath] = attachmentInvocation.argv.flatMap((arg, index, argv) =>
+    arg === '--image' ? [argv[index + 1]] : []);
+  assert.notEqual(snapshotPath, await realpath(imagePath));
+  assert.deepEqual(attachmentInvocation.imageBytes, ['89504e470d0a1a0a']);
+  await fixture.waitForSession(created.id, (current) => current.status === 'done');
+  await waitFor(() => stat(snapshotPath).then(() => false, () => true));
+  await assert.rejects(stat(snapshotPath), 'the server-visible Codex lifecycle cleans private image snapshots');
 
   assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
   const resumed = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'Continue cleanly' });
@@ -528,6 +598,47 @@ test('a failed Codex resume remains stopped and exposes a stable code', async (t
   assert.equal(fixture.registry.get(created.id)!.stoppedCode, 'codex_binary_not_executable');
 });
 
+test('Codex resume preflight errors redact ordinary launch values from every public boundary', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-resume-preflight-redaction-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const fake = await writeFakeCodex(dir);
+  const marker = join(dir, 'break-version');
+  const bin = join(dir, 'stateful-codex');
+  await writeFile(bin, `#!/usr/bin/env node
+const { existsSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+if (process.argv.includes('--version') && existsSync(${JSON.stringify(marker)})) {
+  process.stdout.write('workspace customer-internal-42 has no readable version\\n');
+  process.exit(0);
+}
+const result = spawnSync(${JSON.stringify(fake)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });
+process.exit(result.status ?? 1);
+`);
+  await chmod(bin, 0o755);
+  const fixture = await bootCodex(t, {
+    bin, env: { WORKSPACE_LABEL: 'customer-internal-42' },
+  });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  await writeFile(marker, 'broken');
+
+  const response = await fixture.command({ cmd: 'resume', id: created.id });
+  const sessionText = JSON.stringify(fixture.registry.get(created.id));
+  const events = await fetch(`${fixture.base}/events`);
+  const reader = events.body!.getReader();
+  const payload = new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  const persisted = await readFile(fixture.statePath, 'utf8');
+
+  assert.equal(response.status, 400);
+  for (const text of [JSON.stringify(response.data), sessionText, payload, persisted]) {
+    assert.ok(!text.includes('customer-internal-42'));
+  }
+  assert.match(response.data.error, /workspace \[REDACTED\]/);
+});
+
 test('a missing worktree rejects Codex resume before Registry revival', async (t) => {
   const fixture = await bootCodex(t);
   const created = await fixture.create('first');
@@ -570,6 +681,53 @@ test('a successful Codex resume prepares again and reuses its vendor session id'
   assert.equal(invocations.at(-1)!.argv.at(-1), 'fake-thread');
 });
 
+test('concurrent Codex resumes reserve one session before preflight', async (t) => {
+  const fixture = await bootCodex(t, { gatedPreflight: true });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  const gate = fixture.preflightGate!;
+  await writeFile(gate.enable, 'enabled');
+
+  const first = fixture.command({ cmd: 'resume', id: created.id, prompt: 'first resume' });
+  await waitFor(() => gate.count().then((count) => count === 1));
+  const second = fixture.command({ cmd: 'resume', id: created.id, prompt: 'second resume' });
+  const firstObservable = await Promise.race([
+    second.then((response) => ({ kind: 'response' as const, response })),
+    waitFor(() => gate.count().then((count) => count === 2), 1_000).then(() => ({ kind: 'two-preflights' as const })),
+  ]);
+  await writeFile(gate.release, 'release');
+  const responses = await Promise.all([first, second]);
+
+  assert.equal(firstObservable.kind, 'response', 'the duplicate must be rejected before starting another preflight');
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  assert.equal(await gate.count(), 1, 'only the reserved resume may run readiness checks');
+  await waitFor(async () => (await fixture.invocations()).length === 2);
+  assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first', 'first resume']);
+});
+
+test('deleting a Codex session during gated resume prevents its later launch', async (t) => {
+  const fixture = await bootCodex(t, { gatedPreflight: true });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  const gate = fixture.preflightGate!;
+  await writeFile(gate.enable, 'enabled');
+
+  const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
+  await waitFor(() => gate.count().then((count) => count === 1));
+  assert.equal((await fixture.command({ cmd: 'delete', id: created.id })).status, 200);
+  await writeFile(gate.release, 'release');
+  const response = await resume;
+
+  assert.equal(response.status, 409);
+  assert.equal(fixture.registry.get(created.id), undefined);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first']);
+});
+
 test('Codex account environment reaches its process but not public event JSON', async (t) => {
   const fixture = await bootCodex(t, { env: { CODEX_TOKEN: 'event-secret' } });
   const created = await fixture.create('first');
@@ -608,6 +766,53 @@ test('a short account environment value does not redact ordinary transcript text
 
   assert.deepEqual(fixture.registry.get(created.id)!.transcript.find((msg) => msg.kind === 'error'),
     { kind: 'error', text: 'fake backend error for workspace info' });
+});
+
+test('Codex lifecycle upserts redact long ordinary launch values before Registry admission', async (t) => {
+  const secret = 'customer-internal-42';
+  const fixture = await bootCodex(t, { env: { WORKSPACE_LABEL: secret } });
+  const created = await fixture.create('ordinary-env-rich-lifecycle');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.registry.save();
+  const session = fixture.registry.get(created.id)!;
+  const transcriptText = JSON.stringify(session.transcript);
+  const command = session.transcript.find((message) => message.kind === 'tool' && message.id === 'rich-command');
+  const mcp = session.transcript.find((message) => message.kind === 'tool' && message.id === 'rich-mcp');
+  const reasoning = session.transcript.find((message) => message.kind === 'reasoning');
+  const todo = session.transcript.find((message) => message.kind === 'todo');
+
+  assert.ok(command?.kind === 'tool');
+  assert.deepEqual({ id: command.id, name: command.name, summary: command.summary }, {
+    id: 'rich-command', name: 'shell', summary: 'npm test [REDACTED]',
+  });
+  assert.ok(mcp?.kind === 'tool');
+  assert.deepEqual({ id: mcp.id, name: mcp.name, summary: mcp.summary }, {
+    id: 'rich-mcp', name: 'rich-[REDACTED]', summary: 'fake-[REDACTED].rich-[REDACTED]',
+  });
+  assert.deepEqual(reasoning, {
+    kind: 'reasoning', id: 'rich-reasoning', text: 'Verified the lifecycle [REDACTED]',
+  });
+  assert.deepEqual(todo, {
+    kind: 'todo', id: 'rich-todo', items: [
+      { text: 'Inspect events [REDACTED]', completed: true },
+      { text: 'Run tests [REDACTED]', completed: true },
+    ],
+  });
+  assert.ok(!transcriptText.includes(secret));
+
+  for (const item of ['rich-command', 'rich-mcp', 'rich-file']) {
+    const response = await fetch(`${fixture.base}/detail?session=${created.id}&item=${item}`);
+    assert.equal(response.status, 200);
+    const detail = JSON.stringify(await response.json());
+    assert.ok(!detail.includes(secret), item);
+    assert.match(detail, /\[REDACTED\]/, item);
+  }
+  const events = await fetch(`${fixture.base}/events`);
+  const reader = events.body!.getReader();
+  const payload = new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
+  assert.ok(!payload.includes(secret));
+  assert.ok(!await readFile(fixture.statePath, 'utf8').then((text) => text.includes(secret)));
 });
 
 test('a vendor session id that matches an account value is still resumable', async (t) => {
@@ -1037,8 +1242,9 @@ test('POST /upload writes the file into the session worktree', async (t) => {
   });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { path: 'uploads/notes.txt' });
-  assert.equal(await readFile(join(wt, 'uploads', 'notes.txt'), 'utf8'), 'hello file');
+  const body = await res.json() as { path: string };
+  assert.match(body.path, /^\.switchboard-upload-[0-9a-f]{32}-notes\.txt$/);
+  assert.equal(await readFile(join(wt, body.path), 'utf8'), 'hello file');
 });
 
 test('POST /upload rejects a filename that escapes the worktree', async (t) => {
@@ -1088,6 +1294,84 @@ test('POST /upload refuses to follow a symlinked uploads directory', async (t) =
     stat(join(outside, 'notes.txt')),
     'a refused upload must not have written anything into the symlink target',
   );
+});
+
+test('POST /upload cannot be redirected by swapping its parent after validation', async (t) => {
+  let reached!: (target: string) => void;
+  let release!: () => void;
+  const opened = new Promise<string>((resolve) => { reached = resolve; });
+  const continueWrite = new Promise<void>((resolve) => { release = resolve; });
+  const { base, registry } = await boot(t, undefined, {
+    beforeUploadWrite: async (target) => {
+      reached(target);
+      await continueWrite;
+    },
+  });
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-race-'));
+  const outside = await mkdtemp(join(tmpdir(), 'sb-outside-race-'));
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await mkdir(join(wt, 'uploads'));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const upload = fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST', body: 'bound payload',
+  });
+  await Promise.race([
+    opened,
+    upload.then(() => { throw new Error('upload wrote before the deterministic race barrier'); }),
+  ]);
+  await rm(join(wt, 'uploads'), { recursive: true });
+  await symlink(outside, join(wt, 'uploads'));
+  release();
+  const response = await upload;
+
+  assert.equal(response.status, 200);
+  await assert.rejects(stat(join(outside, 'notes.txt')),
+    'the swapped outside directory must not receive even an empty file');
+  const { path } = await response.json() as { path: string };
+  assert.equal(await readFile(join(wt, path), 'utf8'), 'bound payload');
+});
+
+test('POST /upload writes through its opened file, never a swapped outside symlink', async (t) => {
+  let reached!: (target: string) => void;
+  let release!: () => void;
+  const opened = new Promise<string>((resolve) => { reached = resolve; });
+  const continueWrite = new Promise<void>((resolve) => { release = resolve; });
+  const { base, registry } = await boot(t, undefined, {
+    beforeUploadWrite: async (target) => {
+      reached(target);
+      await continueWrite;
+    },
+  });
+  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-leaf-race-'));
+  const outside = join(dirname(wt), `outside-${Date.now()}-${Math.random()}.txt`);
+  t.after(() => rm(wt, { recursive: true, force: true }));
+  t.after(() => rm(outside, { force: true }));
+  await writeFile(outside, 'outside sentinel');
+  await mkdir(join(wt, 'uploads'));
+  const s = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r',
+    cwd: wt, branch: 'b', title: 't',
+  });
+
+  const upload = fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
+    method: 'POST', body: 'must stay contained',
+  });
+  const target = await Promise.race([
+    opened,
+    upload.then(() => { throw new Error('upload wrote before the deterministic race barrier'); }),
+  ]);
+  await rm(target, { force: true });
+  await symlink(outside, target);
+  release();
+  const response = await upload;
+
+  assert.equal(response.status, 409);
+  assert.equal(await readFile(outside, 'utf8'), 'outside sentinel');
 });
 
 test('POST /command auto sets the flag on a stopped session, which has no live handle', async (t) => {

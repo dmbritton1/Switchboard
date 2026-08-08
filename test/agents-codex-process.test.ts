@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -16,6 +16,7 @@ type FakeInvocation = {
   prompt: string;
   cwd: string;
   codexHome: string | null;
+  imageBytes: string[];
 };
 
 type ProcessFixture = {
@@ -186,11 +187,58 @@ test('PNG, JPEG, and WebP attachments reach the real SDK as native image argumen
 
   const [invocation] = await fixture.readInvocations();
   assert.equal(invocation.prompt, 'Inspect the attachments\nAttached file: notes.txt');
-  assert.deepEqual(invocation.argv.flatMap((arg, index, argv) =>
-    arg === '--image' ? [argv[index + 1]] : []), await Promise.all([
-    realpath(paths.png), realpath(paths.jpeg), realpath(paths.webp),
-  ]));
+  const imagePaths = invocation.argv.flatMap((arg, index, argv) =>
+    arg === '--image' ? [argv[index + 1]] : []);
+  assert.equal(imagePaths.length, 3);
+  assert.ok(imagePaths.every((path) => !Object.values(paths).includes(path)),
+    'the SDK must receive private snapshots, not mutable worktree paths');
+  assert.deepEqual(invocation.imageBytes, [
+    '89504e470d0a1a0a', 'ffd8ff', Buffer.from('RIFF0000WEBP').toString('hex'),
+  ]);
+  for (const path of imagePaths) {
+    await waitFor(() => stat(path).then(() => false, () => true));
+    await assert.rejects(stat(path), 'successful turns clean image snapshots');
+  }
   assert.ok(!invocation.argv.includes(paths.file), 'ordinary files belong in prompt text, not --image');
+});
+
+test('a failed Codex turn cleans its private image snapshot', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const imagePath = join(fixture.cwd, 'failure.png');
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'startup-failure', ['failure.png']);
+  const events: AdapterEvent[] = [];
+
+  createCodexAdapter(fixture.runtime).start({ cwd: fixture.cwd, env: {}, prompt }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'stopped'));
+  const [invocation] = await fixture.readInvocations();
+  const snapshotPath = invocation.argv[invocation.argv.indexOf('--image') + 1];
+
+  assert.notEqual(snapshotPath, imagePath);
+  await waitFor(() => stat(snapshotPath).then(() => false, () => true));
+  await assert.rejects(stat(snapshotPath), 'failed turns clean image snapshots');
+});
+
+test('stopping an in-flight Codex image turn cleans its private snapshot', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const imagePath = join(fixture.cwd, 'hold.png');
+  await writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const prompt = await resolveAgentPrompt(fixture.cwd, 'hold', ['hold.png']);
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAdapter(fixture.runtime).start(
+    { cwd: fixture.cwd, env: {}, prompt }, (event) => events.push(event),
+  );
+  await waitFor(async () => (await fixture.readInvocations()).length === 1);
+  const [invocation] = await fixture.readInvocations();
+  const snapshotPath = invocation.argv[invocation.argv.indexOf('--image') + 1];
+  assert.notEqual(snapshotPath, imagePath);
+  assert.ok((await stat(snapshotPath)).isFile(), 'snapshot stays available for the live SDK turn');
+  await waitFor(async () => (await fixture.readHoldLifecycle()).includes('alive'));
+
+  handle.stop();
+  await waitFor(async () => (await fixture.readHoldLifecycle()).includes('aborted'));
+  await waitFor(() => stat(snapshotPath).then(() => false, () => true));
+  await assert.rejects(stat(snapshotPath), 'stopping the turn cleans its image snapshot');
 });
 
 test('a queued image swapped to a symlink is rejected before the SDK invocation', async (t) => {

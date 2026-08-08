@@ -64,6 +64,10 @@ test('usage events replace a session’s SDK-backed last-turn usage', () => {
     inputTokens: 10, outputTokens: 5,
     cachedInputTokens: 3, cacheWriteInputTokens: 7, reasoningOutputTokens: 2,
   });
+
+  reg.apply(id, { type: 'usage', inputTokens: 12, outputTokens: 6 });
+  assert.deepEqual(reg.get(id)!.lastUsage, { inputTokens: 12, outputTokens: 6 },
+    'a later basic event replaces, rather than inherits, optional fields from the prior turn');
 });
 
 test('Codex settings persist only explicit values and legacy sessions inherit them', async (t) => {

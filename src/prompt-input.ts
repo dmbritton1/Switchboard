@@ -1,6 +1,9 @@
-import { open, lstat, realpath } from 'node:fs/promises';
-import { basename, extname, isAbsolute, join, normalize, relative, sep } from 'node:path';
+import { constants } from 'node:fs';
+import { open, lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { extname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 import type { AgentPrompt, PromptAttachment } from './types.ts';
+import { uploadAttachmentName } from './upload.ts';
 
 const MAX_ATTACHMENTS = 10;
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -110,7 +113,7 @@ export async function resolveAgentPrompt(
     }
 
     attachments.push({
-      name: basename(relativePath),
+      name: uploadAttachmentName(relativePath),
       relativePath,
       absolutePath: realCandidate,
       kind: await classifyImage(realCandidate, index),
@@ -127,4 +130,100 @@ export async function revalidateAgentPrompt(cwd: string, prompt: AgentPrompt): P
     prompt.text,
     prompt.attachments.map((attachment) => attachment.relativePath),
   );
+}
+
+async function verifiedImageBytes(
+  cwd: string,
+  attachment: PromptAttachment,
+  index: number,
+): Promise<Buffer> {
+  const submittedPath = join(cwd, attachment.relativePath);
+  const [realCwd, submittedStat] = await Promise.all([
+    realpath(cwd).catch(() => { throw new Error('The session worktree is unavailable.'); }),
+    lstat(submittedPath).catch(() => { throw new Error(`Attachment ${index + 1} does not exist.`); }),
+  ]);
+  if (submittedStat.isSymbolicLink()) {
+    throw new Error(`Attachment ${index + 1} must be a regular file, not a symbolic link.`);
+  }
+  if (!submittedStat.isFile()) throw new Error(`Attachment ${index + 1} must be a regular file.`);
+
+  const candidate = await realpath(submittedPath)
+    .catch(() => { throw new Error(`Attachment ${index + 1} does not exist.`); });
+  if (!isContained(realCwd, candidate)) throw new Error('Attachment paths must stay inside the worktree.');
+
+  let source;
+  try {
+    source = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    throw new Error(`Attachment ${index + 1} could not be read.`);
+  }
+  try {
+    const openedStat = await source.stat();
+    if (!openedStat.isFile()
+      || openedStat.dev !== submittedStat.dev || openedStat.ino !== submittedStat.ino) {
+      throw new Error(`Attachment ${index + 1} changed while it was being verified.`);
+    }
+    const bytes = await source.readFile();
+    const extension = extname(attachment.relativePath).toLowerCase();
+    if (!hasImageSignature(extension, bytes.subarray(0, 12))) {
+      throw new Error(`Attachment ${index + 1} has invalid image contents.`);
+    }
+    return bytes;
+  } finally {
+    await source.close();
+  }
+}
+
+/**
+ * Copies verified worktree image bytes into private, unguessable files that only
+ * the adapter sees. The SDK can reopen these paths without reopening mutable
+ * user-controlled worktree paths.
+ */
+export async function snapshotCodexPrompt(
+  cwd: string,
+  prompt: AgentPrompt,
+): Promise<{ prompt: AgentPrompt; cleanup(): Promise<void> }> {
+  const validated = await revalidateAgentPrompt(cwd, prompt);
+  const images = validated.attachments.filter((attachment) => attachment.kind === 'image');
+  if (images.length === 0) return { prompt: validated, async cleanup() {} };
+
+  const snapshotDir = await mkdtemp(join(tmpdir(), 'switchboard-codex-image-'));
+  let cleaned = false;
+  const cleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    await rm(snapshotDir, { recursive: true, force: true });
+  };
+  try {
+    const snapshotPaths = new Map<PromptAttachment, string>();
+    for (const [index, attachment] of validated.attachments.entries()) {
+      if (attachment.kind !== 'image') continue;
+      const bytes = await verifiedImageBytes(cwd, attachment, index);
+      const snapshotPath = join(snapshotDir, `${index}${extname(attachment.relativePath).toLowerCase()}`);
+      const snapshot = await open(
+        snapshotPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await snapshot.writeFile(bytes);
+      } finally {
+        await snapshot.close();
+      }
+      snapshotPaths.set(attachment, snapshotPath);
+    }
+    return {
+      prompt: {
+        text: validated.text,
+        attachments: validated.attachments.map((attachment) => ({
+          ...attachment,
+          ...(snapshotPaths.has(attachment) ? { absolutePath: snapshotPaths.get(attachment)! } : {}),
+        })),
+      },
+      cleanup,
+    };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 }

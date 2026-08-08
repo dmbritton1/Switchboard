@@ -1,6 +1,6 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Server } from 'node:http';
-import { readFile, readdir, rm, stat, lstat, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rm, stat, lstat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
@@ -12,7 +12,9 @@ import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
+import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
+import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
@@ -69,6 +71,32 @@ function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent
     }
     case 'stopped':
       return { ...event, reason: redactAccountValue(event.reason, account) };
+    case 'upsert-msg': {
+      const msg = event.msg;
+      if (msg.kind === 'reasoning') {
+        return { ...event, msg: { ...msg, text: redactAccountValue(msg.text, account) } };
+      }
+      if (msg.kind === 'todo') {
+        return { ...event, msg: { ...msg, items: msg.items.map((item) => ({
+          ...item, text: redactAccountValue(item.text, account),
+        })) } };
+      }
+      const redactedDetail = msg.detail === undefined
+        ? null
+        : safeCodexDetail(redactAccountValue(msg.detail, account), {});
+      return {
+        ...event,
+        msg: {
+          ...msg,
+          name: redactAccountValue(msg.name, account),
+          summary: redactAccountValue(msg.summary, account),
+          ...(redactedDetail ? {
+            detail: redactedDetail.text,
+            detailTruncated: (msg.detailTruncated ?? false) || redactedDetail.truncated,
+          } : {}),
+        },
+      };
+    }
     // vendor-session-id is deliberately not redacted: it is an identifier the
     // server hands straight back to resumeThread(), never rendered as prose. A
     // value that happened to contain an account value would come back rewritten
@@ -170,9 +198,13 @@ export function createServer(opts: {
   usage: Usage;
   accounts: Account[];
   resolvePrompt?: typeof resolveAgentPrompt;
+  beforeUploadWrite?: (target: string) => Promise<void>;
 }): Server {
-  const { registry, usage, accounts, resolvePrompt = resolveAgentPrompt } = opts;
+  const {
+    registry, usage, accounts, resolvePrompt = resolveAgentPrompt, beforeUploadWrite,
+  } = opts;
   const handles = new Map<string, AgentHandle>();
+  const resumeReservations = new Map<string, symbol>();
 
   function snapshot() {
     return {
@@ -279,7 +311,7 @@ export function createServer(opts: {
           if (error instanceof CodexRuntimeError) {
             return {
               status: 400,
-              json: { error: redactCodexText(error.message, account.env), code: error.code },
+              json: { error: redactAccountValue(error.message, account), code: error.code },
             };
           }
           throw error;
@@ -379,57 +411,76 @@ export function createServer(opts: {
       }
 
       case 'resume': {
-        const session = registry.get(String(body.id));
+        const sessionId = String(body.id);
+        const session = registry.get(sessionId);
         if (!session) return { status: 404, json: { error: 'no such session' } };
         // Without this, resume on a live session (or a double-click on Resume)
         // calls launch(), whose handles.set() overwrites the live handle —
         // orphaning an agent that no stop() can reach while it still holds write
         // access to the worktree a second agent is now editing.
-        if (session.status !== 'stopped') {
+        if (session.status !== 'stopped' || handles.has(sessionId)) {
           return { status: 409, json: { error: 'session is not stopped' } };
+        }
+        if (resumeReservations.has(sessionId)) {
+          return { status: 409, json: { error: 'session resume is already in progress' } };
         }
         const account = accounts.find((a) => a.name === session.account);
         if (!account) return { status: 400, json: { error: 'account no longer configured' } };
-        // A worktree can be removed (merged and cleaned up, or deleted by hand)
-        // while its session card lives on. Spawning into a missing cwd makes the
-        // Claude SDK report a native-binary/platform mismatch — the binary is
-        // fine, the directory is gone — so check here and say what actually
-        // happened rather than passing that error on.
-        if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
-          const rawReason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
-          if (account.provider === 'codex') {
-            const reason = redactAccountValue(rawReason, account);
-            registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
-            return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
-          }
-          return { status: 409, json: { error: rawReason } };
-        }
-        let prepared: PreparedProvider;
+        const reservation = Symbol(sessionId);
+        resumeReservations.set(sessionId, reservation);
         try {
-          prepared = await prepareProvider(account);
-        } catch (error) {
-          if (error instanceof CodexRuntimeError) {
-            const reason = redactCodexText(error.message, account.env);
-            registry.recordStoppedFailure(session.id, reason, error.code);
-            return { status: 400, json: { error: reason, code: error.code } };
+          // A worktree can be removed (merged and cleaned up, or deleted by hand)
+          // while its session card lives on. Spawning into a missing cwd makes the
+          // Claude SDK report a native-binary/platform mismatch — the binary is
+          // fine, the directory is gone — so check here and say what actually
+          // happened rather than passing that error on.
+          if (!(await stat(session.cwd).then((s) => s.isDirectory(), () => false))) {
+            const rawReason = `worktree is gone: ${session.cwd} — delete this session, or recreate the worktree`;
+            if (account.provider === 'codex') {
+              const reason = redactAccountValue(rawReason, account);
+              registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+              return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+            }
+            return { status: 409, json: { error: rawReason } };
           }
-          throw error;
+          let prepared: PreparedProvider;
+          try {
+            prepared = await prepareProvider(account);
+          } catch (error) {
+            if (error instanceof CodexRuntimeError) {
+              const reason = redactAccountValue(error.message, account);
+              registry.recordStoppedFailure(session.id, reason, error.code);
+              return { status: 400, json: { error: reason, code: error.code } };
+            }
+            throw error;
+          }
+          // No request can interleave between this final identity/status check and
+          // synchronous revival + launch. The reservation blocks another resume;
+          // identity catches delete; handle absence prevents overwriting a live agent.
+          if (resumeReservations.get(sessionId) !== reservation
+            || registry.get(sessionId) !== session
+            || session.status !== 'stopped'
+            || handles.has(sessionId)) {
+            return { status: 409, json: { error: 'session changed while resume was preparing' } };
+          }
+          // registry.revive() (not a direct mutation) so subscribers get #notify()'d
+          // immediately; neither adapter emits a synchronous status event at start(),
+          // so without this an SSE client would keep showing 'stopped' until the
+          // resumed agent's first async event arrived.
+          registry.revive(session.id);
+          const prompt = typeof body.prompt === 'string' ? body.prompt : 'continue';
+          const promptId = account.provider === 'codex' && typeof body.prompt === 'string'
+            ? registry.appendPrompt(session.id, prompt, 'queued')
+            : undefined;
+          const launchError = launch(
+            session.id, account, prepared.adapter, session.cwd, { text: prompt, attachments: [] },
+            session.vendorSessionId ?? undefined, promptId,
+          );
+          if (launchError) return { status: 500, json: launchError };
+          return { status: 200, json: { ok: true } };
+        } finally {
+          if (resumeReservations.get(sessionId) === reservation) resumeReservations.delete(sessionId);
         }
-        // registry.revive() (not a direct mutation) so subscribers get #notify()'d
-        // immediately; neither adapter emits a synchronous status event at start(),
-        // so without this an SSE client would keep showing 'stopped' until the
-        // resumed agent's first async event arrived.
-        registry.revive(session.id);
-        const prompt = typeof body.prompt === 'string' ? body.prompt : 'continue';
-        const promptId = account.provider === 'codex' && typeof body.prompt === 'string'
-          ? registry.appendPrompt(session.id, prompt, 'queued')
-          : undefined;
-        const launchError = launch(
-          session.id, account, prepared.adapter, session.cwd, { text: prompt, attachments: [] },
-          session.vendorSessionId ?? undefined, promptId,
-        );
-        if (launchError) return { status: 500, json: launchError };
-        return { status: 200, json: { ok: true } };
       }
 
       case 'merge': {
@@ -624,27 +675,29 @@ export function createServer(opts: {
           }
           chunks.push(c as Buffer);
         }
-        // mkdir({recursive:true}) is a no-op if uploads already exists, and
-        // writeFile follows symlinks — so a tracked symlink named uploads/ (or
-        // uploads/<name>) checked out by an untrusted branch could redirect this
-        // write outside the worktree. lstat (unlike stat) doesn't follow
-        // symlinks, so it tells us the truth about what's actually there. A
-        // missing path is fine — that's the normal new-file case — only an
-        // existing symlink is refused.
+        // Preserve the explicit rejection for a tracked legacy uploads symlink,
+        // but do not write through that mutable directory at all. The contained
+        // writer creates an unpredictable direct child of the worktree root and
+        // binds all bytes to its already-opened file handle.
         const uploadsDir = join(session.cwd, 'uploads');
-        const target = join(uploadsDir, name);
-        for (const p of [uploadsDir, target]) {
-          const st = await lstat(p).catch(() => null);
-          if (st?.isSymbolicLink()) {
-            res.writeHead(400, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
-            return;
-          }
+        if ((await lstat(uploadsDir).catch(() => null))?.isSymbolicLink()) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
+          return;
         }
-        await mkdir(uploadsDir, { recursive: true });
-        await writeFile(target, Buffer.concat(chunks));
+        let storedPath: string;
+        try {
+          storedPath = await writeContainedUpload(
+            session.cwd, name, Buffer.concat(chunks), beforeUploadWrite,
+          );
+        } catch (error) {
+          const changed = error instanceof UploadChangedError;
+          res.writeHead(changed ? 409 : 400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: changed ? error.message : 'could not store upload' }));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ path: `uploads/${name}` }));
+        res.end(JSON.stringify({ path: storedPath }));
         return;
       }
 
