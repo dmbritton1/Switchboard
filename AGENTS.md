@@ -33,12 +33,30 @@ Registry and git worktrees, then into a provider adapter.
 - Treat account environment values as launch-only secrets: never persist, log,
   return over SSE, or render them.
 - Preserve the target repository's Codex configuration and instructions.
+- Keep `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'` as
+  mandatory overrides. Per-session Codex settings may be explicit or omitted
+  (omitted means inherit), but they must never expose or weaken either policy.
+- Tool detail is redacted before Registry admission, bounded to 32 KiB per item
+  and 2 MiB globally, evicted least-recently-updated, omitted from SSE, and
+  read lazily only by session/item ID. Do not persist or expose raw reasoning
+  or absolute attachment paths.
+- Supported PNG, JPEG, and WebP uploads use SDK `local_image`; other files stay
+  as worktree-relative text references. Preserve retryable draft and pending
+  attachment behavior when an upload or send fails.
+- Treat SDK usage as last-turn data and account pace as an estimate; never
+  present either as a provider rate or plan limit.
 
 ## Test isolation
 
 Tests use the fake Codex executable through the real SDK boundary, a temporary
 `CODEX_HOME`, and local temporary files. Do not add paid, networked, or real
 account tests to `npm test`.
+
+`npm run evaluate:codex-app-server` is an optional, manual no-turn probe of the
+installed local app-server. It may initialize and read auth state without
+refresh, but must not create a thread or start a turn. Its recorded decision is
+SDK-only; do not add a hybrid or replacement transport without a later approved
+design and implementation plan.
 
 ## Change discipline
 

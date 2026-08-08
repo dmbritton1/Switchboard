@@ -649,6 +649,18 @@ Phase 2 is complete when:
 - The approval evaluation has a working prototype, a decision record, and no
   unresolved production transport ambiguity.
 
+### Implementation status
+
+Phase 2 completion verification passed: the production path remains SDK-only;
+the installed `0.145.0` app-server passed real no-turn schema, initialization,
+authentication-state, and clean-shutdown checks; and no live/paid turn or
+vendor-thread continuity was authorized or proven. The hybrid and replacement
+options are rejected pending a future approved transport plan. Tasks 0–9 are
+100% of this approved two-phase specification and deliver the design's
+estimated 90–95% of the desired local Codex worker experience, not parity with
+every Codex app, cloud, connector, collaboration, or external-session
+capability.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |

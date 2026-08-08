@@ -163,8 +163,59 @@ spend a model turn, or read a real Codex account.
   shows the stale entry; `git worktree prune` clears it. (The one case a
   delete leaves the card in place is when that `rm -rf` fallback fails too.)
 
-Phase 2 remains intentionally out of scope: live item lifecycle rendering,
-bounded/redacted tool details, reasoning and todo presentation, structured
-local-image input, inherited-by-default per-session settings, improved usage
-reporting where supported, and the SDK-versus-app-server interactive-approval
-evaluation.
+## Codex Phase 2 behavior
+
+Codex tool activity is one live row per item: it changes from `running` to
+`ok` or `error` instead of adding duplicate rows. Command, edit, and MCP detail
+is redacted before storage, capped at 32 KiB per item and 2 MiB across all
+sessions. When the global cap is exceeded, Switchboard evicts whole detail
+bodies in least-recently-updated order. The row and its eviction metadata stay
+visible. Detail bodies are persisted but omitted from SSE; the browser fetches
+the already-redacted body lazily by session and item ID, refreshes it only when
+its revision changes, and keeps an expanded row open across transcript rebuilds.
+
+Reasoning summaries and todo status are separate transcript entries. They are
+not raw hidden reasoning. PNG, JPEG, and WebP uploads become native SDK
+`local_image` input. Other uploaded files remain worktree-relative path
+references in the text input; absolute paths never enter browser history. A
+rejected send keeps its draft and pending attachments so it can be retried, and
+a failed upload remains visible until retried, dismissed, or the operator moves
+to another session.
+
+Codex thread settings are optional. Omitted settings inherit the selected
+Codex/user/repository configuration; only explicit settings are saved and used
+again on resume. Settings cannot be changed during an active turn, but a
+stopped session can update them for its next resume. The worktree directory,
+`sandboxMode: 'workspace-write'`, and `approvalPolicy: 'never'` are mandatory
+overrides and are not settings users can weaken.
+
+The session shows the SDK's last-turn usage fields when available. Account pace
+remains an estimate from observed input/output spend against the local account
+budget, not a provider rate-limit or plan-limit reading.
+
+The Phase 2 app-server evaluation passed its real, installed-`0.145.0` no-turn
+schema-generation, initialization, authentication-state, and clean-shutdown
+checks. It intentionally did not start a live/paid turn, so turn lifecycle and
+vendor-thread continuity are not proven. Production therefore remains SDK-only;
+the hybrid and replacement paths are rejected pending a future approved
+transport plan. See
+[`docs/superpowers/reports/2026-08-01-codex-app-server-decision.md`](docs/superpowers/reports/2026-08-01-codex-app-server-decision.md).
+This completes 100% of the approved two-phase specification and the design's
+estimated 90–95% of the desired local Codex worker experience; it is not parity
+with every Codex app, cloud, connector, collaboration, or external-session
+capability.
+
+## Verification
+
+```bash
+npm test
+```
+
+The normal suite is offline and uses fake Codex processes. The optional bounded
+no-turn evaluator uses the installed local Codex app-server, initializes it,
+reads auth state without refresh, and shuts it down; it does not create a
+thread or spend a model turn:
+
+```bash
+npm run evaluate:codex-app-server
+```
