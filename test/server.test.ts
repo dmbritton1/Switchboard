@@ -175,6 +175,74 @@ test('a successful Codex create finishes with the fake executable', async (t) =>
   assert.equal(fixture.registry.get(created.id)!.vendorSessionId, 'fake-thread');
 });
 
+test('Codex create persists only supplied settings, updates stopped sessions, and reuses them on resume', async (t) => {
+  const fixture = await bootCodex(t);
+  const created = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'codex-settings', prompt: 'first',
+    codexSettings: { model: 'gpt-5.3-codex', networkAccessEnabled: false },
+  });
+  assert.equal(created.status, 200);
+  await fixture.waitForSession(created.data.id, (session) => session.status === 'done');
+  assert.deepEqual(fixture.registry.get(created.data.id)!.codexSettings, {
+    model: 'gpt-5.3-codex', networkAccessEnabled: false,
+  });
+  assert.doesNotMatch(JSON.stringify(fixture.registry.publicSessions()), /modelReasoningEffort|webSearchMode/);
+
+  await fixture.command({ cmd: 'stop', id: created.data.id });
+  await fixture.waitForSession(created.data.id, (session) => session.status === 'stopped');
+  const change = await fixture.command({
+    cmd: 'codex-settings', id: created.data.id, codexSettings: { webSearchMode: 'cached' },
+  });
+  assert.equal(change.status, 200);
+  assert.deepEqual(fixture.registry.get(created.data.id)!.codexSettings, { webSearchMode: 'cached' });
+
+  assert.equal((await fixture.command({ cmd: 'resume', id: created.data.id, prompt: 'continue' })).status, 200);
+  await fixture.waitForSession(created.data.id, (session) => session.status === 'done');
+  const resumed = (await fixture.invocations()).at(-1)!.argv.join(' ');
+  assert.match(resumed, /web_search="cached"/);
+  assert.ok(!/network_access_enabled|model_reasoning_effort/.test(resumed));
+});
+
+test('Codex settings reject non-Codex, live, and malformed changes', async (t) => {
+  const { base, registry } = await boot(t);
+  const claude = registry.create({
+    provider: 'claude', account: 'claude-main', repo: '/r', cwd: '/r/claude', branch: 'claude', title: 'claude',
+  });
+  for (const body of [{ cmd: 'codex-settings', id: claude.id, codexSettings: {} }]) {
+    const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
+    assert.equal(response.status, 409);
+  }
+  for (const status of ['working', 'done', 'needs-you'] as const) {
+    const codex = registry.create({
+      provider: 'codex', account: 'codex', repo: '/r', cwd: `/r/${status}`, branch: status, title: status,
+    });
+    if (status === 'needs-you') {
+      registry.apply(codex.id, { type: 'approval', request: { id: 'p', tool: 'tool', summary: 'wait' } });
+    } else if (status === 'done') {
+      registry.apply(codex.id, { type: 'status', status });
+    }
+    const response = await fetch(`${base}/command`, {
+      method: 'POST', body: JSON.stringify({ cmd: 'codex-settings', id: codex.id, codexSettings: {} }),
+    });
+    assert.equal(response.status, 409, status);
+  }
+  const stopped = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/stopped', branch: 'stopped', title: 'stopped',
+  });
+  registry.apply(stopped.id, { type: 'stopped', reason: 'stopped' });
+  const malformed = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'codex-settings', id: stopped.id, codexSettings: { networkAccessEnabled: 'false' } }),
+  });
+  assert.equal(malformed.status, 400);
+  const create = await fetch(`${base}/command`, {
+    method: 'POST',
+    body: JSON.stringify({ cmd: 'create', account: 'claude-main', repo: '/r', branch: 'bad', prompt: 'no', codexSettings: {} }),
+  });
+  assert.equal(create.status, 400);
+  assert.equal(registry.all().length, 5);
+});
+
 test('Codex send validates attachments, persists only names, and resumes without replaying them', async (t) => {
   const fixture = await bootCodex(t);
   const created = await fixture.create('first');

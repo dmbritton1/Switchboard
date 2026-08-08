@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { MAX_CODEX_DETAIL_TOTAL_BYTES } from './agents/codex-detail.ts';
+import { validateCodexSettings } from './agents/codex-settings.ts';
 import type {
-  AdapterEvent, CodexFailureCode, PromptDelivery, PublicMsg, PublicSession, Session, ToolMsg, UpsertMsg,
+  AdapterEvent, CodexFailureCode, CodexThreadSettings, PromptDelivery, PublicMsg, PublicSession, Session, ToolMsg, UpsertMsg,
 } from './types.ts';
 import type { Usage } from './usage.ts';
 
-type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title'>;
+type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title' | 'codexSettings'>;
 
 export type ToolDetailRead = {
   text: string | null;
@@ -65,6 +66,7 @@ export class Registry {
       pending: null,
       stoppedReason: null,
       stoppedCode: null,
+      ...(init.codexSettings ? { codexSettings: { ...init.codexSettings } } : {}),
       startedAt: now,
       statusSince: now,
     };
@@ -327,6 +329,14 @@ export class Registry {
     this.#notify();
   }
 
+  setCodexSettings(id: string, settings: CodexThreadSettings | undefined): void {
+    const s = this.#sessions.get(id);
+    if (!s) return;
+    if (settings) s.codexSettings = { ...settings };
+    else delete s.codexSettings;
+    this.#notify();
+  }
+
   subscribe(fn: () => void): () => void {
     this.#subs.add(fn);
     return () => this.#subs.delete(fn);
@@ -379,6 +389,15 @@ export class Registry {
       // garbage sessions keyed on `undefined`.
       for (const s of (Array.isArray(raw) ? raw : []) as Session[]) {
         if (!s || typeof s.id !== 'string') continue;
+        let codexSettings: CodexThreadSettings | undefined;
+        if (s.provider === 'codex') {
+          try {
+            codexSettings = validateCodexSettings(s.codexSettings);
+          } catch {
+            // State is hand-editable: drop malformed settings rather than
+            // forwarding an unvalidated value into the SDK on resume.
+          }
+        }
         let interruptedCount = 0;
         const transcript = (Array.isArray(s.transcript) ? s.transcript : []).flatMap((message) => {
           if (!message || typeof message !== 'object') return [];
@@ -398,8 +417,10 @@ export class Registry {
           transcript.push({ kind: 'error', text: unsentMessage(interruptedCount) });
         }
         // Agents are children of this process; nothing survived the restart.
+        const { codexSettings: _storedCodexSettings, ...stored } = s;
         reg.#sessions.set(s.id, {
-          ...s,
+          ...stored,
+          ...(codexSettings ? { codexSettings } : {}),
           transcript,
           status: 'stopped',
           statusSince: Date.now(),

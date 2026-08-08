@@ -149,6 +149,30 @@ export function snapshotFiles(iterable) {
   return Array.from(iterable ?? []);
 }
 
+/** Convert the settings form's string controls into an omission-preserving payload. */
+export function codexSettingsFromForm(values) {
+  const model = String(values.model ?? '').trim();
+  const settings = {
+    ...(model ? { model } : {}),
+    ...(values.reasoning ? { modelReasoningEffort: values.reasoning } : {}),
+    ...(values.webSearch ? { webSearchMode: values.webSearch } : {}),
+    ...(values.network === 'enabled' ? { networkAccessEnabled: true } : {}),
+    ...(values.network === 'disabled' ? { networkAccessEnabled: false } : {}),
+  };
+  return Object.keys(settings).length ? settings : undefined;
+}
+
+/** A compact stopped-session menu label that still exposes explicit false. */
+export function codexSettingsSummary(settings) {
+  if (!settings || Object.keys(settings).length === 0) return 'Inherit';
+  const values = [];
+  if (settings.model) values.push(`Model: ${settings.model}`);
+  if (settings.modelReasoningEffort) values.push(`Reasoning: ${settings.modelReasoningEffort}`);
+  if (settings.webSearchMode) values.push(`Web search: ${settings.webSearchMode}`);
+  if (settings.networkAccessEnabled !== undefined) values.push(`Network: ${settings.networkAccessEnabled ? 'Enabled' : 'Disabled'}`);
+  return values.join(' · ');
+}
+
 /** Browser-local attachment lifecycle state, deliberately independent of DOM. */
 export function createAttachmentController() {
   return {

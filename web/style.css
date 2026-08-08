@@ -224,20 +224,36 @@ body { margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
   letter-spacing: .04em; text-transform: uppercase; }
 .hint { margin: 0; color: var(--dim); font-size: .8rem; }
 
-#new input, #new textarea, #new select {
+#new input, #new textarea, #new select, #codex-settings-dialog input, #codex-settings-dialog select {
   width: 100%; box-sizing: border-box; padding: .55rem .7rem; background: var(--field);
   color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
   font: inherit; }
 #new textarea { resize: vertical; min-height: 4.5rem; }
 #new input[name=repo] { font-family: var(--mono); font-size: .9em; }
-#new :is(input, textarea, select):focus-visible {
+#new :is(input, textarea, select):focus-visible, #codex-settings-dialog :is(input, select):focus-visible {
   outline: none; border-color: var(--working); box-shadow: 0 0 0 3px #35c46a26; }
 
 /* Native select popups can't be styled, but the control can. */
 .select-wrap { position: relative; }
 .select-wrap::after { content: '▾'; position: absolute; right: .7rem; top: 50%;
   translate: 0 -50%; color: var(--dim); pointer-events: none; }
-#new select { appearance: none; padding-right: 2rem; cursor: pointer; }
+#new select, #codex-settings-dialog select { appearance: none; padding-right: 2rem; cursor: pointer; }
+
+.codex-settings { display: grid; gap: .8rem; margin: 0; padding: 1rem; border: 1px solid var(--line);
+  border-radius: 10px; }
+.codex-settings legend { padding: 0 .35rem; color: var(--dim); font-size: .8rem; font-weight: 600;
+  letter-spacing: .04em; text-transform: uppercase; }
+.field > label span { color: var(--dim); font-weight: 400; text-transform: none; letter-spacing: 0; }
+#codex-settings-dialog { width: min(32rem, 92vw); padding: 0; border: 1px solid var(--line);
+  border-radius: 14px; background: var(--card); color: var(--fg); }
+#codex-settings-dialog::backdrop { background: #000b; }
+#codex-settings-dialog form { display: grid; gap: 1rem; padding: 1.5rem; }
+#codex-settings-dialog h2 { margin: 0; font-size: 1.05rem; }
+#codex-settings-dialog menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
+#codex-settings-dialog menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--line);
+  background: #232323; color: var(--fg); font: inherit; cursor: pointer; }
+#codex-settings-dialog menu button[value=save] { background: var(--working); border-color: var(--working);
+  color: #08210f; font-weight: 650; }
 
 .combo { position: relative; }
 .combo-list { position: absolute; z-index: 1; inset-inline: 0; top: calc(100% + .3rem);

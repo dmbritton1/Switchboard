@@ -11,12 +11,13 @@ import { commitGraph, createWorktree, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
+import { validateCodexSettings } from './agents/codex-settings.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
 } from './agents/codex-runtime.ts';
 import type {
-  Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, Session,
+  Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, CodexThreadSettings, Session,
 } from './types.ts';
 
 const run = promisify(execFile);
@@ -213,9 +214,11 @@ export function createServer(opts: {
     sessionId: string, account: Account, adapter: Adapter, cwd: string, prompt: AgentPrompt, resumeId?: string,
     promptId?: string,
   ): { error: string; code?: CodexFailureCode } | null {
-    const auto = registry.get(sessionId)?.auto ?? false;
+    const session = registry.get(sessionId);
+    const auto = session?.auto ?? false;
+    const codexSettings = session?.codexSettings;
     try {
-      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto }, (e) => {
+      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') usage.record(account.name, safeEvent.inputTokens, safeEvent.outputTokens);
         if (safeEvent.type !== 'stopped') { registry.apply(sessionId, safeEvent); return; }
@@ -256,6 +259,15 @@ export function createServer(opts: {
       case 'create': {
         const account = accounts.find((a) => a.name === body.account);
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
+        if (account.provider !== 'codex' && Object.hasOwn(body, 'codexSettings')) {
+          return { status: 400, json: { error: 'Codex settings are only available for Codex sessions.' } };
+        }
+        let codexSettings: CodexThreadSettings | undefined;
+        try {
+          codexSettings = account.provider === 'codex' ? validateCodexSettings(body.codexSettings) : undefined;
+        } catch (error) {
+          return { status: 400, json: { error: String((error as Error).message ?? error) } };
+        }
         let prepared: PreparedProvider;
         try {
           prepared = await prepareProvider(account);
@@ -281,6 +293,7 @@ export function createServer(opts: {
           cwd,
           branch: String(body.branch),
           title: String(body.branch),
+          ...(codexSettings ? { codexSettings } : {}),
         });
         const prompt = String(body.prompt);
         const promptId = registry.appendPrompt(
@@ -334,6 +347,23 @@ export function createServer(opts: {
         registry.setAuto(session.id, on);
         handles.get(session.id)?.setAuto(on);
         return { status: 200, json: { ok: true, auto: on } };
+      }
+
+      case 'codex-settings': {
+        const session = registry.get(String(body.id));
+        if (!session) return { status: 404, json: { error: 'no such session' } };
+        if (session.provider !== 'codex') {
+          return { status: 409, json: { error: 'Codex settings are only available for Codex sessions.' } };
+        }
+        if (session.status !== 'stopped') {
+          return { status: 409, json: { error: 'Codex settings can only change while the session is stopped.' } };
+        }
+        try {
+          registry.setCodexSettings(session.id, validateCodexSettings(body.codexSettings));
+        } catch (error) {
+          return { status: 400, json: { error: String((error as Error).message ?? error) } };
+        }
+        return { status: 200, json: { ok: true } };
       }
 
       case 'stop': {

@@ -52,6 +52,57 @@ test('a new session starts working with an empty transcript', () => {
   assert.equal(s.pending, null);
 });
 
+test('Codex settings persist only explicit values and legacy sessions inherit them', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-codex-settings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const registry = new Registry(path);
+  const configured = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/configured',
+    branch: 'configured', title: 'configured',
+    codexSettings: { model: 'gpt-5.3-codex', networkAccessEnabled: false },
+  });
+  const inherited = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/inherited',
+    branch: 'inherited', title: 'inherited',
+  });
+
+  registry.setCodexSettings(configured.id, { webSearchMode: 'cached' });
+  await registry.save();
+  const stored = await readFile(path, 'utf8');
+  assert.match(stored, /"webSearchMode": "cached"/);
+  assert.doesNotMatch(stored, /"modelReasoningEffort"|"networkAccessEnabled"/);
+
+  const loaded = await Registry.load(path);
+  assert.deepEqual(loaded.get(configured.id)!.codexSettings, { webSearchMode: 'cached' });
+  assert.equal(loaded.get(inherited.id)!.codexSettings, undefined);
+  assert.equal(loaded.publicSessions().find((s) => s.id === inherited.id)!.codexSettings, undefined);
+});
+
+test('load drops invalid or non-Codex persisted settings so they cannot reach an adapter', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-codex-settings-load-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [
+    {
+      id: 'invalid-codex', provider: 'codex', account: 'codex', vendorSessionId: null,
+      repo: '/r', cwd: '/r/invalid', branch: 'invalid', title: 'invalid', status: 'done', auto: false,
+      codexSettings: { modelReasoningEffort: 'maximum', networkAccessEnabled: 'false' },
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+    {
+      id: 'claude-settings', provider: 'claude', account: 'claude', vendorSessionId: null,
+      repo: '/r', cwd: '/r/claude', branch: 'claude', title: 'claude', status: 'done', auto: false,
+      codexSettings: { model: 'gpt-5.3-codex' },
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+  ] }));
+
+  const loaded = await Registry.load(path);
+  assert.equal(loaded.get('invalid-codex')!.codexSettings, undefined);
+  assert.equal(loaded.get('claude-settings')!.codexSettings, undefined);
+});
+
 test('prompt delivery moves queued to sent by stable id', () => {
   const { reg, id } = make();
   const promptId = reg.appendPrompt(id, 'run the tests', 'queued');

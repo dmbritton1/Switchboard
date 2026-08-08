@@ -9,6 +9,7 @@ import {
   beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
+  codexSettingsFromForm, codexSettingsSummary,
 } from './lib.js';
 
 let state = { sessions: [], accounts: [] };
@@ -442,6 +443,9 @@ function overflowMenu(s) {
   auto.append(box, ' Auto-approve');
 
   menu.append(auto);
+  if (s.provider === 'codex' && s.status === 'stopped') {
+    menu.append(menuItem('Codex settings…', () => openCodexSettings(s)));
+  }
   // A blocked card's one action slot is spent on Allow/Deny, so Stop has no
   // home on the card face for `needs-you` — without it here, the only way to
   // halt a runaway agent mid-prompt would be to Deny it first or delete the
@@ -468,6 +472,33 @@ function confirmDelete(s) {
   dialog.dataset.id = s.id;
   dialog.showModal();
 }
+
+function openCodexSettings(s) {
+  const dialog = $('#codex-settings-dialog');
+  const form = dialog.querySelector('form');
+  form.reset();
+  const settings = s.codexSettings ?? {};
+  form.elements.model.value = settings.model ?? '';
+  form.elements.reasoning.value = settings.modelReasoningEffort ?? '';
+  form.elements.webSearch.value = settings.webSearchMode ?? '';
+  form.elements.network.value = settings.networkAccessEnabled === undefined
+    ? '' : settings.networkAccessEnabled ? 'enabled' : 'disabled';
+  $('#codex-settings-summary').textContent = codexSettingsSummary(s.codexSettings);
+  dialog.dataset.id = s.id;
+  dialog.returnValue = '';
+  dialog.showModal();
+}
+
+$('#codex-settings-dialog').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  const save = dialog.returnValue === 'save';
+  dialog.returnValue = '';
+  if (!save) return;
+  const values = Object.fromEntries(new FormData(dialog.querySelector('form')));
+  await runSessionCommand({
+    cmd: 'codex-settings', id: dialog.dataset.id, codexSettings: codexSettingsFromForm(values),
+  });
+});
 
 const DEL_HINT = {
   false: 'Without the checkbox, the worktree is left on disk untouched — only Switchboard forgets the session.',
@@ -1260,10 +1291,18 @@ async function openNew() {
     o.selected = a.name === freest?.name;
     return o;
   }));
+  updateNewCodexSettings();
 
   $('#new-error').textContent = '';
   dialog.showModal();
 }
+
+function updateNewCodexSettings() {
+  const account = state.accounts.find((a) => a.name === $('#account-select').value);
+  $('#new-codex-settings').hidden = account?.provider !== 'codex';
+}
+
+$('#account-select').addEventListener('change', updateNewCodexSettings);
 
 $('#new').addEventListener('close', async (e) => {
   const dialog = e.target;
@@ -1277,10 +1316,14 @@ $('#new').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
+  const account = state.accounts.find((a) => a.name === f.get('account'));
   const result = await postCommand({
     cmd: 'create',
     repo: f.get('repo'), branch: f.get('branch'),
     account: f.get('account'), prompt: f.get('prompt'),
+    ...(account?.provider === 'codex'
+      ? { codexSettings: codexSettingsFromForm(Object.fromEntries(f)) }
+      : {}),
   });
   if (!result.ok) {
     $('#new-error').textContent = commandFailure(result);

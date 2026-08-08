@@ -13,6 +13,13 @@ export type CodexFailureCode =
   | 'codex_sandbox_denied'
   | 'codex_user_stopped';
 
+export type CodexThreadSettings = {
+  model?: string;
+  modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  webSearchMode?: 'disabled' | 'cached' | 'live';
+  networkAccessEnabled?: boolean;
+};
+
 export type PromptDelivery = 'queued' | 'sent' | 'unsent';
 
 export type PromptAttachment = {
@@ -100,6 +107,7 @@ export type Session = {
   /** Auto-approve every tool call instead of asking. Codex sessions ignore it —
    *  their SDK has no interactive approval to skip (see codex.ts approvalPolicy). */
   auto: boolean;
+  codexSettings?: CodexThreadSettings;
   transcript: Msg[];
   pending: ApprovalRequest | null;
   stoppedReason: string | null;
@@ -133,6 +141,7 @@ export type StartOpts = {
   /** Start with auto-approval already on, so a resumed session keeps the toggle
    *  it had before the restart rather than silently reverting to prompting. */
   auto?: boolean;
+  codexSettings?: CodexThreadSettings;
 };
 
 export type AgentHandle = {

@@ -117,6 +117,33 @@ test('the prepared adapter starts through the real SDK with mandatory safety opt
   assert.ok(!invocations[0].argv.some((arg) => /--model|reasoning|web_search|mcp|network|repo|instruction/i.test(arg)));
 });
 
+test('the prepared adapter forwards only explicit thread settings below fixed safety options', async (t) => {
+  const fixture = await makeProcessFixture(t);
+  const adapter = createCodexAdapter(fixture.runtime);
+  await collect(adapter, fixture, 'configured', (all) =>
+    all.some((event) => event.type === 'status' && event.status === 'done'));
+
+  const inherited = (await fixture.readInvocations())[0].argv;
+  assert.ok(!inherited.some((arg) => /--model|reasoning_effort|web_search|network_access/i.test(arg)));
+
+  const events: AdapterEvent[] = [];
+  adapter.start({
+    cwd: fixture.cwd, env: {}, prompt: { text: 'explicit-settings', attachments: [] },
+    codexSettings: {
+      model: 'gpt-5.3-codex', modelReasoningEffort: 'high', webSearchMode: 'live', networkAccessEnabled: false,
+    },
+  }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'done'));
+
+  const explicit = (await fixture.readInvocations())[1].argv.join(' ');
+  assert.match(explicit, /gpt-5\.3-codex/);
+  assert.match(explicit, /model_reasoning_effort="high"/);
+  assert.match(explicit, /web_search="live"/);
+  assert.match(explicit, /sandbox_workspace_write\.network_access=false/);
+  assert.match(explicit, /workspace-write/);
+  assert.match(explicit, /approval_policy="never"/);
+});
+
 test('a resume id is passed to the SDK CLI', async (t) => {
   const fixture = await makeProcessFixture(t);
   await collect(createCodexAdapter(fixture.runtime), fixture, 'basic', (events) =>

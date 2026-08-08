@@ -73,6 +73,24 @@
       <label for="account-select">Account</label>
       <div class="select-wrap"><select id="account-select" name="account"></select></div>
     </div>
+    <fieldset id="new-codex-settings" class="codex-settings" hidden>
+      <legend>Codex settings</legend>
+      <div class="field"><label for="new-codex-model">Model <span>Inherit</span></label>
+        <input id="new-codex-model" name="model" placeholder="Inherit" maxlength="200"></div>
+      <div class="field"><label for="new-codex-reasoning">Reasoning</label>
+        <div class="select-wrap"><select id="new-codex-reasoning" name="reasoning">
+          <option value="">Inherit</option><option value="minimal">minimal</option><option value="low">low</option>
+          <option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option>
+        </select></div></div>
+      <div class="field"><label for="new-codex-web-search">Web search</label>
+        <div class="select-wrap"><select id="new-codex-web-search" name="webSearch">
+          <option value="">Inherit</option><option value="disabled">disabled</option><option value="cached">cached</option><option value="live">live</option>
+        </select></div></div>
+      <div class="field"><label for="new-codex-network">Network</label>
+        <div class="select-wrap"><select id="new-codex-network" name="network">
+          <option value="">Inherit</option><option value="disabled">Disabled</option><option value="enabled">Enabled</option>
+        </select></div></div>
+    </fieldset>
     <div class="field">
       <label for="prompt-input">First prompt</label>
       <textarea id="prompt-input" name="prompt" required rows="3"
@@ -85,6 +103,30 @@
          dialog's method="dialog" close entirely — Cancel silently does
          nothing on the form's default (empty) state. -->
     <menu><button value="cancel" formnovalidate>Cancel</button><button id="create" value="create">Create worktree</button></menu>
+  </form>
+</dialog>
+<dialog id="codex-settings-dialog">
+  <form method="dialog">
+    <h2>Codex settings</h2>
+    <p id="codex-settings-summary" class="hint"></p>
+    <fieldset class="codex-settings">
+      <div class="field"><label for="codex-model">Model <span>Inherit</span></label>
+        <input id="codex-model" name="model" placeholder="Inherit" maxlength="200"></div>
+      <div class="field"><label for="codex-reasoning">Reasoning</label>
+        <div class="select-wrap"><select id="codex-reasoning" name="reasoning">
+          <option value="">Inherit</option><option value="minimal">minimal</option><option value="low">low</option>
+          <option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option>
+        </select></div></div>
+      <div class="field"><label for="codex-web-search">Web search</label>
+        <div class="select-wrap"><select id="codex-web-search" name="webSearch">
+          <option value="">Inherit</option><option value="disabled">disabled</option><option value="cached">cached</option><option value="live">live</option>
+        </select></div></div>
+      <div class="field"><label for="codex-network">Network</label>
+        <div class="select-wrap"><select id="codex-network" name="network">
+          <option value="">Inherit</option><option value="disabled">Disabled</option><option value="enabled">Enabled</option>
+        </select></div></div>
+    </fieldset>
+    <menu><button value="cancel" formnovalidate>Cancel</button><button value="save">Save settings</button></menu>
   </form>
 </dialog>
 <dialog id="del">

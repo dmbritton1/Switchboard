@@ -10,11 +10,26 @@ import {
   beginAttachmentUpload, addUploadedAttachment, finishAttachmentUpload,
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
+  codexSettingsFromForm, codexSettingsSummary,
 } from '../web/lib.js';
 
 const session = (over = {}) => ({
   id: 'a', repo: '/r/one', branch: 'feat/a', account: 'claude-main',
   status: 'working', pending: null, statusSince: 1000, ...over,
+});
+
+test('Codex settings form preserves inherited values and explicit disabled network access', () => {
+  assert.equal(codexSettingsFromForm({ model: '', reasoning: '', webSearch: '', network: '' }), undefined);
+  assert.deepEqual(codexSettingsFromForm({
+    model: ' gpt-5.3-codex ', reasoning: 'high', webSearch: 'live', network: 'disabled',
+  }), {
+    model: 'gpt-5.3-codex', modelReasoningEffort: 'high', webSearchMode: 'live', networkAccessEnabled: false,
+  });
+});
+
+test('Codex settings summary distinguishes inherited and explicit disabled network access', () => {
+  assert.equal(codexSettingsSummary(undefined), 'Inherit');
+  assert.equal(codexSettingsSummary({ networkAccessEnabled: false }), 'Network: Disabled');
 });
 
 test('sortSessions orders needs-you, working, done, stopped', () => {

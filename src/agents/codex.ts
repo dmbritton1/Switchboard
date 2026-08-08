@@ -166,7 +166,14 @@ export function createCodexAdapter(runtime: PreparedCodexRuntime): Adapter {
       env: runtime.env,
     });
 
+    const settings = opts.codexSettings;
     const threadOptions = {
+      ...(settings?.model !== undefined ? { model: settings.model } : {}),
+      ...(settings?.modelReasoningEffort !== undefined
+        ? { modelReasoningEffort: settings.modelReasoningEffort } : {}),
+      ...(settings?.webSearchMode !== undefined ? { webSearchMode: settings.webSearchMode } : {}),
+      ...(settings?.networkAccessEnabled !== undefined
+        ? { networkAccessEnabled: settings.networkAccessEnabled } : {}),
       workingDirectory: opts.cwd,
       sandboxMode: 'workspace-write' as const,
       // The SDK has no interactive approval callback; the sandbox is the boundary.
