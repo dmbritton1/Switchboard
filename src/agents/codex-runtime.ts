@@ -74,12 +74,24 @@ function parseVersion(output: string): string | null {
   return output.match(VERSION)?.[1] ?? null;
 }
 
-export function redactCodexText(text: string, env: Record<string, string>): string {
+/**
+ * Longest value first, deduplicated. Replacing a short value before a longer one
+ * that contains it leaves the rest of the longer value standing: with
+ * `A=secret` and `B=secretlonger`, insertion order rewrites `secretlonger` to
+ * `[REDACTED]longer` and publishes the suffix of B. Every redaction path routes
+ * through here so no caller can reintroduce the ordering.
+ */
+export function redactValues(text: string, values: Iterable<string>): string {
   let safe = text.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
-  for (const [key, value] of Object.entries(env)) {
-    if (redactable(value) && CREDENTIAL_KEY.test(key)) safe = safe.replaceAll(value, '[REDACTED]');
-  }
+  const ordered = [...new Set(values)].filter(redactable).sort((a, b) => b.length - a.length);
+  for (const value of ordered) safe = safe.replaceAll(value, '[REDACTED]');
   return safe;
+}
+
+export function redactCodexText(text: string, env: Record<string, string>): string {
+  return redactValues(text, Object.entries(env)
+    .filter(([key]) => CREDENTIAL_KEY.test(key))
+    .map(([, value]) => value));
 }
 
 function validateAccount(account: unknown): AccountConfig {

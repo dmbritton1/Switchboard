@@ -16,7 +16,7 @@ import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
 import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
-  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactable,
+  CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
 import type {
   Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode, CodexThreadSettings, Session,
@@ -44,16 +44,14 @@ async function prepareProvider(account: Account): Promise<PreparedProvider> {
 
 /**
  * Account values are launch-only configuration, so any of them — not just the
- * credential-shaped keys redactCodexText() knows about — is removed from text
+ * credential-shaped keys redactCodexText() singles out — is removed from text
  * the browser will see. Short values are left alone: see MIN_REDACTABLE, a
- * substring search for "1" redacts arithmetic, not a secret.
+ * substring search for "1" redacts arithmetic, not a secret. One pass over
+ * every value, not a credential pass then a general one: two passes reorder the
+ * values between them and can strand the tail of an overlapping value.
  */
 function redactAccountValue(text: string, account: Account): string {
-  let safe = redactCodexText(text, account.env);
-  for (const value of Object.values(account.env)) {
-    if (redactable(value)) safe = safe.replaceAll(value, '[REDACTED]');
-  }
-  return safe;
+  return redactValues(text, Object.values(account.env));
 }
 
 function sanitizeCodexEvent(event: AdapterEvent, account: Account): AdapterEvent {
@@ -198,10 +196,15 @@ export function createServer(opts: {
   usage: Usage;
   accounts: Account[];
   resolvePrompt?: typeof resolveAgentPrompt;
+  // These hooks exist so tests can park a request inside a specific await and
+  // drive a real interleaving, rather than racing two fetches and hoping.
+  beforeUploadRootPin?: () => Promise<void>;
   beforeUploadWrite?: (target: string) => Promise<void>;
+  beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
 }): Server {
   const {
-    registry, usage, accounts, resolvePrompt = resolveAgentPrompt, beforeUploadWrite,
+    registry, usage, accounts, resolvePrompt = resolveAgentPrompt,
+    beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval,
   } = opts;
   const handles = new Map<string, AgentHandle>();
   const resumeReservations = new Map<string, symbol>();
@@ -512,11 +515,18 @@ export function createServer(opts: {
         const handle = handles.get(String(body.id));
         handles.delete(String(body.id));
         handle?.stop();
+        // Deregister before the worktree await, not after. Concurrent resume
+        // clears its final guard on Registry identity (see the resume case); if
+        // the session were still registered across this await, resume would pass
+        // that guard and launch an agent into a directory being deleted — and
+        // the remove() below would then drop the session while that agent is
+        // still running, leaving it with no card and no stop().
+        registry.remove(String(body.id));
         if (session && body.removeWorktree) {
+          await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
             .catch(() => rm(session.cwd, { recursive: true, force: true }));
         }
-        registry.remove(String(body.id));
         return { status: 200, json: { ok: true } };
       }
 
@@ -688,7 +698,9 @@ export function createServer(opts: {
         let storedPath: string;
         try {
           storedPath = await writeContainedUpload(
-            session.cwd, name, Buffer.concat(chunks), beforeUploadWrite,
+            session.cwd, name, Buffer.concat(chunks),
+            { ...(beforeUploadRootPin ? { beforeRootPin: beforeUploadRootPin } : {}),
+              ...(beforeUploadWrite ? { beforeWrite: beforeUploadWrite } : {}) },
           );
         } catch (error) {
           const changed = error instanceof UploadChangedError;

@@ -7,6 +7,7 @@ import {
   CodexRuntimeError,
   prepareCodexRuntime,
   redactCodexText,
+  redactValues,
 } from '../src/agents/codex-runtime.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 
@@ -319,5 +320,28 @@ test('redaction leaves values too short to be a credential alone', () => {
   assert.equal(
     redactCodexText('--grep info found 1 match', { LOG_KEY: 'info', DEBUG_TOKEN: '1' }),
     '--grep info found 1 match',
+  );
+});
+
+// Insertion order puts the short value first, which is the order that leaks:
+// replacing 'secret' first would publish 'secretlonger' as '[REDACTED]longer'.
+test('redaction replaces a longer overlapping value before the shorter one it contains', () => {
+  assert.equal(
+    redactCodexText('deploy used secretlonger and secret', {
+      A_TOKEN: 'secret',
+      B_TOKEN: 'secretlonger',
+    }),
+    'deploy used [REDACTED] and [REDACTED]',
+  );
+});
+
+test('redactValues deduplicates and orders every supplied value longest first', () => {
+  assert.equal(
+    redactValues('label=customer-internal-42 short=customer-internal', [
+      'customer-internal',
+      'customer-internal-42',
+      'customer-internal',
+    ]),
+    'label=[REDACTED] short=[REDACTED]',
   );
 });

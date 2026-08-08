@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { chmod, mkdir, mkdtemp, writeFile, realpath, rm, readFile, stat, symlink } from 'node:fs/promises';
+import {
+  chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -45,7 +47,11 @@ const accounts = [
 async function boot(
   t: { after: (fn: () => void) => void },
   registryOptions?: RegistryOptions,
-  serverHooks: { beforeUploadWrite?: (target: string) => Promise<void> } = {},
+  serverHooks: {
+    beforeUploadRootPin?: () => Promise<void>;
+    beforeUploadWrite?: (target: string) => Promise<void>;
+    beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
+  } = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   const registry = new Registry(join(dir, 'state.json'), undefined, registryOptions);
@@ -93,6 +99,7 @@ async function bootCodex(
     env?: Record<string, string>;
     resolvePrompt?: typeof resolveAgentPrompt;
     gatedPreflight?: boolean;
+    beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
   } = {},
 ): Promise<CodexFixture> {
   const dir = await mkdtemp(join(tmpdir(), 'sb-codex-server-'));
@@ -155,6 +162,7 @@ process.exit(result.status ?? 1);
   const server = createServer({
     registry, usage, accounts: [account],
     ...(options.resolvePrompt ? { resolvePrompt: options.resolvePrompt } : {}),
+    ...(options.beforeWorktreeRemoval ? { beforeWorktreeRemoval: options.beforeWorktreeRemoval } : {}),
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as { port: number };
@@ -728,6 +736,45 @@ test('deleting a Codex session during gated resume prevents its later launch', a
   assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first']);
 });
 
+// The test above deletes without removeWorktree, so delete has no await and
+// never overlaps resume. removeWorktree is the branch that awaits, and it used
+// to deregister the session only after that await — leaving resume's final
+// identity guard looking at a session that delete had already committed to
+// destroying, with the worktree about to be removed under the new agent.
+test('deleting a Codex worktree during gated resume prevents an orphaned launch', async (t) => {
+  let removing!: () => void;
+  let releaseRemoval!: () => void;
+  const reachedRemoval = new Promise<void>((resolve) => { removing = resolve; });
+  const removalHeld = new Promise<void>((resolve) => { releaseRemoval = resolve; });
+  const fixture = await bootCodex(t, {
+    gatedPreflight: true,
+    beforeWorktreeRemoval: async () => { removing(); await removalHeld; },
+  });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  const gate = fixture.preflightGate!;
+  await writeFile(gate.enable, 'enabled');
+
+  const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
+  await waitFor(() => gate.count().then((count) => count === 1));
+  const deletion = fixture.command({ cmd: 'delete', id: created.id, removeWorktree: true });
+  // Delete is now parked mid-removal. Releasing resume here runs its final guard
+  // inside that window — the exact interleaving the old ordering lost.
+  await reachedRemoval;
+  await writeFile(gate.release, 'release');
+  const response = await resume;
+  releaseRemoval();
+
+  assert.equal(response.status, 409);
+  assert.equal((await deletion).status, 200);
+  assert.equal(fixture.registry.get(created.id), undefined);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first'],
+    'no agent may be launched into a worktree that delete is removing');
+});
+
 test('Codex account environment reaches its process but not public event JSON', async (t) => {
   const fixture = await bootCodex(t, { env: { CODEX_TOKEN: 'event-secret' } });
   const created = await fixture.create('first');
@@ -1296,44 +1343,52 @@ test('POST /upload refuses to follow a symlinked uploads directory', async (t) =
   );
 });
 
-test('POST /upload cannot be redirected by swapping its parent after validation', async (t) => {
-  let reached!: (target: string) => void;
-  let release!: () => void;
-  const opened = new Promise<string>((resolve) => { reached = resolve; });
-  const continueWrite = new Promise<void>((resolve) => { release = resolve; });
+// Two predecessors of this test proved nothing. The first swapped `wt/uploads`,
+// a directory the upload path stopped using once uploads moved to a direct child
+// of the root. The second swapped the root after open(), where the pre-existing
+// target-inode check already returns 409 on its own. The window that was really
+// unguarded is earlier: between the lstat() that validates the root and the point
+// the root's identity is pinned, a swap there gets the attacker's directory
+// pinned as if it were the worktree, and every later check then agrees with it.
+test('POST /upload refuses when the worktree root is swapped before its identity is pinned', async (t) => {
+  let atPin!: () => void;
+  let releasePin!: () => void;
+  const reachedPin = new Promise<void>((resolve) => { atPin = resolve; });
+  const pinHeld = new Promise<void>((resolve) => { releasePin = resolve; });
   const { base, registry } = await boot(t, undefined, {
-    beforeUploadWrite: async (target) => {
-      reached(target);
-      await continueWrite;
-    },
+    beforeUploadRootPin: async () => { atPin(); await pinHeld; },
   });
-  const wt = await mkdtemp(join(tmpdir(), 'sb-wt-race-'));
-  const outside = await mkdtemp(join(tmpdir(), 'sb-outside-race-'));
+  // realpath() up front: macOS resolves /var to /private/var and the server works
+  // from the canonical root, so the swap has to land on the path it resolved.
+  const wt = await realpath(await mkdtemp(join(tmpdir(), 'sb-wt-pin-race-')));
+  const outside = await realpath(await mkdtemp(join(tmpdir(), 'sb-outside-pin-race-')));
+  const moved = `${wt}-moved`;
+  t.after(() => rm(moved, { recursive: true, force: true }));
   t.after(() => rm(wt, { recursive: true, force: true }));
-  t.after(() => rm(outside, { recursive: true, force: true }));
-  await mkdir(join(wt, 'uploads'));
   const s = registry.create({
     provider: 'claude', account: 'claude-main', repo: '/r',
     cwd: wt, branch: 'b', title: 't',
   });
 
   const upload = fetch(`${base}/upload?id=${s.id}&name=notes.txt`, {
-    method: 'POST', body: 'bound payload',
+    method: 'POST', body: 'must never land under a foreign root',
   });
   await Promise.race([
-    opened,
-    upload.then(() => { throw new Error('upload wrote before the deterministic race barrier'); }),
+    reachedPin,
+    upload.then(() => { throw new Error('the root was pinned before the deterministic barrier'); }),
   ]);
-  await rm(join(wt, 'uploads'), { recursive: true });
-  await symlink(outside, join(wt, 'uploads'));
-  release();
+  // A real directory before and after, so only a dev/ino comparison against the
+  // validating lstat() catches it — re-reading the root here pins the swap.
+  await rename(wt, moved);
+  await rename(outside, wt);
+  releasePin();
   const response = await upload;
 
-  assert.equal(response.status, 200);
-  await assert.rejects(stat(join(outside, 'notes.txt')),
-    'the swapped outside directory must not receive even an empty file');
-  const { path } = await response.json() as { path: string };
-  assert.equal(await readFile(join(wt, path), 'utf8'), 'bound payload');
+  assert.equal(response.status, 409);
+  assert.deepEqual(await readdir(wt), [],
+    'the directory swapped in as the root must receive no file at all');
+  assert.deepEqual(await readdir(moved), [],
+    'and the refusal happens before open(), so the real worktree gets nothing either');
 });
 
 test('POST /upload writes through its opened file, never a swapped outside symlink', async (t) => {
