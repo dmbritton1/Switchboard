@@ -73,6 +73,36 @@ test('fixture identifiers never claim SDK vendor-thread migration', async () => 
   assert.equal(evidence.vendorThreadMigration, 'not-proven');
 });
 
+test('every fixture text turn uses the complete generated UserInput shape', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'switchboard-app-server-inputs-'));
+  const callLog = join(dir, 'calls.jsonl');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  await probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_CALL_LOG: callLog }),
+    fixtureMode: true,
+  });
+
+  const turns = (await readFile(callLog, 'utf8')).trim().split('\n')
+    .map((line) => JSON.parse(line) as { method?: string; params?: unknown })
+    .filter((entry) => entry.method === 'turn/start');
+  assert.deepEqual(turns.map((entry) => entry.params), [
+    {
+      threadId: 'fixture-thread',
+      input: [{ type: 'text', text: 'fixture lifecycle', text_elements: [] }],
+    },
+    {
+      threadId: 'fixture-thread',
+      input: [{ type: 'text', text: 'fixture follow-up', text_elements: [] }],
+    },
+    {
+      threadId: 'fixture-thread',
+      input: [{ type: 'text', text: 'fixture interrupt', text_elements: [] }],
+    },
+  ]);
+});
+
 test('non-fixture evaluation generates matching types and performs no turn', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'switchboard-app-server-no-turn-'));
   const callLog = join(dir, 'calls.jsonl');
@@ -116,6 +146,27 @@ test('non-fixture evaluation generates matching types and performs no turn', asy
       { operation: 'eof' },
     ],
   );
+});
+
+test('schema evidence fails when any stable lifecycle notification is absent', async (t) => {
+  const lifecycleNotifications = [
+    'thread/started',
+    'turn/started',
+    'item/started',
+    'item/completed',
+    'turn/completed',
+  ];
+
+  for (const omitted of lifecycleNotifications) {
+    await t.test(omitted, async () => {
+      const evidence = await probeAppServer({
+        command: fakeCommand,
+        env: env({ FAKE_APP_SERVER_SCHEMA_OMIT: omitted }),
+        fixtureMode: false,
+      });
+      assert.equal(evidence.schemaGenerated, false);
+    });
+  }
 });
 
 test('malformed JSON rejects safely without hanging', async () => {

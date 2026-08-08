@@ -393,7 +393,7 @@ async function probeFixture(
 
     const first = turnFrom(await client.request('turn/start', {
       threadId,
-      input: [{ type: 'text', text: 'fixture lifecycle' }],
+      input: [{ type: 'text', text: 'fixture lifecycle', text_elements: [] }],
     }));
     const firstTurnId = typeof first?.id === 'string' ? first.id : null;
     if (!firstTurnId) throw new Error('Codex app-server returned no fixture turn id.');
@@ -405,7 +405,7 @@ async function probeFixture(
 
     const followUp = turnFrom(await client.request('turn/start', {
       threadId,
-      input: [{ type: 'text', text: 'fixture follow-up' }],
+      input: [{ type: 'text', text: 'fixture follow-up', text_elements: [] }],
     }));
     const followUpId = typeof followUp?.id === 'string' ? followUp.id : null;
     if (!followUpId) throw new Error('Codex app-server returned no follow-up turn id.');
@@ -418,7 +418,7 @@ async function probeFixture(
 
     const cancellable = turnFrom(await client.request('turn/start', {
       threadId,
-      input: [{ type: 'text', text: 'fixture interrupt' }],
+      input: [{ type: 'text', text: 'fixture interrupt', text_elements: [] }],
     }));
     const cancellableId = typeof cancellable?.id === 'string' ? cancellable.id : null;
     if (!cancellableId) throw new Error('Codex app-server returned no cancellable turn id.');
@@ -514,7 +514,14 @@ async function schemaHasStableSurface(directory: string): Promise<boolean> {
       '"method": "item/fileChange/requestApproval"',
       '"method": "mcpServer/elicitation/request"',
     ].every((method) => serverRequests.includes(method))
-    && notifications.includes('"method": "serverRequest/resolved"');
+    && [
+      '"method": "thread/started"',
+      '"method": "turn/started"',
+      '"method": "item/started"',
+      '"method": "item/completed"',
+      '"method": "turn/completed"',
+      '"method": "serverRequest/resolved"',
+    ].every((method) => notifications.includes(method));
 }
 
 async function probeNoTurn(

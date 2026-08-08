@@ -40,7 +40,19 @@ if (process.argv[2] === 'app-server' && process.argv[3] === 'generate-ts') {
     '{ "method": "item/fileChange/requestApproval" }',
     '{ "method": "mcpServer/elicitation/request" }',
   ].join('\n'));
-  writeFileSync(join(out, 'ServerNotification.ts'), '{ "method": "serverRequest/resolved" }\n');
+  const omittedNotification = process.env.FAKE_APP_SERVER_SCHEMA_OMIT;
+  const notifications = [
+    'thread/started',
+    'turn/started',
+    'item/started',
+    'item/completed',
+    'turn/completed',
+    'serverRequest/resolved',
+  ].filter((method) => method !== omittedNotification);
+  writeFileSync(
+    join(out, 'ServerNotification.ts'),
+    `${notifications.map((method) => `{ "method": "${method}" }`).join('\n')}\n`,
+  );
   record({ operation: 'generate-ts' });
   process.exit(0);
 }
@@ -309,6 +321,16 @@ async function handle(message: Message): Promise<void> {
     }
     case 'turn/start': {
       if (message.params?.threadId !== threadId) fail('turn/start used the wrong thread');
+      const input = message.params.input;
+      if (!Array.isArray(input) || input.length !== 1) fail('turn/start requires one input');
+      const [textInput] = input;
+      if (!textInput || typeof textInput !== 'object' || Array.isArray(textInput)
+        || (textInput as Record<string, unknown>).type !== 'text'
+        || typeof (textInput as Record<string, unknown>).text !== 'string'
+        || !Array.isArray((textInput as Record<string, unknown>).text_elements)
+        || ((textInput as Record<string, unknown>).text_elements as unknown[]).length !== 0) {
+        fail('turn/start text input must include empty text_elements');
+      }
       turnNumber += 1;
       const turnId = `fixture-turn-${turnNumber}`;
       send({ id: message.id, result: { turn: turn(turnId, 'inProgress') } });
