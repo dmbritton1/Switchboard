@@ -1,5 +1,5 @@
 import {
-  sortSessions, cardAction, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   transcriptView, requestOnce, fetchToolDetail,
   createDetailController, changeDetailSession, setDetailExpanded,
@@ -10,9 +10,12 @@ import {
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
   codexSettingsFromForm, codexSettingsSummary, usageLines,
+  accountView, freestAccount, newlyNotifiable,
+  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
+  readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
 
-let state = { sessions: [], accounts: [] };
+let state = { sessions: [], accounts: [], commands: [] };
 let openId = null;
 // Transcript rows are rebuilt for every SSE snapshot. These browser-local
 // collections restore the open live trace, cache only its current revision,
@@ -21,7 +24,10 @@ const detailController = createDetailController();
 // Which header panel is open: null, 'queue', or an account name. Mutually
 // exclusive by construction — one variable, not one flag per panel.
 let panel = null;
-let seenNeedsYou = new Set();
+// Keys are `id:status`; see newlyNotifiable in lib.js.
+let seenNotified = new Set();
+
+const NOTIFY_VERB = { 'needs-you': 'needs you', done: 'finished', stopped: 'stopped' };
 // Session whose chat view has already been auto-scrolled once; see renderChatPane().
 let scrolledFor = null;
 // Ids checked for the merge/push toolbar. A plain module-level Set, same pattern
@@ -38,6 +44,17 @@ let queueCommandError = '';
 // genuine navigation boundary clears them; re-rendering the same session does
 // not, so a working agent cannot shake chips loose on every streamed event.
 const attachmentController = createAttachmentController();
+// Worktrees whose `create` command is in flight. `git worktree add` (and the
+// launch after it) takes long enough that the dialog closes and the grid
+// re-renders well before the real session exists in `state` — without this,
+// the user is left staring at an unchanged grid and can't tell anything
+// happened. Not part of `state`: it never comes from an SSE snapshot, and
+// `state` is fully overwritten on every message (see es.onmessage) so
+// anything stuffed into state.sessions would be wiped by the next unrelated
+// snapshot. Cleared once the create command settles, success or failure —
+// on success the real card takes over on the next snapshot; on failure the
+// dialog reopens with an error and there is nothing left to show as pending.
+let pendingCreates = [];
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -67,25 +84,48 @@ async function runQueueCommand(body) {
 
 // EventSource reconnects on its own, so there is no backoff code to write.
 const es = new EventSource('/events');
+// True until the first payload of a connection has been consumed. The server
+// pushes full state on connect, so that payload seeds the seen-set instead of
+// notifying for everything already on the board.
+let seeding = true;
+es.onopen = () => { seeding = true; };
 es.onmessage = (e) => {
   $('#conn').hidden = true;
   state = JSON.parse(e.data);
-  notify();
+  // First snapshot only: state.settings (and everything else) is absent from
+  // the pre-snapshot initial `state`, so ⚙ and + New start disabled in markup
+  // to keep their handlers from reading state.settings off an object that
+  // doesn't have it yet.
+  $('#settings-btn').disabled = false;
+  $('#new-btn').disabled = false;
+  notify(seeding);
+  seeding = false;
   render();
 };
 // EventSource reconnects on its own; this only makes the gap visible.
 es.onerror = () => { $('#conn').hidden = false; };
 
-function notify() {
+function notify(seed) {
   const needs = state.sessions.filter((s) => s.status === 'needs-you');
+  // Deliberately not driven by notifyOn: the title counter answers "how many
+  // are blocked on me", which is not the same question as "what do I want
+  // pinged about".
   document.title = needs.length ? `(${needs.length}) Switchboard` : 'Switchboard';
-  if (document.hasFocus() || Notification.permission !== 'granted') return;
-  for (const s of needs) {
-    if (seenNeedsYou.has(s.id)) continue;
-    seenNeedsYou.add(s.id);
-    new Notification(`${s.branch} needs you`, { body: s.pending?.summary ?? '' });
+  if (Notification.permission !== 'granted') return;
+
+  // `stopped` in notifyOn means a self-inflicted Stop also notifies — accepted,
+  // since the setting is off by default and its label says so. The case that
+  // actually needs guarding is a server restart: Registry.load revives every
+  // session as `stopped` (sessions.ts), which would otherwise fire once per
+  // session on every reconnect. `seed` is what prevents that: the reconnect's
+  // first payload comes through with seed=true (see es.onopen below), so
+  // newlyNotifiable seeds seenNotified from it instead of firing.
+  const on = state.settings?.notifyOn ?? ['needs-you'];
+  const { fire, seen } = newlyNotifiable(state.sessions, on, seenNotified, seed || document.hasFocus());
+  seenNotified = seen;
+  for (const s of fire) {
+    new Notification(`${s.branch} ${NOTIFY_VERB[s.status]}`, { body: s.pending?.summary ?? '' });
   }
-  seenNeedsYou = new Set(needs.map((s) => s.id));
 }
 
 function elapsed(since) {
@@ -102,6 +142,8 @@ function stoppedLabel(s) {
 // neither of which is a session-state event, so this view polls instead of
 // riding render().
 let graphCommits = [];
+// The branch currently hover-traced, so a poll-driven rebuild can restore it.
+let tracedBranch = '';
 
 function setPanel(next) {
   panel = panel === next ? null : next;
@@ -109,23 +151,25 @@ function setPanel(next) {
 }
 
 function accountMeter(a) {
-  const pct = Math.round(a.pace * 100);
+  const v = accountView(a);
   const b = document.createElement('button');
   b.type = 'button';
   b.className = `meter${panel === a.name ? ' open' : ''}`;
-  b.title = `${a.name} — ~${pct}% of its 5h budget (estimate)`;
+  b.title = v.title;
 
   const name = document.createElement('span');
   name.textContent = a.name;
 
   const bar = document.createElement('span');
-  bar.className = `bar ${a.pace > 1 ? 'over' : ''}`;
+  // Real utilization caps at 100 (load caps at 1.0), so `> 1` was unreachable
+  // for exactly the accounts that have a real number to warn about.
+  bar.className = `bar ${v.load >= 1 ? 'over' : ''}`;
   const fill = document.createElement('i');
-  fill.style.width = `${Math.min(pct, 100)}%`;
+  fill.style.width = `${Math.min(v.pct, 100)}%`;
   bar.append(fill);
 
   const num = document.createElement('span');
-  num.textContent = `${pct}%`;
+  num.textContent = `${v.pct}%`;
 
   b.append(name, bar, num);
   b.onclick = () => setPanel(a.name);
@@ -133,17 +177,38 @@ function accountMeter(a) {
 }
 
 function accountPanel(a) {
+  const v = accountView(a);
   const box = document.createElement('div');
   const h = document.createElement('h3');
   h.textContent = a.name;
+
   const line = document.createElement('p');
   line.className = 'meta';
-  line.textContent =
-    `${a.provider} · ~${Math.round(a.pace * 100)}% of a ${a.budget.toLocaleString()} token budget · estimate`;
-  const note = document.createElement('p');
-  note.className = 'meta';
-  note.textContent = 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.';
-  box.append(h, line, note);
+  line.textContent = v.budgetLine;
+  box.append(h, line);
+
+  for (const w of v.windows) {
+    const row = document.createElement('p');
+    row.className = 'meta';
+    // Local time: a UTC reset timestamp is a small puzzle every single glance.
+    row.textContent = `${w.label} · ${w.pct}% · resets ${new Date(w.resetsAt).toLocaleString()}`;
+    box.append(row);
+  }
+
+  if (v.note) {
+    const note = document.createElement('p');
+    note.className = 'meta';
+    note.textContent = v.note;
+    box.append(note);
+  }
+  // Panel only: the meter stays a number, and a logged-out alt account should
+  // not make every glance at the header look like a failure.
+  if (a.limitsError) {
+    const err = document.createElement('p');
+    err.className = 'meta';
+    err.textContent = `No real plan limits: ${a.limitsError}`;
+    box.append(err);
+  }
   return box;
 }
 
@@ -228,6 +293,86 @@ function renderHeader() {
   if (panel && !body) panel = null;
   $('#panel').hidden = !body;
   $('#panel').replaceChildren(...(body ? [body] : []));
+  renderTheme();
+}
+
+/**
+ * The swatch is an element carrying its own data-accent, so it picks up that
+ * accent's --accent from the stylesheet's token block. The hexes stay in one
+ * place — a JS colour table here would be a second copy that the palette test
+ * cannot see.
+ */
+function swatch(accent) {
+  const dot = document.createElement('i');
+  dot.className = 'swatch';
+  dot.dataset.accent = accent;
+  return dot;
+}
+
+/**
+ * Deliberately not menuItem(): that one closes the menu, and here the feedback
+ * is the whole page — trying a second canvas against the same accent should not
+ * cost two clicks to reopen. Escape and any outside click still close it.
+ * wrap.replaceChildren() in renderTheme() below tears down the button that had
+ * focus, so `key` gives each choice a stable identity to refocus after the
+ * rebuild — otherwise a keyboard user's focus falls to <body> on every pick.
+ */
+function themeChoice(content, choose, key) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.dataset.choice = key;
+  b.onclick = (e) => { e.stopPropagation(); choose(); $(`#theme-wrap [data-choice="${key}"]`)?.focus(); };
+  b.append(content);
+  return b;
+}
+
+function renderTheme() {
+  const wrap = $('#theme-wrap');
+  wrap.replaceChildren();
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `menu-btn${menuFor === 'theme' ? ' open' : ''}`;
+  btn.title = 'Theme';
+  btn.setAttribute('aria-label', 'Theme');
+  btn.append(swatch(theme.accent));
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    menuFor = menuFor === 'theme' ? null : 'theme';
+    render();
+  };
+  wrap.append(btn);
+  if (menuFor !== 'theme') return;
+
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  menu.onclick = (e) => e.stopPropagation();
+
+  const row = document.createElement('div');
+  row.className = 'swatch-row';
+  for (const a of ACCENTS) {
+    const b = themeChoice(swatch(a), () => setTheme({ accent: a }), `accent:${a}`);
+    b.className = `swatch-btn${theme.accent === a ? ' on' : ''}`;
+    b.title = a;
+    b.setAttribute('aria-label', `${a} accent`);
+    b.setAttribute('aria-pressed', String(theme.accent === a));
+    row.append(b);
+  }
+  menu.append(row);
+  CANVASES.forEach((c, i) => {
+    if (i === DARK_CANVAS_START) {
+      const label = document.createElement('div');
+      label.className = 'menu-group-label';
+      label.textContent = 'Dark';
+      menu.append(label);
+    }
+    const b = themeChoice(CANVAS_LABEL[c], () => setTheme({ canvas: c }), `canvas:${c}`);
+    b.className = theme.canvas === c ? 'on' : '';
+    b.setAttribute('aria-label', `${CANVAS_LABEL[c]} canvas`);
+    b.setAttribute('aria-pressed', String(theme.canvas === c));
+    menu.append(b);
+  });
+  wrap.append(menu);
 }
 
 function render() {
@@ -266,6 +411,27 @@ const STATUS_THROTTLE_MS = 4000;
 // renderDiffPane() to bypass the throttle just this once. See openTab().
 let forceDiffFetch = false;
 
+// Cached "+N −M · dirty/clean" for #sidebar-diffstat. A separate poll from
+// renderDiffPane()'s, deliberately not sharing its throttle state: that one
+// only fetches while Diff is the open tab, and this line is visible on all
+// three, so it needs to keep polling on Chat and Graph too. The minor overlap
+// while Diff is open (two /status calls landing close together) is cheaper
+// than teaching renderDiffPane() to also feed a consumer it doesn't know about.
+let sidebarDiffFor = null;
+let sidebarDiffText = '';
+
+function pollSidebarDiff() {
+  if (!openId) return;
+  const id = openId;
+  fetch(`/status?id=${id}`).then((r) => r.json()).then((d) => {
+    if (openId !== id) return; // switched or closed while the request was in flight
+    sidebarDiffFor = id;
+    sidebarDiffText = d ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}` : '';
+    $('#sidebar-diffstat').textContent = sidebarDiffText;
+  }).catch(() => {});
+}
+setInterval(pollSidebarDiff, STATUS_THROTTLE_MS);
+
 function renderGrid() {
   scrolledFor = null; // Re-opening a card should jump to its latest message again.
   $('#session').hidden = true;
@@ -274,26 +440,52 @@ function renderGrid() {
   grid.hidden = false;
   grid.replaceChildren();
 
-  // A selected session can vanish (deleted, or gone after a restart's reload)
-  // without ever passing back through a checkbox handler, so prune here rather
-  // than trust the Set to stay in sync with `state` on its own.
-  const live = new Set(state.sessions.map((s) => s.id));
-  for (const id of selected) if (!live.has(id)) selected.delete(id);
-  if (selected.size) grid.append(selectionBar());
-
   const fetchStatus = Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   if (fetchStatus) lastStatusFetch = Date.now();
 
-  const sorted = sortSessions(state.sessions);
+  // state.settings is absent from the pre-snapshot initial `state` (see the
+  // `let state = ...` above) and setInterval(render, 30_000) keeps firing
+  // whether or not a snapshot has arrived yet — e.g. the whole time #conn
+  // shows "reconnecting…" — so these two reads default rather than throw.
+  // Duplicating DEFAULT_SETTINGS' full seven keys here isn't worth it (web/
+  // can't import from src/, and it'd just be a second copy to drift out of
+  // sync); these are the only two fields this function reads.
+  const sorted = sortSessions(
+    visibleSessions(state.sessions, state.settings?.collapseDone ?? false),
+    state.settings?.sort ?? 'blocked',
+  );
+
+  // A selected session can drop out of view — deleted, gone after a restart's
+  // reload, or simply hidden by collapseDone — without ever passing back
+  // through a checkbox handler, so prune here rather than trust the Set to
+  // stay in sync on its own. Pruning against `sorted` (what's on screen)
+  // rather than all of state.sessions matters: Merge/Push act on the whole
+  // selection, and both are irreversible, so a session hidden by
+  // collapseDone must not stay actionable after the user can no longer see it.
+  const visible = new Set(sorted.map((s) => s.id));
+  for (const id of selected) if (!visible.has(id)) selected.delete(id);
+  if (selected.size) grid.append(selectionBar());
+
+  // Pending creates first: they're newer than anything with a real
+  // statusSince, and the whole point is that the user should see one
+  // appear the instant they close the dialog, not scroll to find it.
+  for (const p of pendingCreates) grid.append(pendingCard(p));
+
   for (const s of sorted) grid.append(card(s, fetchStatus));
 
-  if (!state.sessions.length) {
+  if (!sorted.length && !pendingCreates.length) {
     const empty = document.createElement('div');
     empty.id = 'grid-empty';
     const line = document.createElement('p');
-    line.textContent = 'No sessions yet.';
+    // Everything can be hidden without being gone: collapseDone persists, so
+    // the realistic way to hit this is days later, opening Switchboard to a
+    // blank grid and reasonably concluding the sessions vanished rather than
+    // that a checkbox is filtering them out.
+    line.textContent = state.sessions.length ? 'All sessions are hidden.' : 'No sessions yet.';
     const hint = document.createElement('p');
-    hint.textContent = 'Start one with + New in the header.';
+    hint.textContent = state.sessions.length
+      ? 'Finished sessions are hidden — turn off "Hide finished sessions" in ⚙.'
+      : 'Start one with + New in the header.';
     empty.append(line, hint);
     grid.append(empty);
   }
@@ -387,6 +579,31 @@ function actionSlot(s) {
 // The session whose ⋯ menu is open, or null. Same pattern as openId: render()
 // reads it, handlers mutate it and re-render.
 let menuFor = null;
+
+const THEME_KEY = 'switchboard.theme';
+const CANVAS_LABEL = {
+  cream: 'Cream', linen: 'Linen', shell: 'Shell', mist: 'Mist', porcelain: 'Porcelain', bone: 'Bone',
+  obsidian: 'Obsidian', umber: 'Umber', ember: 'Ember', pine: 'Pine', midnight: 'Midnight', graphite: 'Graphite',
+};
+// CANVASES is light-then-dark (see lib.js); this is where the picker below
+// breaks the flat list into the two groups instead of one long column.
+const DARK_CANVAS_START = CANVASES.findIndex((c) => c === 'obsidian');
+// The same value the inline <head> script already applied; re-read here so the
+// picker knows what to tick without parsing the attributes back off <html>.
+// Guarded the same way that inline script guards its own read: blocked storage
+// or a sandboxed context throws here, and this runs at module-evaluation time,
+// so an unguarded throw would take the whole app down before it ever painted.
+let theme = readTheme((() => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } })());
+
+function setTheme(patch) {
+  theme = { ...theme, ...patch };
+  document.documentElement.dataset.accent = theme.accent;
+  document.documentElement.dataset.canvas = theme.canvas;
+  // A write failure must not skip the attributes above or the render() below —
+  // the theme still applies for the session, it just won't persist.
+  try { localStorage.setItem(THEME_KEY, JSON.stringify(theme)); } catch {}
+  render();
+}
 
 function menuItem(label, onclick, extra = '') {
   const b = document.createElement('button');
@@ -537,6 +754,37 @@ document.addEventListener('click', (e) => {
   if (menuFor && !e.target.closest('.menu-wrap')) { menuFor = null; render(); }
 }, true);
 
+// A stand-in for the real card while `git worktree add` + launch are still
+// running server-side (see the 'close' handler on #new). Deliberately a
+// simplified subset of card(): no checkbox, no overflow menu, no click — none
+// of those actions make sense on a session that doesn't exist yet, and this
+// card is gone within a render or two once the real one lands.
+function pendingCard(p) {
+  const el = document.createElement('div');
+  el.className = 'card pending';
+
+  const status = document.createElement('div');
+  status.className = 'status pending';
+  status.textContent = 'creating…';
+
+  const head = document.createElement('div');
+  head.className = 'card-head';
+  head.append(status);
+
+  // p.branch/p.repo/p.account are straight from the create form, same as a
+  // real session's fields — untrusted text only, same as card() below.
+  const branch = document.createElement('div');
+  branch.className = 'branch';
+  branch.textContent = p.branch;
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = `${p.repo.split('/').filter(Boolean).pop() ?? p.repo} · ${p.account}`;
+
+  el.append(head, branch, meta);
+  return el;
+}
+
 function card(s, fetchStatus) {
   const el = document.createElement('div');
   el.className = `card ${s.status}`;
@@ -615,6 +863,38 @@ function stopButton(s) {
 }
 
 /**
+ * Buttons that resolve a pending request: one per option when the agent asked a
+ * question, Allow/Deny otherwise. Shared by the interrupt bar and the session
+ * card so the two never drift. Skip denies the question the ordinary way — the
+ * agent then re-asks in prose and the composer takes over, which is the only
+ * escape hatch while a blocked turn is holding the input queue.
+ * Option labels come from the agent, so they stay textContent like every other
+ * summary here.
+ */
+function decideButtons(id, pending, compact = false) {
+  return decideSpecs(pending).map(({ label, description, command }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    // The interrupt strip is a one-line nudge about a session you are not
+    // reading, so its captions stay in the tooltip; the card is where a choice
+    // is actually weighed, so there they are on the button.
+    if (description && compact) b.title = description;
+    if (description && !compact) {
+      const caption = document.createElement('small');
+      caption.className = 'opt-desc';
+      caption.textContent = description;
+      b.append(caption);
+    }
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      await runSessionCommand({ cmd: 'decide', id, ...command });
+    };
+    return b;
+  });
+}
+
+/**
  * The only cross-session element in the session view: another session blocking
  * on an approval while you are reading this one. Answerable in place, because
  * walking back to the grid to click Allow is the whole friction this removes.
@@ -636,13 +916,7 @@ function renderInterrupt(current) {
   line.textContent = `${first.branch} needs you — ${first.pending.tool}: ${first.pending.summary}`;
   box.append(line);
 
-  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = label;
-    b.onclick = async () => { await runSessionCommand({ cmd: 'decide', id: first.id, allow }); };
-    box.append(b);
-  }
+  box.append(...decideButtons(first.id, first.pending, true));
 
   const open = document.createElement('button');
   open.type = 'button';
@@ -672,17 +946,14 @@ function approval(s) {
   line.textContent = `${s.pending.tool}: ${s.pending.summary}`;
   box.append(line);
 
-  for (const [label, allow] of [['Allow', true], ['Deny', false]]) {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'decide', id: s.id, allow }); };
-    box.append(b);
-  }
+  box.append(...decideButtons(s.id, s.pending));
   return box;
 }
 
 function resumeButton(s) {
   const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'ghost';
   b.textContent = `Resume (${stoppedLabel(s)})`;
   b.onclick = async (e) => { e.stopPropagation(); await runSessionCommand({ cmd: 'resume', id: s.id }); };
   return b;
@@ -699,13 +970,80 @@ function openTab(id, which) {
   // is the one case where the pane would otherwise sit empty for up to
   // STATUS_THROTTLE_MS with nothing on screen yet.
   if (which === 'diff' && (id !== openId || tab !== 'diff')) forceDiffFetch = true;
+  // A session switch should show *that* session's numbers immediately, not
+  // whatever the previous one's poll last wrote into the cache.
+  const switching = id !== openId;
   setOpenSession(id);
   tab = which;
-  if (which === 'graph') { graphCommits = []; loadGraph(); }
+  // The trace belongs to the graph being torn down here, not the next one —
+  // leaving it set re-applies a stale trace to a pointer that's nowhere near
+  // it, and can light up a same-named branch in a different session's graph.
+  if (which === 'graph') { graphCommits = []; tracedBranch = ''; loadGraph(); }
   render();
+  // The expansion set and the payload cache both belong to the session being
+  // left. Carried over, the cache would suppress the first render of the new
+  // session's diff whenever the two happened to be byte-identical.
+  if (switching) {
+    sidebarDiffFor = null; sidebarDiffText = ''; diffOpen.clear(); lastDiffText = '';
+    pollSidebarDiff();
+  }
 }
 
 const TABS = [['chat', 'Chat'], ['diff', 'Diff'], ['graph', 'Graph']];
+
+/**
+ * Branch + status dot, shown in the sidebar so it's readable even once
+ * #session-title has scrolled out of #session-main above it.
+ */
+function renderSidebarChip(s) {
+  const chip = $('#sidebar-chip');
+  chip.replaceChildren();
+  const dot = document.createElement('span');
+  dot.className = `status-dot ${s.status}`;
+  const label = document.createElement('span');
+  label.textContent = s.branch;
+  chip.append(dot, label);
+  chip.title = `${s.branch} · ${s.status}`;
+}
+
+/**
+ * The account meter for this one session, reusing accountMeter() verbatim —
+ * same click-to-open-panel behavior as the header's #meters row, just scoped
+ * to the account this session is actually spending against.
+ */
+function renderSidebarAccount(s) {
+  const account = state.accounts.find((a) => a.name === s.account);
+  $('#sidebar-account').replaceChildren(...(account ? [accountMeter(account)] : []));
+}
+
+function switchRow(other) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'switch-row';
+  const dot = document.createElement('span');
+  dot.className = `status-dot ${other.status}`;
+  const label = document.createElement('span');
+  label.className = 'switch-branch';
+  label.textContent = other.branch;
+  b.append(dot, label);
+  b.title = `${other.branch} · ${other.status}`;
+  b.onclick = () => openTab(other.id, 'chat');
+  return b;
+}
+
+/**
+ * Every other session, one line each, so switching between a few worktrees
+ * never means dropping back to the grid first. Same order the grid itself
+ * uses, so "top of the list" means the same thing in both places.
+ */
+function renderSidebarSwitch(current) {
+  const others = sortSessions(
+    visibleSessions(state.sessions.filter((x) => x.id !== current.id), state.settings?.collapseDone ?? false),
+    state.settings?.sort ?? 'blocked',
+  );
+  $('#sidebar-switch').replaceChildren(...others.map(switchRow));
+  $('#sidebar-switch-wrap').hidden = !others.length;
+}
 
 function renderSession() {
   const s = state.sessions.find((x) => x.id === openId);
@@ -717,6 +1055,17 @@ function renderSession() {
   stoppedReason.hidden = !(s.status === 'stopped' && s.provider === 'codex' && s.stoppedCode && s.stoppedReason);
   stoppedReason.textContent = stoppedReason.hidden ? '' : s.stoppedReason;
   $('#session-menu').replaceChildren(overflowMenu(s));
+  updateComposerButton(s);
+
+  renderSidebarChip(s);
+  // Synced from the cache rather than fetched here: pollSidebarDiff() already
+  // writes the DOM directly on its own interval, so a plain render() (an SSE
+  // snapshot, the 30s timer) doesn't need to trigger a fetch of its own — it
+  // only needs to make sure a session switch doesn't show the previous
+  // session's leftover number for the instant before the next poll lands.
+  $('#sidebar-diffstat').textContent = sidebarDiffFor === s.id ? sidebarDiffText : '';
+  renderSidebarAccount(s);
+  renderSidebarSwitch(s);
 
   const slot = actionSlot(s);
   $('#session-action').replaceChildren(...(slot ? [slot] : []));
@@ -739,6 +1088,157 @@ function renderSession() {
   if (tab === 'graph') renderGraphPane(s);
 }
 
+// Tool runs the user has put into a state other than the one they'd get on
+// their own — see toolRun(). Keyed by the run's first-message index, which is
+// stable because the transcript only ever grows. Cleared on session switch.
+const toolRunOpen = new Map();
+
+/**
+ * One tool call, always on one line. The result is measured onto that line (see
+ * resultMeta) and folded behind it, so a run of eight resolved calls reads as
+ * eight lines instead of eight walls of output. A failure opens itself: that is
+ * the one whose text you actually wanted, and its siblings are not.
+ */
+function toolNode(m, sessionId) {
+  if (m.detailAvailable || m.detailEvicted) {
+    const view = transcriptView(m);
+    const el = document.createElement('div');
+    el.className = view.className;
+    renderToolMessage(el, sessionId, view);
+    return el;
+  }
+  const { label, fold } = resultMeta(m.result);
+  // A denied `rm -rf` and a successful one used to be pixel-identical.
+  const line = `${m.name}: ${m.summary}`
+    + (m.status === 'running' ? '' : ` · ${m.status}`)
+    + (label ? ` · ${label}` : '');
+  // The status class doubles as the styling hook: a tool message with status
+  // 'error' picks up the existing .msg.error colour.
+  const cls = `msg tool ${m.status}`;
+  if (!fold) {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = line;
+    return el;
+  }
+  const d = document.createElement('details');
+  d.className = cls;
+  d.open = m.status === 'error';
+  const sum = document.createElement('summary');
+  sum.textContent = line;
+  // Tool output: the agent's, transitively whatever it read off disk or off
+  // the network. textContent, never innerHTML — same rule as every other
+  // untrusted string in this file.
+  const pre = document.createElement('pre');
+  pre.className = 'tool-result';
+  pre.textContent = m.result;
+  d.append(sum, pre);
+  return d;
+}
+
+/**
+ * A user prompt. Short ones are a plain line, same as every other message. A
+ * long one — a pasted spec, a stack trace, a wall of logs — folds behind a
+ * disclosure the same way a big tool result does (see toolNode): the visible
+ * head stays on the line, the rest opens on purpose. `<details>` rather than
+ * a class toggle for the same reason it's used there — free keyboard access
+ * and screen-reader semantics for something that's otherwise plain markup.
+ */
+function userNode(m) {
+  const fold = promptFold(m.text);
+  const el = document.createElement(fold ? 'details' : 'div');
+  el.className = 'msg user';
+  if (m.id) el.dataset.promptId = m.id;
+  // Where the delivery badge (see below) lands: inside the summary when
+  // folded, so it stays visible whether or not the rest is open; the element
+  // itself otherwise.
+  let head = el;
+  if (fold) {
+    head = document.createElement('summary');
+    head.textContent = fold.head;
+    const hint = document.createElement('span');
+    hint.className = 'prompt-fold-hint';
+    hint.textContent = 'More';
+    head.append(hint);
+    const rest = document.createElement('span');
+    rest.className = 'prompt-more';
+    rest.textContent = fold.rest;
+    el.append(head, rest);
+  } else {
+    el.textContent = m.text;
+  }
+  if (m.delivery === 'queued' || m.delivery === 'unsent') {
+    const delivery = document.createElement('span');
+    delivery.className = `prompt-delivery ${m.delivery}`;
+    delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
+    head.append(' ', delivery);
+  }
+  const attachments = transcriptView(m).attachments;
+  if (attachments?.length) {
+    const line = document.createElement('div');
+    line.className = 'transcript-attachments';
+    line.textContent = `Attachments: ${attachments.join(', ')}`;
+    el.append(line);
+  }
+  return el;
+}
+
+function msgNode(m, sessionId) {
+  if (m.kind === 'tool') return toolNode(m, sessionId);
+  if (m.kind === 'user') return userNode(m);
+  const el = document.createElement('div');
+  el.className = `msg ${m.kind}`;
+  if (m.kind === 'reasoning') {
+    const label = document.createElement('span');
+    label.className = 'reasoning-label';
+    label.textContent = 'Reasoning summary';
+    const summary = document.createElement('p');
+    summary.textContent = m.text;
+    el.append(label, summary);
+  } else if (m.kind === 'todo') {
+    const list = document.createElement('ul');
+    for (const item of m.items) {
+      const row = document.createElement('li');
+      row.className = item.completed ? 'todo-complete' : 'todo-pending';
+      row.textContent = `${item.completed ? '✓' : '○'} ${item.text}`;
+      list.append(row);
+    }
+    el.append(list);
+  } else {
+    el.textContent = m.text;
+  }
+  return el;
+}
+
+/**
+ * A folded run of tool calls. Native <details> rather than a class toggle and a
+ * click handler: it is the same widget, already keyboard-accessible, already
+ * announced as a disclosure by screen readers.
+ */
+function toolRun(g, sessionId) {
+  const d = document.createElement('details');
+  d.className = 'tool-run';
+  const sum = document.createElement('summary');
+  sum.textContent = toolRunLabel(g.msgs);
+  d.append(sum, ...g.msgs.map((m) => msgNode(m, sessionId)));
+
+  // A run opens itself only while you are waiting on it, and collapses once it
+  // is history. Failures used to open the run too, which meant one bad call
+  // unfolded every good one beside it; now the failing call opens itself (see
+  // toolNode) and the run's label still carries the "· N failed" that tells you
+  // to look. That's the condensing; the map below is only for overriding it.
+  const auto = g.msgs.some((m) => m.status === 'running');
+  d.open = toolRunOpen.get(g.at) ?? auto;
+  // Only a state that disagrees with `auto` is remembered, so a run the user
+  // never touched goes back to folding itself when it finishes, while one they
+  // opened by hand stays open across every re-render. The assignment above
+  // fires this once with d.open === auto, which deletes a key that isn't there.
+  d.addEventListener('toggle', () => {
+    if (d.open === auto) toolRunOpen.delete(g.at); else toolRunOpen.set(g.at, d.open);
+  });
+  return d;
+}
+
 function renderChatPane(s) {
   // Measured before the rebuild, because replaceChildren() changes the height:
   // render() runs on every SSE snapshot, i.e. per SDK message, and scrolling
@@ -746,6 +1246,12 @@ function renderChatPane(s) {
   // The first render after opening a session always scrolls — that one is the
   // user asking to see the latest, not reading back.
   const firstOpen = scrolledFor !== openId;
+  // Only cleared on an actual session switch: this re-runs on every snapshot
+  // and on the 30s timer, and an unconditional clear erased upload errors
+  // before they could be read.
+  // Cleared with it: the map is keyed by transcript index, which means a
+  // different session entirely one render later.
+  if (firstOpen) { $('#upload-error').textContent = ''; toolRunOpen.clear(); }
   scrolledFor = openId;
   const nearBottom = firstOpen
     || window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 120;
@@ -766,47 +1272,10 @@ function renderChatPane(s) {
     }
     t.append(details);
   }
-  for (const m of s.transcript) {
-    const view = transcriptView(m);
-    const el = document.createElement('div');
-    el.className = view.className;
-    if (view.kind === 'tool') {
-      renderToolMessage(el, s.id, view);
-    } else if (view.kind === 'reasoning') {
-      const label = document.createElement('span');
-      label.className = 'reasoning-label';
-      label.textContent = 'Reasoning summary';
-      const summary = document.createElement('p');
-      summary.textContent = view.summary;
-      el.append(label, summary);
-    } else if (view.kind === 'todo') {
-      const list = document.createElement('ul');
-      for (const item of view.items) {
-        const row = document.createElement('li');
-        row.className = item.completed ? 'todo-complete' : 'todo-pending';
-        row.textContent = `${item.completed ? '✓' : '○'} ${item.text}`;
-        list.append(row);
-      }
-      el.append(list);
-    } else {
-      el.textContent = view.summary;
-      if (m.kind === 'user' && m.id) el.dataset.promptId = m.id;
-      if (m.kind === 'user' && (m.delivery === 'queued' || m.delivery === 'unsent')) {
-        const delivery = document.createElement('span');
-        delivery.className = `prompt-delivery ${m.delivery}`;
-        delivery.textContent = m.delivery === 'queued' ? 'Queued' : 'Not sent';
-        el.append(' ', delivery);
-      }
-      if (view.attachments?.length) {
-        const attachmentLine = document.createElement('div');
-        attachmentLine.className = 'transcript-attachments';
-        attachmentLine.textContent = `Attachments: ${view.attachments.join(', ')}`;
-        el.append(attachmentLine);
-      }
-    }
-    t.append(el);
-  }
-  if (nearBottom) t.scrollIntoView({ block: 'end' });
+  t.append(...groupTranscript(s.transcript).map(
+    (g) => (g.kind === 'tools' ? toolRun(g, s.id) : msgNode(g.msg, s.id)),
+  ));
+  if (nearBottom) $('#pane-chat').scrollIntoView({ block: 'end' });
 }
 
 function currentToolView(sessionId, itemId) {
@@ -894,31 +1363,118 @@ function renderToolMessage(el, sessionId, view) {
   if (projected.presentation.open) ensureToolDetail(sessionId, view);
 }
 
-// The named slot for the diff spec. /status returns only the totals today, so
-// that is what this shows — a real file-by-file diff needs a server route and
-// is spec'd separately.
+// Expanded files in the Diff pane, by path. Held here rather than in the DOM
+// because the pane is rebuilt whenever the payload changes, which would drop
+// the <details> open flags with it. Cleared on session switch by openTab().
+const diffOpen = new Set();
+// Raw text of the last /diff response, for the identity check in renderDiffPane.
+let lastDiffText = '';
+
+function fileBlock(f) {
+  const el = document.createElement('details');
+  el.className = 'file-diff';
+  el.open = diffOpen.has(f.path);
+  // <details> rather than a button and a hidden div: the browser already owns
+  // the toggle, the keyboard interaction and the aria-expanded state.
+  el.ontoggle = () => (el.open ? diffOpen.add(f.path) : diffOpen.delete(f.path));
+
+  const summary = document.createElement('summary');
+  summary.textContent = diffSummary(f);
+
+  const body = document.createElement('pre');
+  body.className = 'patch';
+  if (f.binary) {
+    body.textContent = 'Binary file';
+  } else if (!f.patch) {
+    // Reachable by design, not just a fetch error: worktreeDiff() degrades to an
+    // empty patch when the patch call exceeds its maxBuffer, and the same
+    // happens for a path git had to quote. Either way a blank box explains
+    // nothing, so say so instead of rendering empty padding.
+    body.textContent = 'Patch unavailable';
+  } else {
+    const line = (text, cls) => {
+      const span = document.createElement('span');
+      // textContent, never innerHTML: a patch body is arbitrary repo text and
+      // this is the one place it reaches the page.
+      span.className = cls;
+      span.textContent = `${text}\n`;
+      return span;
+    };
+    const lines = f.patch.split('\n').map((l) => line(l, patchLineClass(l)));
+    // Appended as its own element rather than pushed into the text, so a body
+    // line that happens to read "… truncated" cannot impersonate the marker.
+    if (f.truncated) lines.push(line('… truncated', 'hunk'));
+    body.replaceChildren(...lines);
+  }
+
+  el.append(summary, body);
+  return el;
+}
+
 function renderDiffPane(s) {
   const due = forceDiffFetch || Date.now() - lastStatusFetch > STATUS_THROTTLE_MS;
   forceDiffFetch = false;
   if (!due) return;
   lastStatusFetch = Date.now();
   const pane = $('#pane-diff');
-  fetch(`/status?id=${s.id}`).then((r) => r.json()).then((d) => {
+  fetch(`/diff?id=${s.id}`).then((r) => r.text()).then((text) => {
     if (openId !== s.id || tab !== 'diff') return;
-    const p = document.createElement('p');
-    p.className = 'meta';
-    p.textContent = d
-      ? `${d.branch} · +${d.added} −${d.removed} · ${d.dirty ? 'uncommitted changes' : 'clean'}`
-      : 'No worktree status available.';
-    const note = document.createElement('p');
-    note.className = 'meta';
-    note.textContent = 'File-by-file diff is not implemented yet.';
-    pane.replaceChildren(p, note);
+    // Compared before parsing, and skipped when identical: the diff usually has
+    // not changed between two polls, and replacing the DOM anyway would reset
+    // the scroll position of a pane the user is reading, every 4 seconds.
+    if (text === lastDiffText) return;
+    const files = JSON.parse(text);
+    // Only cached once parsed: caching first let a bad body (a non-JSON error
+    // page) win the identity check forever after, since JSON.parse's throw
+    // landed in the empty .catch below and every retry of that same response
+    // short-circuited before ever trying again.
+    lastDiffText = text;
+    if (!files.length) {
+      const p = document.createElement('p');
+      p.className = 'meta';
+      p.textContent = 'No uncommitted changes.';
+      pane.replaceChildren(p);
+      return;
+    }
+    pane.replaceChildren(...files.map(fileBlock));
   }).catch(() => {});
 }
 
+/**
+ * Lights up one branch across the whole graph. Elements are compared by
+ * dataset rather than matched with a selector, because a branch name is
+ * arbitrary repo text and would otherwise need escaping to be safe in one.
+ *
+ * `.tracing` follows whether anything actually matched. The rows and lines are
+ * replaced on every 2s poll while `#graph-map` itself survives, so a blindly
+ * set flag would outlive the elements it dimmed and leave the whole graph
+ * faded until the pointer moved again.
+ */
+function traceBranch(name) {
+  const map = $('#graph-map');
+  tracedBranch = name;
+  let matched = false;
+  for (const el of map.querySelectorAll('[data-branch]')) {
+    const on = Boolean(name) && el.dataset.branch === name;
+    el.classList.toggle('traced', on);
+    matched ||= on;
+  }
+  map.classList.toggle('tracing', matched);
+}
+
+/** `hue-N` for a branch, or nothing for trunk, which stays the neutral spine. */
+const hueClass = (hues, name) => (hues.has(name) ? ` hue-${hues.get(name)}` : '');
+
 function renderGraphPane(s) {
   const rows = $('#graph-rows');
+  // Delegated to the map, so a line or a dot traces exactly the way its row
+  // does — the graph is the part people point at. Assignment, not
+  // addEventListener: this runs on every 2s poll and must not stack up.
+  // Leaving a [data-branch] for the gaps between rows clears the trace, which
+  // is why there is no separate per-row mouseleave.
+  const map = $('#graph-map');
+  map.onmouseover = (e) => traceBranch(e.target.closest('[data-branch]')?.dataset.branch ?? '');
+  map.onmouseleave = () => traceBranch('');
   if (!graphCommits.length) {
     rows.replaceChildren(Object.assign(document.createElement('p'), {
       id: 'graph-empty', textContent: 'No commits yet.',
@@ -926,16 +1482,20 @@ function renderGraphPane(s) {
     $('#graph-svg').replaceChildren();
     return;
   }
-  const width = drawGraph(graphCommits);
+  const owner = attributeBranches(graphCommits);
+  const hues = branchHues(owner.values());
+  const width = drawGraph(graphCommits, owner, hues);
   rows.replaceChildren(...graphCommits.map((c) => {
+    const branch = owner.get(c.h) ?? '';
     const row = document.createElement('div');
     row.className = 'commit';
     row.style.marginLeft = `${width + 14}px`;
+    row.dataset.branch = branch;
     const hash = document.createElement('span');
     hash.className = 'hash';
     hash.textContent = c.h.slice(0, 7);
     row.append(hash);
-    for (const r of c.refs) row.append(refPill(r, c.lane));
+    for (const r of c.refs) row.append(refPill(r, c.tier, hueClass(hues, branch)));
     const subject = document.createElement('span');
     subject.className = 'subject';
     subject.textContent = c.subject;
@@ -945,6 +1505,9 @@ function renderGraphPane(s) {
     row.append(subject, when);
     return row;
   }));
+  // The rebuild above discarded the elements carrying `.traced`; restore it so
+  // a poll landing mid-hover neither drops the trace nor strands `.tracing`.
+  traceBranch(tracedBranch);
 }
 
 // ---- Commit graph -------------------------------------------------------
@@ -955,7 +1518,7 @@ const svgEl = (tag, attrs) => {
   return n;
 };
 
-function drawGraph(commits) {
+function drawGraph(commits, owner, hues) {
   const at = new Map(commits.map((c) => [c.h, c]));
   const svg = $('#graph-svg');
   const width = PAD * 2 + Math.max(0, ...commits.map((c) => c.lane)) * LANE;
@@ -964,6 +1527,7 @@ function drawGraph(commits) {
   svg.replaceChildren();
   const x = (c) => PAD + c.lane * LANE;
   const y = (c) => ROW / 2 + c.row * ROW;
+  const branch = (c) => owner.get(c.h) ?? '';
 
   for (const c of commits) {
     for (const [i, ph] of c.p.entries()) {
@@ -977,26 +1541,40 @@ function drawGraph(commits) {
       const d = x1 === x2
         ? `M${x1},${y1}V${y2}`
         : `M${x1},${y1}V${bend}C${x1},${y2} ${x2},${bend} ${x2},${y2}`;
-      // A merge's second parent is drawn in the parent's colour, not the child's:
+      // A merge's second parent is drawn in the parent's tier, not the child's:
       // that line belongs to the branch being merged in.
-      svg.append(svgEl('path', { d, class: `lane${(i ? p.lane : c.lane) % 6}` }));
+      const from = i ? p : c;
+      const name = branch(from);
+      // Two paths, one line: `.hit` is a transparent 14px-wide stroke carrying
+      // the hover, because a 2.5px vertical line spaced 24px from the next one
+      // is a target you miss more often than you hit. Drawn first so the real
+      // line paints over it.
+      svg.append(
+        svgEl('path', { d, class: 'hit', 'data-branch': name }),
+        svgEl('path', { d, class: `tier-${from.tier}${hueClass(hues, name)}`, 'data-branch': name }),
+      );
     }
   }
   for (const c of commits) {
     const head = c.refs.some((r) => r.startsWith('HEAD'));
     svg.append(svgEl('circle', {
       cx: x(c), cy: y(c), r: head ? DOT + 1.5 : DOT,
-      class: `lane${c.lane % 6}${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      class: `tier-${c.tier}${hueClass(hues, branch(c))}`
+        + `${c.p.length > 1 ? ' merge' : ''}${head ? ' head' : ''}`,
+      'data-branch': branch(c),
     }));
   }
   return width;
 }
 
-function refPill(raw, lane) {
+// The pill takes its row's hue, not its own name's: a tag, or a second branch
+// sitting on the same tip, belongs to the line it is pinned to and should read
+// as part of it rather than introducing a colour that appears nowhere else.
+function refPill(raw, tier, hue) {
   const tag = raw.startsWith('tag: ');
   const name = raw.replace(/^tag: /, '').replace(/^HEAD -> /, '');
   const pill = document.createElement('span');
-  pill.className = `ref lane${lane % 6}${tag ? ' tag' : ''}`
+  pill.className = `ref tier-${tier}${hue}${tag ? ' tag' : ''}`
     + (!tag && name.includes('/') ? ' remote' : '') + (raw.startsWith('HEAD') ? ' head' : '');
   // Branch and tag names come from the repo, so they go in as text, never markup.
   const label = document.createElement('span');
@@ -1033,11 +1611,269 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape' && menuFor) { menuFor = null; render(); }
 });
 
+// The datetime input is only meaningful for the "at" choice; `required` is set
+// with it so an empty value can't be submitted, and cleared with it so the
+// other two choices don't trip the form's own validation. Returns `sync` so a
+// caller that resets the form afterward (openNew(), the schedule button below)
+// can re-run it: form.reset() puts the select back to its default option
+// without firing 'change', so without a manual re-sync the datetime field's
+// hidden/required state is left matching whatever was selected before the reset.
+function bindWhen(selectSel, inputSel) {
+  const sel = $(selectSel);
+  const at = $(inputSel);
+  const sync = () => {
+    at.hidden = sel.value !== 'at';
+    at.required = sel.value === 'at';
+  };
+  sel.onchange = sync;
+  sync();
+  return sync;
+}
+const syncWhen = bindWhen('#when-select', '#when-at');
+const syncWhen2 = bindWhen('#when2-select', '#when2-at');
+
+// The server derives a reset trigger's account from the action, so the client
+// never sends one. An invalid or empty datetime yields NaN, which the server
+// rejects with a message the dialog already knows how to show.
+function triggerFor(when, at) {
+  return when === 'reset'
+    ? { kind: 'reset' }
+    : { kind: 'at', time: new Date(at).getTime() };
+}
+
+/**
+ * Slash-command autocomplete for one text field.
+ *
+ * Written as a factory because there are two of these — the chat composer and
+ * the new-session first prompt — and they are styled differently, sit in
+ * different containers, and hold independent open/highlight state. Returns the
+ * repaint, which callers need after they clear the field programmatically
+ * (nothing fires `input` for that).
+ */
+function wireCommandMenu({ field, box, mirror, menu, ids }) {
+  // Matches currently offered, and which one is highlighted. Empty means closed,
+  // so every handler below can test one thing.
+  let matches = [];
+  let index = 0;
+
+  function close() {
+    matches = [];
+    menu.hidden = true;
+    menu.replaceChildren();
+    field.setAttribute('aria-expanded', 'false');
+    field.removeAttribute('aria-activedescendant');
+  }
+
+  /**
+   * Copy the field's own text metrics onto the mirror.
+   *
+   * Read from the live computed style rather than restated in CSS: these two
+   * fields have different padding and different box-sizing, and an <input> does
+   * not even inherit the page font. Any mismatch shows up as the caret sitting
+   * somewhere other than the glyphs.
+   */
+  function matchMetrics() {
+    const cs = getComputedStyle(field);
+    for (const p of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight',
+      'letterSpacing', 'textIndent', 'paddingTop', 'paddingRight', 'paddingBottom',
+      'paddingLeft', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth',
+      'borderLeftWidth', 'wordSpacing']) mirror.style[p] = cs[p];
+    // An <input> computes to `normal`, which would collapse runs of spaces and
+    // wrap where the field does not. A textarea's own value ('pre-wrap') is
+    // already right.
+    mirror.style.whiteSpace = field.tagName === 'INPUT' ? 'pre' : cs.whiteSpace;
+    mirror.style.overflowWrap = cs.overflowWrap;
+  }
+
+  /** Repaint the coloured copy of the command that sits behind the field. */
+  function paint() {
+    const cmd = commandToken(field.value, state.commands ?? []);
+    // The class is what makes the field's own text transparent, so it goes on
+    // only while there is something underneath worth seeing.
+    box.classList.toggle('mirroring', Boolean(cmd));
+    if (!cmd) { mirror.replaceChildren(); return; }
+    matchMetrics();
+    const span = document.createElement('span');
+    span.className = 'cmd';
+    span.textContent = cmd;
+    mirror.replaceChildren(span, document.createTextNode(field.value.slice(cmd.length)));
+    mirror.scrollLeft = field.scrollLeft;
+    mirror.scrollTop = field.scrollTop;
+  }
+
+  function highlight() {
+    [...menu.children].forEach((li, i) => li.setAttribute('aria-selected', String(i === index)));
+    field.setAttribute('aria-activedescendant', `${ids}-${index}`);
+    menu.children[index]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function apply(name) {
+    // Whitespace, not just a space: in the textarea the command can be its own
+    // line, and the rest of the prompt has to survive selecting one.
+    const ws = field.value.search(/\s/);
+    const rest = ws === -1 ? ' ' : field.value.slice(ws);
+    field.value = `/${name}${rest}`;
+    const caret = name.length + 2;
+    field.setSelectionRange(caret, caret);
+    close();
+    paint();
+    field.focus();
+  }
+
+  function render() {
+    const found = commandMenu(field.value, field.selectionStart ?? 0, state.commands ?? []);
+    if (!found) { close(); return; }
+    // Only reset the highlight when the list itself changed; re-rendering for a
+    // caret move must not throw away an arrow-key selection.
+    if (found.matches.join('\n') !== matches.join('\n')) index = 0;
+    matches = found.matches;
+
+    menu.replaceChildren(...matches.map((name, i) => {
+      const li = document.createElement('li');
+      li.id = `${ids}-${i}`;
+      li.setAttribute('role', 'option');
+      const colon = name.indexOf(':');
+      if (colon === -1) li.textContent = `/${name}`;
+      else {
+        const ns = document.createElement('span');
+        ns.className = 'ns';
+        ns.textContent = `/${name.slice(0, colon + 1)}`;
+        li.append(ns, name.slice(colon + 1));
+      }
+      // mousedown, not click: preventDefault here keeps focus in the field, so
+      // the menu never has to race its own blur handler.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); apply(name); });
+      return li;
+    }));
+    menu.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    highlight();
+  }
+
+  // 'input' covers typing and paste; the other two catch a caret move that
+  // changes whether the menu still belongs on screen.
+  for (const evt of ['input', 'click', 'keyup']) {
+    field.addEventListener(evt, () => { render(); paint(); });
+  }
+  field.addEventListener('scroll', () => {
+    mirror.scrollLeft = field.scrollLeft;
+    mirror.scrollTop = field.scrollTop;
+  });
+  field.addEventListener('blur', close);
+
+  field.addEventListener('keydown', (e) => {
+    if (!matches.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      index = (index + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+      highlight();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      // Enter picks the command rather than submitting a half-typed one — and in
+      // the textarea, rather than breaking the line. Submitting happens on the
+      // next Enter, once the menu has closed.
+      e.preventDefault();
+      apply(matches[index]);
+    } else if (e.key === 'Escape') {
+      // The dialog would otherwise take this as "close me" while the user was
+      // only dismissing the menu.
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+
+  return paint;
+}
+
+const paintMirror = wireCommandMenu({
+  field: $('#prompt'), box: $('#prompt-box'), mirror: $('#prompt-mirror'),
+  menu: $('#cmd-menu'), ids: 'cmd-opt',
+});
+
+const paintNewMirror = wireCommandMenu({
+  field: $('#prompt-input'), box: $('#new-prompt-box'), mirror: $('#new-prompt-mirror'),
+  menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
+});
+
+/**
+ * Size the composer to its content: 'auto' first so it can shrink back after a
+ * deletion, then scrollHeight. Called on input and after any programmatic write
+ * (nothing fires `input` for those).
+ */
+function growPrompt() {
+  const box = $('#prompt');
+  box.style.height = 'auto';
+  box.style.height = `${box.scrollHeight}px`;
+}
+$('#prompt').addEventListener('input', growPrompt);
+
+// Enter sends, Shift+Enter breaks the line — a textarea's default is the other
+// way round. defaultPrevented means the command menu already claimed this Enter
+// to pick a completion, and isComposing means an IME is mid-word.
+$('#prompt').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.defaultPrevented) return;
+  e.preventDefault();
+  $('#composer').requestSubmit();
+});
+
+/**
+ * The message both composer buttons act on, or '' with the reason on screen.
+ *
+ * Both of them used to bail on an empty box with a bare `return`, which is a
+ * control that looks enabled and does nothing — the reported bug was ⏱, but
+ * Send had it too, so the check lives here once rather than at each caller.
+ * `required` on the field (see index.html) covers Send's empty case natively;
+ * trimming here first makes a whitespace-only message fail it as well, and
+ * reportValidity() gets ⏱ the same bubble even though type=button skips
+ * validation.
+ */
+function composerText() {
+  const field = $('#prompt');
+  field.value = field.value.trim();
+  // The trim can drop trailing blank lines, which the box is still tall enough for.
+  growPrompt();
+  // Attachments count as a message on their own: the paths are what the agent
+  // acts on, and an image with no covering text is a normal thing to send.
+  const attachments = attachmentController.pendingAttachments;
+  const text = field.value;
+  if (text || attachments.length) return text;
+  paintMirror();
+  $('#composer').reportValidity();
+  return '';
+}
+
+const SEND_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>';
+const STOP_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+
+/**
+ * #send-btn doubles as Send and Stop: an arrow that submits the form while
+ * the session is idle, a square that aborts the run while it's 'working'.
+ * Called from renderSession() on every snapshot, so it stays in step with
+ * the same s.status that drives actionSlot()'s separate, session-level Stop
+ * button (#session-action) — this one is scoped to the composer instead.
+ *
+ * type is flipped along with the icon: 'button' while working keeps a click
+ * from also submitting the form (the onclick below issues 'stop' directly),
+ * 'submit' while idle hands it back to #composer's onsubmit. Enter in the
+ * field still calls requestSubmit() either way, so a message typed mid-turn
+ * still sends (the server queues it) even though the button itself reads Stop.
+ */
+function updateComposerButton(s) {
+  const btn = $('#send-btn');
+  const working = s.status === 'working';
+  btn.innerHTML = working ? STOP_ICON : SEND_ICON;
+  btn.title = working ? 'Stop' : 'Send message';
+  btn.setAttribute('aria-label', working ? 'Stop' : 'Send message');
+  btn.type = working ? 'button' : 'submit';
+  btn.onclick = working ? async () => { await runSessionCommand({ cmd: 'stop', id: s.id }); } : null;
+  $('#composer-dots').hidden = !working;
+}
+
 $('#composer').onsubmit = async (e) => {
   e.preventDefault();
   const draft = $('#prompt').value;
   const text = draft.trim();
-  if (!text) return;
+  if (!composerText()) return;
   const operation = beginAttachmentSend(attachmentController, draft);
   if (!operation) return;
   renderAttachmentComposer();
@@ -1047,22 +1883,85 @@ $('#composer').onsubmit = async (e) => {
   // A response for the session the operator just left must not erase the new
   // session's draft or unlock another session's in-flight send.
   const completion = completeAttachmentSend(attachmentController, operation, result);
-  if (completion.applied) $('#prompt').value = completion.text;
+  if (completion.applied) {
+    $('#prompt').value = completion.text;
+    paintMirror();
+    growPrompt();
+  }
   renderAttachmentComposer();
 };
 
 function updateComposerBusy() {
-  $('#composer button[type="submit"]').disabled = attachmentComposerBusy(attachmentController);
+  const busy = attachmentComposerBusy(attachmentController);
+  $('#send-btn').disabled = busy;
+  $('#schedule-btn').disabled = busy;
   $('#prompt').readOnly = attachmentController.sendInFlight;
-  $('#attach').disabled = attachmentController.sendInFlight;
   $('#attach-input').disabled = attachmentController.sendInFlight;
+  $('#attach').setAttribute('aria-disabled', String(attachmentController.sendInFlight));
   for (const remove of document.querySelectorAll('.attachment-chip button')) {
     remove.disabled = attachmentController.sendInFlight;
   }
 }
 
+$('#schedule-btn').onclick = () => {
+  const text = composerText();
+  if (!text && !attachmentController.pendingAttachments.length) return;
+  const dialog = $('#when-dialog');
+  // Same reason as openNew(): without this, a dialog reopened after an earlier
+  // "When usage resets" pick still shows that choice (and the datetime field
+  // stays hidden to match) for an unrelated later message.
+  dialog.querySelector('form').reset();
+  syncWhen2();
+  $('#when-error').textContent = '';
+  dialog.showModal();
+};
+
+$('#when-dialog').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Same returnValue discipline as the #new dialog: Escape closes without
+  // setting one, and an unconsumed 'ok' would re-fire on the next Escape.
+  const ok = dialog.returnValue === 'ok';
+  dialog.returnValue = '';
+  if (!ok || !openId) return;
+
+  // Same composition as Send: a scheduled message carries its attachment paths
+  // too, and the files are already on disk waiting for fire time.
+  const text = composeMessage(
+    $('#prompt').value,
+    attachmentController.pendingAttachments.map((a) => a.path),
+  );
+  if (!text) return;
+  // Always schedule a `send`, even for a session that is stopped right now: the
+  // headline use of this feature is "send this tonight" against a session
+  // that's live at schedule time but very likely won't be by fire time (a
+  // server restart marks every session `stopped`). Only the server, at fire
+  // time, knows which is true — see the downgrade to `resume` in tick() in
+  // src/server.ts — so the client no longer guesses here.
+  const action = { kind: 'send', sessionId: openId, text };
+
+  const f = new FormData(dialog.querySelector('form'));
+  const result = await postCommand({
+    cmd: 'schedule', trigger: triggerFor(f.get('when'), f.get('at')), action,
+  });
+  if (result.ok) {
+    $('#prompt').value = '';
+    attachmentController.pendingAttachments = [];
+    paintMirror();
+    growPrompt();
+    renderAttachmentComposer();
+    render();
+    return;
+  }
+  // Same pattern as #new: show the server's reason and let the user retry,
+  // rather than the fire-and-forget silence most other buttons in this app get.
+  // This one is a modal the user explicitly confirmed to queue something —
+  // going quiet on failure means they believe it's queued when it isn't.
+  $('#when-error').textContent = commandFailure(result);
+  dialog.showModal();
+});
+
 function renderPendingAttachments() {
-  const box = $('#attachments');
+  const box = $('#thumbs');
   box.replaceChildren();
   for (const attachment of attachmentController.pendingAttachments) {
     const chip = document.createElement('span');
@@ -1086,6 +1985,7 @@ function renderPendingAttachments() {
     chip.append(name, remove);
     box.append(chip);
   }
+  $('#prompt').required = attachmentController.pendingAttachments.length === 0;
 }
 
 function renderUploadError() {
@@ -1147,7 +2047,6 @@ async function upload(files) {
   }
 }
 
-$('#attach').onclick = () => $('#attach-input').click();
 $('#attach-input').onchange = (e) => {
   // FileList is live: capture every File before resetting the input, or the
   // asynchronous upload sees an empty collection in some browsers.
@@ -1172,6 +2071,16 @@ chat.addEventListener('drop', (e) => {
   e.preventDefault();
   chat.classList.remove('dropping');
   upload(e.dataTransfer.files);
+});
+
+// Pasting a screenshot into the composer takes the same path as a drop. The
+// event is left alone when the clipboard holds no files, so pasting text still
+// lands in the textarea normally.
+chat.addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files ?? [])];
+  if (!files.length) return;
+  e.preventDefault();
+  upload(files.map((f, i) => new File([f], pastedName(f.name, Date.now(), i), { type: f.type })));
 });
 
 // A styled combobox standing in for the native <datalist>, which is an OS widget:
@@ -1286,6 +2195,69 @@ const repoCombo = (() => {
   return { setOptions(list_) { all = list_; close(); } };
 })();
 
+function openSettings() {
+  const dialog = $('#settings');
+  const form = dialog.querySelector('form');
+  const s = state.settings;
+
+  form.autoApprove.checked = s.autoApprove;
+  form.branchPrefix.value = s.branchPrefix;
+  form.sort.value = s.sort;
+  form.collapseDone.checked = s.collapseDone;
+  form.autoRequeue.checked = s.autoRequeue;
+  for (const box of form.querySelectorAll('input[name=notifyOn]')) {
+    box.checked = s.notifyOn.includes(box.value);
+  }
+
+  // Rebuilt on every open: accounts.json can change under a running server.
+  // The "freest" option is what `account: null` means.
+  const sel = form.account;
+  const freest = document.createElement('option');
+  freest.value = '';
+  freest.textContent = 'Freest account';
+  freest.selected = s.account === null;
+  sel.replaceChildren(freest, ...state.accounts.map((a) => {
+    const o = document.createElement('option');
+    o.value = a.name;
+    o.textContent = a.name;
+    o.selected = a.name === s.account;
+    return o;
+  }));
+
+  $('#settings-error').textContent = '';
+  dialog.showModal();
+}
+
+$('#settings-btn').onclick = openSettings;
+
+$('#settings').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Same returnValue discipline as #new: Escape closes without setting one, so
+  // an unconsumed 'save' would make the next Escape re-POST the form.
+  const save = dialog.returnValue === 'save';
+  dialog.returnValue = '';
+  if (!save) return;
+
+  const form = dialog.querySelector('form');
+  const patch = {
+    autoApprove: form.autoApprove.checked,
+    account: form.account.value || null,
+    branchPrefix: form.branchPrefix.value,
+    notifyOn: [...form.querySelectorAll('input[name=notifyOn]:checked')].map((b) => b.value),
+    sort: form.sort.value,
+    collapseDone: form.collapseDone.checked,
+    autoRequeue: form.autoRequeue.checked,
+  };
+
+  const result = await postCommand({ cmd: 'settings', patch });
+  if (!result.ok) {
+    // Same as #new's retry path: show the server's reason and reopen with the
+    // user's input intact rather than dropping it into a toast.
+    $('#settings-error').textContent = commandFailure(result);
+    dialog.showModal();
+  }
+});
+
 async function openNew() {
   // reset() before the option lists are rebuilt below, so it can't clobber them:
   // a re-opened dialog otherwise still holds the previous session's repo, branch
@@ -1293,16 +2265,26 @@ async function openNew() {
   // place it is ever set — see there.)
   const dialog = $('#new');
   dialog.querySelector('form').reset();
+  // reset() fires no 'input' event, so the mirror would keep painting the
+  // command from the last time this dialog was open over an empty field.
+  paintNewMirror();
+  syncWhen();
+
+  // reset() has just cleared the branch field, so the prefix goes in after it.
+  $('#branch-input').value = state.settings.branchPrefix;
 
   repoCombo.setOptions(await fetch('/repos').then((r) => r.json()));
 
   const sel = document.querySelector('select[name=account]');
-  const freest = [...state.accounts].sort((a, b) => a.pace - b.pace)[0];
+  // A pinned account that is no longer in accounts.json falls back to freest,
+  // rather than leaving the picker on a name that cannot be created against.
+  const pinned = state.accounts.find((a) => a.name === state.settings.account);
+  const preselect = pinned ?? freestAccount(state.accounts);
   sel.replaceChildren(...state.accounts.map((a) => {
     const o = document.createElement('option');
     o.value = a.name;
     o.textContent = a.name;
-    o.selected = a.name === freest?.name;
+    o.selected = a.name === preselect?.name;
     return o;
   }));
   updateNewCodexSettings();
@@ -1330,19 +2312,36 @@ $('#new').addEventListener('close', async (e) => {
   dialog.returnValue = '';
   if (!create) return;
   const f = new FormData(dialog.querySelector('form'));
-  const account = state.accounts.find((a) => a.name === f.get('account'));
-  const result = await postCommand({
-    cmd: 'create',
-    repo: f.get('repo'), branch: f.get('branch'),
-    account: f.get('account'), prompt: f.get('prompt'),
-    ...(account?.provider === 'codex'
+  const repo = f.get('repo'), branch = f.get('branch'), account = f.get('account');
+  const selectedAccount = state.accounts.find((a) => a.name === account);
+  const action = {
+    kind: 'create', repo, branch, account, prompt: f.get('prompt'),
+    ...(selectedAccount?.provider === 'codex'
       ? { codexSettings: codexSettingsFromForm(Object.fromEntries(f)) }
       : {}),
-  });
+  };
+  const when = f.get('when');
+
+  // Only a create happening *now* gets a pending card. A scheduled one creates
+  // nothing yet — it lands in the queue strip, and a card that says "creating…"
+  // for something due tomorrow would be a lie.
+  const pending = when === 'now' ? { repo, branch, account } : null;
+  if (pending) {
+    // Shown in the grid immediately — see pendingCreates' declaration for why
+    // this can't just wait for the next SSE snapshot.
+    pendingCreates.push(pending);
+    render();
+  }
+
+  const result = await postCommand(when === 'now'
+    ? { cmd: 'create', ...action }
+    : { cmd: 'schedule', trigger: triggerFor(when, f.get('at')), action });
+  if (pending) pendingCreates = pendingCreates.filter((p) => p !== pending);
   if (!result.ok) {
     $('#new-error').textContent = commandFailure(result);
     dialog.showModal();
   }
+  render();
 });
 
 // Chrome and Safari largely ignore (or silently fall back to a "quiet",

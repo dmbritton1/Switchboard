@@ -61,8 +61,8 @@ There are no interactive Codex approvals.
 write every two seconds, on any other state change — so a session that runs to
 completion unattended is still on disk. Usage samples are saved alongside the
 sessions, which is why account pace survives a restart. `state.json` is
-`{ sessions, usage }`; a file from an older build (a bare session array) still
-loads, minus usage history.
+`{ sessions, usage, queue, settings }`; a file from an older build (a bare
+session array) still loads, minus usage history.
 
 ## What it does
 
@@ -73,6 +73,13 @@ session's own header (visible on whichever of its tabs you're on), or — for a
 *different* session while one is already open — from an interrupt band inside
 the session view. Codex runs sandboxed to its worktree with
 `approvalPolicy: 'never'` and never enters `needs-you` — see Limits below.
+
+When Claude asks a question (`AskUserQuestion`), the same three places show the
+question text and one button per option instead of Allow/Deny; the pick is
+recorded in the transcript and handed back to the agent as the tool result.
+`Skip` declines the question, after which the agent re-asks in prose and the
+message box answers it. Questions ignore auto-approve — auto-approving one
+would answer it "the user did not answer" and the question would flash past.
 
 Opening a card opens a session view with Chat, Diff and Graph tabs, sharing
 one header that carries a `⋯` menu and the single action the session's state
@@ -89,9 +96,23 @@ forgets the session, and checking the box additionally runs
 `git worktree remove` (falling back to deleting the directory) on confirmation
 — which **discards any uncommitted work in that worktree**.
 
-Usage percentages are estimates from observed token spend against the `budget`
-in `accounts.json`, not real plan limits — no CLI exposes those. The two
-providers aren't measured identically: the Claude adapter folds
+Claude accounts show their real claude.ai plan usage: Switchboard asks the
+Agent SDK for the 5-hour and 7-day rate-limit windows every five minutes, using
+each account's own launch environment. This costs no tokens — the probe starts
+a session that is never given a prompt. The meter badge always headlines the
+5-hour window (falling back to 7-day only for a plan that doesn't report one);
+tap it open for both numbers, so a nearly-exhausted week is never hidden, just
+not the badge's headline. The bar's fill/color and the New Session picker's
+"freest account" ranking still use the worse of the two windows, so a
+nearly-exhausted week still counts against an account there even though the
+badge reads a quiet 5h number. The API is marked experimental by the SDK and
+may change.
+
+Everything else falls back to an estimate from observed token spend against the
+`budget` in `accounts.json`: Codex accounts, API-key/Bedrock/Vertex accounts
+(where plan limits do not apply), and any account whose probe fails — the
+account panel says which. Those estimates are labelled `~` and "estimate" in
+the UI, and the two providers aren't measured identically: the Claude adapter folds
 `cache_creation_input_tokens` and `cache_read_input_tokens` into the input
 count (a recorded session showed 86 tokens counted before that fix, 38,012
 after — cache tokens are most of real spend under prompt caching), while the
@@ -100,6 +121,81 @@ Codex adapter deliberately does not add `cached_input_tokens` or
 subsets of the reported totals rather than separate counters — an assumption
 noted in the code, not a confirmed one. Keep that in mind when tuning `budget`
 per account.
+
+## Scheduling
+
+Cards can be created for later instead of now, and messages can be scheduled into
+an existing session. The New worktree dialog's **Run** field takes `Now`, `At a
+time…` (a native date-time picker) or `When usage resets`; the ⏱ button beside
+the chat composer schedules a message the same way. Queued items show in a strip
+above the grid and can be removed from there.
+
+`When usage resets` is a real signal for Claude accounts, not a guess: the Agent
+SDK streams a `rate_limit_event` carrying the timestamp at which the window
+rolls, and that timestamp is stored per account. The Codex SDK reports no rate
+limits at all, so a Codex account falls back to the same estimate the account
+bars show — the item fires once the trailing-5h token pace (tokens spent ÷
+`budget`) drops below `RESET_PACE` (0.8, in `src/usage.ts`). That fallback is only
+as good as the budget you tuned in `accounts.json`, same caveat as the bars.
+
+When a Claude session dies while its account is past its limit, a resume is
+queued automatically for when the window rolls; the card appends a line reading
+`⏱ waiting for reset` below the status. Codex sessions never auto-requeue,
+because the Codex SDK reports no rate-limit signal. Stopping a session yourself
+never queues anything. Items waiting on one account fire one at a time, so a
+freshly reset window is not spent all at once — items waiting on a clock fire at
+their time regardless of what else is running.
+
+Scheduled items are one-shot; there is no recurrence. A time that passes while
+Switchboard is down fires on the next start if it is less than 12 hours late
+(`GRACE_MS` in `src/schedule.ts`), and is marked `missed` if it is older than
+that. The queue lives in `state.json` alongside the sessions.
+
+## Settings
+
+The `⚙` button opens a dialog for seven preferences: `autoApprove` (new
+sessions start with auto-approve already on, instead of prompting on the
+first tool call — recorded for Codex sessions too, though their SDK has no
+interactive approval to skip), `account` (which account the New dialog
+preselects; `null` ranks by usage and picks the freest, and a pinned account
+that has since been removed from `accounts.json` falls back to freest the
+same way), `branchPrefix` (prefilled into the New dialog's branch field),
+`notifyOn` (which status transitions raise a browser notification, chosen
+from `needs-you`, `done`, `stopped`), `sort` (grid order — `blocked` puts
+blocked sessions first, then running, then finished; `newest` is flat
+recency; `account` groups by account, blocked-first within each group),
+`collapseDone` (hides finished sessions, but deliberately not `stopped`
+ones — those carry a Resume button and unfinished work), and `autoRequeue`
+(whether a Claude session that dies while its account is past its limit
+still gets a resume queued automatically; turning it off disables the
+auto-resume behavior described under Scheduling above). Every default
+reproduces the behavior the app had before settings existed, so an empty or
+missing settings block changes nothing.
+
+`notifyOn` closes a real gap: Codex sessions never enter `needs-you` (they
+run with `approvalPolicy: 'never'` and no interactive approval — see Limits
+below), so before this setting existed a Codex session produced no browser
+notification, ever. `done` and `stopped` are the only transitions a Codex
+session has to notify on.
+
+Settings live in `state.json` alongside `sessions`, `usage`, and `queue`, and
+the file is meant to be hand-editable: on load, an invalid or unknown-typed
+value falls back to its default rather than throwing, and an unrecognized
+key is dropped. The `settings` HTTP command is deliberately stricter — it
+rejects an unknown key or a wrong-typed value with a 400 — because that file
+is written only by this app, while the command is an unauthenticated
+localhost POST that now changes how agents launch; a client sending
+`sandboxMode`, for instance, should learn it was rejected rather than believe
+it took effect.
+
+Theme and notification sound are deliberately not settings. Theme was cut
+because `web/style.css` is dark-only: twelve custom properties in `:root`
+plus roughly forty more hardcoded colors past them, so a light theme means
+authoring a second palette, not wiring up a toggle. Sound was cut because
+macOS Notification Center already controls it, and better than this dialog
+could. Codex's sandbox mode (`workspace-write`) and approval policy
+(`never`) are also deliberately not settable, and must not become settable —
+see Safety boundaries in `AGENTS.md`.
 
 ## Tests
 
@@ -162,6 +258,14 @@ spend a model turn, or read a real Codex account.
   for that path is now orphaned, not that data survived. `git worktree list`
   shows the stale entry; `git worktree prune` clears it. (The one case a
   delete leaves the card in place is when that `rm -rf` fallback fails too.)
+- The scheduler ticks every 30 seconds and only runs while the server does — a
+  scheduled item is not an OS-level cron job, and nothing fires with Switchboard
+  closed. The auto-requeue heuristic applies only to Claude accounts: any Claude
+  session that dies on its own while its account is past its limit gets a resume
+  queued, including one that died of something unrelated. Codex sessions never
+  auto-requeue, since the Codex SDK reports no rate-limit signal. The visible
+  queue row for an auto-requeue is one you can delete, which is the trade made to
+  avoid matching on provider error text.
 
 ## Codex Phase 2 behavior
 

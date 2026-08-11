@@ -222,7 +222,11 @@ process.stdin.on('end', () => {
   }});
   emit({ type: 'item.completed', item: {
     id: 'command-1', type: 'command_execution', command: 'echo shell',
-    aggregated_output: 'shell output', exit_code: 0, status: 'completed',
+    // Carries the account secret on purpose: tool output is the one payload that
+    // now reaches state.json and the browser, so the redaction that guards it
+    // needs a fixture that actually fails when it regresses.
+    aggregated_output: 'shell output ' + (process.env.FAKE_CODEX_SECRET ?? ''),
+    exit_code: 0, status: 'completed',
   }});
   emit({ type: 'item.completed', item: {
     id: 'file-1', type: 'file_change', status: 'completed',

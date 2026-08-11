@@ -3,9 +3,11 @@ import assert from 'node:assert';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Registry, type RegistryOptions } from '../src/sessions.ts';
+import { Registry, MAX_RESULT, truncateResult, type RegistryOptions } from '../src/sessions.ts';
 import type { AdapterEvent } from '../src/types.ts';
 import { Usage } from '../src/usage.ts';
+import { Scheduler } from '../src/schedule.ts';
+import { DEFAULT_SETTINGS } from '../src/types.ts';
 
 function make(options?: RegistryOptions): { reg: Registry; id: string } {
   const reg = new Registry('/dev/null', undefined, options);
@@ -328,6 +330,14 @@ test('subscribers are notified on every apply', () => {
   assert.equal(calls, 1);
 });
 
+test('touch notifies subscribers without touching any session', () => {
+  const { reg } = make();
+  let calls = 0;
+  reg.subscribe(() => { calls++; });
+  reg.touch();
+  assert.equal(calls, 1);
+});
+
 test('a saved registry reloads with sessions marked stopped', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -390,6 +400,71 @@ test('a tool-result event updates the matching tool message and ignores unknown 
   assert.deepEqual(reg.get(id)!.transcript[0], {
     kind: 'tool', name: 'Bash', summary: 'ls', status: 'error', id: 't1',
   });
+});
+
+test('an answered question is not marked failed by its deny-carried tool result', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'AskUserQuestion', summary: 'TS or Py?', status: 'running', id: 'q1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 'q1', ok: false });
+  assert.equal((reg.get(id)!.transcript[0] as { status: string }).status, 'ok');
+});
+
+test('a tool-result stores the output on the tool message', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'Bash', summary: 'ls', status: 'running', id: 't1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 't1', ok: true, text: 'a.ts\nb.ts' });
+  assert.deepEqual(reg.get(id)!.transcript[0], {
+    kind: 'tool', name: 'Bash', summary: 'ls', status: 'ok', id: 't1', result: 'a.ts\nb.ts',
+  });
+});
+
+test('an answered question stores no result', () => {
+  // Its tool_result is the SDK's deny boilerplate, not output worth reading.
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'AskUserQuestion', summary: 'TS or Py?', status: 'running', id: 'q1' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 'q1', ok: false, text: 'The user did not answer' });
+  assert.equal((reg.get(id)!.transcript[0] as { result?: string }).result, undefined);
+});
+
+test('oversized tool output is capped before it can be stored', () => {
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: { kind: 'tool', name: 'Bash', summary: 'cat big', status: 'running', id: 't2' },
+  });
+  reg.apply(id, { type: 'tool-result', id: 't2', ok: true, text: `${'x'.repeat(50_000)}TAIL` });
+  const { result } = reg.get(id)!.transcript[0] as { result: string };
+  assert.ok(result.length < MAX_RESULT + 100, `stored ${result.length} chars`);
+  assert.ok(result.endsWith('TAIL'), 'keeps the tail, where a failure explains itself');
+  assert.match(result, /^\[48004 earlier characters not shown\]/);
+});
+
+test('Codex output arriving on the message itself is capped too', () => {
+  // Codex has no separate result event, so this is the other storage path.
+  const { reg, id } = make();
+  reg.apply(id, {
+    type: 'msg',
+    msg: {
+      kind: 'tool', name: 'shell', summary: 'build', status: 'ok',
+      result: 'y'.repeat(50_000),
+    },
+  });
+  const { result } = reg.get(id)!.transcript[0] as { result: string };
+  assert.ok(result.length < MAX_RESULT + 100, `stored ${result.length} chars`);
+});
+
+test('truncateResult leaves output that already fits completely alone', () => {
+  assert.equal(truncateResult('short'), 'short');
+  assert.equal(truncateResult('x'.repeat(MAX_RESULT)), 'x'.repeat(MAX_RESULT));
 });
 
 test('concurrent saves all resolve and leave valid, parseable state', async (t) => {
@@ -703,4 +778,146 @@ test('getToolDetail only resolves tool entries with the matching id', () => {
   reg.apply(id, { type: 'upsert-msg', msg: { kind: 'reasoning', id: 'shared', text: 'summary' } });
   assert.equal(reg.getToolDetail(id, 'shared'), null);
   assert.equal(reg.getToolDetail('missing-session', 'shared'), null);
+});
+
+test('the queue round-trips through state.json', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const sched = new Scheduler();
+  sched.add({ kind: 'at', time: 123 }, {
+    kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go',
+  });
+  await new Registry(path, undefined, sched).save();
+
+  const back = new Scheduler();
+  await Registry.load(path, undefined, back);
+  assert.equal(back.all().length, 1);
+  assert.equal(back.all()[0].trigger.kind, 'at');
+});
+
+test('load restores a valid queued item and drops a malformed one', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+
+  const valid = {
+    id: 'v1',
+    trigger: { kind: 'at', time: 123 },
+    action: { kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go' },
+    createdAt: 100,
+    state: 'waiting',
+    error: null,
+  };
+  // Unrecognized trigger.kind — Scheduler.restore() rejects it outright.
+  const malformed = {
+    id: 'bad',
+    trigger: { kind: 'bogus' },
+    action: { kind: 'create', repo: '/r', branch: 'b', account: 'main', prompt: 'go' },
+    createdAt: 100,
+    state: 'waiting',
+    error: null,
+  };
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {}, queue: [valid, malformed] }));
+
+  const sched = new Scheduler();
+  await Registry.load(path, undefined, sched);
+  assert.equal(sched.all().length, 1);
+  assert.equal(sched.all()[0].id, 'v1');
+});
+
+test('a state.json with no queue key loads cleanly', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {} }));
+
+  const sched = new Scheduler();
+  await Registry.load(path, undefined, sched);
+  assert.equal(sched.all().length, 0);
+});
+
+test('DEFAULT_SETTINGS reproduces the pre-settings behavior', () => {
+  assert.deepEqual(DEFAULT_SETTINGS, {
+    autoApprove: false,
+    account: null,
+    branchPrefix: '',
+    notifyOn: ['needs-you'],
+    sort: 'blocked',
+    collapseDone: false,
+    autoRequeue: true,
+  });
+});
+
+test('DEFAULT_SETTINGS is not shared mutable state', () => {
+  // A frozen default that callers spread from cannot be corrupted by one
+  // caller mutating what it thought was its own copy.
+  assert.throws(() => { (DEFAULT_SETTINGS as { autoApprove: boolean }).autoApprove = true; });
+
+  // Spreading creates a shallow copy with a mutable top level, but the
+  // notifyOn array is still frozen, so mutation through the copy throws.
+  const copy = { ...DEFAULT_SETTINGS };
+  assert.throws(() => { copy.notifyOn.push('stopped'); });
+  assert.deepEqual(DEFAULT_SETTINGS.notifyOn, ['needs-you']);
+});
+
+test('a fresh registry starts with the default settings', () => {
+  const reg = new Registry('/dev/null');
+  assert.deepEqual(reg.settings(), DEFAULT_SETTINGS);
+});
+
+test('setSettings merges a partial and notifies subscribers', () => {
+  const reg = new Registry('/dev/null');
+  let calls = 0;
+  reg.subscribe(() => { calls++; });
+  reg.setSettings({ autoApprove: true });
+  assert.equal(reg.settings().autoApprove, true);
+  // Untouched keys keep their defaults — it is a merge, not a replace.
+  assert.equal(reg.settings().autoRequeue, true);
+  assert.equal(calls, 1);
+});
+
+test('settings survive a save/load round trip', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const reg = new Registry(path);
+  reg.setSettings({ autoApprove: true, sort: 'newest', notifyOn: ['needs-you', 'done'] });
+  await reg.save();
+
+  const back = await Registry.load(path);
+  assert.equal(back.settings().autoApprove, true);
+  assert.equal(back.settings().sort, 'newest');
+  assert.deepEqual(back.settings().notifyOn, ['needs-you', 'done']);
+});
+
+test('a state.json with no settings key loads the defaults', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-legacy-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [], usage: {}, queue: [] }));
+
+  const reg = await Registry.load(path);
+  assert.deepEqual(reg.settings(), DEFAULT_SETTINGS);
+});
+
+test('a stored settings block with junk keys and wrong types loads the defaults for them', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-settings-junk-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  // state.json is hand-editable, and a downgrade can leave keys a newer build
+  // wrote. Neither may corrupt the loaded shape.
+  await writeFile(path, JSON.stringify({
+    sessions: [],
+    settings: { autoApprove: 'yes', sort: 'sideways', notifyOn: 'done', fromTheFuture: 1, collapseDone: true },
+  }));
+
+  const reg = await Registry.load(path);
+  const s = reg.settings();
+  assert.equal(s.autoApprove, false, 'a non-boolean falls back to the default');
+  assert.equal(s.sort, 'blocked', 'an unknown enum value falls back to the default');
+  assert.deepEqual(s.notifyOn, ['needs-you'], 'a non-array falls back to the default');
+  assert.equal(s.collapseDone, true, 'a valid key still loads');
+  assert.equal('fromTheFuture' in s, false, 'an unknown key is dropped');
 });

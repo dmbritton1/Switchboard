@@ -1,14 +1,37 @@
 <!doctype html>
+<html lang="en" data-accent="coral" data-canvas="obsidian">
 <meta charset="utf-8">
 <title>Switchboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- The shipped default is Obsidian + Coral, carried by the attributes above
+     rather than duplicated into :root, so a browser with JS broken still gets
+     a complete theme and this script only ever *overrides*. Inline and above
+     the stylesheet link because an external file is a second request that can
+     lose the race with first paint; this is the only inline script in the
+     file. It restates the two name lists because it cannot import lib.js — a
+     test in test/ui.test.ts asserts the copies match. -->
+<script>
+  try {
+    const t = JSON.parse(localStorage.getItem('switchboard.theme')) ?? {};
+    if (/^(clay|coral|ochre|moss|fern|teal|slate|indigo|plum|mulberry)$/.test(t.accent)) document.documentElement.dataset.accent = t.accent;
+    if (/^(cream|linen|shell|mist|porcelain|bone|obsidian|umber|ember|pine|midnight|graphite)$/.test(t.canvas)) document.documentElement.dataset.canvas = t.canvas;
+  } catch {}
+</script>
 <link rel="stylesheet" href="/style.css">
 <header id="bar">
   <span id="brand">Switchboard</span>
   <span id="conn" hidden>reconnecting…</span>
   <div id="meters"></div>
   <button id="queue-badge" type="button" hidden></button>
-  <button id="new-btn" type="button">+ New</button>
+  <!-- .menu-wrap so the outside-click closer in app.js recognises clicks inside
+       the open menu as inside; #theme-wrap cancels that class's margin-left,
+       the same way #session-menu .menu-wrap does. Filled by renderTheme(). -->
+  <span id="theme-wrap" class="menu-wrap"></span>
+  <!-- Disabled until the first SSE snapshot lands: both buttons' handlers read
+       state.settings, which is absent from the pre-snapshot initial `state`
+       (see the `let state = ...` in app.js). Re-enabled in es.onmessage. -->
+  <button id="settings-btn" type="button" title="Settings" aria-label="Settings" disabled>⚙</button>
+  <button id="new-btn" type="button" disabled>+ New</button>
 </header>
 <div id="panel" hidden></div>
 <div id="notif-bar" hidden>
@@ -18,34 +41,102 @@
 <main id="grid"></main>
 <p id="command-error" role="alert"></p>
 <section id="session" hidden>
-  <header>
+  <!-- Fixed to the viewport rather than sticky to #session's own flow, so
+       back/tabs/the current action/this session's account meter/other sessions
+       all stay reachable no matter how far the transcript is scrolled or which
+       pane is open — before this, only #interrupt/#session-action stuck below
+       #bar, and #back/#tabs themselves scrolled away with the title the moment
+       you read past the first screen. Nested inside #session, not a sibling of
+       it, so the existing `[hidden]` rule hides this along with everything
+       else when the grid is showing instead of needing its own JS toggle. -->
+  <aside id="sidebar">
     <button id="back">← grid</button>
-    <h2 id="session-title"></h2>
-    <p id="session-stopped-reason" class="meta" hidden></p>
-    <span id="session-menu"></span>
-  </header>
-  <nav id="tabs" role="tablist"></nav>
-  <div id="session-sticky">
-    <div id="interrupt" hidden></div>
-    <div id="session-action"></div>
-  </div>
+    <!-- Branch + status dot — filled by renderSession(). The title itself
+         lives in #session-main and scrolls out of view with it, so this is
+         what says which session the sidebar belongs to once you've scrolled
+         past that. -->
+    <div id="sidebar-chip" class="sidebar-group"></div>
+    <nav id="tabs" class="sidebar-group" role="tablist"></nav>
+    <!-- The same numbers /status gives a grid card or the Diff pane, just kept
+         fresh regardless of which tab is open — see pollSidebarDiff() in
+         app.js. -->
+    <p id="sidebar-diffstat" class="sidebar-group meta"></p>
+    <div id="session-sticky" class="sidebar-group">
+      <div id="interrupt" hidden></div>
+      <div id="session-action"></div>
+    </div>
+    <!-- Filled with the same accountMeter() the header's #meters row builds
+         for every account, just this session's one — see renderSession(). -->
+    <div id="sidebar-account" class="sidebar-group"></div>
+    <div id="sidebar-switch-wrap" class="sidebar-group" hidden>
+      <p class="sidebar-label">Sessions</p>
+      <nav id="sidebar-switch"></nav>
+    </div>
+  </aside>
 
-  <div id="pane-chat">
-    <div id="transcript"></div>
-    <div id="attachments" aria-live="polite"></div>
-    <form id="composer">
-      <button id="attach" type="button" aria-controls="attach-input">📎 Attach</button>
-      <input id="attach-input" class="visually-hidden" type="file" multiple tabindex="-1"
-             aria-label="Choose files to attach" aria-describedby="attachments">
-      <input id="prompt" placeholder="Message…" autocomplete="off"><button type="submit">Send</button>
-    </form>
-    <p id="upload-error"></p>
-  </div>
+  <div id="session-main">
+    <header>
+      <h2 id="session-title"></h2>
+      <p id="session-stopped-reason" class="meta" hidden></p>
+      <span id="session-menu"></span>
+    </header>
 
-  <div id="pane-diff" hidden></div>
+    <div id="pane-chat">
+      <div id="transcript"></div>
+      <form id="composer">
+        <!-- One bordered shell holding attachments, the field and the controls, so
+             the composer reads as a single object instead of four styled parts
+             sitting next to each other. The border and focus ring live here; the
+             textarea inside is borderless. -->
+        <div id="composer-shell">
+          <!-- Thumbnails of images attached to the message being composed. Empty
+               (and display:none) until an upload lands; cleared once it is sent. -->
+          <div id="thumbs" aria-live="polite"></div>
+          <div id="prompt-box" class="cmd-box">
+            <!-- Paints the command in colour underneath the real input, which cannot
+                 style part of its own value. Hidden from AT: it duplicates the input. -->
+            <div id="prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
+            <!-- textarea, not input: an input scrolls sideways and shows only the tail
+                 of a long message. rows=1 keeps it one line until the text needs more.
+                 required: both composer buttons bail on an empty message, so without
+                 it they are dead controls that look enabled. This makes Send say so
+                 natively, and #schedule-btn borrows the same check — see app.js. -->
+            <textarea id="prompt" class="cmd-field" placeholder="Message…" rows="1" required
+                      autocomplete="off" role="combobox" aria-expanded="false"
+                      aria-controls="cmd-menu"></textarea>
+            <ul id="cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+          </div>
+          <div id="composer-tools">
+            <!-- The file input is hidden in CSS rather than with [hidden]: a
+                 display:none input cannot take focus, which left the attach
+                 control out of the tab order entirely. -->
+            <label id="attach" title="Attach files" aria-label="Attach files" aria-controls="attach-input">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+              <input id="attach-input" type="file" multiple></label>
+            <!-- Shown only while the open session's status is 'working' — see
+                 updateComposerButton() in app.js, which also fills #send-btn. -->
+            <div id="composer-dots" class="dots" hidden aria-hidden="true"><span></span><span></span><span></span></div>
+            <button id="schedule-btn" type="button" title="Schedule this message" aria-label="Schedule this message">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+            </button>
+            <!-- Content (icon + label) is set entirely by updateComposerButton():
+                 an arrow that submits while idle, a square that stops while
+                 working. Starts as the idle/arrow state so there's no flash of an
+                 empty button before the first render fills it in. -->
+            <button id="send-btn" type="submit" title="Send message" aria-label="Send message">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+            </button>
+          </div>
+        </div>
+      </form>
+      <p id="upload-error"></p>
+    </div>
 
-  <div id="pane-graph" hidden>
-    <div id="graph-map"><svg id="graph-svg"></svg><div id="graph-rows"></div></div>
+    <div id="pane-diff" hidden></div>
+
+    <div id="pane-graph" hidden>
+      <div id="graph-map"><svg id="graph-svg"></svg><div id="graph-rows"></div></div>
+    </div>
   </div>
 </section>
 <dialog id="new">
@@ -92,9 +183,26 @@
         </select></div></div>
     </fieldset>
     <div class="field">
+      <label for="when-select">Run</label>
+      <div class="select-wrap"><select id="when-select" name="when">
+        <option value="now">Now</option>
+        <option value="at">At a time…</option>
+        <option value="reset">When usage resets</option>
+      </select></div>
+      <!-- Native picker: no date library, and it hands back a local wall-clock
+           string that `new Date()` parses as local time, which is what the user
+           meant. -->
+      <input id="when-at" name="at" type="datetime-local" hidden>
+    </div>
+    <div class="field">
       <label for="prompt-input">First prompt</label>
-      <textarea id="prompt-input" name="prompt" required rows="3"
-                placeholder="What should the agent do?"></textarea>
+      <div id="new-prompt-box" class="cmd-box">
+        <div id="new-prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
+        <textarea id="prompt-input" class="cmd-field" name="prompt" required rows="3"
+                  placeholder="What should the agent do?"
+                  role="combobox" aria-expanded="false" aria-controls="new-cmd-menu"></textarea>
+        <ul id="new-cmd-menu" class="cmd-menu" role="listbox" aria-label="Slash commands" hidden></ul>
+      </div>
     </div>
     <p id="new-error"></p>
     <!-- formnovalidate: without it, Cancel is still a type=submit button inside
@@ -129,6 +237,21 @@
     <menu><button value="cancel" formnovalidate>Cancel</button><button value="save">Save settings</button></menu>
   </form>
 </dialog>
+<dialog id="when-dialog">
+  <form method="dialog">
+    <h2>Schedule message</h2>
+    <div class="field">
+      <label for="when2-select">Run</label>
+      <div class="select-wrap"><select id="when2-select" name="when">
+        <option value="at">At a time…</option>
+        <option value="reset">When usage resets</option>
+      </select></div>
+      <input id="when2-at" name="at" type="datetime-local">
+    </div>
+    <p id="when-error"></p>
+    <menu><button value="cancel" formnovalidate>Cancel</button><button value="ok">Schedule</button></menu>
+  </form>
+</dialog>
 <dialog id="del">
   <form method="dialog">
     <h2>Delete session</h2>
@@ -140,6 +263,58 @@
     <menu>
       <button value="cancel" formnovalidate>Cancel</button>
       <button id="del-go" value="delete">Delete</button>
+    </menu>
+  </form>
+</dialog>
+<dialog id="settings">
+  <form method="dialog">
+    <h2>Settings</h2>
+
+    <h3>New sessions</h3>
+    <label class="check">
+      <input type="checkbox" name="autoApprove">
+      Start with auto-approve on
+    </label>
+    <div class="field">
+      <label for="settings-account">Default account</label>
+      <div class="select-wrap"><select id="settings-account" name="account"></select></div>
+      <p class="hint">Which account the New dialog preselects.</p>
+    </div>
+    <div class="field">
+      <label for="settings-prefix">Branch prefix</label>
+      <input id="settings-prefix" name="branchPrefix" autocomplete="off" spellcheck="false"
+             placeholder="feat/">
+    </div>
+
+    <h3>Notifications</h3>
+    <label class="check"><input type="checkbox" name="notifyOn" value="needs-you"> A session needs you</label>
+    <label class="check"><input type="checkbox" name="notifyOn" value="done"> A session finishes</label>
+    <label class="check"><input type="checkbox" name="notifyOn" value="stopped"> A session stops or fails (including one you stop yourself)</label>
+
+    <h3>Grid</h3>
+    <div class="field">
+      <label for="settings-sort">Sort</label>
+      <div class="select-wrap"><select id="settings-sort" name="sort">
+        <option value="blocked">Blocked first</option>
+        <option value="newest">Newest first</option>
+        <option value="account">By account</option>
+      </select></div>
+    </div>
+    <label class="check"><input type="checkbox" name="collapseDone"> Hide finished sessions</label>
+
+    <h3>Behavior</h3>
+    <label class="check">
+      <input type="checkbox" name="autoRequeue">
+      Resume rate-limited sessions when the window resets
+    </label>
+    <p class="hint">Claude accounts only — Codex reports no rate-limit signal.</p>
+
+    <p id="settings-error"></p>
+    <!-- formnovalidate for the same reason #new's Cancel has it; see the
+         comment there. -->
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="save">Save</button>
     </menu>
   </form>
 </dialog>

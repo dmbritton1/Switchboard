@@ -280,6 +280,9 @@ test('completed SDK JSONL items normalize into append-only text and tool upserts
   const { events } = await collect(createCodexAdapter(fixture.runtime), fixture, 'basic', (all) =>
     all.some((event) => event.type === 'status' && event.status === 'done'));
 
+  const serialized = JSON.stringify(events);
+  assert.ok(!serialized.includes('never-expose-me'), 'account secret must not survive into any event');
+
   assert.deepEqual(events.filter((event) => event.type === 'msg'), [
     { type: 'msg', msg: { kind: 'text', text: 'fake response: basic' } },
   ]);

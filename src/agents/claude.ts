@@ -3,8 +3,15 @@ import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
-  Adapter, AdapterEvent, AgentHandle, AgentPrompt, ApprovalRequest, StartOpts,
+  AccountLimits, Adapter, AdapterEvent, AgentHandle, AgentPrompt, ApprovalRequest, QuestionOption,
+  StartOpts,
 } from '../types.ts';
+// Named for Codex only because that is where it was first needed — the function
+// itself is provider-agnostic (text in, account env in, redacted text out), so
+// it is reused here rather than reimplemented for Claude.
+import { redactCodexText as redactSecrets } from './codex-runtime.ts';
+import { simulatorServer } from './simulator.ts';
+import { browserServer, CHROME } from './browser.ts';
 
 export function renderClaudePrompt(prompt: AgentPrompt): string {
   return [
@@ -13,12 +20,84 @@ export function renderClaudePrompt(prompt: AgentPrompt): string {
   ].filter(Boolean).join('\n');
 }
 
-/** One line describing a tool call, for the transcript. */
-function summarize(name: string, input: Record<string, unknown>): string {
+/**
+ * In-process, so there is no server to spawn, no port and no new dependency —
+ * the handlers run in this process and hand the model a PNG it can actually
+ * look at, which is the one thing Bash cannot do.
+ *
+ * Each is gated on the thing it drives existing: xcrun ships nowhere but macOS,
+ * and Chrome may simply not be installed. Advertising a tool that can only ever
+ * fail costs every session context to no purpose.
+ */
+const mcpServers = {
+  ...(process.platform === 'darwin' ? { simulator: simulatorServer } : {}),
+  ...(CHROME ? { browser: browserServer } : {}),
+};
+
+/**
+ * One line describing a tool call. `listOptions` is off for the approval card,
+ * which renders the choices as buttons right underneath and would otherwise
+ * print each label twice; the transcript has no buttons and keeps them.
+ */
+function summarize(name: string, input: Record<string, unknown>, listOptions = true): string {
+  // AskUserQuestion carries none of the fields below, so it used to render as
+  // the bare tool name — the question itself never reached the UI. The SDK has
+  // no interactive terminal, so allowing it returns "The user did not answer";
+  // showing the text at least lets the answer be typed into the composer.
+  if (name === 'AskUserQuestion' && Array.isArray(input.questions)) {
+    type Q = { question?: string; options?: { label?: string }[] };
+    return (input.questions as Q[])
+      .map((q) => (listOptions
+        ? `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`
+        : q.question ?? ''))
+      .join(' | ');
+  }
   if (typeof input.command === 'string') return input.command;
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   return name;
+}
+
+/**
+ * Choices to render as answer buttons, or null for any tool that is not a
+ * question. Only the first question's options: the tool allows up to four
+ * questions, but one flat row of buttons cannot say which question an answer
+ * belongs to. Multi-question calls still show every question in the summary and
+ * can be answered by typing into the composer.
+ * ponytail: first question only — widen to a per-question row if that turns
+ * out to be common.
+ */
+export function questionOptions(
+  name: string,
+  input: Record<string, unknown>,
+): QuestionOption[] | null {
+  if (name !== 'AskUserQuestion' || !Array.isArray(input.questions)) return null;
+  const first = input.questions[0] as
+    { options?: { label?: unknown; description?: unknown }[] } | undefined;
+  const options = (first?.options ?? [])
+    .filter((o) => typeof o?.label === 'string' && o.label.length > 0)
+    .map((o) => ({
+      label: o.label as string,
+      // Optional in our own type even though the tool schema requires it: the
+      // input is the agent's, not ours, and a missing description should cost a
+      // subtitle, not the whole button.
+      ...(typeof o.description === 'string' && o.description ? { description: o.description } : {}),
+    }));
+  return options.length ? options : null;
+}
+
+/**
+ * The text a `tool_result` block carries, flattened. The SDK sends either a
+ * plain string or a block array; non-text blocks (images) are dropped, because
+ * the transcript stores text only — see the `result` field on Msg.
+ */
+export function resultText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return (content as Record<string, unknown>[])
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text as string)
+    .join('\n');
 }
 
 /** Pure: one SDK message in, zero or more normalized events out. */
@@ -34,6 +113,30 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
   // that's the one meant to report session identity.
   if (m.type === 'system' && m.subtype === 'init' && 'session_id' in m && m.session_id) {
     out.push({ type: 'vendor-session-id', id: m.session_id as string });
+    // The init message is the only place the CLI says which slash commands it
+    // resolved — plugins included. Reading it here costs nothing: the message
+    // already arrives, and no other part of the system can know the answer.
+    const commands = (m as { slash_commands?: unknown }).slash_commands;
+    if (Array.isArray(commands)) {
+      const names = commands.filter((c): c is string => typeof c === 'string');
+      if (names.length) out.push({ type: 'slash-commands', commands: names });
+    }
+    return out;
+  }
+
+  // SDKRateLimitEvent (sdk.d.ts) is a member of the SDKMessage union, so it
+  // arrives through the same for-await loop as everything else — the real reset
+  // timestamp costs no extra plumbing. The status is passed through as reported;
+  // deciding what a rejection means is Usage#noteLimit's job, not this one's.
+  if (m.type === 'rate_limit_event') {
+    const info = (m as { rate_limit_info?: { status?: string; resetsAt?: number } }).rate_limit_info;
+    if (info?.status) {
+      out.push({
+        type: 'rate-limit',
+        status: info.status as 'allowed' | 'allowed_warning' | 'rejected',
+        resetsAt: typeof info.resetsAt === 'number' ? info.resetsAt : null,
+      });
+    }
     return out;
   }
 
@@ -70,7 +173,15 @@ export function normalizeClaude(m: SDKMessage): AdapterEvent[] {
     if (Array.isArray(content)) {
       for (const block of content as Record<string, unknown>[]) {
         if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-          out.push({ type: 'tool-result', id: block.tool_use_id, ok: !block.is_error });
+          const text = resultText(block.content);
+          out.push({
+            type: 'tool-result',
+            id: block.tool_use_id,
+            ok: !block.is_error,
+            // Omitted rather than empty: a tool that returns nothing should leave
+            // the transcript row bare, not sprout an empty output box.
+            ...(text ? { text } : {}),
+          });
         }
       }
       return out;
@@ -209,10 +320,19 @@ export const claudeAdapter: Adapter = {
       toolName: string,
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
+      const options = questionOptions(toolName, toolInput);
       // Read at call time, not captured: setAuto() can flip this mid-session and
-      // every later tool call must see the new value.
-      if (auto) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
-      const request = { id: `a${++approvalSeq}`, tool: toolName, summary: summarize(toolName, toolInput) };
+      // every later tool call must see the new value. A question is exempt: auto
+      // means "don't make me approve tool calls", and allowing AskUserQuestion
+      // just makes the CLI answer "The user did not answer the questions" — the
+      // question would flash past with nothing to click.
+      if (auto && !options) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
+      const request = {
+        id: `a${++approvalSeq}`,
+        tool: toolName,
+        summary: summarize(toolName, toolInput, !options),
+        ...(options ? { options } : {}),
+      };
       const { promise, isHead } = approvals.wait(request);
       if (isHead) emit({ type: 'approval', request });
       return promise;
@@ -225,6 +345,7 @@ export const claudeAdapter: Adapter = {
       // callback was never removed.
       env: { ...process.env, ...opts.env } as Options['env'],
       canUseTool,
+      ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
       ...(opts.resumeId ? { resume: opts.resumeId } : {}),
     };
 
@@ -235,7 +356,16 @@ export const claudeAdapter: Adapter = {
       try {
         for await (const m of q) {
           emit({ type: 'status', status: 'working' });
-          for (const e of normalizeClaude(m)) emit(e);
+          // Tool output is the one event that can echo the account's own
+          // environment back at us — an agent that runs `env`, or a build that
+          // prints its auth header, would otherwise put a live credential into
+          // state.json, the SSE snapshot and the screen. normalizeClaude stays
+          // pure and env-free, so the scrub happens here, where opts.env is.
+          for (const e of normalizeClaude(m)) {
+            emit(e.type === 'tool-result' && e.text
+              ? { ...e, text: redactSecrets(e.text, opts.env) }
+              : e);
+          }
         }
         emit({ type: 'stopped', reason: 'session ended' });
       } catch (err) {
@@ -248,10 +378,15 @@ export const claudeAdapter: Adapter = {
         emit({ type: 'status', status: 'working' });
         input.push(renderClaudePrompt(prompt));
       },
-      decide(allow: boolean) {
-        const outcome = approvals.resolve(allow
-          ? { behavior: 'allow', updatedInput: {} }
-          : { behavior: 'deny', message: 'denied from switchboard' });
+      // An answer is delivered as a deny: `message` is the only field the SDK
+      // feeds back into the tool result, and allowing AskUserQuestion would let
+      // the CLI resolve it as unanswered instead.
+      decide(allow: boolean, answer?: string) {
+        const outcome = approvals.resolve(answer
+          ? { behavior: 'deny', message: `The user answered: ${answer}` }
+          : allow
+            ? { behavior: 'allow', updatedInput: {} }
+            : { behavior: 'deny', message: 'denied from switchboard' });
         if (!outcome) return;
         emit({ type: 'approval-resolved' });
         if (outcome.next) emit({ type: 'approval', request: outcome.next });
@@ -279,3 +414,76 @@ export const claudeAdapter: Adapter = {
     };
   },
 };
+
+/**
+ * Real claude.ai plan limits for one account, or a rejection.
+ *
+ * The SDK exposes this only on a live `Query`, but a Query does not need a
+ * session: the prompt stream below never yields, so the CLI starts, answers the
+ * control request, and is closed again without a prompt, a model turn, or a
+ * token of spend. That is what makes idle accounts pollable — which is the
+ * whole point, since "which account is freest" has to be answerable *before* a
+ * session exists.
+ *
+ * Deliberately does not reuse a running session's Query. That would mean
+ * threading a method through AgentHandle and the registry and would still need
+ * this standalone path for idle accounts.
+ *
+ * Rejects rather than returning null so the caller has one failure channel:
+ * a thrown error, a timeout, and `rate_limits_available: false` all mean the
+ * same thing to every consumer — no real number for this account.
+ */
+export async function probeLimits(
+  env: Record<string, string>,
+  timeoutMs = 30_000,
+): Promise<AccountLimits> {
+  const q = query({
+    // Never yields: the SDK pulls, gets nothing, and no turn is ever started.
+    prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+      await new Promise<never>(() => {});
+    })(),
+    options: {
+      env: { ...process.env, ...env } as Options['env'],
+      // Isolation: omitting settingSources loads the user's ~/.claude/settings.json
+      // plus project/local settings resolved against this server process's cwd,
+      // which can fire SessionStart hooks and boot every configured MCP server —
+      // per Claude account, every 5 minutes, forever — just to read a usage
+      // number. A usage probe must not have side effects.
+      settingSources: [],
+    },
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const usage = await Promise.race([
+      q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+      new Promise<never>((_, reject) => {
+        // A hung CLI must not wedge the refresh loop forever.
+        timer = setTimeout(() => reject(new Error('usage probe timed out')), timeoutMs);
+      }),
+    ]);
+    if (!usage.rate_limits_available || !usage.rate_limits) {
+      // API key, Bedrock, Vertex, or a token without the profile scope. Not an
+      // error the user can act on, but not a number either.
+      throw new Error('plan rate limits are not available for this account');
+    }
+    const win = (w: { utilization: number | null; resets_at: string | null } | null | undefined) =>
+      (w && typeof w.utilization === 'number' && w.resets_at
+        ? { utilization: w.utilization, resetsAt: w.resets_at }
+        : null);
+    const fiveHour = win(usage.rate_limits.five_hour);
+    const sevenDay = win(usage.rate_limits.seven_day);
+    // Both windows are optional in the SDK type, so `rate_limits_available: true`
+    // does not guarantee either one is actually present. Rejecting here — the
+    // same failure channel as the check above — keeps a missing number from
+    // being reported as an authoritative 0%, which would sort this account as
+    // the freest one available and render with none of the estimate's caveats.
+    if (!fiveHour && !sevenDay) {
+      throw new Error('plan rate limits were reported available but both windows were empty');
+    }
+    return { fiveHour, sevenDay, subscription: usage.subscription_type };
+  } finally {
+    clearTimeout(timer);
+    // Releases the child process. Without this the node event loop stays alive.
+    q.close();
+  }
+}

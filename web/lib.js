@@ -7,11 +7,28 @@ const ORDER = { 'needs-you': 0, working: 1, done: 2, stopped: 3 };
 const MIXED = 'Selected worktrees belong to different repos — pick worktrees from one repo';
 const basename = (p) => p.split('/').filter(Boolean).pop() ?? p;
 
-/** Blocked first, then running, then finished — most recently changed first within each. */
-export function sortSessions(sessions) {
-  return [...sessions].sort(
-    (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince,
-  );
+const byBlocked = (a, b) => ORDER[a.status] - ORDER[b.status] || b.statusSince - a.statusSince;
+
+/**
+ * Grid order. `blocked` is the default and the original behavior: blocked
+ * first, then running, then finished, most recently changed first within each.
+ * `newest` is a flat recency list. `account` groups by account name and falls
+ * back to `blocked` inside each group, so grouping never costs you the
+ * blocked-first reflex within the account you are looking at.
+ */
+export function sortSessions(sessions, mode = 'blocked') {
+  const cmp = mode === 'newest'
+    ? (a, b) => b.statusSince - a.statusSince
+    : mode === 'account'
+      ? (a, b) => a.account.localeCompare(b.account) || byBlocked(a, b)
+      : byBlocked;
+  return [...sessions].sort(cmp);
+}
+
+/** Hides finished sessions when the setting asks. `stopped` is deliberately not
+ *  hidden: it carries a Resume button and unfinished work, unlike `done`. */
+export function visibleSessions(sessions, collapseDone) {
+  return collapseDone ? sessions.filter((s) => s.status !== 'done') : sessions;
 }
 
 /**
@@ -32,6 +49,31 @@ export function cardAction(session, queue = []) {
     return held ? { kind: 'waiting', account: held.trigger.account } : { kind: 'resume' };
   }
   return { kind: 'none' };
+}
+
+/**
+ * The buttons a pending request gets: `{ label, description, command }`, where
+ * `command` is merged into the decide call. An AskUserQuestion carries
+ * `options`, and each one answers the question outright, captioned with the
+ * agent's own explanation of that choice; Skip denies it normally so the agent
+ * falls back to asking in prose, which the composer can answer. Everything else
+ * is the usual Allow/Deny, which needs no caption.
+ */
+export function decideSpecs(pending) {
+  if (!pending.options?.length) {
+    return [
+      { label: 'Allow', command: { allow: true } },
+      { label: 'Deny', command: { allow: false } },
+    ];
+  }
+  return [
+    ...pending.options.map(({ label, description }) => ({
+      label,
+      description,
+      command: { answer: label },
+    })),
+    { label: 'Skip', description: 'None of these — answer in your own words instead.', command: { allow: false } },
+  ];
 }
 
 /** A queue item's trigger, rendered for the queue strip. */
@@ -77,6 +119,116 @@ export function selectionState(sessions, selected) {
     },
     push: { enabled: !mixed, reason: mixed ? MIXED : '' },
   };
+}
+
+/**
+ * The transcript with consecutive tool messages folded into one collapsible
+ * run, so a stretch of Read/Bash/Edit chatter costs one line instead of twenty.
+ * Everything else passes through as `{ kind: 'msg', msg }`, and a run of one is
+ * demoted back to a plain message — wrapping a single line in a disclosure
+ * widget trades noise for noise.
+ *
+ * `at` is the index of the run's first message. The transcript is append-only,
+ * so that index is a stable key for "did the user expand this run?" across the
+ * full rebuild render() does on every SSE snapshot.
+ */
+export function groupTranscript(transcript) {
+  const out = [];
+  for (const [i, msg] of transcript.entries()) {
+    const last = out.at(-1);
+    if (msg.kind !== 'tool') out.push({ kind: 'msg', msg });
+    else if (last?.kind === 'tools') last.msgs.push(msg);
+    else out.push({ kind: 'tools', at: i, msgs: [msg] });
+  }
+  return out.map((g) => (g.kind === 'tools' && g.msgs.length === 1
+    ? { kind: 'msg', msg: g.msgs[0] }
+    : g));
+}
+
+/**
+ * The one line a collapsed run shows. Tool names, not summaries: the summaries
+ * are the thing being hidden, and the names are what tells you whether the run
+ * was reading around or rewriting your files. Unresolved state (running, failed)
+ * is on the label because that is what decides whether it is worth opening.
+ */
+export function toolRunLabel(msgs) {
+  const names = [...new Set(msgs.map((m) => m.name))];
+  const failed = msgs.filter((m) => m.status === 'error').length;
+  return `${msgs.length} tool calls · ${names.slice(0, 3).join(', ')}${names.length > 3 ? '…' : ''}`
+    + (failed ? ` · ${failed} failed` : '')
+    + (msgs.some((m) => m.status === 'running') ? ' · running' : '');
+}
+
+/**
+ * How a resolved tool call presents its output: `label` goes on the call's one
+ * line, `fold` says whether the full text is worth hiding behind a disclosure.
+ *
+ * Long output is measured, not shown — the size is what tells you whether
+ * opening it is worth it. A short single-line result is exempt: it is already
+ * its own best summary, and folding it would cost a click to reveal less than
+ * the click did.
+ */
+export function resultMeta(result) {
+  const text = (result ?? '').replace(/\n+$/, '');
+  if (!text) return { label: '', fold: false };
+  const lines = text.split('\n');
+  if (lines.length === 1 && text.length <= 80) return { label: text, fold: false };
+  return { label: `${lines.length} line${lines.length === 1 ? '' : 's'}`, fold: true };
+}
+
+// A prompt this many lines, or this many characters, is long enough that
+// showing it in full pushes every reply below it off screen — a pasted spec
+// or stack trace reads as "prompt, prompt, prompt, then finally the agent
+// says something." Chosen to comfortably fit a short paragraph or two, the
+// common case, while still catching anything meant to be read by scrolling.
+const PROMPT_FOLD_LINES = 6;
+const PROMPT_FOLD_CHARS = 600;
+
+/**
+ * Where to fold a long user prompt, or null if it is short enough to show in
+ * full. `head` and `rest` always concatenate back to the original text
+ * exactly — no ellipsis or other marker is spliced in — so the visible part
+ * is never gibberish and the full prompt is still exactly what was sent, not
+ * a lossy reconstruction of it.
+ *
+ * A prompt with real line breaks (the common paste) folds at a line boundary,
+ * which keeps whole paragraphs intact on each side. One with no line breaks
+ * to speak of (or absurdly long ones) instead folds near the character cap,
+ * on the nearest word boundary so the visible edge doesn't end mid-word.
+ */
+export function promptFold(text) {
+  const lines = text.split('\n');
+  if (lines.length <= PROMPT_FOLD_LINES && text.length <= PROMPT_FOLD_CHARS) return null;
+  if (lines.length > PROMPT_FOLD_LINES) {
+    return {
+      head: lines.slice(0, PROMPT_FOLD_LINES).join('\n'),
+      rest: `\n${lines.slice(PROMPT_FOLD_LINES).join('\n')}`,
+    };
+  }
+  let cut = text.lastIndexOf(' ', PROMPT_FOLD_CHARS);
+  // No space anywhere near the cap (one very long token) — just cut on it.
+  if (cut < PROMPT_FOLD_CHARS * 0.5) cut = PROMPT_FOLD_CHARS;
+  return { head: text.slice(0, cut), rest: text.slice(cut) };
+}
+
+/**
+ * The message that actually reaches the agent: what the user typed, then the
+ * paths of whatever they attached, one per line.
+ *
+ * The paths ride in the text because no adapter accepts attachments — see
+ * docs/superpowers/specs/2026-07-30-file-upload-design.md. They are appended
+ * at send time instead of being typed into the box, so the composer can show a
+ * removable chip rather than a path the user has to delete by hand.
+ */
+export function composeMessage(text, paths) {
+  return [text.trim(), ...paths].filter(Boolean).join('\n');
+}
+
+// Every pasted screenshot arrives named "image.png", and the upload route
+// overwrites by name — so two pastes in one message would collide and both
+// paths in the prompt would point at the second image. Stamp them unique.
+export function pastedName(name, at = Date.now(), i = 0) {
+  return `paste-${at}-${i}-${name || 'image.png'}`;
 }
 
 export const CODEX_FAILURE_LABEL = Object.freeze({
@@ -508,4 +660,276 @@ export async function fetchToolDetail(sessionId, itemId, fetchImpl = fetch) {
     throw new Error('Detail request failed.');
   }
   return body;
+}
+
+/**
+ * The account the New worktree dialog defaults to.
+ *
+ * Not simply the lowest `load`. Since real plan limits landed, an account that
+ * has them reports true utilization while one that doesn't falls back to the
+ * local token-spend estimate — which reads 0% until Switchboard has watched it
+ * spend something, and is 0% forever for a provider it can't probe. Ranking
+ * those two numbers against each other made every un-probed account the
+ * "freest" one available, so the dialog silently defaulted to it. A real number
+ * outranks an estimate (`real` in accountView() is the same test); ties fall
+ * back to load.
+ */
+export function freestAccount(accounts) {
+  return [...accounts].sort(
+    (a, b) => Number(Boolean(b.limits)) - Number(Boolean(a.limits)) || a.load - b.load,
+  )[0];
+}
+
+/**
+ * Which sessions just entered a status worth notifying about.
+ *
+ * Keyed `id:status` rather than by id alone, so needs-you and done are tracked
+ * independently and a session that goes needs-you -> working -> needs-you
+ * notifies twice, which is two real interruptions.
+ *
+ * `seed` exists for one reason: EventSource reconnects on its own and the
+ * server pushes a full snapshot on connect. Called with seed=true on the first
+ * payload after a connect, this fires nothing and returns a seen-set covering
+ * everything already on the board — without it, every dropped connection
+ * notifies once per finished session for work that ended hours ago.
+ *
+ * The returned set is rebuilt from the current sessions each call, so a
+ * deleted session's keys do not accumulate forever.
+ */
+export function newlyNotifiable(sessions, notifyOn, seen, seed = false) {
+  const watched = sessions.filter((s) => notifyOn.includes(s.status));
+  const next = new Set(watched.map((s) => `${s.id}:${s.status}`));
+  const fire = seed ? [] : watched.filter((s) => !seen.has(`${s.id}:${s.status}`));
+  return { fire, seen: next };
+}
+
+/**
+ * Everything the meter and the account panel need to decide *what* to say,
+ * with no DOM. The two branches are the point: an account with real plan
+ * limits and one falling back to the local budget estimate must not be worded
+ * the same, or an estimate reads as fact.
+ *
+ * The headline number is always the 5-hour window when the plan reports one:
+ * it is the window that resets every few hours, so it is the one worth a
+ * reflex check at a glance. Weekly utilization is still visible — both windows
+ * are in `windows`, which the tap-open panel lists in full — it just does not
+ * get to replace the badge's number. (`load`, used for the bar fill/color and
+ * the New Session picker, is unrelated: it stays the worse-of-both-windows
+ * fraction the server computes, so a nearly-exhausted week still ranks that
+ * account as less free even though the badge reads 5h.)
+ */
+export function accountView(a) {
+  const l = a.limits;
+  if (!l) {
+    const pct = Math.round(a.pace * 100);
+    return {
+      load: a.load ?? a.pace,
+      pct,
+      real: false,
+      title: `${a.name} — ~${pct}% of its 5h budget (estimate)`,
+      budgetLine: `${a.provider} · ~${pct}% of a ${a.budget.toLocaleString()} token budget · estimate`,
+      note: 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.',
+      windows: [],
+    };
+  }
+  const windows = [
+    l.fiveHour && { label: '5h', pct: l.fiveHour.utilization, resetsAt: l.fiveHour.resetsAt },
+    l.sevenDay && { label: '7d', pct: l.sevenDay.utilization, resetsAt: l.sevenDay.resetsAt },
+  ].filter(Boolean);
+  // Fall back to whatever is there (7d only) for a plan that does not report a
+  // 5h window at all. windows[0] is a safe fallback, not a guess: probeLimits()
+  // rejects rather than resolving when both windows are empty, so `limits`
+  // non-null guarantees at least one entry here.
+  const primary = windows.find((w) => w.label === '5h') ?? windows[0];
+  return {
+    load: a.load,
+    pct: primary.pct,
+    real: true,
+    title: `${a.name} — ${primary.pct}% of the ${primary.label} limit`,
+    budgetLine: `${a.provider} · ${l.subscription ?? 'unknown'} plan`,
+    note: '',
+    windows,
+  };
+}
+
+/**
+ * The command token at the start of `text`, or -1 if there isn't one. Ends at
+ * any whitespace, not just a space: the new-session prompt is a textarea, where
+ * the command is the first line and a newline ends it just as surely.
+ */
+function tokenEnd(text) {
+  if (!text.startsWith('/')) return -1;
+  const ws = text.search(/\s/);
+  return ws === -1 ? text.length : ws;
+}
+
+/** Where a name sorts for `query`: whole-name prefix, bare-name prefix, or substring. */
+function rank(name, query) {
+  const lower = name.toLowerCase();
+  // Commands are listed namespaced ("ponytail:ponytail-help") but typing the
+  // bare name works too, so "help" has to reach past the plugin prefix.
+  const bare = lower.slice(lower.indexOf(':') + 1);
+  if (lower.startsWith(query)) return 0;
+  if (bare.startsWith(query)) return 1;
+  return lower.includes(query) ? 2 : 3;
+}
+
+/**
+ * What the composer's command menu should show, or null for "no menu".
+ *
+ * The menu belongs to the first token only: once the caret is past it the user
+ * is writing arguments, and a list of commands is just in the way.
+ */
+export function commandMenu(text, caret, commands, limit = 8) {
+  const end = tokenEnd(text);
+  if (end === -1 || caret > end) return null;
+  const query = text.slice(1, end).toLowerCase();
+  const matches = commands
+    .filter((c) => rank(c, query) < 3)
+    .sort((a, b) => rank(a, query) - rank(b, query) || a.localeCompare(b))
+    .slice(0, limit);
+  return matches.length ? { query, matches } : null;
+}
+
+/**
+ * The leading command if it is one the agent will actually recognise, else null.
+ * This is what gets coloured — highlighting an unknown token would promise the
+ * user something that is about to be sent as plain text.
+ */
+export function commandToken(text, commands) {
+  const end = tokenEnd(text);
+  if (end === -1) return null;
+  const token = text.slice(1, end);
+  const known = commands.some((c) => c === token || c.slice(c.indexOf(':') + 1) === token);
+  return known ? text.slice(0, end) : null;
+}
+
+// In picker order: ten accents by ascending OKLCH hue, starting near coral,
+// then the twelve canvases — six light families, then their six dark twins.
+// The hexes live in web/style.css, which is what test/palette.test.ts
+// measures — these are only names.
+export const ACCENTS = Object.freeze([
+  'clay', 'coral', 'ochre', 'moss', 'fern', 'teal', 'slate', 'indigo', 'plum', 'mulberry',
+]);
+export const CANVASES = Object.freeze([
+  'cream', 'linen', 'shell', 'mist', 'porcelain', 'bone',
+  'obsidian', 'umber', 'ember', 'pine', 'midnight', 'graphite',
+]);
+
+const DEFAULT_THEME = Object.freeze({ accent: 'coral', canvas: 'obsidian' });
+
+/**
+ * The stored theme, or the default for anything that is not a known pair.
+ * localStorage is user-editable and this value is read before the stylesheet
+ * applies, so an unvalidated one paints an unstyled page. The two halves fall
+ * back independently: an unrecognised accent should not also throw away a
+ * perfectly good canvas.
+ */
+export function readTheme(raw) {
+  let stored;
+  try {
+    stored = JSON.parse(raw);
+  } catch {
+    return { ...DEFAULT_THEME };
+  }
+  return {
+    accent: ACCENTS.includes(stored?.accent) ? stored.accent : DEFAULT_THEME.accent,
+    canvas: CANVASES.includes(stored?.canvas) ? stored.canvas : DEFAULT_THEME.canvas,
+  };
+}
+
+/**
+ * Maps each commit to the branch whose line it sits on, for hover-tracing.
+ *
+ * git only reports a ref at a branch's tip, so every commit below it is
+ * anonymous. Walking back from each tip recovers the rest. The first tip to
+ * claim a commit keeps it — the same first-claimer-wins rule assignLanes
+ * already applies to lanes — and the walk stops at trunk, which has its own
+ * tier and needs no tracing.
+ */
+function branchNames(c) {
+  return c.refs
+    .filter((r) => !r.startsWith('tag: '))
+    .map((r) => r.replace(/^HEAD -> /, ''))
+    .filter((r) => r !== 'HEAD');
+}
+
+/**
+ * A hue slot per branch name — the index of a `.hue-N` rule in the stylesheet,
+ * which is where the actual colours live.
+ *
+ * Keyed on the name and not the lane: lanes are recycled as branches close, so
+ * a lane colour renamed itself mid-graph and said nothing about which branch
+ * you were looking at. Assigned by sorted position rather than by hashing the
+ * name, which collides — five branches drew in three colours on the first repo
+ * this was tried against. Sorting gives the first HUES branches a colour each;
+ * past that they wrap, which hover-to-trace separates. The cost is that adding
+ * a branch shifts the colours of the names sorting after it.
+ */
+export const HUES = 5;
+
+export function branchHues(names) {
+  return new Map([...new Set(names)].sort().map((name, i) => [name, i % HUES]));
+}
+
+export function attributeBranches(commits) {
+  const at = new Map(commits.map((c) => [c.h, c]));
+  const owner = new Map();
+  // Seed each ref-bearing commit with its own name before any walk runs. A
+  // merge's walk reaches every ancestor of both parents, including another
+  // branch's tip (the merged-in branch's own history) — without a seed, that
+  // walk would run first (it's the child, so it's earlier in topo order) and
+  // claim the tip for itself before the tip ever gets to claim its own name.
+  for (const c of commits) {
+    if (c.tier === 'trunk') continue;
+    const names = branchNames(c);
+    if (names.length && !owner.has(c.h)) owner.set(c.h, names[0]);
+  }
+  for (const c of commits) {
+    const names = branchNames(c);
+    for (const name of names) {
+      const queue = [c.h];
+      const seen = new Set();
+      while (queue.length) {
+        const h = queue.shift();
+        const cur = at.get(h);
+        // Missing parent (outside the window) or trunk, which has its own tier.
+        if (!cur || cur.tier === 'trunk') continue;
+        // Claimed by a different name: another branch's tip, which the seed
+        // pass pre-claimed for itself — stop rather than swallow its history.
+        const claimed = owner.get(h);
+        if (claimed !== undefined && claimed !== name) continue;
+        // Expanded already. The guard above deliberately lets a same-name node
+        // through, so without this a node reachable by two paths inside one
+        // branch re-expands its whole ancestry each time — exponential on
+        // nested merges, in a function that reruns every 2s poll.
+        if (seen.has(h)) continue;
+        seen.add(h);
+        owner.set(h, name);
+        queue.push(...cur.p);
+      }
+    }
+  }
+  return owner;
+}
+
+/**
+ * The one-line label for a file in the Diff pane. Binary files get a word
+ * rather than `+0 −0`: git refuses to count their lines and so does this, and
+ * a pair of zeroes would read as "nothing changed".
+ */
+export function diffSummary(file) {
+  const name = file.old ? `${file.old} → ${file.path}` : file.path;
+  return file.binary ? `${name} · binary` : `${name} · +${file.added} −${file.removed}`;
+}
+
+/**
+ * Which class one line of a unified patch body wears. The `---`/`+++` file
+ * headers are stripped server-side, so a leading `+` here is always content.
+ */
+export function patchLineClass(line) {
+  if (line.startsWith('@@')) return 'hunk';
+  if (line.startsWith('+')) return 'add';
+  if (line.startsWith('-')) return 'del';
+  return '';
 }

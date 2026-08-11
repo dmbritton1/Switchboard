@@ -21,8 +21,13 @@ function errMsg(err: unknown): string {
   return trimmed || String((err as Error).message ?? err);
 }
 
+/**
+ * `uploads/` is excluded for the same reason the add below excludes it: those
+ * files are conversation inputs, not work. Counting them as dirty would ask
+ * for a commit that then stages nothing and fails on "nothing to commit".
+ */
 async function isDirty(cwd: string): Promise<boolean> {
-  const { stdout } = await run('git', ['status', '--porcelain'], { cwd });
+  const { stdout } = await run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd });
   return stdout.trim().length > 0;
 }
 
@@ -42,7 +47,7 @@ async function isRepoDirty(repo: string): Promise<boolean> {
   return stdout.trim().length > 0;
 }
 
-async function currentBranch(cwd: string): Promise<string> {
+export async function currentBranch(cwd: string): Promise<string> {
   const { stdout } = await run('git', ['branch', '--show-current'], { cwd });
   return stdout.trim();
 }
@@ -90,7 +95,14 @@ export async function mergeWorktrees(
       }
       if (await isDirty(cwd)) {
         try {
-          await run('git', ['add', '-A'], { cwd });
+          // `uploads/` is where /upload drops pasted and attached files so the
+          // agent can read them by path. They are inputs to the conversation,
+          // not work product, and staging them here committed every screenshot
+          // into the branch and then permanently into the merge target.
+          // ponytail: excludes the whole directory, so a repo that tracks its
+          // own `uploads/` loses auto-commit for it. Narrow to the paths the
+          // registry recorded if that ever bites.
+          await run('git', ['add', '-A', '--', '.', ':(exclude)uploads'], { cwd });
           await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
         } catch (err) {
           return { ok: false, merged, error: `committing "${branch}" failed: ${errMsg(err)}` };
