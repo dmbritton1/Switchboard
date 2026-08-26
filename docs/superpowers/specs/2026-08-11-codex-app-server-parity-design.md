@@ -1,16 +1,17 @@
 # Codex app-server parity design
 
-**Date:** 2026-08-11
+**Date:** 2026-08-11; revised 2026-08-26
 
-**Status:** Approved
+**Status:** Revised — awaiting review
 
-**Scope:** Codex transport and five Claude-parity gaps in Switchboard
+**Scope:** A reusable Codex app-server foundation, usage telemetry as its first
+release, and five later Claude-parity gaps in Switchboard
 
 ## Summary
 
-Switchboard currently runs Codex through `@openai/codex-sdk` 0.145.0. That
-transport supports thread lifecycle and streamed items, but it cannot provide
-the interactive and account-level surfaces needed for:
+Switchboard currently runs Codex turns through `@openai/codex-sdk` 0.145.0.
+That transport supports thread lifecycle and streamed items, but it cannot
+provide the interactive and account-level surfaces needed for:
 
 1. Codex approvals and `needs-you` state.
 2. Structured user questions.
@@ -18,9 +19,13 @@ the interactive and account-level surfaces needed for:
 4. Switchboard-injected browser and simulator screenshot tools.
 5. Reliable Codex plan/rate-limit telemetry and automatic reset requeue.
 
-These features will be implemented on Codex app-server. The rollout is staged:
-new, explicitly opted-in sessions use app-server while existing SDK sessions
-retain the SDK for their entire lifetime. The two transports must never own the
+These features will be implemented on Codex app-server, but account telemetry
+lands first. The first release creates one reusable, account-scoped app-server
+supervisor per Codex account and uses it only to read plan and rate-limit data.
+All Codex threads and turns remain SDK-owned during that release. Later phases
+extend the same supervisor to opted-in new app-server sessions, interactions,
+capabilities, tools, and typed usage-limit recovery. Existing SDK sessions
+retain the SDK for their entire lifetime, and the two transports never own the
 same vendor thread.
 
 The design uses stable app-server APIs except for one narrowly allowlisted,
@@ -30,16 +35,22 @@ are documented as under development.
 
 ## Goals
 
+- Ship authoritative Codex usage windows, including the normally reported
+  five-hour window, before migrating any Codex turn transport.
+- Make that first release the durable app-server account/process foundation for
+  later work rather than a disposable polling probe.
+- Use authoritative Codex reset timestamps for manual reset scheduling from the
+  first release, with a fresh provider check before queued work is released.
 - Give Codex sessions the same visible `needs-you` and Auto behavior that Claude
-  sessions have today.
+  sessions have today in a later interaction phase.
 - Render one app-server question at a time while responding to the complete
   request atomically.
 - Keep Switchboard's Claude-shaped slash menu while translating selections into
   native Codex inputs.
 - Share the existing browser and simulator screenshot implementations between
   Claude and Codex.
-- Use authoritative Codex account windows and reset timestamps for display,
-  scheduling, and recovery.
+- Add exact automatic recovery only after app-server owns the affected turn and
+  reports typed `UsageLimitExceeded` data.
 - Preserve the fixed Codex `workspace-write` sandbox, repository instructions,
   repository configuration, worktree isolation, and launch-secret boundaries.
 - Keep `npm test` offline, deterministic, and free of paid account calls.
@@ -58,22 +69,39 @@ are documented as under development.
 - Automatically replaying an interrupted turn after a transport crash.
 - Guessing a Codex reset time for an API-key-only or otherwise unsupported
   account.
+- Inferring `UsageLimitExceeded` from SDK error text, or from the coincidence of
+  an SDK failure and an exhausted account window.
+- Automatically requeueing a failed SDK-owned Codex turn. Exact recovery waits
+  for the later app-server turn-transport phase.
 
 ## Selected delivery approach
 
 Work proceeds foundation-first in independently releasable phases:
 
-1. App-server transport, supervision, schema validation, persisted transport
-   ownership, and SDK fallback for legacy sessions.
-2. Approvals, `needs-you`, sequential questions, and MCP elicitation.
-3. Claude-shaped capability discovery plus browser/simulator MCP sidecars.
-4. Plan/rate-limit telemetry and Claude-like automatic reset requeue.
-5. App-server default after live compatibility gates and a soak period.
+1. Account-scoped app-server supervision, version-matched schema validation,
+   authoritative plan/rate-limit telemetry, provider-neutral meters and
+   ranking, and fresh reset-aware manual scheduling. No app-server thread or
+   turn is created; every Codex session remains SDK-owned.
+2. App-server thread transport for explicitly opted-in new sessions, persisted
+   transport ownership, and SDK fallback for legacy sessions.
+3. Approvals, `needs-you`, sequential questions, and MCP elicitation.
+4. Claude-shaped capability discovery plus browser/simulator MCP sidecars.
+5. Typed `UsageLimitExceeded` recovery for app-server-owned turns, followed by
+   the app-server new-session default only after live compatibility gates and a
+   soak period.
 
-A feature-by-feature transport bridge was rejected because it would duplicate
-request correlation, lifecycle, and fallback logic. A single big-bang
-replacement was rejected because it would combine transport, UI, account, and
-MCP risk into one rollback boundary.
+The first phase is not a second, throwaway app-server client. It establishes the
+same request correlation, process supervision, generated contract, and account
+ownership that later phases extend. A short-lived process spawned every five
+minutes was rejected because it would discard notification support and require
+process-lifecycle work to be replaced later. A single big-bang replacement was
+rejected because it would delay the requested usage meter and combine
+transport, UI, account, and MCP risk into one rollback boundary.
+
+The existing `2026-08-11-codex-*.md` implementation plans predate this revised
+ordering. They must be replaced or revised before execution; their old
+foundation-first-then-limits dependency order is not authorization to defer the
+telemetry-first release described here.
 
 ## Architecture
 
@@ -81,18 +109,25 @@ MCP risk into one rollback boundary.
 flowchart LR
     UI["Switchboard browser"] --> HTTP["HTTP and SSE server"]
     HTTP --> REG["Registry and scheduler"]
-    HTTP --> ROUTE{"Persisted session transport"}
-    ROUTE -->|"Legacy session"| SDK["Existing Codex SDK adapter"]
-    ROUTE -->|"Opted-in new session"| SUP["Account-scoped app-server supervisor"]
+    HTTP --> SDK["Existing Codex SDK adapter"]
+    HTTP --> SUP["Account-scoped app-server supervisor"]
     SUP --> CODEX["codex app-server process"]
-    CODEX --> WT["Dedicated session worktrees"]
-    CODEX --> MCP["Browser and simulator MCP sidecars"]
     SUP --> LIMITS["Account limits and reset scheduler"]
+    HTTP -. "later opted-in sessions" .-> ROUTE{"Persisted session transport"}
+    ROUTE -.-> SDK
+    ROUTE -.-> SUP
+    SUP -. "later phases" .-> WT["Dedicated session worktrees"]
+    SUP -. "later phases" .-> MCP["Browser and simulator MCP sidecars"]
 ```
 
 ### Transport ownership
 
-Add a persisted `codexTransport: "sdk" | "app-server"` field to Codex sessions.
+The telemetry-first release adds no session transport field: every Codex session
+continues to use the SDK. The app-server process owns account telemetry only and
+must not start, resume, read, or interrupt a vendor thread.
+
+When the later turn-transport phase begins, add a persisted
+`codexTransport: "sdk" | "app-server"` field to Codex sessions.
 
 - A restored Codex session without the field is treated as `sdk`.
 - New sessions copy the selected transport from their account configuration.
@@ -106,40 +141,61 @@ diagnostics. It does not permit cross-transport migration.
 
 ### Account-scoped supervisor
 
-Each opted-in Codex account gets one app-server child process. This matches the
-account-scoped authentication environment and rate-limit stream while allowing
-the process to multiplex several Switchboard sessions. Each app-server thread
-still receives exactly one dedicated git worktree.
+Each Codex account gets one app-server child process after telemetry preflight
+succeeds. This matches the account-scoped authentication environment and
+rate-limit stream. In the first release the process is long-lived only for
+account telemetry; it owns no threads and receives no worktree. Later it may
+multiplex opted-in app-server sessions, each of which still receives exactly one
+dedicated git worktree.
 
 The supervisor owns:
 
 - App-server initialization and capability negotiation.
 - Monotonic client request IDs and a pending-resolver map.
-- Server-request correlation and response delivery.
-- Thread ID to Switchboard session ID routing.
 - Process shutdown, bounded restart backoff, and malformed-output handling.
 - Account plan and rate-limit reads/notifications.
 - Redaction before events reach the Registry.
-- MCP sidecar process configuration and status.
+- Coalesced explicit reads and five-minute reconciliation.
 
-A supervisor crash stops all of its active turns with a typed transport error,
-clears their pending interactions, and marks queued prompts unsent. It may
-restart for future work, but it does not replay interrupted turns because a
-command or file change may already have taken effect.
+Later phases add server-request correlation, thread-to-session routing, and MCP
+sidecar configuration to this same supervisor. They do not introduce another
+app-server process owner.
+
+During the telemetry-first release, a supervisor crash marks its account
+snapshot stale, reports a sanitized soft error, and leaves SDK sessions
+untouched. Once the supervisor owns turns, a crash additionally stops its
+active turns with a typed transport error, clears pending interactions, and
+marks queued prompts unsent. It may restart for future work, but it never
+replays an interrupted turn because a command or file change may already have
+taken effect.
+
+The telemetry process uses a phase-specific method allowlist and does not enable
+experimental capabilities, inject MCP sidecars, or issue thread/turn methods.
+It always starts with process-local, version-matched overrides that disable MCP
+servers and lifecycle hooks for that child without writing `.codex/config.toml`
+or changing the user's configuration. If the pinned executable cannot guarantee
+that side-effect-free startup, telemetry preflight fails and the account keeps
+the local estimate.
 
 ### Version-matched protocol contract
 
-Switchboard is currently pinned to Codex SDK/CLI 0.145.0, while required account
-and capability APIs were added later. The transport phase therefore begins by:
+Switchboard is currently pinned to Codex SDK/CLI 0.145.0. A generated schema
+from the installed executable contains the account rate-limit methods required
+for the first release. Each phase nevertheless treats its exact generated
+schema as authoritative and begins by:
 
 1. Selecting and pinning one SDK/CLI version whose generated schema includes
-   every required method.
+   that phase's required methods.
 2. Generating protocol types/schema from that exact executable.
-3. Checking the required stable method allowlist and the one experimental
-   `tool/requestUserInput` exception.
-4. Rejecting app-server preflight when the executable version does not match the
+3. For phase one, allowing only initialization, `account/read`,
+   `account/rateLimits/read`, `account/updated`, and
+   `account/rateLimits/updated`.
+4. Expanding the allowlist only when a later phase begins. The experimental
+   `tool/requestUserInput` exception remains capability-gated to the interaction
+   phase.
+5. Rejecting app-server preflight when the executable version does not match the
    compiled protocol contract.
-5. Keeping the SDK transport operational during the rollout.
+6. Keeping the SDK transport operational throughout the rollout.
 
 No production implementation should copy shapes from current online
 documentation without first confirming them in the pinned executable's
@@ -335,8 +391,8 @@ requires a separate design.
 
 ## Plan and rate-limit telemetry
 
-Generalize the account-limit model so it no longer assumes fixed Claude window
-names:
+This is the first user-visible app-server feature. Generalize the account-limit
+model so it no longer assumes fixed Claude window names:
 
 ```ts
 type AccountLimitSnapshot = {
@@ -360,23 +416,41 @@ Codex uses:
 - `account/read` and `account/updated` for plan type.
 - `account/rateLimits/read` for initial state and reconciliation.
 - `account/rateLimits/updated` for live changes.
-- `codexErrorInfo: UsageLimitExceeded` for typed turn failure.
 
-The badge headlines the shortest applicable window. The expanded account panel
-shows every window and local reset time. Account ranking continues to use the
-highest reported utilization so a nearly exhausted long window cannot be
-hidden by a quiet short one.
+The first release does not consume thread or turn events. A later app-server
+turn-transport phase additionally uses `codexErrorInfo: UsageLimitExceeded` for
+typed turn failure.
+
+The badge headlines the shortest applicable window, normally the five-hour
+window. It never assumes that Codex will always report fixed 5h/7d names; the
+provider's duration and label remain authoritative. The expanded account panel
+shows every window and local reset time. Account ranking uses the highest
+reported utilization so a nearly exhausted long window cannot be hidden by a
+quiet short one.
 
 Snapshots are not persisted. Refresh them:
 
 - At supervisor initialization.
 - Every five minutes.
 - After relevant account notifications.
-- After `UsageLimitExceeded`.
 - Immediately before releasing reset-queued work.
+- In the later recovery phase, after `UsageLimitExceeded`.
+
+Only one read may be in flight per account. Concurrent startup, timer,
+notification, scheduler-boundary, and later recovery requests coalesce behind
+that read. A successful full read replaces the snapshot atomically; a partial
+notification merges only schema-defined fields into the latest full snapshot
+and triggers reconciliation when it cannot be applied safely.
 
 Local token pace remains a labeled ranking estimate. It is not authoritative
 enough to release Codex reset work.
+
+If a refresh fails after a prior success, keep the last provider snapshot only
+as visibly stale diagnostic data in the expanded account panel and mark it
+non-authoritative. The headline meter and account ranking fall back to local
+pace. Stale data cannot enable reset scheduling or release work. If no successful
+snapshot exists in the current process, the existing local estimate remains the
+only meter and the account panel displays a sanitized explanation.
 
 ### Authoritative reset eligibility
 
@@ -391,9 +465,23 @@ manual resume. Their `When usage resets` option is disabled with an explanation.
 After restart, restored reset items remain waiting until the first authoritative
 refresh succeeds; a persisted timestamp cannot release work by itself.
 
-### Automatic recovery
+This eligibility applies when creating a `When usage resets` item in the first
+release. Existing or restored items are reconsidered after the supervisor's
+first successful current-process read. At the expected boundary, Switchboard
+performs another fresh limits read. It releases the item only when every
+blocking window reports capacity; if the read fails, remains reached, or moves
+the reset later, the item stays queued. No local pace threshold can override
+provider state.
 
-When a Codex turn fails with `UsageLimitExceeded`:
+### Automatic recovery after app-server turn adoption
+
+Automatic failure recovery is intentionally not part of the telemetry-first
+release. The SDK exposes only an error message for a failed turn, so attributing
+that failure to account exhaustion would require matching text or assuming that
+an unrelated failure was usage-caused merely because a window was reached.
+Neither inference is allowed.
+
+After app-server owns an opted-in turn and reports typed `UsageLimitExceeded`:
 
 1. Stop it with typed code `codex_usage_limited`.
 2. Refresh the account's limits immediately.
@@ -439,8 +527,12 @@ Extend the typed Codex failure set to distinguish:
 
 Rules:
 
-- New app-server work fails clearly when preflight fails; it never silently
-  creates an SDK-owned session.
+- Telemetry preflight/read failure is soft: keep SDK sessions startable, use the
+  labeled estimate, and show only a sanitized account-panel explanation.
+- A telemetry-only supervisor crash cannot stop, mutate, or requeue an SDK-owned
+  session.
+- Once app-server session transport is selectable, new app-server work fails
+  clearly when preflight fails; it never silently creates an SDK-owned session.
 - A crash clears actionable interactions and never leaves stale approval UI.
 - Client request timeouts fail the affected operation; protocol corruption
   terminates and restarts the supervisor rather than continuing desynchronized.
@@ -456,6 +548,25 @@ Rules:
 `npm test` remains offline and uses the fake Codex executable, temporary
 `CODEX_HOME`, and local temporary files.
 
+### Telemetry-first release gate
+
+Before any app-server thread transport exists, prove through the real stdio
+boundary and fake process that:
+
+- The generated contract contains the phase-one account request and notification
+  allowlist.
+- Initialization, account reads, rate-limit reads/updates, reconciliation,
+  coalescing, timeout, crash, restart, and clean shutdown behave deterministically.
+- The telemetry client never issues `thread/*`, `turn/*`, approval, question,
+  capability, MCP, or experimental requests.
+- Startup does not run repository hooks, start injected sidecars, modify user or
+  repository configuration, or expose account environment values.
+- Multi-window normalization, the shortest-window headline, worst-window
+  ranking, stale fallback, and local reset rendering are correct.
+- Manual reset items require current-process authoritative state and a fresh
+  boundary read before release.
+- An SDK turn failure never creates an automatic reset resume.
+
 ### Protocol fixtures
 
 - Validate every required request, response, notification, and error variant
@@ -468,7 +579,8 @@ Rules:
 Drive the real stdio boundary with fixtures covering:
 
 - Concurrent and out-of-order client responses.
-- Multiple sessions on one account supervisor.
+- Account telemetry with no thread or turn in the first release.
+- Multiple sessions on one account supervisor after turn transport lands.
 - New turn, follow-up, resume, interrupt, and clean shutdown.
 - Command/file approvals and FIFO behavior.
 - Sequential questions, MCP form/URL elicitation, and automatic resolution.
@@ -496,9 +608,14 @@ Drive the real stdio boundary with fixtures covering:
 
 ### Opt-in live smoke suite
 
-Keep real-account checks outside `npm test`. The production cutover gate covers:
+Keep real-account checks outside `npm test`. The telemetry-first live gate is
+no-turn and covers real initialization, authentication read, plan/rate-limit
+read, notification compatibility when naturally observed, and clean shutdown.
+It must not create a thread, start a turn, refresh authentication explicitly,
+or intentionally consume usage.
 
-- Real initialization, authentication read, plan read, and clean shutdown.
+The later production transport cutover gate additionally covers:
+
 - New turn, follow-up, process restart, and resume.
 - Command and file approval round trips.
 - Guarded `tool/requestUserInput` round trip.
@@ -511,15 +628,22 @@ live suite must not intentionally exhaust an account.
 
 ## Rollout and rollback
 
-The Codex account configuration gains an explicit transport selection.
+Rollout has separate telemetry and transport gates:
 
-1. Initial default remains SDK.
-2. Opted-in accounts use app-server for new sessions.
-3. After live gates and a soak period, app-server becomes the new-session
-   default while an explicit SDK override remains.
-4. Existing sessions retain their persisted transport.
-5. Rollback changes future sessions only.
-6. SDK removal requires zero remaining SDK sessions and a separate cleanup
+1. Initial default remains SDK for every Codex session.
+2. Pass the offline and opt-in no-turn telemetry gates, then enable the
+   account-scoped supervisor for Codex accounts. Supported ChatGPT-backed
+   accounts show authoritative limits; unsupported or failed accounts keep the
+   existing estimate. No session transport setting exists yet.
+3. Soak telemetry independently. Rollback stops the supervisors and restores
+   estimate-only display without touching sessions or state.
+4. A later phase adds explicit transport selection. Opted-in accounts use
+   app-server only for new sessions; existing sessions retain their persisted
+   transport.
+5. After the full live gate and a separate turn-transport soak, app-server
+   becomes the new-session default while an explicit SDK override remains.
+6. Transport rollback changes future sessions only.
+7. SDK removal requires zero remaining SDK sessions and a separate cleanup
    decision.
 
 An existing app-server session may be resumed with app-server or abandoned. It
@@ -532,7 +656,25 @@ display name.
 
 ## Acceptance criteria
 
-The program is complete when all of the following are true:
+The telemetry-first release is complete when all of the following are true:
+
+- The account-scoped app-server supervisor remains alive for telemetry and is
+  the process/request foundation later phases will extend.
+- Every Codex thread and turn remains SDK-owned, and the supervisor issues no
+  thread or turn request.
+- A supported Codex account displays authoritative plan data and every reported
+  limit window; the badge normally shows the five-hour window when present.
+- Account ranking uses the most exhausted authoritative window.
+- Failed, stale, logged-out, and unsupported telemetry falls back safely to a
+  clearly labeled estimate.
+- `When usage resets` is enabled only from fresh authoritative state and releases
+  work only after a successful boundary refresh reports capacity.
+- SDK turn failures never trigger inferred automatic recovery.
+- No provider snapshot, credential, account environment value, raw stderr, or
+  absolute attachment path is persisted or exposed.
+- The complete offline suite and opt-in no-turn telemetry smoke pass.
+
+The full parity program is complete when all of the following are true:
 
 - Real Codex command/file approvals drive `needs-you`, Allow, and Deny.
 - Auto matches the current Claude session behavior without granting irreversible
