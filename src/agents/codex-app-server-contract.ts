@@ -31,6 +31,7 @@ export const PRIVATE_NOTIFICATIONS = [
 ] as const;
 
 const GENERATION_TIMEOUT_MS = 10_000;
+const GENERATION_TERMINATION_GRACE_MS = 250;
 const VERIFIED_CONTRACTS = new Map<string, Promise<void>>();
 const AUTH_MODES = [
   'apikey',
@@ -95,11 +96,12 @@ async function generatedFiles(directory: string): Promise<Map<string, string>> {
 async function generate(commandPath: string, env: Record<string, string>, directory: string, timeoutMs: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
+    let timingOut = false;
     const child = spawn(commandPath, ['app-server', 'generate-ts', '--out', directory], {
       env,
       stdio: ['ignore', 'ignore', 'pipe'],
     });
-    child.stderr.resume();
+    child.stderr?.resume();
     const finish = (error?: Error): void => {
       if (settled) return;
       settled = true;
@@ -107,14 +109,30 @@ async function generate(commandPath: string, env: Record<string, string>, direct
       if (error) reject(error);
       else resolve();
     };
+    let resolveClose: () => void;
+    const close = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const waitForClose = (milliseconds: number): Promise<boolean> => Promise.race([
+      close.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), milliseconds)),
+    ]);
     const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      finish(new Error('schema generation timed out'));
+      timingOut = true;
+      void (async () => {
+        child.kill('SIGTERM');
+        if (!await waitForClose(GENERATION_TERMINATION_GRACE_MS)) child.kill('SIGKILL');
+        await close;
+        finish(new Error('schema generation timed out'));
+      })();
     }, timeoutMs);
     child.once('error', () => finish(new Error('schema generation failed')));
     child.once('close', (code, signal) => {
-      if (code === 0 && signal === null) finish();
-      else finish(new Error('schema generation failed'));
+      resolveClose();
+      if (!timingOut) {
+        if (code === 0 && signal === null) finish();
+        else finish(new Error('schema generation failed'));
+      }
     });
   });
 }

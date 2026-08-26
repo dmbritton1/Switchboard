@@ -33,6 +33,16 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   if (!out) fail('generate-ts requires --out');
   const schemaMode = process.env.FAKE_APP_SERVER_SCHEMA_MODE;
   if (schemaMode === 'hang') setInterval(() => {}, 1_000);
+  if (schemaMode === 'ignore-term') {
+    const pidFile = process.env.FAKE_APP_SERVER_SCHEMA_PID_FILE;
+    if (pidFile) writeFileSync(pidFile, String(process.pid));
+    process.on('SIGTERM', () => {
+      const marker = process.env.FAKE_APP_SERVER_SCHEMA_EXIT_MARKER;
+      if (marker) appendFileSync(marker, 'SIGTERM');
+    });
+    setInterval(() => {}, 1_000);
+    await new Promise<void>(() => {});
+  }
   if (schemaMode === 'error') fail(`fake schema failure ${process.env.CODEX_TOKEN ?? ''}`);
   if (schemaMode === 'malformed') {
     writeFileSync(join(out, 'malformed.ts'), 'not the generated schema');
@@ -89,7 +99,6 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, usedPercent: number, windowDurationMins: number, resetsAt: number, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
   writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
   writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
-  writeFileSync(join(out, 'CodexAppServerVersion.ts'), 'export const version = "0.145.0";\n');
   record({ operation: 'generate-ts' });
   process.exit(0);
 }

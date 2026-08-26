@@ -46,6 +46,29 @@ async function launch(args: string[], launchEnv: Record<string, string>): Promis
   });
 }
 
+async function waitForFile(path: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await readFile(path);
+      return;
+    } catch {
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+}
+
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error: unknown) {
+    return error !== null && typeof error === 'object' && 'code' in error
+      && (error as { code?: unknown }).code === 'ESRCH';
+  }
+}
+
 test('the phase-one telemetry allowlist remains exactly pinned', () => {
   assert.equal(CODEX_TELEMETRY_VERSION, '0.145.0');
   assert.deepEqual(TELEMETRY_CLIENT_METHODS, [
@@ -186,6 +209,36 @@ test('generated contract bounds schema generation time', async () => {
     (error: unknown) => error instanceof Error
       && error.message === 'Codex telemetry contract verification failed.',
   );
+});
+
+test('generated contract reaps a generator that ignores SIGTERM after timeout', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-contract-reap-'));
+  const marker = join(directory, 'signals');
+  const pidFile = join(directory, 'pid');
+  let pid: number | undefined;
+  t.after(async () => {
+    if (pid !== undefined && !processIsGone(pid)) process.kill(pid, 'SIGKILL');
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+ignore-term',
+      env: env({
+        FAKE_APP_SERVER_SCHEMA_MODE: 'ignore-term',
+        FAKE_APP_SERVER_SCHEMA_EXIT_MARKER: marker,
+        FAKE_APP_SERVER_SCHEMA_PID_FILE: pidFile,
+      }),
+    }), { timeoutMs: 1_000 }),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+
+  await waitForFile(marker, 1_000);
+  pid = Number(await readFile(pidFile, 'utf8'));
+  assert.ok(Number.isSafeInteger(pid) && pid > 0);
+  assert.equal(await readFile(marker, 'utf8'), 'SIGTERM');
+  assert.equal(processIsGone(pid), true);
 });
 
 test('generated contract rejects malformed schema output', async () => {
