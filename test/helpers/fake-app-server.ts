@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import readline from 'node:readline';
 
@@ -25,36 +25,93 @@ function record(value: Record<string, unknown>): void {
   if (path) appendFileSync(path, `${JSON.stringify(value)}\n`);
 }
 
-if (process.argv[2] === 'app-server' && process.argv[3] === 'generate-ts') {
+const appServerIndex = process.argv.indexOf('app-server');
+
+if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts') {
   const outIndex = process.argv.indexOf('--out');
   const out = outIndex === -1 ? undefined : process.argv[outIndex + 1];
   if (!out) fail('generate-ts requires --out');
+  const schemaMode = process.env.FAKE_APP_SERVER_SCHEMA_MODE;
+  if (schemaMode === 'hang') setInterval(() => {}, 1_000);
+  if (schemaMode === 'error') fail(`fake schema failure ${process.env.CODEX_TOKEN ?? ''}`);
+  if (schemaMode === 'malformed') {
+    writeFileSync(join(out, 'malformed.ts'), 'not the generated schema');
+    process.exit(0);
+  }
+  mkdirSync(join(out, 'v2'), { recursive: true });
+  const omit = process.env.FAKE_APP_SERVER_SCHEMA_OMIT;
+  const include = (value: string): boolean => value !== omit;
   writeFileSync(join(out, 'ClientRequest.ts'), [
-    '{ "method": "thread/start" }',
-    '{ "method": "turn/start" }',
-    '{ "method": "thread/resume" }',
-    '{ "method": "turn/interrupt" }',
-  ].join('\n'));
+    'initialize',
+    'account/read',
+    'account/rateLimits/read',
+    'thread/start',
+    'turn/start',
+    'thread/resume',
+    'turn/interrupt',
+  ].filter(include).map((method) => `{ "method": "${method}" }`).join('\n'));
+  const serverRequests = [
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+    'item/permissions/requestApproval',
+    'item/tool/call',
+    'account/chatgptAuthTokens/refresh',
+    'attestation/generate',
+    'applyPatchApproval',
+    'execCommandApproval',
+    ...(process.env.FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST
+      ? [process.env.FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST]
+      : []),
+  ].filter(include);
   writeFileSync(join(out, 'ServerRequest.ts'), [
-    '{ "method": "item/commandExecution/requestApproval" }',
-    '{ "method": "item/fileChange/requestApproval" }',
-    '{ "method": "mcpServer/elicitation/request" }',
+    `export type ServerRequest = ${serverRequests.map((method) => `{ "method": "${method}" }`).join(' | ')};`,
   ].join('\n'));
-  const omittedNotification = process.env.FAKE_APP_SERVER_SCHEMA_OMIT;
   const notifications = [
+    'account/updated',
+    'account/rateLimits/updated',
+    'remoteControl/status/changed',
     'thread/started',
     'turn/started',
     'item/started',
     'item/completed',
     'turn/completed',
     'serverRequest/resolved',
-  ].filter((method) => method !== omittedNotification);
+  ].filter(include);
   writeFileSync(
     join(out, 'ServerNotification.ts'),
     `${notifications.map((method) => `{ "method": "${method}" }`).join('\n')}\n`,
   );
+  writeFileSync(join(out, 'ServerNotificationEnvelope.ts'), 'export type ServerNotificationEnvelope = { emittedAtMs?: number };\n');
+  writeFileSync(join(out, 'AuthMode.ts'), 'export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey";\n');
+  writeFileSync(join(out, 'v2', 'Account.ts'), 'export type Account = { "type": "apiKey" } | { "type": "chatgpt" } | { "type": "amazonBedrock" };\n');
+  writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, usedPercent: number, windowDurationMins: number, resetsAt: number, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
+  writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
+  writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
+  writeFileSync(join(out, 'CodexAppServerVersion.ts'), 'export const version = "0.145.0";\n');
   record({ operation: 'generate-ts' });
   process.exit(0);
+}
+
+if (appServerIndex !== -1) {
+  const rootArgs = process.argv.slice(2, appServerIndex);
+  const configs = rootArgs.flatMap((value, index) => value === '-c' ? [rootArgs[index + 1]] : []);
+  const strict = rootArgs.includes('--strict-config');
+  const knownConfigs = new Set(['hooks={}', 'mcp_servers={}', 'otel.exporter="none"']);
+  if (strict && configs.some((value) => !knownConfigs.has(value))) fail('strict config rejected unknown key');
+  if (!strict && process.env.FAKE_APP_SERVER_STRICT_CONFIG_MARKER) {
+    writeFileSync(process.env.FAKE_APP_SERVER_STRICT_CONFIG_MARKER, 'strict config missing');
+    fail('strict config required');
+  }
+  if (!configs.includes('hooks={}') && process.env.FAKE_APP_SERVER_INHERITED_HOOK_MARKER) {
+    writeFileSync(process.env.FAKE_APP_SERVER_INHERITED_HOOK_MARKER, 'inherited hook');
+    fail('inherited hook ran');
+  }
+  if (!configs.includes('mcp_servers={}') && process.env.FAKE_APP_SERVER_INHERITED_MCP_MARKER) {
+    writeFileSync(process.env.FAKE_APP_SERVER_INHERITED_MCP_MARKER, 'inherited mcp');
+    fail('inherited MCP server started');
+  }
 }
 
 function send(message: Message): void {

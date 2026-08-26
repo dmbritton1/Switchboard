@@ -1,0 +1,214 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
+import {
+  CODEX_TELEMETRY_VERSION,
+  DENIED_SERVER_METHODS,
+  PRIVATE_NOTIFICATIONS,
+  TELEMETRY_CLIENT_METHODS,
+  TELEMETRY_NOTIFICATIONS,
+  telemetryAppServerArgs,
+  verifyTelemetryContract,
+} from '../src/agents/codex-app-server-contract.ts';
+
+const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
+
+function env(overrides: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    ),
+    ...overrides,
+  };
+}
+
+function runtime(overrides: Partial<PreparedCodexRuntime> = {}): PreparedCodexRuntime {
+  return {
+    source: 'explicit',
+    commandPath: fakeCommand,
+    version: '0.145.0',
+    env: env(),
+    diagnostics: [],
+    ...overrides,
+  };
+}
+
+async function launch(args: string[], launchEnv: Record<string, string>): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(fakeCommand, args, { env: launchEnv, stdio: 'ignore' });
+    child.once('error', reject);
+    child.once('close', (code) => resolve(code));
+  });
+}
+
+test('the phase-one telemetry allowlist remains exactly pinned', () => {
+  assert.equal(CODEX_TELEMETRY_VERSION, '0.145.0');
+  assert.deepEqual(TELEMETRY_CLIENT_METHODS, [
+    'initialize',
+    'account/read',
+    'account/rateLimits/read',
+  ]);
+  assert.deepEqual(TELEMETRY_NOTIFICATIONS, [
+    'account/updated',
+    'account/rateLimits/updated',
+  ]);
+  assert.deepEqual(DENIED_SERVER_METHODS, [
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+    'item/permissions/requestApproval',
+    'item/tool/call',
+    'account/chatgptAuthTokens/refresh',
+    'attestation/generate',
+    'applyPatchApproval',
+    'execCommandApproval',
+  ]);
+  assert.deepEqual(PRIVATE_NOTIFICATIONS, ['remoteControl/status/changed']);
+
+  for (const method of TELEMETRY_CLIENT_METHODS) {
+    assert.equal(method.startsWith('thread/'), false);
+    assert.equal(method.startsWith('turn/'), false);
+    assert.equal(/account\/(?:login|logout|.*refresh|.*usage|.*credit|.*write|.*delete)/.test(method), false);
+  }
+});
+
+test('telemetry launch arguments clear inherited hooks and MCP configuration', () => {
+  assert.deepEqual(telemetryAppServerArgs(), [
+    '--strict-config',
+    '-c', 'hooks={}',
+    '-c', 'mcp_servers={}',
+    '-c', 'otel.exporter="none"',
+    'app-server', '--listen', 'stdio://',
+  ]);
+});
+
+test('launch refuses inherited hooks, MCP servers, and unknown strict configuration', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-launch-'));
+  const hookMarker = join(directory, 'hook-ran');
+  const mcpMarker = join(directory, 'mcp-ran');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const launchEnv = env({
+    FAKE_APP_SERVER_INHERITED_HOOK_MARKER: hookMarker,
+    FAKE_APP_SERVER_INHERITED_MCP_MARKER: mcpMarker,
+    FAKE_APP_SERVER_STRICT_CONFIG_MARKER: join(directory, 'strict-missing'),
+  });
+
+  assert.equal(await launch([
+    '--strict-config',
+    '-c', 'mcp_servers={}',
+    '-c', 'otel.exporter="none"',
+    'app-server', '--listen', 'stdio://',
+  ], launchEnv), 2);
+  assert.equal(await readFile(hookMarker, 'utf8'), 'inherited hook');
+
+  assert.equal(await launch([
+    '--strict-config',
+    '-c', 'hooks={}',
+    '-c', 'otel.exporter="none"',
+    'app-server', '--listen', 'stdio://',
+  ], launchEnv), 2);
+  assert.equal(await readFile(mcpMarker, 'utf8'), 'inherited mcp');
+
+  assert.equal(await launch([
+    '-c', 'hooks={}',
+    '-c', 'mcp_servers={}',
+    '-c', 'otel.exporter="none"',
+    'app-server', '--listen', 'stdio://',
+  ], launchEnv), 2);
+  assert.equal(await readFile(join(directory, 'strict-missing'), 'utf8'), 'strict config missing');
+
+  assert.equal(await launch([
+    '--strict-config',
+    '-c', 'hooks={}',
+    '-c', 'mcp_servers={}',
+    '-c', 'unknown_option=true',
+    'app-server', '--listen', 'stdio://',
+  ], launchEnv), 2);
+});
+
+test('generated contract accepts the exact phase-one schema and reuses a verified runtime', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-contract-'));
+  const calls = join(directory, 'calls.jsonl');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const prepared = runtime({ env: env({ FAKE_APP_SERVER_CALL_LOG: calls }), version: '0.145.0+cache' });
+
+  await verifyTelemetryContract(prepared);
+  await verifyTelemetryContract(prepared);
+
+  assert.deepEqual(
+    (await readFile(calls, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)),
+    [{ operation: 'generate-ts' }],
+  );
+});
+
+test('generated contract rejects an omitted required member', async () => {
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+omitted',
+      env: env({ FAKE_APP_SERVER_SCHEMA_OMIT: 'account/rateLimits/updated' }),
+    })),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+});
+
+test('generated contract rejects a newly added server request', async () => {
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+server-request',
+      env: env({ FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST: 'item/future/requestApproval' }),
+    })),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+});
+
+test('generated contract rejects an incompatible runtime version before generation', async () => {
+  await assert.rejects(
+    verifyTelemetryContract(runtime({ version: '0.146.0' })),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+});
+
+test('generated contract bounds schema generation time', async () => {
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+timeout',
+      env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'hang' }),
+    }), { timeoutMs: 30 }),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+});
+
+test('generated contract rejects malformed schema output', async () => {
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+malformed',
+      env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'malformed' }),
+    })),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.',
+  );
+});
+
+test('generated contract never exposes account values or raw stderr', async () => {
+  const secret = 'contract-account-secret';
+  await assert.rejects(
+    verifyTelemetryContract(runtime({
+      version: '0.145.0+stderr',
+      env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'error', CODEX_TOKEN: secret }),
+    })),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry contract verification failed.'
+      && !error.message.includes(secret)
+      && !error.message.includes('fake schema failure'),
+  );
+});
