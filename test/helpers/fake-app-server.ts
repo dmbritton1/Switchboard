@@ -20,7 +20,34 @@ let turnNumber = 0;
 let initialized = false;
 let heldAccountRead: Message | undefined;
 let heldClientRequest: Message | undefined;
+let rateLimitReads = 0;
 const serverResolvers = new Map<string | number, (message: Message) => void>();
+
+function fromJsonEnvironment(name: string, fallback: unknown): unknown {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    fail(`${name} must contain JSON`);
+  }
+}
+
+const defaultRateLimits = {
+  rateLimits: {
+    limitId: null,
+    limitName: null,
+    primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 2_000_000_000 },
+    secondary: { usedPercent: 50, windowDurationMins: 10_080, resetsAt: 2_000_604_800 },
+    credits: null,
+    individualLimit: null,
+    spendControlReached: false,
+    planType: 'unknown',
+    rateLimitReachedType: null,
+  },
+  rateLimitsByLimitId: null,
+  rateLimitResetCredits: null,
+};
 
 function record(value: Record<string, unknown>): void {
   const path = process.env.FAKE_APP_SERVER_CALL_LOG;
@@ -89,8 +116,8 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'ServerNotificationEnvelope.ts'), 'export type ServerNotificationEnvelope = { emittedAtMs?: number };\n');
   writeFileSync(join(out, 'AuthMode.ts'), 'export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey";\n');
   writeFileSync(join(out, 'v2', 'Account.ts'), 'export type Account = { "type": "apiKey" } | { "type": "chatgpt" } | { "type": "amazonBedrock" };\n');
-  writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, usedPercent: number, windowDurationMins: number, resetsAt: number, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
-  writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
+  writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, limitName: string | null, primary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, secondary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
+  writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimits: RateLimitSnapshot, rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
   writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
   record({ operation: 'generate-ts' });
   process.exit(0);
@@ -213,11 +240,66 @@ function accountRead(message: Message): void {
   if (message.params?.refreshToken !== false) fail('account/read must disable token refresh');
   send({
     id: message.id,
-    result: {
+    result: fromJsonEnvironment('FAKE_APP_SERVER_ACCOUNT_RESPONSE', {
       account: { type: 'chatgpt', email: null, planType: 'unknown' },
       requiresOpenaiAuth: true,
-    },
+    }),
   });
+}
+
+function notifyAfterRateLimitRead(): void {
+  if (rateLimitReads !== 1) return;
+  if (mode === 'telemetry-rate-burst') {
+    setTimeout(() => {
+      const sparse = {
+        rateLimits: {
+          limitId: null,
+          serverName: 'private-sparse-server',
+          installationId: 'private-sparse-installation',
+        },
+      };
+      send({ method: 'account/rateLimits/updated', params: sparse });
+      send({ method: 'account/rateLimits/updated', params: sparse });
+      send({ method: 'account/rateLimits/updated', params: sparse });
+    }, 5);
+  }
+  if (mode === 'telemetry-auth-cycle') {
+    setTimeout(() => {
+      send({ method: 'account/updated', params: { authMode: 'headers', planType: null } });
+      send({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: null } } });
+      send({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: null } } });
+    }, 5);
+    setTimeout(() => {
+      send({ method: 'account/updated', params: { authMode: 'chatgpt', planType: 'pro' } });
+    }, 15);
+  }
+  if (mode === 'telemetry-auth-during-read') {
+    setTimeout(() => {
+      send({ method: 'account/rateLimits/updated', params: { rateLimits: { limitId: null } } });
+    }, 5);
+  }
+  if (mode === 'telemetry-private-notification') {
+    setTimeout(() => {
+      send({
+        method: 'remoteControl/status/changed',
+        params: {
+          serverName: 'private-server-name',
+          installationId: 'private-installation-id',
+          environmentId: 'private-environment-id',
+        },
+      });
+    }, 5);
+  }
+  if (mode === 'telemetry-refresh-request') {
+    setTimeout(() => {
+      void serverRequest(7_001, 'account/chatgptAuthTokens/refresh', {
+        refreshToken: 'private-refresh-token',
+        accountId: 'private-account-id',
+      }).then((response) => {
+        if (!denied(response)) fail('auth refresh server request was not denied');
+      });
+    }, 5);
+  }
 }
 
 async function serverRequest(
@@ -427,6 +509,23 @@ async function handle(message: Message): Promise<void> {
       if (interleave) heldAccountRead = message;
       else accountRead(message);
       return;
+    case 'account/rateLimits/read':
+      if (!initialized) fail('account/rateLimits/read before initialized');
+      rateLimitReads += 1;
+      if (mode === 'telemetry-auth-during-read' && rateLimitReads === 2) {
+        send({ method: 'account/updated', params: { authMode: 'headers', planType: null } });
+        setTimeout(() => send({
+          id: message.id,
+          result: fromJsonEnvironment('FAKE_APP_SERVER_RATE_LIMITS_RESPONSE', defaultRateLimits),
+        }), 5);
+        return;
+      }
+      send({
+        id: message.id,
+        result: fromJsonEnvironment('FAKE_APP_SERVER_RATE_LIMITS_RESPONSE', defaultRateLimits),
+      });
+      notifyAfterRateLimitRead();
+      return;
     case 'thread/start': {
       if (!initialized) fail('thread/start before initialized');
       send({ method: 'thread/started', params: { thread: thread() } });
@@ -525,5 +624,10 @@ lines.on('line', (line) => {
 });
 lines.on('close', () => {
   record({ operation: 'eof' });
+  if (mode === 'ignore-eof') {
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1_000);
+    return;
+  }
   if (mode === 'normal' && serverResolvers.size > 0) fail('client closed with unresolved server requests');
 });
