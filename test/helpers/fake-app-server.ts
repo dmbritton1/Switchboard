@@ -3,9 +3,10 @@
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import readline from 'node:readline';
+import { DENIED_SERVER_METHODS } from '../../src/agents/codex-app-server-contract.ts';
 
 type Message = {
-  id?: number;
+  id?: string | number;
   method?: string;
   params?: Record<string, unknown>;
   result?: unknown;
@@ -18,7 +19,8 @@ const threadId = 'fixture-thread';
 let turnNumber = 0;
 let initialized = false;
 let heldAccountRead: Message | undefined;
-const serverResolvers = new Map<number, (message: Message) => void>();
+let heldClientRequest: Message | undefined;
+const serverResolvers = new Map<string | number, (message: Message) => void>();
 
 function record(value: Record<string, unknown>): void {
   const path = process.env.FAKE_APP_SERVER_CALL_LOG;
@@ -61,16 +63,7 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'turn/interrupt',
   ].filter(include).map((method) => `{ "method": "${method}" }`).join('\n'));
   const serverRequests = [
-    'item/commandExecution/requestApproval',
-    'item/fileChange/requestApproval',
-    'item/tool/requestUserInput',
-    'mcpServer/elicitation/request',
-    'item/permissions/requestApproval',
-    'item/tool/call',
-    'account/chatgptAuthTokens/refresh',
-    'attestation/generate',
-    'applyPatchApproval',
-    'execCommandApproval',
+    ...DENIED_SERVER_METHODS,
     ...(process.env.FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST
       ? [process.env.FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST]
       : []),
@@ -228,7 +221,7 @@ function accountRead(message: Message): void {
 }
 
 async function serverRequest(
-  id: number,
+  id: string | number,
   method: string,
   params: Record<string, unknown>,
 ): Promise<Message> {
@@ -239,6 +232,63 @@ async function serverRequest(
 
 function resolved(requestId: number): void {
   send({ method: 'serverRequest/resolved', params: { threadId, requestId } });
+}
+
+function denied(response: Message): boolean {
+  const error = response.error;
+  return error !== null
+    && typeof error === 'object'
+    && !Array.isArray(error)
+    && (error as Record<string, unknown>).code === -32601;
+}
+
+async function handleClientCorrelation(message: Message): Promise<boolean> {
+  switch (message.method) {
+    case 'initialize': {
+      send({
+        method: 'fixture/notice',
+        params: { delivered: true },
+        emittedAtMs: 1,
+        unrecognizedEnvelopeField: 'ignored',
+      } as Message);
+      const numeric = await serverRequest(1, 'fixture/numeric-server-request', { source: 'server' });
+      if (!denied(numeric)) fail('numeric server request was not denied');
+      send({ id: message.id, result: { initialized: true } });
+      return true;
+    }
+    case 'client/first':
+      heldClientRequest = message;
+      return true;
+    case 'client/second': {
+      if (!heldClientRequest) fail('client/second arrived before client/first');
+      send({ id: message.id, result: { response: 'second' } });
+      const string = await serverRequest('server-1', 'fixture/string-server-request', { source: 'server' });
+      if (!denied(string)) fail('string server request was not denied');
+      send({ id: heldClientRequest.id, result: { response: 'first' } });
+      heldClientRequest = undefined;
+      return true;
+    }
+    default:
+      fail(`unsupported client correlation method ${String(message.method)}`);
+  }
+}
+
+async function handleDeniedServerRequests(message: Message): Promise<boolean> {
+  if (message.method !== 'initialize') return false;
+  for (const [index, method] of DENIED_SERVER_METHODS.entries()) {
+    const response = await serverRequest(1_000 + index, method, { fixture: true });
+    if (!denied(response)) fail(`server request ${method} was not denied`);
+  }
+  send({
+    id: message.id,
+    result: {
+      userAgent: 'codex-app-server/0.145.0',
+      codexHome: '/fixture/codex-home',
+      platformFamily: 'unix',
+      platformOs: 'macos',
+    },
+  });
+  return true;
 }
 
 async function completeApprovalTurn(turnId: string): Promise<void> {
@@ -256,9 +306,7 @@ async function completeApprovalTurn(turnId: string): Promise<void> {
     command: 'printf ok',
     cwd: '/fixture',
   });
-  if (JSON.stringify(command.result) !== JSON.stringify({ decision: 'acceptForSession' })) {
-    fail('unexpected command approval response');
-  }
+  if (!denied(command)) fail('command approval was not denied');
   resolved(900);
   send({
     method: 'item/completed',
@@ -276,9 +324,7 @@ async function completeApprovalTurn(turnId: string): Promise<void> {
     startedAtMs: 2,
     reason: 'fixture file approval',
   });
-  if (JSON.stringify(file.result) !== JSON.stringify({ decision: 'accept' })) {
-    fail('unexpected file approval response');
-  }
+  if (!denied(file)) fail('file approval was not denied');
   resolved(901);
   send({
     method: 'item/completed',
@@ -298,13 +344,7 @@ async function completeApprovalTurn(turnId: string): Promise<void> {
       required: ['confirmed'],
     },
   });
-  if (JSON.stringify(elicitation.result) !== JSON.stringify({
-    action: 'decline',
-    content: null,
-    _meta: null,
-  })) {
-    fail('unexpected MCP elicitation response');
-  }
+  if (!denied(elicitation)) fail('MCP elicitation was not denied');
   resolved(902);
   send({
     method: 'item/completed',
@@ -324,15 +364,28 @@ async function handle(message: Message): Promise<void> {
     return;
   }
 
-  if (mode === 'malformed') {
-    process.stdout.write('{malformed\n');
+  if (mode === 'malformed' || mode === 'malformed-and-exit') {
+    process.stdout.write(`{malformed ${process.env.PROBE_TOKEN ?? ''}\n`);
+    if (mode === 'malformed-and-exit') process.exit(26);
     return;
   }
   if (mode === 'crash') {
     process.stderr.write(`controlled crash ${process.env.PROBE_TOKEN ?? ''}\n`);
     process.exit(23);
   }
+  if (mode === 'write-failure') {
+    process.stdin.destroy();
+    setImmediate(() => process.exit(27));
+    return;
+  }
+  if (mode === 'unknown-response') {
+    send({ id: 999, result: { unexpected: true } });
+    return;
+  }
   if (mode === 'hang' || mode === 'ignore-term') return;
+
+  if (mode === 'client-correlation' && await handleClientCorrelation(message)) return;
+  if (mode === 'deny-server-requests' && await handleDeniedServerRequests(message)) return;
 
   if (message.method !== undefined) {
     record({

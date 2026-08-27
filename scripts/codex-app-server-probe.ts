@@ -1,15 +1,17 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { prepareCodexRuntime } from '../src/agents/codex-runtime.ts';
+import { AppServerClient } from '../src/agents/codex-app-server-client.ts';
+import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
+import { prepareCodexRuntime, redactValues } from '../src/agents/codex-runtime.ts';
 
 const REQUEST_TIMEOUT_MS = 5_000;
 const SCHEMA_TIMEOUT_MS = 30_000;
 const TERMINATION_GRACE_MS = 250;
 const SIGKILL_WAIT_MS = 1_000;
+const DENIED_SERVER_METHOD_SET = new Set<string>(DENIED_SERVER_METHODS);
 
 export type AppServerEvidence = {
   version: string;
@@ -26,20 +28,6 @@ export type AppServerEvidence = {
   processCrashHandled: boolean;
   vendorThreadMigration: 'verified' | 'not-proven';
   cleanShutdown: boolean;
-};
-
-type Message = {
-  id?: unknown;
-  method?: unknown;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
-};
-
-type Pending = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
 };
 
 type NotificationWaiter = {
@@ -70,70 +58,39 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds).unref());
 }
 
-class AppServerClient {
-  readonly #child: ChildProcessWithoutNullStreams;
-  readonly #lines: readline.Interface;
-  readonly #pending = new Map<number, Pending>();
+class ProbeObserver {
   readonly #notifications: Array<{ method: string; params: unknown }> = [];
   readonly #waiters = new Set<NotificationWaiter>();
   readonly #serverMethods = new Map<string, string>();
   readonly #resolvedServerRequests = new Set<string>();
-  readonly #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
-  #nextId = 1;
-  #closing = false;
-  #failed = false;
-  #exited = false;
   #terminalError: Error | null = null;
-  #termination: Promise<void> | null = null;
 
-  constructor(command: string, args: string[], env: Record<string, string>) {
-    this.#child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
-    this.#child.stderr.on('data', () => {
-      // Deliberately consume and discard stderr. It may contain paths, account
-      // identifiers, or credentials, none of which are evaluation evidence.
-    });
-    this.#child.stdin.on('error', () => {
-      this.#fail(new Error('Codex app-server input closed unexpectedly.'));
-    });
-    this.#lines = readline.createInterface({ input: this.#child.stdout });
-    this.#lines.on('line', (line) => this.#receive(line));
-    this.#exit = new Promise((resolve) => {
-      this.#child.once('error', () => {
-        this.#fail(new Error('Codex app-server could not be started.'));
-      });
-      this.#child.once('close', (code, signal) => {
-        this.#exited = true;
-        if (!this.#closing) {
-          const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
-          this.#fail(new Error(`Codex app-server exited unexpectedly (${detail}).`));
-        }
-        resolve({ code, signal });
-      });
-    });
+  onNotification(method: string, params: unknown): void {
+    this.#notifications.push({ method, params });
+    if (method === 'serverRequest/resolved') {
+      const requestId = object(params)?.requestId;
+      if (requestId !== undefined) this.#resolvedServerRequests.add(idKey(requestId));
+    }
+    for (const waiter of this.#waiters) {
+      if (waiter.method !== method || !waiter.predicate(params)) continue;
+      this.#waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      waiter.resolve(params);
+    }
   }
 
-  request(method: string, params: unknown): Promise<unknown> {
-    if (this.#terminalError) return Promise.reject(this.#terminalError);
-    const id = this.#nextId++;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.#pending.delete(id);
-        const timeout = new Error(
-          `Codex app-server request ${method} timed out after ${REQUEST_TIMEOUT_MS}ms.`,
-        );
-        void this.#terminateBounded().then(
-          () => reject(timeout),
-          () => reject(new Error('Codex app-server could not be terminated after request timeout.')),
-        );
-      }, REQUEST_TIMEOUT_MS);
-      this.#pending.set(id, { resolve, reject, timer });
-      this.#send({ method, id, params });
-    });
+  onServerRequest(id: string | number, method: string): void {
+    this.#serverMethods.set(idKey(id), method);
   }
 
-  notify(method: string, params?: unknown): void {
-    if (this.#terminalError) throw this.#terminalError;
-    this.#send(params === undefined ? { method } : { method, params });
+  onExit(error: Error): void {
+    if (this.#terminalError) return;
+    this.#terminalError = error;
+    for (const waiter of this.#waiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.#waiters.clear();
   }
 
   waitFor(method: string, predicate: (params: unknown) => boolean): Promise<unknown> {
@@ -142,7 +99,6 @@ class AppServerClient {
       (notification) => notification.method === method && predicate(notification.params),
     );
     if (previous) return Promise.resolve(previous.params);
-
     return new Promise((resolve, reject) => {
       const waiter: NotificationWaiter = {
         method,
@@ -151,13 +107,7 @@ class AppServerClient {
         reject,
         timer: setTimeout(() => {
           this.#waiters.delete(waiter);
-          const timeout = new Error(
-            `Codex app-server notification ${method} timed out after ${REQUEST_TIMEOUT_MS}ms.`,
-          );
-          void this.#terminateBounded().then(
-            () => reject(timeout),
-            () => reject(new Error('Codex app-server could not be terminated after notification timeout.')),
-          );
+          reject(new Error(`Codex app-server notification ${method} timed out after ${REQUEST_TIMEOUT_MS}ms.`));
         }, REQUEST_TIMEOUT_MS),
       };
       this.#waiters.add(waiter);
@@ -176,152 +126,31 @@ class AppServerClient {
     }
     return false;
   }
+}
 
-  async shutdown(): Promise<boolean> {
-    if (this.#terminalError) throw this.#terminalError;
-    this.#closing = true;
-    this.#child.stdin.end();
-    try {
-      const outcome = await Promise.race([
-        this.#exit.then((exit) => ({ type: 'exit' as const, exit })),
-        delay(REQUEST_TIMEOUT_MS).then(() => ({ type: 'timeout' as const })),
-      ]);
-      if (outcome.type === 'timeout') {
-        await this.#terminateBounded();
-        throw new Error(`Codex app-server shutdown timed out after ${REQUEST_TIMEOUT_MS}ms.`);
-      }
-      const { code, signal } = outcome.exit;
-      return code === 0 && signal === null;
-    } finally {
-      this.#lines.close();
-    }
-  }
-
-  async dispose(): Promise<void> {
-    this.#closing = true;
-    await this.#terminateBounded();
-    this.#lines.close();
-  }
-
-  #send(message: Record<string, unknown>): void {
-    if (this.#child.stdin.destroyed) {
-      throw new Error('Codex app-server input closed unexpectedly.');
-    }
-    this.#child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
-      if (error) this.#fail(new Error('Codex app-server input closed unexpectedly.'));
-    });
-  }
-
-  #receive(line: string): void {
-    let message: Message;
-    try {
-      message = JSON.parse(line) as Message;
-    } catch {
-      this.#fail(new Error('Codex app-server returned invalid JSON.'));
-      return;
-    }
-    if (!object(message)) {
-      this.#fail(new Error('Codex app-server returned an invalid message.'));
-      return;
-    }
-
-    if (typeof message.method === 'string' && message.id !== undefined) {
-      this.#handleServerRequest(message);
-      return;
-    }
-    if (typeof message.id === 'number' && message.method === undefined) {
-      const pending = this.#pending.get(message.id);
-      if (!pending) {
-        this.#fail(new Error('Codex app-server returned an unknown response id.'));
-        return;
-      }
-      this.#pending.delete(message.id);
-      clearTimeout(pending.timer);
-      if (message.error !== undefined) pending.reject(new Error('Codex app-server request failed.'));
-      else pending.resolve(message.result);
-      return;
-    }
-    if (typeof message.method === 'string' && message.id === undefined) {
-      this.#recordNotification(message.method, message.params);
-      return;
-    }
-    this.#fail(new Error('Codex app-server returned an invalid message.'));
-  }
-
-  #handleServerRequest(message: Message): void {
-    const method = message.method as string;
-    const requestId = idKey(message.id);
-    this.#serverMethods.set(requestId, method);
-    let result: Record<string, unknown>;
-    switch (method) {
-      case 'item/commandExecution/requestApproval':
-        result = { decision: 'acceptForSession' };
-        break;
-      case 'item/fileChange/requestApproval':
-        result = { decision: 'accept' };
-        break;
-      case 'mcpServer/elicitation/request':
-        result = { action: 'decline', content: null, _meta: null };
-        break;
-      default:
-        this.#fail(new Error('Codex app-server requested an unsupported or experimental client action.'));
-        return;
-    }
-    this.#send({ id: message.id, result });
-  }
-
-  #recordNotification(method: string, params: unknown): void {
-    this.#notifications.push({ method, params });
-    if (method === 'serverRequest/resolved') {
-      const requestId = object(params)?.requestId;
-      if (requestId !== undefined) this.#resolvedServerRequests.add(idKey(requestId));
-    }
-    for (const waiter of this.#waiters) {
-      if (waiter.method !== method || !waiter.predicate(params)) continue;
-      this.#waiters.delete(waiter);
-      clearTimeout(waiter.timer);
-      waiter.resolve(params);
-    }
-  }
-
-  #terminateBounded(): Promise<void> {
-    if (this.#termination) return this.#termination;
-    this.#termination = (async () => {
-      if (this.#exited) return;
-      this.#child.kill('SIGTERM');
-      const exitedAfterTerm = await Promise.race([
-        this.#exit.then(() => true),
-        delay(TERMINATION_GRACE_MS).then(() => false),
-      ]);
-      if (exitedAfterTerm || this.#exited) return;
-      this.#child.kill('SIGKILL');
-      const exitedAfterKill = await Promise.race([
-        this.#exit.then(() => true),
-        delay(SIGKILL_WAIT_MS).then(() => false),
-      ]);
-      if (!exitedAfterKill && !this.#exited) {
-        throw new Error('Codex app-server child could not be reaped.');
-      }
-    })();
-    return this.#termination;
-  }
-
-  #fail(error: Error): void {
-    if (this.#failed) return;
-    this.#failed = true;
-    this.#terminalError = error;
-    for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(error);
-    }
-    this.#pending.clear();
-    for (const waiter of this.#waiters) {
-      clearTimeout(waiter.timer);
-      waiter.reject(error);
-    }
-    this.#waiters.clear();
-    void this.#terminateBounded().catch(() => {});
-  }
+function createProbeClient(
+  command: string,
+  args: string[],
+  env: Record<string, string>,
+  observer: ProbeObserver,
+): AppServerClient {
+  let client: AppServerClient;
+  client = new AppServerClient({
+    command,
+    args,
+    env,
+    redact: (text) => redactValues(text, Object.values(env)),
+    onNotification: (method, params) => observer.onNotification(method, params),
+    onServerRequest: (id, method) => {
+      observer.onServerRequest(id, method);
+      const message = DENIED_SERVER_METHOD_SET.has(method)
+        ? 'Unsupported by the Phase 1 probe.'
+        : 'Unsupported server request.';
+      client.respondError(id, -32601, message);
+    },
+    onExit: (error) => observer.onExit(error),
+  });
+  return client;
 }
 
 function threadIdFrom(result: unknown): string | null {
@@ -348,11 +177,12 @@ async function controlledCrashHandled(
   env: Record<string, string>,
 ): Promise<boolean> {
   const secret = 'fixture-controlled-crash-secret';
-  const client = new AppServerClient(command, [], {
+  const observer = new ProbeObserver();
+  const client = createProbeClient(command, [], {
     ...env,
     FAKE_APP_SERVER_MODE: 'crash',
     PROBE_TOKEN: secret,
-  });
+  }, observer);
   try {
     await client.request('initialize', {
       clientInfo: { name: 'switchboard_probe', title: 'Switchboard probe', version: '0.1.0' },
@@ -364,7 +194,7 @@ async function controlledCrashHandled(
       && /exited unexpectedly/i.test(error.message)
       && !error.message.includes(secret);
   } finally {
-    await client.dispose();
+    await client.close();
   }
 }
 
@@ -372,7 +202,8 @@ async function probeFixture(
   command: string,
   env: Record<string, string>,
 ): Promise<AppServerEvidence> {
-  const client = new AppServerClient(command, [], env);
+  const observer = new ProbeObserver();
+  const client = createProbeClient(command, [], env, observer);
   try {
     const initialized = object(await client.request('initialize', {
       clientInfo: { name: 'switchboard_probe', title: 'Switchboard probe', version: '0.1.0' },
@@ -398,7 +229,7 @@ async function probeFixture(
     const firstTurnId = typeof first?.id === 'string' ? first.id : null;
     if (!firstTurnId) throw new Error('Codex app-server returned no fixture turn id.');
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    await client.waitFor(
+    await observer.waitFor(
       'turn/completed',
       (params) => completedTurn(params, threadId, firstTurnId, 'completed'),
     );
@@ -409,7 +240,7 @@ async function probeFixture(
     }));
     const followUpId = typeof followUp?.id === 'string' ? followUp.id : null;
     if (!followUpId) throw new Error('Codex app-server returned no follow-up turn id.');
-    await client.waitFor(
+    await observer.waitFor(
       'turn/completed',
       (params) => completedTurn(params, threadId, followUpId, 'completed'),
     );
@@ -423,17 +254,18 @@ async function probeFixture(
     const cancellableId = typeof cancellable?.id === 'string' ? cancellable.id : null;
     if (!cancellableId) throw new Error('Codex app-server returned no cancellable turn id.');
     await client.request('turn/interrupt', { threadId, turnId: cancellableId });
-    await client.waitFor(
+    await observer.waitFor(
       'turn/completed',
       (params) => completedTurn(params, threadId, cancellableId, 'interrupted'),
     );
 
     const lifecycleRoundTrip = first.status === 'inProgress'
-      && client.sawNotification('item/started', (params) => itemForTurn(params, firstTurnId))
-      && client.sawNotification('item/completed', (params) => itemForTurn(params, firstTurnId));
+      && observer.sawNotification('item/started', (params) => itemForTurn(params, firstTurnId))
+      && observer.sawNotification('item/completed', (params) => itemForTurn(params, firstTurnId));
     const followUpRoundTrip = followUp.status === 'inProgress';
     const cancellationRoundTrip = cancellable.status === 'inProgress';
-    const cleanShutdown = await client.shutdown();
+    await client.close();
+    const cleanShutdown = true;
     const processCrashHandled = await controlledCrashHandled(command, env);
 
     return {
@@ -445,15 +277,15 @@ async function probeFixture(
       followUpRoundTrip,
       resumeRoundTrip: resumedThreadId === threadId,
       cancellationRoundTrip,
-      commandApprovalRoundTrip: client.serverRequestRoundTrip('item/commandExecution/requestApproval'),
-      fileApprovalRoundTrip: client.serverRequestRoundTrip('item/fileChange/requestApproval'),
-      mcpElicitationObserved: client.serverRequestRoundTrip('mcpServer/elicitation/request'),
+      commandApprovalRoundTrip: observer.serverRequestRoundTrip('item/commandExecution/requestApproval'),
+      fileApprovalRoundTrip: observer.serverRequestRoundTrip('item/fileChange/requestApproval'),
+      mcpElicitationObserved: observer.serverRequestRoundTrip('mcpServer/elicitation/request'),
       processCrashHandled,
       vendorThreadMigration: 'not-proven',
       cleanShutdown,
     };
   } finally {
-    await client.dispose();
+    await client.close();
   }
 }
 
@@ -509,11 +341,7 @@ async function schemaHasStableSurface(directory: string): Promise<boolean> {
     '"method": "thread/resume"',
     '"method": "turn/interrupt"',
   ].every((method) => clientRequests.includes(method))
-    && [
-      '"method": "item/commandExecution/requestApproval"',
-      '"method": "item/fileChange/requestApproval"',
-      '"method": "mcpServer/elicitation/request"',
-    ].every((method) => serverRequests.includes(method))
+    && DENIED_SERVER_METHODS.every((method) => serverRequests.includes(`"method": "${method}"`))
     && [
       '"method": "thread/started"',
       '"method": "turn/started"',
@@ -533,7 +361,7 @@ async function probeNoTurn(
   try {
     await generateSchema(command, env, schemaDirectory);
     const schemaGenerated = await schemaHasStableSurface(schemaDirectory);
-    client = new AppServerClient(command, ['app-server', '--listen', 'stdio://'], env);
+    client = createProbeClient(command, ['app-server', '--listen', 'stdio://'], env, new ProbeObserver());
     const initialized = object(await client.request('initialize', {
       clientInfo: { name: 'switchboard_probe', title: 'Switchboard probe', version: '0.1.0' },
       capabilities: null,
@@ -543,7 +371,8 @@ async function probeNoTurn(
     const authStateReadable = account !== null
       && 'account' in account
       && typeof account.requiresOpenaiAuth === 'boolean';
-    const cleanShutdown = await client.shutdown();
+    await client.close();
+    const cleanShutdown = true;
     return {
       version: parseVersion(initialized?.userAgent),
       schemaGenerated,
@@ -561,7 +390,7 @@ async function probeNoTurn(
       cleanShutdown,
     };
   } finally {
-    if (client) await client.dispose();
+    if (client) await client.close();
     await rm(schemaDirectory, { recursive: true, force: true });
   }
 }

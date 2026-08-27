@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import { probeAppServer } from '../scripts/codex-app-server-probe.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
@@ -65,6 +66,18 @@ test('server request IDs remain distinct from interleaved client responses', asy
   assert.equal(evidence.commandApprovalRoundTrip, true);
   assert.equal(evidence.fileApprovalRoundTrip, true);
   assert.equal(evidence.mcpElicitationObserved, true);
+});
+
+test('fixture probe denies every pinned server request including auth refresh', async () => {
+  const evidence = await probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_MODE: 'deny-server-requests' }),
+    fixtureMode: true,
+  });
+
+  assert.equal(evidence.initialized, true);
+  assert.equal(evidence.authStateReadable, true);
+  assert.ok(DENIED_SERVER_METHODS.includes('account/chatgptAuthTokens/refresh'));
 });
 
 test('fixture identifiers never claim SDK vendor-thread migration', async () => {
