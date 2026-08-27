@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  normalizeClaude, approvalQueue, questionOptions, renderClaudePrompt, resultText,
+  normalizeClaude, approvalQueue, probeLimits, questionOptions, renderClaudePrompt, resultText,
 } from '../src/agents/claude.ts';
 import type { AdapterEvent } from '../src/types.ts';
 
@@ -321,6 +321,51 @@ test('a rate_limit_event does not report a vendor session id', () => {
     session_id: 's1',
   }]);
   assert.ok(!events.some((e) => e.type === 'vendor-session-id'));
+});
+
+test('probeLimits normalizes Claude windows into provider-neutral snapshots', async () => {
+  let closed = false;
+  const before = Date.now();
+  const result = await probeLimits({}, 10, () => ({
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 100, resets_at: '2026-08-03T19:10:00Z' },
+        seven_day: { utilization: 42, resets_at: '2026-08-10T08:00:00Z' },
+      },
+      subscription_type: 'max',
+    }),
+    close: () => { closed = true; },
+  }) as never);
+
+  const { fetchedAt, ...snapshot } = result;
+  assert.equal(typeof fetchedAt, 'number');
+  assert.ok(fetchedAt >= before && fetchedAt <= Date.now(), 'fetchedAt must describe this probe');
+  assert.deepEqual(snapshot, {
+    plan: 'max',
+    windows: [
+      { id: '5h', label: '5h', usedPercent: 100, windowDurationMins: 300, resetsAt: Date.parse('2026-08-03T19:10:00Z'), reached: true },
+      { id: '7d', label: '7d', usedPercent: 42, windowDurationMins: 10_080, resetsAt: Date.parse('2026-08-10T08:00:00Z'), reached: false },
+    ],
+    blocks: [],
+    authoritative: true,
+    fresh: true,
+  });
+  assert.equal(closed, true, 'the no-turn probe must still release its SDK query');
+});
+
+test('probeLimits rejects a Claude response without usable windows', async () => {
+  await assert.rejects(
+    probeLimits({}, 10, () => ({
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+        rate_limits_available: true,
+        rate_limits: { five_hour: null, seven_day: null },
+        subscription_type: 'pro',
+      }),
+      close: () => {},
+    }) as never),
+    /both windows were empty/,
+  );
 });
 
 test('draining the approval queue settles every queued request, not just the head', async () => {

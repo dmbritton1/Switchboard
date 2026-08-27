@@ -203,23 +203,40 @@ export type AdapterEvent =
   | { type: 'prompt-delivery'; id: string; delivery: 'sent' | 'unsent' }
   | { type: 'stopped'; reason: string; code?: CodexFailureCode };
 
-/** One claude.ai plan rate-limit window. `utilization` is 0-100, not a
- *  fraction — that is the SDK's unit, kept as-is so a stray /100 is a visible
- *  bug rather than a plausible-looking number. */
-export type LimitWindow = {
-  utilization: number;
-  /** ISO 8601, straight from the SDK. */
-  resetsAt: string;
+/** A provider-neutral account usage window. Percentages are 0-100, not fractions. */
+export type AccountLimitWindow = {
+  id: string;
+  label: string;
+  usedPercent: number;
+  windowDurationMins: number | null;
+  /** Epoch milliseconds inside Switchboard, never provider timestamp text. */
+  resetsAt: number | null;
+  reached: boolean;
 };
 
-/** Real plan limits for one account. A window is null when the SDK reports it
- *  as null, which it does for windows that do not apply to the plan. */
-export type AccountLimits = {
-  fiveHour: LimitWindow | null;
-  sevenDay: LimitWindow | null;
-  /** 'pro' | 'max' | 'team' | 'enterprise', or null. Not an enum here: it is a
-   *  display string and an unrecognized plan should render, not throw. */
-  subscription: string | null;
+export type AccountLimitBlockReason =
+  | 'rate_limit_reached'
+  | 'workspace_owner_credits_depleted'
+  | 'workspace_member_credits_depleted'
+  | 'workspace_owner_usage_limit_reached'
+  | 'workspace_member_usage_limit_reached'
+  | 'spend_control_reached';
+
+/** A bucket- or account-level provider block. */
+export type AccountLimitBlock = {
+  id: string;
+  reason: AccountLimitBlockReason;
+  resettable: boolean;
+};
+
+/** Last normalized provider read. It is intentionally process-local. */
+export type AccountLimitSnapshot = {
+  plan: string | null;
+  windows: AccountLimitWindow[];
+  blocks: AccountLimitBlock[];
+  fetchedAt: number;
+  authoritative: true;
+  fresh: boolean;
 };
 
 export type StartOpts = {

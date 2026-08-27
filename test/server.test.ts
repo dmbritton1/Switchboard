@@ -2142,39 +2142,40 @@ test('a session stopped via the stop command is never requeued, even past the li
   assert.deepEqual(scheduler.all(), [], 'a deliberate Stop must not resurrect the session');
 });
 
-// ---- refreshLimits / accountLoad / snapshot limits fields ----------------
+// ---- refreshLimits / accountLoad / generic snapshot fields ----------------
 
-const fiveAndSeven = (five: number, seven: number) => ({
-  fiveHour: { utilization: five, resetsAt: '2026-08-03T19:10:00Z' },
-  sevenDay: { utilization: seven, resetsAt: '2026-08-10T08:00:00Z' },
-  subscription: 'pro',
+const limitSnapshot = (windows = [
+  { id: '5h', label: '5h', usedPercent: 11, windowDurationMins: 300, resetsAt: 10 * 3600_000, reached: false },
+  { id: '7d', label: '7d', usedPercent: 1, windowDurationMins: 10_080, resetsAt: 20 * 3600_000, reached: false },
+], blocks: Array<{ id: string; reason: 'rate_limit_reached'; resettable: boolean }> = []) => ({
+  plan: 'pro', windows, blocks, fetchedAt: 0, authoritative: true as const, fresh: true,
 });
 
-test('refreshLimits probes claude accounts only and stores the result', async () => {
+test('refreshLimits probes claude accounts only and stores a generic snapshot', async () => {
   const usage = new Usage();
   const seen: Record<string, string>[] = [];
   await refreshLimits(usage, accounts, async (env) => {
     seen.push(env);
-    return fiveAndSeven(11, 1);
+    return limitSnapshot();
   });
 
   assert.equal(seen.length, 1, 'the codex account must not be probed');
-  assert.deepEqual(usage.getLimits('claude-main').limits, fiveAndSeven(11, 1));
-  assert.deepEqual(usage.getLimits('codex'), { limits: null, error: null });
+  assert.deepEqual(usage.getLimitSnapshot('claude-main').snapshot, limitSnapshot());
+  assert.deepEqual(usage.getLimitSnapshot('codex'), { snapshot: null, error: null });
 });
 
 test('refreshLimits passes the account env through to the probe', async () => {
   const usage = new Usage();
   const withEnv = [{ name: 'alt', provider: 'claude' as const, budget: 1000, env: { CLAUDE_CONFIG_DIR: '/tmp/alt' } }];
   let got: Record<string, string> | null = null;
-  await refreshLimits(usage, withEnv, async (env) => { got = env; return fiveAndSeven(3, 2); });
+  await refreshLimits(usage, withEnv, async (env) => { got = env; return limitSnapshot(); });
   assert.deepEqual(got, { CLAUDE_CONFIG_DIR: '/tmp/alt' });
 });
 
-test('a rejected probe records the reason and leaves limits null', async () => {
+test('a rejected probe records the sanitized reason and leaves the snapshot null', async () => {
   const usage = new Usage();
   await refreshLimits(usage, accounts, async () => { throw new Error('logged out'); });
-  assert.deepEqual(usage.getLimits('claude-main'), { limits: null, error: 'logged out' });
+  assert.deepEqual(usage.getLimitSnapshot('claude-main'), { snapshot: null, error: 'logged out' });
 });
 
 test('one account failing does not stop another from being probed', async () => {
@@ -2185,35 +2186,49 @@ test('one account failing does not stop another from being probed', async () => 
   ];
   await refreshLimits(usage, two, async (_env) => {
     if (_env.WHICH === 'a') throw new Error('nope');
-    return fiveAndSeven(7, 7);
+    return limitSnapshot([
+      { id: '5h', label: '5h', usedPercent: 7, windowDurationMins: 300, resetsAt: 10 * 3600_000, reached: false },
+    ]);
   });
-  assert.equal(usage.getLimits('b').limits?.fiveHour?.utilization, 7);
+  assert.equal(usage.getLimitSnapshot('b').snapshot?.windows[0].usedPercent, 7);
 });
 
-test('accountLoad takes the worse of the two windows', () => {
+test('accountLoad uses the maximum utilization across arbitrary windows', () => {
   const usage = new Usage();
-  usage.setLimits('claude-main', fiveAndSeven(5, 96), null);
-  // A quiet 5h window must not hide a nearly-exhausted week.
+  usage.setLimitSnapshot('claude-main', limitSnapshot([
+    { id: 'monthly', label: 'Monthly', usedPercent: 5, windowDurationMins: 43_200, resetsAt: null, reached: false },
+    { id: 'burst', label: 'Burst', usedPercent: 96, windowDurationMins: null, resetsAt: null, reached: false },
+  ]));
   assert.equal(accountLoad(usage, accounts[0]), 0.96);
 });
 
-test('accountLoad falls back to pace without limits', () => {
+test('accountLoad returns full load for any fresh authoritative block', () => {
+  const usage = new Usage();
+  usage.setLimitSnapshot('claude-main', limitSnapshot([
+    { id: '5h', label: '5h', usedPercent: 5, windowDurationMins: 300, resetsAt: null, reached: false },
+  ], [{ id: 'default', reason: 'rate_limit_reached', resettable: true }]));
+  assert.equal(accountLoad(usage, accounts[0]), 1);
+});
+
+test('accountLoad falls back to pace without a fresh snapshot', () => {
   const usage = new Usage();
   usage.record('codex', 400, 0, Date.now());
   assert.equal(accountLoad(usage, accounts[1]), 0.4);
 });
 
-test('accountLoad prefers a real 5% over a 90% pace estimate', () => {
+test('accountLoad prefers a fresh provider 5% over a 90% pace estimate', () => {
   const usage = new Usage();
-  usage.setLimits('claude-main', fiveAndSeven(5, 5), null);
+  usage.setLimitSnapshot('claude-main', limitSnapshot([
+    { id: '5h', label: '5h', usedPercent: 5, windowDurationMins: 300, resetsAt: null, reached: false },
+  ]));
   usage.record('claude-main', 900, 0, Date.now());
   assert.equal(accountLoad(usage, accounts[0]), 0.05);
 });
 
-test('the snapshot carries limits, limitsError and load per account', async (t) => {
+test('the SSE snapshot carries a generic limit snapshot, sanitized error, and load per account', async (t) => {
   const { base, usage } = await boot(t);
-  usage.setLimits('claude-main', fiveAndSeven(11, 1), null);
-  usage.setLimits('codex', null, 'not supported');
+  usage.setLimitSnapshot('claude-main', limitSnapshot());
+  usage.failLimitSnapshot('codex', 'not supported');
   // codex's budget is 1000 (see the `accounts` fixture above); recording spend
   // here means `load: 0` below can only pass if load actually tracks pace —
   // with no recorded spend at all, pace() (and a hardcoded 0) look identical.
@@ -2223,11 +2238,11 @@ test('the snapshot carries limits, limitsError and load per account', async (t) 
   const main = snap.accounts.find((a: { name: string }) => a.name === 'claude-main');
   const codex = snap.accounts.find((a: { name: string }) => a.name === 'codex');
 
-  assert.deepEqual(main.limits, fiveAndSeven(11, 1));
-  assert.equal(main.limitsError, null);
+  assert.deepEqual(main.limitSnapshot, limitSnapshot());
+  assert.equal(main.limitSnapshotError, null);
   assert.equal(main.load, 0.11);
-  assert.equal(codex.limits, null);
-  assert.equal(codex.limitsError, 'not supported');
+  assert.equal(codex.limitSnapshot, null);
+  assert.equal(codex.limitSnapshotError, 'not supported');
   assert.equal(codex.load, 0.4);
 
 });

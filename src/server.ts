@@ -20,7 +20,7 @@ import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
 import type {
-  AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
+  AccountLimitSnapshot, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
   CodexThreadSettings, NotifyOn, Session, Settings, SortMode, Trigger,
 } from './types.ts';
 
@@ -290,14 +290,14 @@ export function parseSettingsPatch(body: unknown): { patch: Partial<Settings> } 
 
 /**
  * One fraction per account, so the meter and the New Session picker cannot
- * disagree. Real plan utilization when we have it, the local budget estimate
- * otherwise. `max` of the two windows: a 95%-consumed week has to outrank a
- * quiet five-hour window, and both are already 0-100 from the SDK.
+ * disagree. Fresh authoritative provider data wins; local pace is only an
+ * estimate fallback when that read is unavailable or stale.
  */
 export function accountLoad(usage: Usage, a: Account): number {
-  const { limits } = usage.getLimits(a.name);
-  if (!limits) return usage.pace(a.name, a.budget);
-  const pct = Math.max(limits.fiveHour?.utilization ?? 0, limits.sevenDay?.utilization ?? 0);
+  const { snapshot } = usage.getLimitSnapshot(a.name);
+  if (!snapshot || !snapshot.authoritative || !snapshot.fresh) return usage.pace(a.name, a.budget);
+  if (snapshot.blocks.length > 0) return 1;
+  const pct = Math.max(0, ...snapshot.windows.map((window) => window.usedPercent));
   return pct / 100;
 }
 
@@ -305,7 +305,7 @@ export function accountLoad(usage: Usage, a: Account): number {
  * One refresh pass over every Claude account, concurrently.
  *
  * `probe` is a parameter so tests drive this with a fake and never spawn a CLI.
- * Every failure is swallowed into `limitsError`: a probe that throws must leave
+ * Every failure is swallowed into the normalized snapshot error: a probe that throws must leave
  * the account showing exactly the estimate UI it shows today, never block a
  * session, and never take its neighbours down with it — hence allSettled and
  * the per-account try.
@@ -313,20 +313,20 @@ export function accountLoad(usage: Usage, a: Account): number {
 export async function refreshLimits(
   usage: Usage,
   accounts: Account[],
-  probe: (env: Record<string, string>) => Promise<AccountLimits> = probeLimits,
+  probe: (env: Record<string, string>) => Promise<AccountLimitSnapshot> = probeLimits,
 ): Promise<void> {
   await Promise.allSettled(
     accounts
       .filter((a) => a.provider === 'claude')
       .map(async (a) => {
         try {
-          usage.setLimits(a.name, await probe(a.env), null);
+          usage.setLimitSnapshot(a.name, await probe(a.env));
         } catch (err) {
           // The SDK can build messages like "...exited with code N. stderr: <tail>",
           // which may contain this account's own env values (paths, tokens) — the
           // same reason launch()'s codex error path redacts before it reaches the
           // browser, for an error the user never even triggered by hand.
-          usage.setLimits(a.name, null, redactAccountValue(String((err as Error).message ?? err), a));
+          usage.failLimitSnapshot(a.name, redactAccountValue(String((err as Error).message ?? err), a));
         }
       }),
   );
@@ -374,14 +374,14 @@ export function createServer(opts: {
       queue: scheduler.all(),
       settings: registry.settings(),
       accounts: accounts.map((a) => {
-        const { limits, error } = usage.getLimits(a.name);
+        const { snapshot: limitSnapshot, error: limitSnapshotError } = usage.getLimitSnapshot(a.name);
         return {
           name: a.name,
           provider: a.provider,
           budget: a.budget,
           pace: usage.pace(a.name, a.budget),
-          limits,
-          limitsError: error,
+          limitSnapshot,
+          limitSnapshotError,
           load: accountLoad(usage, a),
         };
       }),

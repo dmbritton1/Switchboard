@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { Usage } from '../src/usage.ts';
+import { providerTimestampMs, Usage } from '../src/usage.ts';
+import type { AccountLimitSnapshot } from '../src/types.ts';
 
 const HOUR = 3600_000;
 
@@ -59,13 +60,19 @@ test('a rejection with no reset time stores nothing', () => {
   assert.equal(u.resetAt('main'), null);
 });
 
-test('resetsAt in seconds is normalized to milliseconds', () => {
+test('providerTimestampMs normalizes seconds while retaining milliseconds and fake clocks', () => {
+  assert.equal(providerTimestampMs(1_800_000_000), 1_800_000_000_000);
+  assert.equal(providerTimestampMs(1_800_000_000_000), 1_800_000_000_000);
+  assert.equal(providerTimestampMs(5 * HOUR), 5 * HOUR);
+  assert.equal(providerTimestampMs(null), null);
+  assert.equal(providerTimestampMs(Infinity), null);
+  assert.equal(providerTimestampMs('1_800_000_000'), null);
+});
+
+test('noteLimit uses provider timestamp normalization without changing Claude recovery', () => {
   const u = new Usage();
-  // The SDK types resetsAt as a bare `number` with no documented unit.
-  u.noteLimit('sec', 'rejected', 1_800_000_000);        // seconds
-  u.noteLimit('ms', 'rejected', 1_800_000_000_000);     // milliseconds
+  u.noteLimit('sec', 'rejected', 1_800_000_000);
   assert.equal(u.resetAt('sec'), 1_800_000_000_000);
-  assert.equal(u.resetAt('ms'), 1_800_000_000_000);
 });
 
 test('free() prefers a known reset time over the pace estimate', () => {
@@ -112,33 +119,136 @@ test('restore ignores a malformed resets block', () => {
   assert.equal(u.resetAt('c'), 5 * HOUR);
 });
 
-const limits = (five: number, seven: number) => ({
-  fiveHour: { utilization: five, resetsAt: '2026-08-03T19:10:00Z' },
-  sevenDay: { utilization: seven, resetsAt: '2026-08-10T08:00:00Z' },
-  subscription: 'pro',
+const snapshot = (over: Partial<AccountLimitSnapshot> = {}): AccountLimitSnapshot => ({
+  plan: 'pro',
+  windows: [
+    { id: 'short', label: 'Short', usedPercent: 11, windowDurationMins: 60, resetsAt: 10 * HOUR, reached: false },
+    { id: 'long', label: 'Long', usedPercent: 1, windowDurationMins: 10_080, resetsAt: 20 * HOUR, reached: false },
+  ],
+  blocks: [],
+  fetchedAt: 0,
+  authoritative: true,
+  fresh: true,
+  ...over,
 });
 
-test('getLimits on an unprobed account is empty, not undefined', () => {
+test('getLimitSnapshot on an unprobed account is empty, not undefined', () => {
   const u = new Usage();
-  assert.deepEqual(u.getLimits('main'), { limits: null, error: null });
+  assert.deepEqual(u.getLimitSnapshot('main'), { snapshot: null, error: null });
 });
 
-test('setLimits stores limits and a later success clears a previous error', () => {
+test('setLimitSnapshot stores arbitrary windows and clears a previous error', () => {
   const u = new Usage();
-  u.setLimits('main', null, 'logged out');
-  assert.deepEqual(u.getLimits('main'), { limits: null, error: 'logged out' });
+  u.failLimitSnapshot('main', 'logged out');
+  assert.deepEqual(u.getLimitSnapshot('main'), { snapshot: null, error: 'logged out' });
 
-  u.setLimits('main', limits(11, 1), null);
-  assert.deepEqual(u.getLimits('main'), { limits: limits(11, 1), error: null });
+  const read = snapshot({
+    windows: [
+      { id: 'monthly', label: 'Monthly', usedPercent: 45, windowDurationMins: 43_200, resetsAt: 30 * 24 * HOUR, reached: false },
+      { id: 'burst', label: 'Burst', usedPercent: 12, windowDurationMins: null, resetsAt: null, reached: false },
+    ],
+  });
+  u.setLimitSnapshot('main', read);
+  assert.deepEqual(u.getLimitSnapshot('main'), { snapshot: read, error: null });
 });
 
-test('limits are not persisted: a percentage is wrong the moment we are not running', () => {
+test('a failed snapshot refresh retains provider data but marks it stale', () => {
+  const u = new Usage();
+  const read = snapshot();
+  u.setLimitSnapshot('main', read);
+  u.failLimitSnapshot('main', 'refresh failed');
+
+  assert.deepEqual(u.getLimitSnapshot('main'), {
+    snapshot: { ...read, fresh: false },
+    error: 'refresh failed',
+  });
+});
+
+test('a failed snapshot refresh without prior data keeps only the error', () => {
+  const u = new Usage();
+  u.failLimitSnapshot('main', 'refresh failed');
+  assert.deepEqual(u.getLimitSnapshot('main'), { snapshot: null, error: 'refresh failed' });
+});
+
+test('authoritative reset eligibility uses the latest reset across reached windows', () => {
+  const u = new Usage();
+  u.setLimitSnapshot('main', snapshot({ windows: [
+    { id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: 10 * HOUR, reached: true },
+    { id: 'week', label: 'Week', usedPercent: 100, windowDurationMins: 10_080, resetsAt: 20 * HOUR, reached: true },
+  ] }));
+  assert.deepEqual(u.authoritativeResetEligibility('main', 5 * HOUR), { eligible: true, resetsAt: 20 * HOUR });
+});
+
+test('authoritative reset eligibility rejects stale, unreached, and missing/past reset states', () => {
+  const cases: Array<{ name: string; read: AccountLimitSnapshot; now: number }> = [
+    { name: 'stale', read: snapshot({ fresh: false }), now: 0 },
+    { name: 'unreached', read: snapshot(), now: 0 },
+    { name: 'missing reset', read: snapshot({ windows: [
+      { id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: null, reached: true },
+    ] }), now: 0 },
+    { name: 'past reset', read: snapshot({ windows: [
+      { id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: 5 * HOUR, reached: true },
+    ] }), now: 5 * HOUR },
+  ];
+
+  for (const { name, read, now } of cases) {
+    const u = new Usage();
+    u.setLimitSnapshot('main', read);
+    const result = u.authoritativeResetEligibility('main', now);
+    assert.equal(result.eligible, false, name);
+  }
+});
+
+test('only resettable rate-limit blocks may accompany reset scheduling', () => {
+  const resettable = new Usage();
+  resettable.setLimitSnapshot('main', snapshot({
+    windows: [{ id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: 10 * HOUR, reached: true }],
+    blocks: [{ id: 'default', reason: 'rate_limit_reached', resettable: true }],
+  }));
+  assert.deepEqual(resettable.authoritativeResetEligibility('main', 0), { eligible: true, resetsAt: 10 * HOUR });
+
+  for (const reason of [
+    'workspace_owner_credits_depleted',
+    'workspace_member_credits_depleted',
+    'workspace_owner_usage_limit_reached',
+    'workspace_member_usage_limit_reached',
+    'spend_control_reached',
+  ] as const) {
+    const u = new Usage();
+    u.setLimitSnapshot('main', snapshot({
+      windows: [{ id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: 10 * HOUR, reached: true }],
+      blocks: [{ id: 'default', reason, resettable: true }],
+    }));
+    assert.equal(u.authoritativeResetEligibility('main', 0).eligible, false, reason);
+  }
+});
+
+test('provider snapshots are never persisted while token samples and Claude resets round-trip', () => {
   const u = new Usage();
   u.record('main', 100, 100, 0);
-  u.setLimits('main', limits(11, 1), null);
-  // The persisted shape gained a `resets` block when scheduling landed (a reset
-  // time is still true after a restart, unlike a utilization percentage). The
-  // assertion this test exists for is unchanged: nothing from setLimits() is in
-  // here — no utilization, no subscription, no error.
-  assert.deepEqual(u.toJSON(), { samples: { main: [{ t: 0, tokens: 200 }] }, resets: {} });
+  u.noteLimit('main', 'rejected', 5 * HOUR);
+  u.setLimitSnapshot('main', snapshot({
+    plan: 'max',
+    blocks: [{ id: 'workspace', reason: 'spend_control_reached', resettable: false }],
+  }));
+
+  const persisted = u.toJSON();
+  const serialized = JSON.stringify(persisted);
+  for (const hidden of ['max', 'windows', 'blocks', 'fetchedAt', String(10 * HOUR)]) {
+    assert.doesNotMatch(serialized, new RegExp(hidden));
+  }
+
+  const back = new Usage();
+  back.restore(persisted, 0);
+  assert.equal(back.pace('main', 1000, 0), 0.2);
+  assert.equal(back.resetAt('main'), 5 * HOUR);
+  assert.deepEqual(back.getLimitSnapshot('main'), { snapshot: null, error: null });
+});
+
+test('a generic snapshot never populates the Claude rejected-event reset channel', () => {
+  const u = new Usage();
+  u.setLimitSnapshot('main', snapshot({ windows: [
+    { id: 'hour', label: 'Hour', usedPercent: 100, windowDurationMins: 60, resetsAt: 10 * HOUR, reached: true },
+  ] }));
+  assert.equal(u.resetAt('main'), null);
 });

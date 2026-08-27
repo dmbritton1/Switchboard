@@ -3,7 +3,7 @@ import type {
   Options, PermissionResult, SDKMessage, SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import type {
-  AccountLimits, Adapter, AdapterEvent, AgentHandle, AgentPrompt, ApprovalRequest, QuestionOption,
+  AccountLimitSnapshot, Adapter, AdapterEvent, AgentHandle, AgentPrompt, ApprovalRequest, QuestionOption,
   StartOpts,
 } from '../types.ts';
 // Named for Codex only because that is where it was first needed — the function
@@ -436,8 +436,9 @@ export const claudeAdapter: Adapter = {
 export async function probeLimits(
   env: Record<string, string>,
   timeoutMs = 30_000,
-): Promise<AccountLimits> {
-  const q = query({
+  startQuery: typeof query = query,
+): Promise<AccountLimitSnapshot> {
+  const q = startQuery({
     // Never yields: the SDK pulls, gets nothing, and no turn is ever started.
     prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
       await new Promise<never>(() => {});
@@ -466,12 +467,25 @@ export async function probeLimits(
       // error the user can act on, but not a number either.
       throw new Error('plan rate limits are not available for this account');
     }
-    const win = (w: { utilization: number | null; resets_at: string | null } | null | undefined) =>
-      (w && typeof w.utilization === 'number' && w.resets_at
-        ? { utilization: w.utilization, resetsAt: w.resets_at }
-        : null);
-    const fiveHour = win(usage.rate_limits.five_hour);
-    const sevenDay = win(usage.rate_limits.seven_day);
+    const win = (
+      id: string,
+      label: string,
+      windowDurationMins: number,
+      w: { utilization: number | null; resets_at: string | null } | null | undefined,
+    ) => {
+      if (!w || typeof w.utilization !== 'number' || !Number.isFinite(w.utilization) || !w.resets_at) return null;
+      const parsed = Date.parse(w.resets_at);
+      return {
+        id,
+        label,
+        usedPercent: w.utilization,
+        windowDurationMins,
+        resetsAt: Number.isFinite(parsed) ? parsed : null,
+        reached: w.utilization >= 100,
+      };
+    };
+    const fiveHour = win('5h', '5h', 300, usage.rate_limits.five_hour);
+    const sevenDay = win('7d', '7d', 10_080, usage.rate_limits.seven_day);
     // Both windows are optional in the SDK type, so `rate_limits_available: true`
     // does not guarantee either one is actually present. Rejecting here — the
     // same failure channel as the check above — keeps a missing number from
@@ -480,7 +494,14 @@ export async function probeLimits(
     if (!fiveHour && !sevenDay) {
       throw new Error('plan rate limits were reported available but both windows were empty');
     }
-    return { fiveHour, sevenDay, subscription: usage.subscription_type };
+    return {
+      plan: usage.subscription_type,
+      windows: [fiveHour, sevenDay].filter((window): window is NonNullable<typeof window> => window !== null),
+      blocks: [],
+      fetchedAt: Date.now(),
+      authoritative: true,
+      fresh: true,
+    };
   } finally {
     clearTimeout(timer);
     // Releases the child process. Without this the node event loop stays alive.
