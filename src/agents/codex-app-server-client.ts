@@ -112,6 +112,7 @@ export class AppServerClient {
       return;
     }
     this.#closing = true;
+    this.#settlePendingForClose();
     this.#child.stdin.end();
     try {
       const outcome = await Promise.race([
@@ -216,6 +217,12 @@ export class AppServerClient {
     }
     this.#settleTerminal();
     void this.#terminateBounded().catch(() => {});
+  }
+
+  #settlePendingForClose(): void {
+    if (this.#pending.size === 0 || this.#terminalError) return;
+    this.#terminalError = this.#error('Codex app-server closed while requests were pending.');
+    this.#settleTerminal();
   }
 
   #settleTerminal(): void {

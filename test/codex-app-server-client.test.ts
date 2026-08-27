@@ -197,6 +197,30 @@ test('close is idempotent', async () => {
   await Promise.all([client.close(), client.close(), client.close()]);
 });
 
+test('close settles a pending request when the child exits cleanly', async (t) => {
+  const exits: Error[] = [];
+  const client = clientFor({
+    mode: 'pending-until-eof',
+    requestTimeoutMs: 1_000,
+    overrides: { PROBE_TOKEN: 'client-secret-value' },
+    onExit: (error) => exits.push(error),
+  });
+  t.after(() => client.close());
+
+  const pending = client.request('initialize');
+  const rejected = rejectsWithin(
+    pending,
+    250,
+    (error) => error instanceof Error
+      && /closed|terminated/i.test(error.message)
+      && !error.message.includes('client-secret-value'),
+  );
+  await client.close();
+  await rejected;
+  assert.equal(exits.length, 1);
+  assert.equal(exits[0]?.message.includes('client-secret-value'), false);
+});
+
 test('multiple racing terminal signals settle a pending request and callback exactly once', async (t) => {
   const exits: Error[] = [];
   const client = clientFor({ mode: 'malformed-and-exit', onExit: (error) => exits.push(error) });

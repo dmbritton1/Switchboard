@@ -382,7 +382,7 @@ async function handle(message: Message): Promise<void> {
     send({ id: 999, result: { unexpected: true } });
     return;
   }
-  if (mode === 'hang' || mode === 'ignore-term') return;
+  if (mode === 'hang' || mode === 'ignore-term' || mode === 'pending-until-eof') return;
 
   if (mode === 'client-correlation' && await handleClientCorrelation(message)) return;
   if (mode === 'deny-server-requests' && await handleDeniedServerRequests(message)) return;
