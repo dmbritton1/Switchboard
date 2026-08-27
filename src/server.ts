@@ -321,12 +321,10 @@ export async function refreshLimits(
       .map(async (a) => {
         try {
           usage.setLimitSnapshot(a.name, await probe(a.env));
-        } catch (err) {
-          // The SDK can build messages like "...exited with code N. stderr: <tail>",
-          // which may contain this account's own env values (paths, tokens) — the
-          // same reason launch()'s codex error path redacts before it reaches the
-          // browser, for an error the user never even triggered by hand.
-          usage.failLimitSnapshot(a.name, redactAccountValue(String((err as Error).message ?? err), a));
+        } catch {
+          // Provider errors can include stderr, paths, and account metadata. This
+          // value is sent over SSE, so preserve only a stable action for the user.
+          usage.failLimitSnapshot(a.name, 'Unable to refresh account limits. Check that this account is signed in.');
         }
       }),
   );

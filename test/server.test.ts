@@ -2172,10 +2172,23 @@ test('refreshLimits passes the account env through to the probe', async () => {
   assert.deepEqual(got, { CLAUDE_CONFIG_DIR: '/tmp/alt' });
 });
 
-test('a rejected probe records the sanitized reason and leaves the snapshot null', async () => {
-  const usage = new Usage();
-  await refreshLimits(usage, accounts, async () => { throw new Error('logged out'); });
-  assert.deepEqual(usage.getLimitSnapshot('claude-main'), { snapshot: null, error: 'logged out' });
+test('a failed provider probe exposes a stable path-free error over SSE', async (t) => {
+  const { base, usage } = await boot(t);
+  const secret = 'claude-account-secret';
+  const providerPath = '/private/provider/claude-probe.stderr';
+  await refreshLimits(usage, [{
+    name: 'claude-main', provider: 'claude', budget: 1000, env: { CLAUDE_TOKEN: secret },
+  }], async () => {
+    throw new Error(`provider rejected ${secret}: see ${providerPath}`);
+  });
+
+  const snap = await firstSnapshot(base);
+  const account = snap.accounts.find((a: { name: string }) => a.name === 'claude-main');
+  const publicSnapshot = JSON.stringify(snap);
+  assert.equal(account.limitSnapshot, null);
+  assert.equal(account.limitSnapshotError, 'Unable to refresh account limits. Check that this account is signed in.');
+  assert.ok(!publicSnapshot.includes(secret), 'account environment values must not reach SSE');
+  assert.ok(!publicSnapshot.includes(providerPath), 'provider absolute paths must not reach SSE');
 });
 
 test('one account failing does not stop another from being probed', async () => {
