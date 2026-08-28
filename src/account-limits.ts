@@ -9,12 +9,7 @@ import { Usage } from './usage.ts';
 const CLAUDE_FAILURE = 'Unable to refresh account limits. Check that this account is signed in.';
 const CODEX_FAILURE = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
 const BOUNDARY_TIMEOUT = 'Timed out waiting for a fresh Codex limit read.';
-const STABLE_CODEX_AUTH_FAILURES = new Set<string>([
-  CODEX_TELEMETRY_REASONS.apiKey,
-  CODEX_TELEMETRY_REASONS.signedOut,
-  CODEX_TELEMETRY_REASONS.bedrock,
-  CODEX_TELEMETRY_REASONS.externalTokens,
-]);
+const STABLE_CODEX_AUTH_FAILURES = new Set<string>(Object.values(CODEX_TELEMETRY_REASONS));
 
 export type ResetRelease = { ready: boolean; reason: string };
 

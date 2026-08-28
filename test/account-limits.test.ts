@@ -380,14 +380,8 @@ test('blocks failed, unsupported, and malformed boundary reads without exposing 
   }
 });
 
-test('preserves only known stable unsupported-auth reasons', async () => {
-  const stable = [
-    CODEX_TELEMETRY_REASONS.apiKey,
-    CODEX_TELEMETRY_REASONS.signedOut,
-    CODEX_TELEMETRY_REASONS.bedrock,
-    CODEX_TELEMETRY_REASONS.externalTokens,
-  ];
-  for (const reason of stable) {
+test('preserves every known stable unsupported-auth reason', async () => {
+  for (const reason of Object.values(CODEX_TELEMETRY_REASONS)) {
     const usage = new Usage();
     const coordinator = createAccountLimitCoordinator({
       accounts: [accounts[1]], usage, onChange: () => {}, prepareCodex: async () => runtime(),
