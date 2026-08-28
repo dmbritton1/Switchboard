@@ -1,10 +1,10 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm, mkdir, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, readFile, rename, readdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { prepareCodexRuntime } from './agents/codex-runtime.ts';
-import type { Account } from './accounts.ts';
+import { DEFAULT_BUDGET, validateAccountName, type Account } from './accounts.ts';
 
 const runFile = promisify(execFile);
 
@@ -385,5 +385,60 @@ export class Linker {
     this.#pending = null;
     await rm(p.staging, { recursive: true, force: true });
     this.#notify();
+  }
+
+  /**
+   * Renames the staging dir into place and returns the account entry. Does NOT
+   * write accounts.json — the server owns that, so this class never needs to
+   * know where the file lives.
+   *
+   * Rename first, persist second: a failed write then leaves an orphan
+   * directory, which is harmless, rather than an account entry pointing at a
+   * directory that does not exist.
+   */
+  async commit(name: string): Promise<{ account?: Account; error?: string }> {
+    const p = this.#pending;
+    if (!p) return { error: 'no link is in progress' };
+    if (p.phase !== 'naming') return { error: 'the sign-in is not ready to be named' };
+
+    const invalid = validateAccountName(name, [...this.#accounts()]);
+    if (invalid) return { error: invalid };
+
+    const target = join(this.#root, name);
+    try {
+      await rename(p.staging, target);
+    } catch (error) {
+      return { error: this.redact(String((error as Error).message ?? error)) };
+    }
+
+    const account: Account = {
+      name,
+      provider: p.provider,
+      budget: DEFAULT_BUDGET,
+      env: { [CREDENTIAL_ENV[p.provider]]: target },
+      ...(p.identity ? { identity: p.identity.email } : {}),
+    };
+
+    this.#clearTimers(p);
+    this.#pending = null;
+    this.#notify();
+    return { account };
+  }
+
+  /**
+   * Removes staging dirs left by a crash or a kill. Deliberately narrow: only
+   * `.pending-*` entries. A sweep that deleted any unrecognised directory under
+   * the accounts root would eat real credentials after an unrelated bug.
+   */
+  async sweep(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.#root);
+    } catch {
+      return;
+    }
+    await Promise.all(entries
+      .filter((entry) => entry.startsWith('.pending-'))
+      .map((entry) => rm(join(this.#root, entry), { recursive: true, force: true })));
   }
 }

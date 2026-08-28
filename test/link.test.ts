@@ -226,3 +226,65 @@ test('linking a different identity than an existing account still reaches naming
   await h.linker.cancel();
   await h.cleanup();
 });
+
+test('commit renames staging into the accounts root and returns the entry', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt', email: 'dwight@example.com' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const { account, error } = await h.linker.commit('claude-dwight');
+  assert.equal(error, undefined);
+  assert.equal(account?.name, 'claude-dwight');
+  assert.equal(account?.provider, 'claude');
+  assert.equal(account?.budget, 2_000_000);
+  assert.equal(account?.identity, 'dwight@example.com');
+  assert.equal(account?.env.CLAUDE_CONFIG_DIR, join(h.dir, 'accounts', 'claude-dwight'));
+  const { readFile } = await import('node:fs/promises');
+  assert.ok(await readFile(join(h.dir, 'accounts', 'claude-dwight', '.claude.json'), 'utf8'));
+  assert.equal(h.linker.snapshot(), null);
+  await h.cleanup();
+});
+
+test('commit rejects a name that could escape the accounts root', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  for (const bad of ['../evil', 'a/b', '', 'UPPER']) {
+    const { error } = await h.linker.commit(bad);
+    assert.equal(typeof error, 'string', `expected ${bad} rejected`);
+  }
+  assert.equal(h.linker.snapshot()?.phase, 'naming');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('commit rejects a name already taken', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt' });
+  h.accounts.push({ name: 'taken', provider: 'claude', budget: 1, env: {} });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const { error } = await h.linker.commit('taken');
+  assert.match(error ?? '', /already exists/);
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('commit is refused before the link reaches naming', async () => {
+  const h = await harness({ provider: 'claude' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'awaiting-user');
+  const { error } = await h.linker.commit('claude-x');
+  assert.match(error ?? '', /not ready/);
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('sweep removes leftover staging dirs and nothing else', async () => {
+  const h = await harness();
+  const { mkdir, readdir } = await import('node:fs/promises');
+  const root = join(h.dir, 'accounts');
+  await mkdir(join(root, '.pending-abandoned'), { recursive: true });
+  await mkdir(join(root, 'claude-keep'), { recursive: true });
+  await h.linker.sweep();
+  assert.deepEqual((await readdir(root)).sort(), ['claude-keep']);
+  await h.cleanup();
+});
