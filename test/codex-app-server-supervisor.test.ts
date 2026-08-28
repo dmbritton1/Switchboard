@@ -75,6 +75,57 @@ type ScriptedClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError
   crash: () => void;
 };
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
+
+function managedAccountResult(): Record<string, unknown> {
+  return {
+    account: { type: 'chatgpt', email: null, planType: 'pro' },
+    requiresOpenaiAuth: true,
+  };
+}
+
+function rateLimitsResult(): Record<string, unknown> {
+  return {
+    rateLimits: {
+      limitId: null,
+      limitName: null,
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 2_000_000_000 },
+      secondary: null,
+      spendControlReached: false,
+      rateLimitReachedType: null,
+    },
+    rateLimitsByLimitId: null,
+  };
+}
+
+function deferredAccountClient(
+  options: AppServerClientOptions,
+  accountRead: Promise<unknown>,
+  requests: string[],
+  denied: Array<{ id: string | number; code: number; message: string }> = [],
+): ScriptedClient {
+  return {
+    request: async <T>(method: string): Promise<T> => {
+      requests.push(method);
+      if (method === 'initialize') return { initialized: true } as T;
+      if (method === 'account/read') return accountRead as Promise<T>;
+      if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+      throw new Error('unsupported scripted request');
+    },
+    notify: () => {},
+    respondError: (id, code, message) => { denied.push({ id, code, message }); },
+    close: async () => {},
+    crash: () => options.onExit(new Error('private scripted crash')),
+  };
+}
+
 function scriptedClient(options: AppServerClientOptions, fail = false): ScriptedClient {
   return {
     request: async <T>(method: string): Promise<T> => {
@@ -152,6 +203,128 @@ test('verifies before one child starts, initializes before reads, coalesces read
   assert.equal(log.filter((entry) => entry.method === 'initialize').length, 1);
   assert.equal(log.some((entry) => /^(thread|turn)\//.test(String(entry.method))), false);
   assert.equal(log.some((entry) => entry.method === 'getAuthStatus'), false);
+});
+
+test('reconcile joins a pending initialize before reading auth state', async (t) => {
+  const initialize = deferred<unknown>();
+  const requests: string[] = [];
+  const observed = callbacks();
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => ({
+      request: async <T>(method: string): Promise<T> => {
+        requests.push(method);
+        if (method === 'initialize') return initialize.promise as Promise<T>;
+        if (method === 'account/read') return managedAccountResult() as T;
+        if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+        throw new Error('unsupported scripted request');
+      },
+      notify: () => {},
+      respondError: () => {},
+      close: async () => {},
+      crash: () => options.onExit(new Error('private scripted crash')),
+    }),
+  });
+  t.after(() => supervisor.close());
+
+  const startup = supervisor.start();
+  await waitFor(() => requests.includes('initialize'));
+  const reconciliation = supervisor.reconcile().then(
+    (snapshot) => ({ status: 'fulfilled' as const, snapshot }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  );
+  const early = await Promise.race([
+    reconciliation.then(() => 'settled' as const),
+    new Promise<'pending'>((resolve) => setImmediate(() => resolve('pending'))),
+  ]);
+  initialize.resolve({ initialized: true });
+
+  await startup;
+  const result = await reconciliation;
+  assert.equal(early, 'pending');
+  assert.equal(result.status, 'fulfilled');
+  if (result.status === 'fulfilled') assert.equal(result.snapshot.fresh, true);
+  assert.deepEqual(observed.stale, []);
+});
+
+test('token refresh denial during startup account read stays unsupported until a managed auth update', async (t) => {
+  const accountRead = deferred<unknown>();
+  const observed = callbacks();
+  const requests: string[] = [];
+  const denied: Array<{ id: string | number; code: number; message: string }> = [];
+  let protocol!: AppServerClientOptions;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return deferredAccountClient(options, accountRead.promise, requests, denied);
+    },
+  });
+  t.after(() => supervisor.close());
+
+  const startup = supervisor.start();
+  await waitFor(() => requests.includes('account/read'));
+  protocol.onServerRequest(7_001, 'account/chatgptAuthTokens/refresh', {
+    refreshToken: 'private-refresh-token',
+  });
+  accountRead.resolve(managedAccountResult());
+  await startup;
+
+  assert.deepEqual(denied.map(({ id, code }) => ({ id, code })), [{ id: 7_001, code: -32601 }]);
+  assert.deepEqual(observed.stale, [externalTokens]);
+  assert.equal(observed.snapshots.length, 0);
+  await assert.rejects(
+    supervisor.reconcile(),
+    (error: unknown) => error instanceof Error && error.message === externalTokens,
+  );
+
+  protocol.onNotification('account/updated', { authMode: 'chatgpt', planType: 'pro' });
+  await waitFor(() => observed.snapshots.length === 1);
+  assert.equal(observed.snapshots[0]?.plan, 'pro');
+});
+
+test('unsupported auth update during startup account read stays latched until a later managed update', async (t) => {
+  const accountRead = deferred<unknown>();
+  const observed = callbacks();
+  const requests: string[] = [];
+  let protocol!: AppServerClientOptions;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return deferredAccountClient(options, accountRead.promise, requests);
+    },
+  });
+  t.after(() => supervisor.close());
+
+  const startup = supervisor.start();
+  await waitFor(() => requests.includes('account/read'));
+  protocol.onNotification('account/updated', { authMode: 'headers', planType: null });
+  accountRead.resolve(managedAccountResult());
+  await startup;
+
+  assert.deepEqual(observed.stale, [externalHeaders]);
+  assert.equal(observed.snapshots.length, 0);
+  await assert.rejects(
+    supervisor.reconcile(),
+    (error: unknown) => error instanceof Error && error.message === externalHeaders,
+  );
+
+  protocol.onNotification('account/updated', { authMode: 'chatgpt', planType: 'team' });
+  await waitFor(() => observed.snapshots.length === 1);
+  assert.equal(observed.snapshots[0]?.plan, 'team');
 });
 
 test('runs real contract verification before telemetry startup', async (t) => {

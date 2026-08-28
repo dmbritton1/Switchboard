@@ -64,6 +64,7 @@ export class CodexAppServerSupervisor {
   #launch: Promise<void> | null = null;
   #read: Promise<AccountLimitSnapshot> | null = null;
   #auth: CodexTelemetryAuth | null = null;
+  #authRevision = 0;
   #staleReason: string | null = null;
   #restartTimer: TimerHandle | null = null;
   #restartAttempt = 0;
@@ -80,8 +81,8 @@ export class CodexAppServerSupervisor {
 
   start(): Promise<void> {
     if (this.#closed) return Promise.reject(unavailableError());
-    if (this.#client) return Promise.resolve();
     if (this.#launch) return this.#launch;
+    if (this.#client) return Promise.resolve();
     if (this.#restartTimer !== null) return Promise.reject(unavailableError());
     return this.#beginLaunch();
   }
@@ -129,10 +130,11 @@ export class CodexAppServerSupervisor {
       this.#assertActive(client);
       client.notify('initialized');
       this.#readyClient = client;
-      const account = normalizeCodexAccountRead(
-        await client.request('account/read', { refreshToken: false }),
-      );
+      const authRevision = this.#authRevision;
+      const accountInput = await client.request('account/read', { refreshToken: false });
       this.#assertActive(client);
+      if (this.#authRevision !== authRevision) return;
+      const account = normalizeCodexAccountRead(accountInput);
       this.#auth = account;
       if (!account.supported) {
         this.#restartAttempt = 0;
@@ -170,6 +172,7 @@ export class CodexAppServerSupervisor {
     if (client !== this.#readyClient) return;
     if (method === 'account/updated') {
       const auth = normalizeCodexAuthUpdate(params);
+      this.#authRevision += 1;
       this.#auth = auth;
       if (!auth.supported) {
         this.#markStale(auth.reason);
@@ -194,6 +197,7 @@ export class CodexAppServerSupervisor {
         : 'Unknown to the Switchboard telemetry client.',
     );
     if (method === 'account/chatgptAuthTokens/refresh') {
+      this.#authRevision += 1;
       this.#auth = {
         supported: false,
         plan: null,
