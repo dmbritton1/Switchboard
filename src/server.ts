@@ -35,6 +35,74 @@ export type Account = {
   bin?: string;
 };
 
+type LimitIntervalHandle = unknown;
+
+export type AccountLimitLifecycleDeps = {
+  intervalMs?: number;
+  setInterval?: (callback: () => void, delay: number) => LimitIntervalHandle;
+  clearInterval?: (handle: LimitIntervalHandle) => void;
+};
+
+function defaultLimitInterval(callback: () => void, delay: number): ReturnType<typeof setInterval> {
+  return setInterval(callback, delay).unref();
+}
+
+function defaultClearLimitInterval(handle: LimitIntervalHandle): void {
+  clearInterval(handle as ReturnType<typeof setInterval>);
+}
+
+/**
+ * Attaches account telemetry only after the HTTP server is listening. The
+ * coordinator owns provider processes; this seam owns cadence and shutdown.
+ */
+export function attachAccountLimitLifecycle(
+  server: Server,
+  coordinator: AccountLimitCoordinator,
+  deps: AccountLimitLifecycleDeps = {},
+): void {
+  const intervalMs = deps.intervalMs ?? 5 * 60_000;
+  const setLimitInterval = deps.setInterval ?? defaultLimitInterval;
+  const clearLimitInterval = deps.clearInterval ?? defaultClearLimitInterval;
+  let timer: LimitIntervalHandle | null = null;
+  let active = false;
+  let began = false;
+  let closed = false;
+
+  const run = async (initial: boolean): Promise<void> => {
+    if (closed || active) return;
+    active = true;
+    try {
+      if (initial) await coordinator.start();
+      else await coordinator.reconcile();
+    } catch {
+      // Account failures are displayed through Usage; HTTP startup remains live.
+    } finally {
+      active = false;
+    }
+  };
+
+  const begin = () => {
+    if (began || closed) return;
+    began = true;
+    queueMicrotask(() => {
+      if (closed) return;
+      void run(true);
+      timer = setLimitInterval(() => { void run(false); }, intervalMs);
+    });
+  };
+
+  if (server.listening) begin();
+  else server.once('listening', begin);
+  server.once('close', () => {
+    closed = true;
+    if (timer !== null) {
+      clearLimitInterval(timer);
+      timer = null;
+    }
+    void coordinator.close().catch(() => {});
+  });
+}
+
 type PreparedProvider = {
   adapter: Adapter;
 };
@@ -346,11 +414,13 @@ export function createServer(opts: {
   beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
   /** Entry-point owned telemetry lifecycle. Tests inject a fake, never a child process. */
   limitCoordinator?: AccountLimitCoordinator;
+  /** Injectable interval seam for process-free lifecycle tests. */
+  limitLifecycle?: AccountLimitLifecycleDeps;
 }): Server & { tick: () => Promise<void> } {
   const {
     registry, usage, accounts, scheduler = new Scheduler(), prepare = prepareProvider,
     resolvePrompt = resolveAgentPrompt,
-    beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval, limitCoordinator,
+    beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval, limitCoordinator, limitLifecycle,
   } = opts;
   const handles = new Map<string, AgentHandle>();
   const resumeReservations = new Map<string, symbol>();
@@ -1175,7 +1245,7 @@ export function createServer(opts: {
   // must not fire a create into an already-deleted state directory.
   const tickTimer = setInterval(() => { void tick().catch(() => {}); }, TICK_MS).unref();
   server.on('close', () => clearInterval(tickTimer));
-  server.on('close', () => { void limitCoordinator?.close().catch(() => {}); });
+  if (limitCoordinator) attachAccountLimitLifecycle(server, limitCoordinator, limitLifecycle);
 
   // Exposed so tests can drive exactly one pass instead of racing a 30s timer.
   (server as Server & { tick: () => Promise<void> }).tick = tick;
@@ -1197,33 +1267,9 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
     usage,
     onChange: () => registry.touch(),
   });
-  // Entry point only, never inside createServer: test/server.test.ts imports
-  // createServer directly, and an interval started there would leak a timer and
-  // a CLI spawn into every server test.
-  const REFRESH_MS = 5 * 60_000;
-  let refreshing = false;
-  let initialLimitRead = true;
-  const refresh = async () => {
-    if (refreshing) return;      // a slow probe must not stack up passes
-    refreshing = true;
-    try {
-      if (initialLimitRead) {
-        initialLimitRead = false;
-        await limitCoordinator.start();
-      } else {
-        await limitCoordinator.reconcile();
-      }
-    } finally { refreshing = false; }
-  };
-  void refresh();
-  // ponytail: unconditional timer — it does not check whether a browser is
-  // connected. Gate it on live SSE clients if the spawns ever show up in a
-  // profile.
-  const refreshTimer = setInterval(() => void refresh(), REFRESH_MS).unref();
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
   const server = createServer({ registry, usage, scheduler, accounts, limitCoordinator });
-  server.on('close', () => clearInterval(refreshTimer));
   server.listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }

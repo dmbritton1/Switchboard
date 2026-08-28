@@ -47,23 +47,85 @@ const accounts = [
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
 
-test('createServer closes an injected account-limit coordinator without starting telemetry itself', async () => {
+test('account telemetry starts asynchronously after HTTP listen and cleans up with server close', async () => {
   const registry = new Registry('/tmp/switchboard-coordinator-test.json');
   const usage = new Usage();
-  let starts = 0;
+  const order: string[] = [];
   let closes = 0;
+  let cleared: unknown = null;
+  let intervalDelay = 0;
   const limitCoordinator: AccountLimitCoordinator = {
-    start: async () => { starts += 1; },
+    start: async () => { order.push('telemetry-start'); },
     reconcile: async () => {},
     codexResetEligibility: () => ({ eligible: false, reason: 'not used' }),
     releaseCodexAfterFreshRead: async () => ({ ready: false, reason: 'not used' }),
     close: async () => { closes += 1; },
   };
-  const server = createServer({ registry, usage, accounts, limitCoordinator });
-  assert.equal(starts, 0, 'createServer must not spawn telemetry or start a timer');
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const timer = { id: 'limit-reconcile' };
+  const server = createServer({
+    registry, usage, accounts, limitCoordinator,
+    limitLifecycle: {
+      setInterval: (_callback: () => void, delay: number) => { intervalDelay = delay; return timer; },
+      clearInterval: (handle: unknown) => { cleared = handle; },
+    },
+  });
+  assert.deepEqual(order, [], 'construction must not start telemetry');
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => {
+    order.push('http-listening');
+    resolve();
+  }));
+  await Promise.resolve();
+  assert.deepEqual(order, ['http-listening', 'telemetry-start']);
+  assert.equal(intervalDelay, 5 * 60_000);
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  await Promise.resolve();
+  assert.equal(cleared, timer);
   assert.equal(closes, 1);
+});
+
+test('account telemetry reconciliation never overlaps the initial or prior pass', async () => {
+  const registry = new Registry('/tmp/switchboard-coordinator-overlap-test.json');
+  const usage = new Usage();
+  let resolveStart!: () => void;
+  let resolveReconcile!: () => void;
+  const startGate = new Promise<void>((resolve) => { resolveStart = resolve; });
+  let reconcileGate = new Promise<void>((resolve) => { resolveReconcile = resolve; });
+  let starts = 0;
+  let reconciles = 0;
+  let interval!: () => void;
+  const limitCoordinator: AccountLimitCoordinator = {
+    start: async () => { starts += 1; await startGate; },
+    reconcile: async () => { reconciles += 1; await reconcileGate; },
+    codexResetEligibility: () => ({ eligible: false, reason: 'not used' }),
+    releaseCodexAfterFreshRead: async () => ({ ready: false, reason: 'not used' }),
+    close: async () => {},
+  };
+  const server = createServer({
+    registry, usage, accounts, limitCoordinator,
+    limitLifecycle: {
+      setInterval: (callback: () => void) => { interval = callback; return 1; },
+      clearInterval: () => {},
+    },
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await Promise.resolve();
+  assert.equal(starts, 1);
+  interval();
+  assert.equal(reconciles, 0, 'the initial read is still active');
+  resolveStart();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  interval();
+  assert.equal(reconciles, 1);
+  interval();
+  assert.equal(reconciles, 1, 'a previous reconcile is still active');
+  resolveReconcile();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  reconcileGate = Promise.resolve();
+  interval();
+  assert.equal(reconciles, 2);
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
 async function boot(
@@ -2278,6 +2340,20 @@ test('the SSE snapshot carries a generic limit snapshot, sanitized error, and lo
   assert.equal(codex.limitSnapshotError, 'not supported');
   assert.equal(codex.load, 0.4);
 
+});
+
+test('the SSE snapshot falls back to local pace after a previously successful provider snapshot becomes stale', async (t) => {
+  const { base, usage } = await boot(t);
+  usage.setLimitSnapshot('codex', limitSnapshot([
+    { id: '5h', label: '5h', usedPercent: 5, windowDurationMins: 300, resetsAt: null, reached: false },
+  ]));
+  usage.record('codex', 400, 0, Date.now());
+  usage.failLimitSnapshot('codex', 'Codex account telemetry is temporarily unavailable. Using the local estimate.');
+
+  const snap = await firstSnapshot(base);
+  const codex = snap.accounts.find((account: { name: string }) => account.name === 'codex');
+  assert.equal(codex.limitSnapshot.fresh, false);
+  assert.equal(codex.load, 0.4, 'stale authoritative data must not mask the local estimate');
 });
 
 test('GET /diff returns the worktree changes file by file', async (t) => {

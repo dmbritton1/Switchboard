@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createAccountLimitCoordinator, type CodexSupervisorFactory } from '../src/account-limits.ts';
+import { CODEX_TELEMETRY_REASONS } from '../src/agents/codex-limits.ts';
 import { Usage } from '../src/usage.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AccountLimitSnapshot } from '../src/types.ts';
@@ -21,6 +22,16 @@ function snapshot(overrides: Partial<AccountLimitSnapshot> = {}): AccountLimitSn
     blocks: [], fetchedAt: 1_000, authoritative: true, fresh: true,
     ...overrides,
   };
+}
+
+function availableSnapshot(overrides: Partial<AccountLimitSnapshot> = {}): AccountLimitSnapshot {
+  return snapshot({
+    windows: [{
+      id: '5h', label: '5h', usedPercent: 10, windowDurationMins: 300,
+      resetsAt: 3_000, reached: false,
+    }],
+    ...overrides,
+  });
 }
 
 function runtime(): PreparedCodexRuntime {
@@ -146,8 +157,8 @@ test('starts Claude probes and Codex supervisors concurrently, then publishes on
   await waitFor(() => begun.length === 2);
   assert.deepEqual(begun.sort(), ['claude', 'codex']);
   assert.equal(changes, 0, 'the browser update waits for the entire pass');
-  claudeRead.resolve(snapshot({ windows: [] }));
-  codexRead.resolve(snapshot({ windows: [] }));
+  claudeRead.resolve(availableSnapshot());
+  codexRead.resolve(availableSnapshot());
   await pass;
   assert.equal(changes, 1);
   await coordinator.close();
@@ -175,6 +186,67 @@ test('coalesces overlapping concurrent reconciliation passes and signals one cha
     id: '5h', label: '5h', usedPercent: 30, windowDurationMins: 300, resetsAt: 2_000, reached: false,
   }] }));
   await Promise.all([one, two]);
+  assert.equal(changes, 1);
+  await coordinator.close();
+});
+
+test('publishes supervisor snapshot and stale callbacks immediately outside reconciliation', async () => {
+  const usage = new Usage();
+  let changes = 0;
+  let onSnapshot!: (value: AccountLimitSnapshot) => void;
+  let onStale!: (reason: string) => void;
+  const factory: CodexSupervisorFactory = (options) => {
+    onSnapshot = options.onSnapshot;
+    onStale = options.onStale;
+    return {
+      reconcile: async () => availableSnapshot(),
+      readAtResetBoundary: async () => availableSnapshot(),
+      close: async () => {},
+    };
+  };
+  const coordinator = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage, onChange: () => { changes += 1; },
+    prepareCodex: async () => runtime(), supervisorFactory: factory,
+  });
+  await coordinator.start();
+  assert.equal(changes, 1);
+
+  onSnapshot(availableSnapshot({ plan: 'team' }));
+  assert.equal(changes, 2, 'an unsolicited provider snapshot must reach SSE immediately');
+  assert.equal(usage.getLimitSnapshot('codex-one').snapshot?.plan, 'team');
+
+  onStale(CODEX_TELEMETRY_REASONS.apiKey);
+  assert.equal(changes, 3, 'an unsolicited stale transition must reach SSE immediately');
+  assert.equal(usage.getLimitSnapshot('codex-one').error, CODEX_TELEMETRY_REASONS.apiKey);
+  await coordinator.close();
+});
+
+test('coalesces supervisor snapshot and stale callbacks to one notification during reconciliation', async () => {
+  const usage = new Usage();
+  let changes = 0;
+  const gate = deferred<AccountLimitSnapshot>();
+  let onSnapshot!: (value: AccountLimitSnapshot) => void;
+  let onStale!: (reason: string) => void;
+  const coordinator = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage, onChange: () => { changes += 1; },
+    prepareCodex: async () => runtime(),
+    supervisorFactory: (options) => {
+      onSnapshot = options.onSnapshot;
+      onStale = options.onStale;
+      return {
+        reconcile: () => gate.promise,
+        readAtResetBoundary: async () => availableSnapshot(),
+        close: async () => {},
+      };
+    },
+  });
+  const pass = coordinator.start();
+  await waitFor(() => typeof onSnapshot === 'function');
+  onSnapshot(availableSnapshot());
+  onStale(CODEX_TELEMETRY_REASONS.signedOut);
+  assert.equal(changes, 0);
+  gate.resolve(availableSnapshot());
+  await pass;
   assert.equal(changes, 1);
   await coordinator.close();
 });
@@ -226,7 +298,7 @@ test('forces a boundary read when the current Codex snapshot is absent or stale'
       accounts: [accounts[1]], usage, onChange: () => {}, prepareCodex: async () => runtime(),
       supervisorFactory: supervisorFactory([], [], [], async () => {
         reads += 1;
-        return snapshot({ windows: [] });
+        return availableSnapshot();
       }),
     });
     assert.deepEqual(await coordinator.releaseCodexAfterFreshRead('codex-one', 2_000), {
@@ -279,12 +351,21 @@ test('blocks a fresh snapshot that has a block, a reached window without a futur
 });
 
 test('blocks failed, unsupported, and malformed boundary reads without exposing provider diagnostics', async () => {
-  const responses: Array<() => Promise<AccountLimitSnapshot>> = [
-    async () => { throw new Error('provider failed at /private/path with codex-secret-value'); },
-    async () => { throw new Error('Codex account telemetry is unavailable for API key authentication.'); },
-    async () => null as unknown as AccountLimitSnapshot,
+  const responses: Array<{ read: () => Promise<AccountLimitSnapshot>; expected: string }> = [
+    {
+      read: async () => { throw new Error('provider failed at /private/path with codex-secret-value'); },
+      expected: 'Codex account telemetry is temporarily unavailable. Using the local estimate.',
+    },
+    {
+      read: async () => { throw new Error(CODEX_TELEMETRY_REASONS.apiKey); },
+      expected: CODEX_TELEMETRY_REASONS.apiKey,
+    },
+    {
+      read: async () => null as unknown as AccountLimitSnapshot,
+      expected: 'Codex account telemetry is temporarily unavailable. Using the local estimate.',
+    },
   ];
-  for (const read of responses) {
+  for (const { read, expected } of responses) {
     const usage = new Usage();
     const coordinator = createAccountLimitCoordinator({
       accounts: [accounts[1]], usage, onChange: () => {}, prepareCodex: async () => runtime(),
@@ -292,9 +373,75 @@ test('blocks failed, unsupported, and malformed boundary reads without exposing 
     });
     const result = await coordinator.releaseCodexAfterFreshRead('codex-one', 2_000);
     assert.equal(result.ready, false);
-    assert.equal(usage.getLimitSnapshot('codex-one').error, 'Codex account telemetry is temporarily unavailable. Using the local estimate.');
+    assert.equal(usage.getLimitSnapshot('codex-one').error, expected);
     assert.equal(JSON.stringify(usage.getLimitSnapshot('codex-one')).includes('/private/path'), false);
     assert.equal(JSON.stringify(usage.getLimitSnapshot('codex-one')).includes('codex-secret-value'), false);
+    await coordinator.close();
+  }
+});
+
+test('preserves only known stable unsupported-auth reasons', async () => {
+  const stable = [
+    CODEX_TELEMETRY_REASONS.apiKey,
+    CODEX_TELEMETRY_REASONS.signedOut,
+    CODEX_TELEMETRY_REASONS.bedrock,
+    CODEX_TELEMETRY_REASONS.externalTokens,
+  ];
+  for (const reason of stable) {
+    const usage = new Usage();
+    const coordinator = createAccountLimitCoordinator({
+      accounts: [accounts[1]], usage, onChange: () => {}, prepareCodex: async () => runtime(),
+      supervisorFactory: supervisorFactory([], [], [], async () => { throw new Error(reason); }),
+    });
+    assert.equal((await coordinator.releaseCodexAfterFreshRead('codex-one')).ready, false);
+    assert.equal(usage.getLimitSnapshot('codex-one').error, reason);
+    await coordinator.close();
+  }
+
+  const usage = new Usage();
+  const coordinator = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage, onChange: () => {}, prepareCodex: async () => runtime(),
+    supervisorFactory: supervisorFactory([], [], [], async () => {
+      throw new Error(`hostile /private/provider ${accounts[1].env.CODEX_TOKEN}`);
+    }),
+  });
+  await coordinator.releaseCodexAfterFreshRead('codex-one');
+  assert.equal(usage.getLimitSnapshot('codex-one').error, 'Codex account telemetry is temporarily unavailable. Using the local estimate.');
+  await coordinator.close();
+});
+
+test('fails closed on empty or malformed normalized windows', async () => {
+  const malformed: AccountLimitSnapshot[] = [
+    availableSnapshot({ windows: [] }),
+    availableSnapshot({ windows: [{
+      id: '', label: '5h', usedPercent: 10, windowDurationMins: 300, resetsAt: 3_000, reached: false,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '', usedPercent: 10, windowDurationMins: 300, resetsAt: 3_000, reached: false,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '5h', usedPercent: Number.NaN, windowDurationMins: 300, resetsAt: 3_000, reached: false,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '5h', usedPercent: 10, windowDurationMins: -1, resetsAt: 3_000, reached: false,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '5h', usedPercent: 10, windowDurationMins: 300, resetsAt: Number.NaN, reached: false,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '5h', usedPercent: 10, windowDurationMins: 300, resetsAt: 3_000,
+      reached: 'no' as unknown as boolean,
+    }] }),
+    availableSnapshot({ windows: [{
+      id: '5h', label: '5h', usedPercent: 100, windowDurationMins: 300, resetsAt: 3_000, reached: false,
+    }] }),
+  ];
+  for (const value of malformed) {
+    const coordinator = createAccountLimitCoordinator({
+      accounts: [accounts[1]], usage: new Usage(), onChange: () => {}, prepareCodex: async () => runtime(),
+      supervisorFactory: supervisorFactory([], [], [], async () => value),
+    });
+    assert.equal((await coordinator.releaseCodexAfterFreshRead('codex-one')).ready, false);
     await coordinator.close();
   }
 });

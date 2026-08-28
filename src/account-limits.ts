@@ -1,5 +1,6 @@
 import { probeLimits } from './agents/claude.ts';
 import { CodexAppServerSupervisor } from './agents/codex-app-server-supervisor.ts';
+import { CODEX_TELEMETRY_REASONS } from './agents/codex-limits.ts';
 import { prepareCodexRuntime, redactValues, type PreparedCodexRuntime } from './agents/codex-runtime.ts';
 import type { Account } from './server.ts';
 import type { AccountLimitSnapshot } from './types.ts';
@@ -8,6 +9,12 @@ import { Usage } from './usage.ts';
 const CLAUDE_FAILURE = 'Unable to refresh account limits. Check that this account is signed in.';
 const CODEX_FAILURE = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
 const BOUNDARY_TIMEOUT = 'Timed out waiting for a fresh Codex limit read.';
+const STABLE_CODEX_AUTH_FAILURES = new Set<string>([
+  CODEX_TELEMETRY_REASONS.apiKey,
+  CODEX_TELEMETRY_REASONS.signedOut,
+  CODEX_TELEMETRY_REASONS.bedrock,
+  CODEX_TELEMETRY_REASONS.externalTokens,
+]);
 
 export type ResetRelease = { ready: boolean; reason: string };
 
@@ -48,11 +55,42 @@ export type AccountLimitCoordinatorOptions = {
 function isCleanSnapshot(value: unknown): value is AccountLimitSnapshot {
   if (!value || typeof value !== 'object') return false;
   const snapshot = value as Partial<AccountLimitSnapshot>;
-  return snapshot.authoritative === true
-    && snapshot.fresh === true
-    && Array.isArray(snapshot.windows)
-    && Array.isArray(snapshot.blocks)
-    && snapshot.windows.every((window) => window && typeof window.reached === 'boolean');
+  if (snapshot.authoritative !== true
+    || snapshot.fresh !== true
+    || !Number.isFinite(snapshot.fetchedAt)
+    || (snapshot.plan !== null && (typeof snapshot.plan !== 'string' || snapshot.plan.length === 0))
+    || !Array.isArray(snapshot.windows)
+    || snapshot.windows.length === 0
+    || !Array.isArray(snapshot.blocks)) return false;
+  const ids = new Set<string>();
+  const validWindows = snapshot.windows.every((window) => {
+    const valid = !!window
+      && typeof window.id === 'string'
+      && window.id.length > 0
+      && typeof window.label === 'string'
+      && window.label.length > 0
+      && typeof window.usedPercent === 'number'
+      && Number.isFinite(window.usedPercent)
+      && window.usedPercent >= 0
+      && (window.windowDurationMins === null
+        || (typeof window.windowDurationMins === 'number'
+          && Number.isFinite(window.windowDurationMins)
+          && window.windowDurationMins >= 0))
+      && (window.resetsAt === null
+        || (typeof window.resetsAt === 'number' && Number.isFinite(window.resetsAt)))
+      && typeof window.reached === 'boolean'
+      && window.reached === (window.usedPercent >= 100)
+      && !ids.has(window.id);
+    if (valid) ids.add(window.id);
+    return valid;
+  });
+  return validWindows
+    && snapshot.blocks.every((block) => !!block
+      && typeof block.id === 'string'
+      && block.id.length > 0
+      && typeof block.reason === 'string'
+      && block.reason.length > 0
+      && typeof block.resettable === 'boolean');
 }
 
 class Coordinator implements AccountLimitCoordinator {
@@ -68,6 +106,8 @@ class Coordinator implements AccountLimitCoordinator {
   readonly #starting = new Map<string, Promise<CodexLimitSupervisor>>();
   readonly #boundaryReads = new Map<string, Promise<ResetRelease>>();
   #reconciliation: Promise<void> | null = null;
+  #reconciliationActive = false;
+  #reconciliationChanged = false;
   #close: Promise<void> | null = null;
   #closed = false;
 
@@ -129,20 +169,22 @@ class Coordinator implements AccountLimitCoordinator {
   }
 
   async #runReconciliation(): Promise<void> {
-    const results = await Promise.allSettled(this.#accounts.map((account) => this.#reconcileAccount(account)));
-    if (results.length > 0 && !this.#closed) {
-      try {
-        this.#onChange();
-      } catch {
-        // Browser notification observers must not affect the next reconciliation pass.
-      }
+    this.#reconciliationActive = true;
+    this.#reconciliationChanged = false;
+    try {
+      await Promise.allSettled(this.#accounts.map((account) => this.#reconcileAccount(account)));
+    } finally {
+      this.#reconciliationActive = false;
+      const changed = this.#reconciliationChanged;
+      this.#reconciliationChanged = false;
+      if (changed) this.#notifyChanged();
     }
   }
 
   async #reconcileAccount(account: Account): Promise<void> {
     if (account.provider === 'claude') {
       try {
-        this.#usage.setLimitSnapshot(account.name, await this.#probeClaude(account.env));
+        this.#storeSnapshot(account.name, await this.#probeClaude(account.env));
       } catch (error) {
         this.#fail(account, error, CLAUDE_FAILURE);
       }
@@ -150,7 +192,7 @@ class Coordinator implements AccountLimitCoordinator {
     }
     try {
       const supervisor = await this.#supervisor(account);
-      this.#usage.setLimitSnapshot(account.name, await supervisor.reconcile());
+      this.#storeSnapshot(account.name, await supervisor.reconcile());
     } catch (error) {
       this.#fail(account, error, CODEX_FAILURE);
     }
@@ -166,7 +208,7 @@ class Coordinator implements AccountLimitCoordinator {
         this.#fail(account, new Error(CODEX_FAILURE), CODEX_FAILURE);
         return { ready: false, reason: CODEX_FAILURE };
       }
-      this.#usage.setLimitSnapshot(account.name, result.snapshot);
+      this.#storeSnapshot(account.name, result.snapshot);
       return this.#releaseFromSnapshot(result.snapshot);
     } catch (error) {
       this.#fail(account, error, CODEX_FAILURE);
@@ -180,7 +222,7 @@ class Coordinator implements AccountLimitCoordinator {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const settled = read.then(
       (snapshot) => ({ kind: 'snapshot' as const, snapshot }),
-      () => ({ kind: 'failure' as const }),
+      (error: unknown) => ({ kind: 'failure' as const, error }),
     );
     const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
       timer = setTimeout(() => resolve({ kind: 'timeout' }), this.#boundaryTimeoutMs);
@@ -189,7 +231,7 @@ class Coordinator implements AccountLimitCoordinator {
       const result = await Promise.race([settled, timeout]);
       if (result.kind === 'snapshot') return { timedOut: false, snapshot: result.snapshot };
       if (result.kind === 'timeout') return { timedOut: true };
-      throw new Error(CODEX_FAILURE);
+      throw result.error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -229,7 +271,7 @@ class Coordinator implements AccountLimitCoordinator {
     const supervisor = this.#supervisorFactory({
       account,
       runtime,
-      onSnapshot: (snapshot) => this.#usage.setLimitSnapshot(account.name, snapshot),
+      onSnapshot: (snapshot) => this.#storeSnapshot(account.name, snapshot),
       onStale: (reason) => this.#fail(account, reason, CODEX_FAILURE),
     });
     this.#supervisors.set(account.name, supervisor);
@@ -240,8 +282,30 @@ class Coordinator implements AccountLimitCoordinator {
     // Always redact before this crosses the Usage/SSE boundary. The public value
     // remains a stable action rather than a provider diagnostic.
     const message = redactValues(error instanceof Error ? error.message : String(error), Object.values(account.env));
-    const publicError = message === fallback ? message : fallback;
+    const publicError = account.provider === 'codex' && STABLE_CODEX_AUTH_FAILURES.has(message)
+      ? message
+      : fallback;
     this.#usage.failLimitSnapshot(account.name, publicError);
+    this.#notifyChanged();
+  }
+
+  #storeSnapshot(account: string, snapshot: AccountLimitSnapshot): void {
+    const previous = this.#usage.getLimitSnapshot(account).snapshot;
+    this.#usage.setLimitSnapshot(account, snapshot);
+    if (previous !== snapshot) this.#notifyChanged();
+  }
+
+  #notifyChanged(): void {
+    if (this.#closed) return;
+    if (this.#reconciliationActive) {
+      this.#reconciliationChanged = true;
+      return;
+    }
+    try {
+      this.#onChange();
+    } catch {
+      // Browser notification observers cannot affect telemetry ownership.
+    }
   }
 
   async #closeNow(): Promise<void> {
