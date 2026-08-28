@@ -93,6 +93,15 @@ test('cancel kills the child, clears the snapshot and removes staging', async ()
   await h.cleanup();
 });
 
+test('claude requests a code, discovered from the CLI\'s own output', async () => {
+  const h = await harness({ provider: 'claude', mode: 'ok' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.codeRequested === true);
+  assert.equal(h.linker.snapshot()?.codeRequested, true);
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
 test('subscribers are notified on every phase change and stop after unsubscribe', async () => {
   const h = await harness();
   let calls = 0;

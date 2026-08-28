@@ -75,6 +75,11 @@ type Pending = {
   tail: string;
   urlTimer: ReturnType<typeof setTimeout> | null;
   overallTimer: ReturnType<typeof setTimeout> | null;
+  /** True once #fail has committed a terminal error state. Guards #onClose
+   *  and #fail against re-entry: SIGTERM from a first #fail() reliably
+   *  produces a later 'close' event, which must not overwrite the specific
+   *  error message with a generic exit-code one or fire a second notify. */
+  settled: boolean;
 };
 
 export class Linker {
@@ -138,13 +143,18 @@ export class Linker {
       child = this.#spawn ? this.#spawn(provider, env) : await defaultSpawnLogin(provider, env);
     } catch (error) {
       await rm(staging, { recursive: true, force: true });
-      return { error: String((error as Error).message ?? error) };
+      // Redact against the local `staging` var, not the (not-yet-set)
+      // #pending — and not the upstream env-key redactor, which only
+      // catches keys matching /token|key|secret|password|.../ and would
+      // never flag CODEX_HOME/CLAUDE_CONFIG_DIR.
+      const message = String((error as Error).message ?? error);
+      return { error: message.split(staging).join('[credential dir]') };
     }
 
     const pending: Pending = {
       provider, phase: 'starting', url: null, codeRequested: false,
       identity: null, suggestedName: null, error: null,
-      staging, child, tail: '', urlTimer: null, overallTimer: null,
+      staging, child, tail: '', urlTimer: null, overallTimer: null, settled: false,
     };
     this.#pending = pending;
 
@@ -159,7 +169,7 @@ export class Linker {
     child.stderr?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => this.#onOutput(chunk, true));
     child.stderr?.on('data', (chunk: string) => this.#onOutput(chunk, false));
-    child.on('error', (error) => { void this.#fail(String(error.message)); });
+    child.on('error', (error) => { void this.#fail(this.redact(String(error.message))); });
     child.on('close', (code) => this.#onClose(code));
 
     this.#notify();
@@ -172,8 +182,12 @@ export class Linker {
     p.tail = (p.tail + chunk).slice(-MAX_OUTPUT_TAIL);
 
     let changed = false;
+    // Matched against the accumulated tail, not the raw chunk: a real CLI's
+    // spinner/redraw output can split a URL or the prompt across two writes,
+    // which the fake CLI (one write per line) can never exercise but a real
+    // binary can.
     if (!p.url) {
-      const match = AUTH_URL.exec(chunk);
+      const match = AUTH_URL.exec(p.tail);
       if (match) {
         p.url = match[0];
         p.phase = 'awaiting-user';
@@ -182,7 +196,7 @@ export class Linker {
       }
     }
     // Only stdout carries the prompt, and only Claude emits one.
-    if (isStdout && !p.codeRequested && CODE_PROMPT.test(chunk)) {
+    if (isStdout && !p.codeRequested && CODE_PROMPT.test(p.tail)) {
       p.codeRequested = true;
       changed = true;
     }
@@ -193,8 +207,12 @@ export class Linker {
    *  terminal phases so the state machine is observable. */
   #onClose(code: number | null): void {
     const p = this.#pending;
-    if (!p) return;
+    if (!p || p.settled) return;
     if (code === 0) {
+      // The login succeeded and staging now holds real credentials — the
+      // overall timer must not be left running to later `rm` them out from
+      // under a link that already finished.
+      this.#clearTimers(p);
       p.phase = 'verifying';
       this.#notify();
       return;
@@ -211,7 +229,11 @@ export class Linker {
 
   async #fail(message: string): Promise<void> {
     const p = this.#pending;
-    if (!p) return;
+    if (!p || p.settled) return;
+    // Set before the await below so a concurrent re-entry (e.g. the 'close'
+    // event this SIGTERM is about to produce) sees settled=true immediately,
+    // not just after the rm() completes.
+    p.settled = true;
     this.#clearTimers(p);
     p.child.kill('SIGTERM');
     await rm(p.staging, { recursive: true, force: true });
