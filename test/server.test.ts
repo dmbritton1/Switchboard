@@ -5,7 +5,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
 import { Registry, type RegistryOptions } from '../src/sessions.ts';
@@ -15,6 +15,9 @@ import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsP
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
+import { writeFakeLoginCli } from './helpers/fake-login.ts';
+import { createAccountStore, type Account } from '../src/accounts.ts';
+import { Linker, type PublicLink } from '../src/link.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 
 const run = promisify(execFile);
@@ -73,6 +76,66 @@ async function boot(
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   return { base: `http://127.0.0.1:${port}`, registry, usage, scheduler, server };
+}
+
+/**
+ * Like boot(), but with account linking wired up: a real Linker pointed at a
+ * fake login CLI (test/helpers/fake-login.ts) so link-start spawns a real
+ * child process and never a real `claude`/`codex` binary, and a real
+ * accountStore over a temp accounts.json.
+ *
+ * The Linker's `accounts` getter and createServer's `accounts` option share
+ * the exact same array reference — mirroring the entry point in src/server.ts
+ * — so link-confirm's `accounts.push(account)` is immediately visible to the
+ * Linker's own duplicate-identity check and suggestName().
+ */
+async function bootLinking(
+  t: { after: (fn: () => void) => void },
+  options: { mode?: 'ok' | 'no-prompt' | 'bad-code' | 'no-url' | 'slow'; email?: string | null } = {},
+) {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-link-'));
+  const accountsPath = join(dir, 'accounts.json');
+  await writeFile(accountsPath, '[]\n');
+  const bin = await writeFakeLoginCli(dir, { provider: 'claude', mode: options.mode, email: options.email });
+  const registry = new Registry(join(dir, 'state.json'));
+  const usage = new Usage();
+  const scheduler = new Scheduler();
+  const linkAccounts: Account[] = [];
+  const accountsRoot = join(dir, 'accounts');
+  const linker = new Linker({
+    accountsRoot,
+    accounts: () => linkAccounts,
+    spawnLogin: (provider, env) => spawn(bin, provider === 'claude' ? ['auth', 'login'] : ['login'], {
+      env: { ...process.env, ...env },
+    }),
+    claudeBin: bin,
+    urlTimeoutMs: 5_000,
+    overallTimeoutMs: 10_000,
+  });
+  const accountStore = createAccountStore(accountsPath);
+  const server = createServer({
+    registry, usage, scheduler, accounts: linkAccounts, accountStore, linker,
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address() as { port: number };
+  const base = `http://127.0.0.1:${port}`;
+  t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
+  return {
+    base, registry, usage, scheduler, server, linker, accountsPath, accountsRoot, accounts: linkAccounts,
+  };
+}
+
+/** Resolves once `linker.snapshot()` satisfies `predicate`, or rejects after 5s. */
+function untilLink(linker: Linker, predicate: (link: PublicLink | null) => boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (!predicate(linker.snapshot())) return;
+      unsub(); clearTimeout(timer); resolve();
+    };
+    const timer = setTimeout(() => { unsub(); reject(new Error('timed out waiting for link phase')); }, 5_000);
+    const unsub = linker.subscribe(check);
+    check();
+  });
 }
 
 /**
@@ -2270,4 +2333,69 @@ test('GET /diff is behind the Host guard like every other route', async (t) => {
     method: 'GET', headers: { Host: 'evil.example' },
   });
   assert.equal(res.status, 403);
+});
+
+// ---- account linking --------------------------------------------------
+
+test('link commands are rejected when the account store seam is absent', async (t) => {
+  // Every pre-existing server test constructs createServer without an
+  // accountStore. Those tests must keep passing untouched, so linking has to
+  // be off by default rather than reaching for a real accounts.json.
+  const { base } = await boot(t);
+  const res = await post(base, { cmd: 'link-start', provider: 'claude' });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /not available/);
+});
+
+test('link-start rejects an unknown provider', async (t) => {
+  const { base } = await bootLinking(t);
+  const res = await post(base, { cmd: 'link-start', provider: 'gpt' });
+  assert.equal(res.status, 400);
+});
+
+test('link-start refuses a second concurrent link', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-start', provider: 'claude' })).status, 200);
+  const second = await post(base, { cmd: 'link-start', provider: 'claude' });
+  assert.equal(second.status, 409);
+  await post(base, { cmd: 'link-cancel' });
+});
+
+test('link-code and link-confirm 409 when out of phase', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-code', code: 'x' })).status, 409);
+  assert.equal((await post(base, { cmd: 'link-confirm', name: 'a' })).status, 409);
+});
+
+test('link-cancel with nothing pending is a 200, not an error', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-cancel' })).status, 200);
+});
+
+test('a completed link appears in accounts.json and in the snapshot', async (t) => {
+  const { base, linker, accountsPath } = await bootLinking(t, { mode: 'no-prompt', email: 'dwight@example.com' });
+  await post(base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(linker, (l) => l?.phase === 'naming');
+  const res = await post(base, { cmd: 'link-confirm', name: 'claude-dwight' });
+  assert.equal(res.status, 200);
+  const written = JSON.parse(await readFile(accountsPath, 'utf8'));
+  assert.deepEqual(written.map((a: { name: string }) => a.name), ['claude-dwight']);
+  const snap = await firstSnapshot(base);
+  assert.ok(snap.accounts.some((a: { name: string }) => a.name === 'claude-dwight'));
+  assert.equal(snap.link, null);
+});
+
+// The AGENTS.md rule: account env values, which includes every credential
+// directory path, must never reach the browser.
+test('the snapshot never contains the staging path or the submitted code', async (t) => {
+  const { base, linker } = await bootLinking(t, { mode: 'bad-code' });
+  await post(base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(linker, (l) => l?.codeRequested === true);
+  const staging = linker.stagingDir();
+  assert.ok(staging, 'expected a staging dir while awaiting a code');
+  await post(base, { cmd: 'link-code', code: 'sentinel-secret-code' });
+  await untilLink(linker, (l) => l?.phase === 'error');
+  const serialized = JSON.stringify(await firstSnapshot(base));
+  assert.ok(!serialized.includes('sentinel-secret-code'));
+  assert.ok(!serialized.includes(staging));
 });

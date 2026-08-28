@@ -19,7 +19,8 @@ import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
-import { type Account, loadAccounts } from './accounts.ts';
+import { createAccountStore, loadAccounts, type Account, type AccountStore } from './accounts.ts';
+import { Linker, type PublicLink } from './link.ts';
 import type {
   AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
   CodexThreadSettings, NotifyOn, Session, Settings, SortMode, Trigger,
@@ -335,6 +336,10 @@ export function createServer(opts: {
   /** Provider preflight seam used by the offline server tests. */
   prepare?: (account: Account) => Promise<PreparedProvider>;
   resolvePrompt?: typeof resolveAgentPrompt;
+  /** Persistence for linked accounts. Absent disables linking entirely, which
+   *  is what keeps every pre-existing server test unchanged. */
+  accountStore?: AccountStore;
+  linker?: Linker;
   // These hooks exist so tests can park a request inside a specific await and
   // drive a real interleaving, rather than racing two fetches and hoping.
   beforeUploadRootPin?: () => Promise<void>;
@@ -343,7 +348,7 @@ export function createServer(opts: {
 }): Server & { tick: () => Promise<void> } {
   const {
     registry, usage, accounts, scheduler = new Scheduler(), prepare = prepareProvider,
-    resolvePrompt = resolveAgentPrompt,
+    resolvePrompt = resolveAgentPrompt, accountStore, linker,
     beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval,
   } = opts;
   const handles = new Map<string, AgentHandle>();
@@ -368,6 +373,7 @@ export function createServer(opts: {
       sessions: registry.publicSessions(),
       queue: scheduler.all(),
       settings: registry.settings(),
+      link: linker?.snapshot() ?? null,
       accounts: accounts.map((a) => {
         const { limits, error } = usage.getLimits(a.name);
         return {
@@ -827,6 +833,56 @@ export function createServer(opts: {
         return { status: 200, json: { ok: true } };
       }
 
+      case 'link-start': {
+        if (!linker || !accountStore) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        const provider = body.provider;
+        if (provider !== 'claude' && provider !== 'codex') {
+          return { status: 400, json: { error: 'provider must be claude or codex' } };
+        }
+        const { error } = await linker.start(provider);
+        // A pending link is the only reason start() refuses, and that is a
+        // conflict rather than a malformed request.
+        if (error) return { status: 409, json: { error } };
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'link-code': {
+        if (!linker) return { status: 400, json: { error: 'account linking is not available' } };
+        if (typeof body.code !== 'string') {
+          return { status: 400, json: { error: 'code must be a string' } };
+        }
+        const { error } = linker.submitCode(body.code);
+        if (error) return { status: 409, json: { error } };
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'link-confirm': {
+        if (!linker || !accountStore) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        if (typeof body.name !== 'string') {
+          return { status: 400, json: { error: 'name must be a string' } };
+        }
+        const { account, error } = await linker.commit(body.name);
+        if (error || !account) return { status: 409, json: { error } };
+        // Directory renamed, now make it durable, then admit it to the running
+        // process. Only this entry enters memory: the file on disk may have
+        // gained hand edits while the browser tab was open, and adopting those
+        // here would be an uncontrolled reload triggered by an unrelated action.
+        await accountStore.append(account);
+        accounts.push(account);
+        registry.touch();
+        return { status: 200, json: { ok: true, name: account.name } };
+      }
+
+      case 'link-cancel': {
+        if (!linker) return { status: 400, json: { error: 'account linking is not available' } };
+        await linker.cancel();
+        return { status: 200, json: { ok: true } };
+      }
+
       default:
         return { status: 400, json: { error: `unknown cmd: ${String(body.cmd)}` } };
     }
@@ -928,11 +984,13 @@ export function createServer(opts: {
         push();
         const unsubRegistry = registry.subscribe(push);
         const unsubScheduler = scheduler.subscribe(push);
+        const unsubLink = linker ? linker.subscribe(push) : () => {};
         // Keeps proxies and sleeping laptops from dropping an idle stream.
         const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
         req.on('close', () => {
           unsubRegistry();
           unsubScheduler();
+          unsubLink();
           clearInterval(ping);
         });
         return;
@@ -1181,6 +1239,12 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   const statePath = new URL('../state.json', import.meta.url).pathname;
   const accountsPath = new URL('../accounts.json', import.meta.url).pathname;
   const accounts = await loadAccounts(accountsPath);
+  const accountStore = createAccountStore(accountsPath);
+  const accountsRoot = join(homedir(), '.switchboard', 'accounts');
+  const linker = new Linker({ accountsRoot, accounts: () => accounts });
+  // Clears staging dirs left by a crash or a kill. A pending link deliberately
+  // does not survive a restart.
+  await linker.sweep();
   const usage = new Usage();
   const scheduler = new Scheduler();
   const registry = await Registry.load(statePath, usage, scheduler);
@@ -1209,6 +1273,6 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
-  createServer({ registry, usage, scheduler, accounts })
+  createServer({ registry, usage, scheduler, accounts, accountStore, linker })
     .listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }
