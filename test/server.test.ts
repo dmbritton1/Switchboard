@@ -14,6 +14,7 @@ import { Scheduler } from '../src/schedule.ts';
 import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch } from '../src/server.ts';
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree } from '../src/worktree.ts';
+import type { AccountLimitCoordinator } from '../src/account-limits.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 
@@ -45,6 +46,25 @@ const accounts = [
   { name: 'claude-main', provider: 'claude' as const, budget: 1000, env: {} },
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
+
+test('createServer closes an injected account-limit coordinator without starting telemetry itself', async () => {
+  const registry = new Registry('/tmp/switchboard-coordinator-test.json');
+  const usage = new Usage();
+  let starts = 0;
+  let closes = 0;
+  const limitCoordinator: AccountLimitCoordinator = {
+    start: async () => { starts += 1; },
+    reconcile: async () => {},
+    codexResetEligibility: () => ({ eligible: false, reason: 'not used' }),
+    releaseCodexAfterFreshRead: async () => ({ ready: false, reason: 'not used' }),
+    close: async () => { closes += 1; },
+  };
+  const server = createServer({ registry, usage, accounts, limitCoordinator });
+  assert.equal(starts, 0, 'createServer must not spawn telemetry or start a timer');
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  assert.equal(closes, 1);
+});
 
 async function boot(
   t: { after: (fn: () => void) => void },
