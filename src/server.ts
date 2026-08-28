@@ -445,15 +445,28 @@ export function createServer(opts: {
       queue: scheduler.all(),
       settings: registry.settings(),
       accounts: accounts.map((a) => {
-        const { snapshot: limitSnapshot, error: limitSnapshotError } = usage.getLimitSnapshot(a.name);
+        const { snapshot: limits, error: limitsError } = usage.getLimitSnapshot(a.name);
+        const resetScheduling = a.provider === 'claude'
+          ? { eligible: true, resetsAt: usage.resetAt(a.name), reason: '' }
+          : (() => {
+            const eligibility = limitCoordinator?.codexResetEligibility(a.name);
+            return eligibility?.eligible
+              ? { eligible: true, resetsAt: eligibility.resetsAt, reason: '' }
+              : {
+                eligible: false,
+                resetsAt: null,
+                reason: eligibility?.reason ?? 'no fresh Codex usage window',
+              };
+          })();
         return {
           name: a.name,
           provider: a.provider,
           budget: a.budget,
           pace: usage.pace(a.name, a.budget),
-          limitSnapshot,
-          limitSnapshotError,
+          limits,
+          limitsError,
           load: accountLoad(usage, a),
+          resetScheduling,
         };
       }),
     };

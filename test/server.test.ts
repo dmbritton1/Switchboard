@@ -15,6 +15,7 @@ import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsP
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree } from '../src/worktree.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from '../src/account-limits.ts';
+import { resetScheduleView } from '../web/lib.js';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 
@@ -2622,8 +2623,8 @@ test('a failed provider probe exposes a stable path-free error over SSE', async 
   const snap = await firstSnapshot(base);
   const account = snap.accounts.find((a: { name: string }) => a.name === 'claude-main');
   const publicSnapshot = JSON.stringify(snap);
-  assert.equal(account.limitSnapshot, null);
-  assert.equal(account.limitSnapshotError, 'Unable to refresh account limits. Check that this account is signed in.');
+  assert.equal(account.limits, null);
+  assert.equal(account.limitsError, 'Unable to refresh account limits. Check that this account is signed in.');
   assert.ok(!publicSnapshot.includes(secret), 'account environment values must not reach SSE');
   assert.ok(!publicSnapshot.includes(providerPath), 'provider absolute paths must not reach SSE');
 });
@@ -2675,8 +2676,11 @@ test('accountLoad prefers a fresh provider 5% over a 90% pace estimate', () => {
   assert.equal(accountLoad(usage, accounts[0]), 0.05);
 });
 
-test('the SSE snapshot carries a generic limit snapshot, sanitized error, and load per account', async (t) => {
-  const { base, usage } = await boot(t);
+test('the SSE snapshot carries the exact browser limit shape without legacy aliases', async (t) => {
+  const limitCoordinator = fakeLimitCoordinator({
+    eligibility: { eligible: false, reason: 'Codex needs a fresh usage window.' },
+  });
+  const { base, usage } = await boot(t, undefined, { limitCoordinator });
   usage.setLimitSnapshot('claude-main', limitSnapshot());
   usage.failLimitSnapshot('codex', 'not supported');
   // codex's budget is 1000 (see the `accounts` fixture above); recording spend
@@ -2688,13 +2692,57 @@ test('the SSE snapshot carries a generic limit snapshot, sanitized error, and lo
   const main = snap.accounts.find((a: { name: string }) => a.name === 'claude-main');
   const codex = snap.accounts.find((a: { name: string }) => a.name === 'codex');
 
-  assert.deepEqual(main.limitSnapshot, limitSnapshot());
-  assert.equal(main.limitSnapshotError, null);
+  assert.deepEqual(Object.keys(main).sort(), [
+    'budget', 'limits', 'limitsError', 'load', 'name', 'pace', 'provider', 'resetScheduling',
+  ]);
+  assert.deepEqual(main.limits, limitSnapshot());
+  assert.equal(main.limitsError, null);
   assert.equal(main.load, 0.11);
-  assert.equal(codex.limitSnapshot, null);
-  assert.equal(codex.limitSnapshotError, 'not supported');
+  assert.equal(codex.limits, null);
+  assert.equal(codex.limitsError, 'not supported');
   assert.equal(codex.load, 0.4);
+  assert.equal('limitSnapshot' in main, false);
+  assert.equal('limitSnapshotError' in main, false);
+});
 
+test('SSE reset scheduling projects eligible and ineligible Codex while Claude stays enabled', async (t) => {
+  const eligibleReset = Date.now() + 3_600_000;
+  const eligible = await boot(t, undefined, {
+    limitCoordinator: fakeLimitCoordinator({ eligibility: { eligible: true, resetsAt: eligibleReset } }),
+  });
+  const eligibleSnap = await firstSnapshot(eligible.base);
+  const eligibleCodex = eligibleSnap.accounts.find((a: { name: string }) => a.name === 'codex');
+  assert.deepEqual(
+    eligibleCodex.resetScheduling,
+    { eligible: true, resetsAt: eligibleReset, reason: '' },
+  );
+  assert.deepEqual(resetScheduleView(eligibleCodex), { enabled: true, reason: '' });
+  const eligibleClaude = eligibleSnap.accounts.find((a: { name: string }) => a.name === 'claude-main');
+  assert.deepEqual(
+    eligibleClaude.resetScheduling,
+    { eligible: true, resetsAt: null, reason: '' },
+  );
+  assert.deepEqual(resetScheduleView(eligibleClaude), { enabled: true, reason: '' });
+
+  const ineligible = await boot(t, undefined, {
+    limitCoordinator: fakeLimitCoordinator({ eligibility: { eligible: false, reason: 'Sign in to Codex first.' } }),
+  });
+  const ineligibleSnap = await firstSnapshot(ineligible.base);
+  const ineligibleCodex = ineligibleSnap.accounts.find((a: { name: string }) => a.name === 'codex');
+  assert.deepEqual(
+    ineligibleCodex.resetScheduling,
+    { eligible: false, resetsAt: null, reason: 'Sign in to Codex first.' },
+  );
+  assert.deepEqual(resetScheduleView(ineligibleCodex), {
+    enabled: false,
+    reason: 'Sign in to Codex first.',
+  });
+  const ineligibleClaude = ineligibleSnap.accounts.find((a: { name: string }) => a.name === 'claude-main');
+  assert.deepEqual(
+    ineligibleClaude.resetScheduling,
+    { eligible: true, resetsAt: null, reason: '' },
+  );
+  assert.deepEqual(resetScheduleView(ineligibleClaude), { enabled: true, reason: '' });
 });
 
 test('the SSE snapshot falls back to local pace after a previously successful provider snapshot becomes stale', async (t) => {
@@ -2707,7 +2755,7 @@ test('the SSE snapshot falls back to local pace after a previously successful pr
 
   const snap = await firstSnapshot(base);
   const codex = snap.accounts.find((account: { name: string }) => account.name === 'codex');
-  assert.equal(codex.limitSnapshot.fresh, false);
+  assert.equal(codex.limits.fresh, false);
   assert.equal(codex.load, 0.4, 'stale authoritative data must not mask the local estimate');
 });
 

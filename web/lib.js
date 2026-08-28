@@ -710,8 +710,9 @@ const durationLabel = (mins) => (mins % 1440 === 0 ? `${mins / 1440}d`
 
 function viewWindow(value, stale) {
   if (!value || typeof value.id !== 'string' || !value.id
-    || !Number.isFinite(value.usedPercent) || !Number.isFinite(value.windowDurationMins)
-    || value.windowDurationMins <= 0) return null;
+    || !Number.isFinite(value.usedPercent)
+    || (value.windowDurationMins !== null
+      && (!Number.isFinite(value.windowDurationMins) || value.windowDurationMins <= 0))) return null;
   return {
     id: value.id,
     label: typeof value.label === 'string' && value.label ? value.label : value.id,
@@ -741,34 +742,36 @@ export function usageWindowLine(window) {
 /**
  * Everything the meter and account panel need to decide what to say, without
  * retaining raw provider data. A snapshot is real only while it is authoritative,
- * fresh, and carries at least one usable window; stale windows remain available
- * for the expanded ledger but the collapsed meter deliberately falls back to
- * Switchboard's local estimate.
+ * fresh, and carries at least one timed window; untimed or stale windows remain
+ * available for the expanded ledger but the collapsed meter deliberately falls
+ * back to Switchboard's local estimate when no timed headline is available.
  */
 export function accountView(a) {
-  // Task 7's browser shape names these `limits`; accept the current generic
-  // SSE aliases during the rollout so an older server cannot make the meter
-  // silently fall back to its estimate.
-  const l = a.limits ?? a.limitSnapshot;
+  const l = a.limits;
   const fresh = l?.authoritative === true && l?.fresh === true;
   const windows = Array.isArray(l?.windows)
     ? l.windows.map((w) => viewWindow(w, !fresh)).filter(Boolean).sort(
-      (x, y) => x.windowDurationMins - y.windowDurationMins || x.id.localeCompare(y.id),
+      (x, y) => (x.windowDurationMins === null ? 1 : 0) - (y.windowDurationMins === null ? 1 : 0)
+        || (x.windowDurationMins ?? 0) - (y.windowDurationMins ?? 0)
+        || x.id.localeCompare(y.id),
     )
     : [];
-  const real = fresh && windows.length > 0;
+  const primary = windows.find((window) => window.windowDurationMins !== null);
+  const real = fresh && Boolean(primary);
   const estimatedLoad = Number.isFinite(a.pace) ? a.pace : 0;
   const load = real && Number.isFinite(a.load) ? a.load : estimatedLoad;
-  const pct = real ? windows[0].pct : Math.round(estimatedLoad * 100);
+  const pct = real ? primary.pct : Math.round(estimatedLoad * 100);
   const plan = typeof l?.plan === 'string' && l.plan && l.plan !== 'unknown' ? l.plan : null;
-  const error = typeof (a.limitsError ?? a.limitSnapshotError) === 'string'
-    ? (a.limitsError ?? a.limitSnapshotError) : '';
+  const error = typeof a.limitsError === 'string' ? a.limitsError : '';
 
   if (!real) return {
     load, pct, real: false,
     title: `${a.name} — ~${pct}% of its 5h budget (estimate)`,
     budgetLine: `${a.provider} · ~${pct}% of a ${a.budget.toLocaleString()} token budget · estimate`,
-    note: l && windows.length ? 'Provider limits are stale; the meter uses a local estimate.'
+    note: l && windows.length
+      ? fresh
+        ? 'Provider limits include no timed window; the meter uses a local estimate.'
+        : 'Provider limits are stale; the meter uses a local estimate.'
       : 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.',
     windows,
     blocks: viewBlocks(l?.blocks),
@@ -776,7 +779,6 @@ export function accountView(a) {
     error,
   };
 
-  const primary = windows[0];
   return {
     load, pct, real: true,
     title: `${a.name} — ${primary.pct}% of the ${durationLabel(primary.windowDurationMins)} limit`,

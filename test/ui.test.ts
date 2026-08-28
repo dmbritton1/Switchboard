@@ -856,18 +856,6 @@ test('usageWindowLine renders a local reset and stale state for the expanded led
   }), 'Blocked · 100% · reached');
 });
 
-test('accountView accepts the current SSE limitSnapshot aliases without retaining provider payloads', () => {
-  const v = accountView(acct({
-    limits: undefined,
-    limitSnapshot: limits({ plan: 'plus' }),
-    limitsError: undefined,
-    limitSnapshotError: 'Unable to refresh account limits. Check that this account is signed in.',
-  }));
-  assert.equal(v.real, true);
-  assert.equal(v.plan, 'plus');
-  assert.match(v.error, /signed in/);
-});
-
 test('accountView sorts copied provider windows by shortest duration then stable id', () => {
   const source = [
     window({ id: 'z', label: 'Weekly', usedPercent: 3, windowDurationMins: 10080 }),
@@ -878,6 +866,38 @@ test('accountView sorts copied provider windows by shortest duration then stable
   assert.deepEqual(v.windows.map((w) => w.id), ['a', 'b', 'z']);
   assert.equal(v.pct, 12, 'the stable id tie-break chooses the headline');
   assert.deepEqual(source.map((w) => w.id), ['z', 'b', 'a'], 'SSE data is not sorted in place');
+});
+
+test('accountView preserves null-duration secondary windows after every timed window', () => {
+  const source = [
+    window({ id: 'unknown-b', label: 'Secondary B', usedPercent: 77, windowDurationMins: null }),
+    window({ id: 'timed', label: 'Primary', usedPercent: 14, windowDurationMins: 300 }),
+    window({ id: 'unknown-a', label: 'Secondary A', usedPercent: 9, windowDurationMins: null }),
+  ];
+  const v = accountView(acct({ pace: 0.6, load: 0.77, limits: limits({ windows: source }) }));
+  assert.equal(v.real, true);
+  assert.equal(v.title, 'claude-main — 14% of the 5h limit');
+  assert.deepEqual(v.windows.map((w) => [w.id, w.windowDurationMins]), [
+    ['timed', 300], ['unknown-a', null], ['unknown-b', null],
+  ]);
+  assert.deepEqual(source.map((w) => w.id), ['unknown-b', 'timed', 'unknown-a']);
+});
+
+test('accountView lists null-duration-only provider history but uses the local estimate headline', () => {
+  const v = accountView(acct({
+    pace: 0.34,
+    load: 0.91,
+    limits: limits({ windows: [
+      window({ id: 'secondary', label: 'Secondary', usedPercent: 91, windowDurationMins: null }),
+    ] }),
+  }));
+  assert.equal(v.real, false);
+  assert.equal(v.pct, 34);
+  assert.equal(v.title, 'claude-main — ~34% of its 5h budget (estimate)');
+  assert.deepEqual(v.windows.map((w) => [w.id, w.pct, w.windowDurationMins]), [
+    ['secondary', 91, null],
+  ]);
+  assert.match(v.note, /timed window.*local estimate/i);
 });
 
 test('accountView preserves arbitrary labels and every valid provider window in the expanded ledger', () => {
@@ -978,6 +998,302 @@ test('reset scheduling disables only unsupported Codex reset work and keeps time
   assert.deepEqual(resetScheduleView(acct({
     provider: 'claude', resetScheduling: { eligible: false, resetsAt: null, reason: 'irrelevant' },
   })), { enabled: true, reason: '' });
+});
+
+class TestClassList {
+  private element: TestElement;
+  constructor(element: TestElement) { this.element = element; }
+  #names() { return new Set(this.element.className.split(/\s+/).filter(Boolean)); }
+  add(...names: string[]) { const set = this.#names(); names.forEach((name) => set.add(name)); this.element.className = [...set].join(' '); }
+  remove(...names: string[]) { const set = this.#names(); names.forEach((name) => set.delete(name)); this.element.className = [...set].join(' '); }
+  contains(name: string) { return this.#names().has(name); }
+  toggle(name: string, force?: boolean) {
+    const on = force ?? !this.contains(name);
+    if (on) this.add(name); else this.remove(name);
+    return on;
+  }
+}
+
+class TestElement {
+  children: TestElement[] = [];
+  parentElement: TestElement | null = null;
+  className = '';
+  classList = new TestClassList(this);
+  dataset: Record<string, string> = {};
+  style: Record<string, string> & { setProperty: (name: string, value: string) => void };
+  hidden = false;
+  disabled = false;
+  required = false;
+  checked = false;
+  open = false;
+  selected = false;
+  value = '';
+  title = '';
+  type = '';
+  role = '';
+  id = '';
+  name = '';
+  scrollHeight = 0;
+  scrollTop = 0;
+  scrollLeft = 0;
+  innerHTML = '';
+  onclick: ((event?: any) => any) | null = null;
+  onchange: ((event?: any) => any) | null = null;
+  #text = '';
+  #attrs = new Map<string, string>();
+  #listeners = new Map<string, Array<(event: any) => any>>();
+
+  readonly ownerDocument: TestDocument;
+  readonly tagName: string;
+  constructor(ownerDocument: TestDocument, tagName = 'DIV') {
+    this.ownerDocument = ownerDocument;
+    this.tagName = tagName;
+    const style = {} as TestElement['style'];
+    style.setProperty = (name, value) => { style[name] = value; };
+    this.style = style;
+  }
+
+  set textContent(value: unknown) { this.#text = String(value ?? ''); this.children = []; }
+  get textContent() { return this.#text + this.children.map((child) => child.textContent).join(''); }
+  append(...values: any[]) {
+    for (const value of values.flat()) {
+      const child = value instanceof TestElement ? value : this.ownerDocument.createTextNode(String(value));
+      child.parentElement = this;
+      this.children.push(child);
+    }
+  }
+  replaceChildren(...values: any[]) { this.children = []; this.#text = ''; this.append(...values); }
+  remove() {
+    if (!this.parentElement) return;
+    this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+    this.parentElement = null;
+  }
+  setAttribute(name: string, value: unknown) { this.#attrs.set(name, String(value)); }
+  getAttribute(name: string) { return this.#attrs.get(name) ?? null; }
+  removeAttribute(name: string) { this.#attrs.delete(name); }
+  toggleAttribute(name: string, force?: boolean) {
+    const on = force ?? !this.#attrs.has(name);
+    if (on) this.#attrs.set(name, ''); else this.#attrs.delete(name);
+  }
+  addEventListener(type: string, listener: (event: any) => any) {
+    this.#listeners.set(type, [...(this.#listeners.get(type) ?? []), listener]);
+  }
+  dispatchEvent(event: any) {
+    event.target ??= this;
+    this[`on${event.type}`]?.(event);
+    for (const listener of this.#listeners.get(event.type) ?? []) listener(event);
+    return true;
+  }
+  querySelector(selector: string): TestElement | null {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+  querySelectorAll(selector: string): TestElement[] {
+    const all = this.descendants();
+    if (selector === 'form') {
+      const found = all.find((element) => element.tagName === 'FORM');
+      if (found) return [found];
+      const form = this.ownerDocument.createElement('form');
+      this.append(form);
+      return [form];
+    }
+    const option = selector.match(/^option\[value=([^\]]+)\]$/);
+    if (option) return all.filter((element) => element.tagName === 'OPTION' && element.value === option[1]);
+    if (selector.startsWith('.')) {
+      const className = selector.slice(1).split(/[ :>]/)[0];
+      return all.filter((element) => element.classList.contains(className));
+    }
+    return all.filter((element) => element.tagName === selector.toUpperCase());
+  }
+  descendants(): TestElement[] {
+    return this.children.flatMap((child) => [child, ...child.descendants()]);
+  }
+  closest() { return null; }
+  contains(other: TestElement) { return other === this || this.descendants().includes(other); }
+  focus() {}
+  reportValidity() { return true; }
+  requestSubmit() {}
+  reset() {}
+  scrollIntoView() {}
+  setSelectionRange() {}
+}
+
+class TestDocument {
+  title = '';
+  documentElement = new TestElement(this, 'HTML');
+  #ids = new Map<string, TestElement>();
+  #listeners = new Map<string, Array<(event: any) => any>>();
+
+  createElement(tag: string) { return new TestElement(this, tag.toUpperCase()); }
+  createTextNode(text: string) { const node = new TestElement(this, '#TEXT'); node.textContent = text; return node; }
+  createDocumentFragment() { return new TestElement(this, '#FRAGMENT'); }
+  element(id: string, tag = 'div') {
+    const existing = this.#ids.get(id);
+    if (existing) return existing;
+    const element = this.createElement(tag);
+    element.id = id;
+    this.#ids.set(id, element);
+    return element;
+  }
+  select(id: string, values: string[]) {
+    const select = this.element(id, 'select');
+    select.replaceChildren(...values.map((value) => {
+      const option = this.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      return option;
+    }));
+    select.value = values[0] ?? '';
+    return select;
+  }
+  querySelector(selector: string): TestElement | null {
+    if (selector.startsWith('#')) return this.element(selector.slice(1));
+    if (selector === 'select[name=account]') return this.element('account-select', 'select');
+    return null;
+  }
+  querySelectorAll(selector: string): TestElement[] {
+    return [...this.#ids.values()].flatMap((element) => [element, ...element.descendants()])
+      .filter((element) => selector === '.attachment-chip button'
+        ? element.tagName === 'BUTTON' && element.parentElement?.classList.contains('attachment-chip')
+        : false);
+  }
+  addEventListener(type: string, listener: (event: any) => any) {
+    this.#listeners.set(type, [...(this.#listeners.get(type) ?? []), listener]);
+  }
+  hasFocus() { return false; }
+}
+
+test('real DOM and SSE rendering keeps usage detail scoped and reset options reactive', async () => {
+  const document = new TestDocument();
+  const when = document.select('when-select', ['now', 'at', 'reset']);
+  const when2 = document.select('when2-select', ['at', 'reset']);
+  document.element('when-at', 'input');
+  document.element('when2-at', 'input');
+  const accountSelect = document.select('account-select', ['codex-ready', 'codex-wait', 'claude-main']);
+  document.element('new-reset-note', 'p');
+  document.element('when2-reset-note', 'p');
+
+  let source: any;
+  class TestEventSource {
+    onopen: ((event?: any) => void) | null = null;
+    onmessage: ((event: { data: string }) => void) | null = null;
+    onerror: ((event?: any) => void) | null = null;
+    constructor() { source = this; }
+  }
+  class TestNotification { static permission = 'denied'; static async requestPermission() { return 'denied'; } }
+  const globals = {
+    document,
+    window: { Notification: TestNotification, confirm: () => true, scrollY: 0, innerHeight: 800 },
+    EventSource: TestEventSource,
+    Notification: TestNotification,
+    localStorage: { getItem: () => null, setItem: () => {} },
+    navigator: { clipboard: { writeText: () => {} } },
+    getComputedStyle: () => new Proxy({}, { get: () => '' }),
+    setInterval: () => 1,
+    fetch: async () => new Response(JSON.stringify({ added: 0, removed: 0, dirty: false })),
+  };
+  const originalDescriptors = new Map(
+    Object.keys(globals).map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
+  );
+  for (const [name, value] of Object.entries(globals)) {
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  }
+
+  const reset = Date.parse('2026-08-03T19:10:00Z');
+  const account = (name: string, provider: 'codex' | 'claude', over: Record<string, unknown> = {}) => ({
+    name, provider, budget: 1000, pace: 0.4, load: 0.2,
+    limits: limits({ windows: [
+      window({ id: `${name}:five`, label: '5h', usedPercent: 20, resetsAt: reset }),
+      window({ id: `${name}:secondary`, label: 'Secondary', usedPercent: 7, windowDurationMins: null, resetsAt: null }),
+    ] }),
+    limitsError: null,
+    resetScheduling: { eligible: true, resetsAt: reset, reason: '' },
+    ...over,
+  });
+  const session = (accountName: string) => ({
+    id: 's1', provider: accountName === 'claude-main' ? 'claude' : 'codex', account: accountName,
+    repo: '/repo', cwd: '/repo/wt', branch: 'feature', title: 'Feature', status: 'stopped',
+    statusSince: Date.now(), pending: null, transcript: [], lastUsage: null,
+  });
+  const snapshot = (sessionAccount = 'codex-wait', ready = true) => ({
+    commands: [], queue: [],
+    settings: { notifyOn: [], sort: 'blocked', collapseDone: false, account: null, branchPrefix: 'codex/' },
+    sessions: [session(sessionAccount)],
+    accounts: [
+      account('codex-ready', 'codex', {
+        limits: limits({
+          plan: 'pro',
+          windows: [
+            window({ id: 'ready:five', label: '5h', usedPercent: 20, resetsAt: reset }),
+            window({ id: 'ready:secondary', label: 'Secondary', usedPercent: 7, windowDurationMins: null, resetsAt: null }),
+          ],
+          blocks: [{ id: 'spend', reason: 'Spend control reached', resettable: false }],
+        }),
+        limitsError: 'Unable to refresh account limits. Check that this account is signed in.',
+        resetScheduling: { eligible: ready, resetsAt: ready ? reset : null, reason: ready ? '' : 'Refresh limits first.' },
+        env: { SECRET_TOKEN: 'must-not-render' },
+        rawProvider: { host: 'must-not-render' },
+      }),
+      account('codex-wait', 'codex', {
+        limits: limits({ fresh: false }),
+        resetScheduling: { eligible: false, resetsAt: null, reason: 'Wait for a fresh Codex window.' },
+      }),
+      account('claude-main', 'claude', {
+        limits: null,
+        resetScheduling: { eligible: true, resetsAt: null, reason: '' },
+      }),
+    ],
+  });
+
+  try {
+    await import(`../web/app.js?dom=${Date.now()}`);
+    accountSelect.value = 'codex-ready';
+    source.onmessage({ data: JSON.stringify(snapshot()) });
+
+    const meters = document.element('meters');
+    const readyMeter = meters.children.find((child) => child.textContent.includes('codex-ready'))!;
+    const staleMeter = meters.children.find((child) => child.textContent.includes('codex-wait'))!;
+    assert.match(readyMeter.title, /20% of the 5h limit/);
+    assert.equal(readyMeter.textContent.includes('pro'), false, 'plan is panel-only');
+    assert.equal(readyMeter.textContent.includes('Spend control'), false, 'blocks are panel-only');
+    assert.equal(readyMeter.textContent.includes('signed in'), false, 'sanitized errors are panel-only');
+    assert.match(staleMeter.textContent, /~40%/);
+    assert.equal(staleMeter.textContent.includes('11%'), false, 'stale provider percentage stays expanded');
+
+    readyMeter.onclick?.();
+    const panel = document.element('panel').textContent;
+    assert.match(panel, /pro plan/);
+    assert.match(panel, /5h · 20% · resets/);
+    assert.match(panel, /Secondary · 7%/);
+    assert.match(panel, /Spend control reached/);
+    assert.match(panel, /Check that this account is signed in/);
+    assert.doesNotMatch(panel, /must-not-render/);
+
+    staleMeter.onclick?.();
+    assert.match(document.element('panel').textContent, /stale/);
+
+    const resetOption = when.querySelector('option[value=reset]')!;
+    assert.equal(resetOption.disabled, false);
+    accountSelect.value = 'codex-wait';
+    accountSelect.dispatchEvent({ type: 'change' });
+    assert.equal(resetOption.disabled, true);
+    assert.match(document.element('new-reset-note').textContent, /fresh Codex window/);
+    assert.equal(when.querySelector('option[value=at]')!.disabled, false);
+    accountSelect.value = 'claude-main';
+    accountSelect.dispatchEvent({ type: 'change' });
+    assert.equal(resetOption.disabled, false, 'Claude retains reset scheduling without provider data');
+
+    const card = document.element('grid').children.find((child) => child.dataset.id === 's1')!;
+    card.onclick?.();
+    const sessionReset = when2.querySelector('option[value=reset]')!;
+    assert.equal(sessionReset.disabled, true);
+    source.onmessage({ data: JSON.stringify(snapshot('codex-ready', true)) });
+    assert.equal(sessionReset.disabled, false, 'SSE session/account changes rerender eligibility');
+  } finally {
+    for (const [name, descriptor] of originalDescriptors) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as any)[name];
+    }
+  }
 });
 
 test('sortSessions defaults to blocked-first', () => {
