@@ -520,6 +520,11 @@ async function handle(message: Message): Promise<void> {
         }), 5);
         return;
       }
+      const configuredRateLimitError = fromJsonEnvironment('FAKE_APP_SERVER_RATE_LIMITS_ERROR', null);
+      if (configuredRateLimitError !== null) {
+        send({ id: message.id, error: configuredRateLimitError });
+        return;
+      }
       send({
         id: message.id,
         result: fromJsonEnvironment('FAKE_APP_SERVER_RATE_LIMITS_RESPONSE', defaultRateLimits),

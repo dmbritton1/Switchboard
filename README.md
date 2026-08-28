@@ -122,6 +122,16 @@ subsets of the reported totals rather than separate counters — an assumption
 noted in the code, not a confirmed one. Keep that in mind when tuning `budget`
 per account.
 
+Codex accounts with managed ChatGPT authentication also show provider plan
+windows through a separate app-server telemetry process. The shortest window is
+the meter headline, so a reported five-hour window is the five-hour reading;
+expanded account panels retain every provider window and the plan name. This
+process is telemetry-only: Switchboard continues to start, resume, and run every
+Codex turn through the SDK. If telemetry is unavailable, unsupported, or fails
+after a successful read, its process-local snapshot becomes stale and the UI
+falls back to the clearly labelled local token-pace estimate. Provider snapshots
+are never written to `state.json`.
+
 ## Scheduling
 
 Cards can be created for later instead of now, and messages can be scheduled into
@@ -130,21 +140,24 @@ time…` (a native date-time picker) or `When usage resets`; the ⏱ button besi
 the chat composer schedules a message the same way. Queued items show in a strip
 above the grid and can be removed from there.
 
-`When usage resets` is a real signal for Claude accounts, not a guess: the Agent
-SDK streams a `rate_limit_event` carrying the timestamp at which the window
-rolls, and that timestamp is stored per account. The Codex SDK reports no rate
-limits at all, so a Codex account falls back to the same estimate the account
-bars show — the item fires once the trailing-5h token pace (tokens spent ÷
-`budget`) drops below `RESET_PACE` (0.8, in `src/usage.ts`). That fallback is only
-as good as the budget you tuned in `accounts.json`, same caveat as the bars.
+`When usage resets` remains a real event/pace path for Claude accounts: the
+Agent SDK streams a `rate_limit_event` carrying the timestamp at which the
+window rolls, and its existing `Usage.resetAt()`/`Usage.free()` behavior is
+unchanged. For Codex, scheduling is available only from fresh, resettable
+provider windows and Switchboard performs a new authoritative read when work
+reaches that reset boundary before releasing it. Credit depletion,
+workspace-usage limits, and spend-control blocks have no authoritative reset
+time in this phase, so their work remains manually resumable rather than being
+released automatically.
 
 When a Claude session dies while its account is past its limit, a resume is
 queued automatically for when the window rolls; the card appends a line reading
 `⏱ waiting for reset` below the status. Codex sessions never auto-requeue,
-because the Codex SDK reports no rate-limit signal. Stopping a session yourself
-never queues anything. Items waiting on one account fire one at a time, so a
-freshly reset window is not spent all at once — items waiting on a clock fire at
-their time regardless of what else is running.
+because automatic recovery of an SDK-owned Codex failure is deferred until a
+future app-server turn transport is approved. Stopping a session yourself never
+queues anything. Items waiting on one account fire one at a time, so a freshly
+reset window is not spent all at once — items waiting on a clock fire at their
+time regardless of what else is running.
 
 Scheduled items are one-shot; there is no recurrence. A time that passes while
 Switchboard is down fires on the next start if it is less than 12 hours late
@@ -206,6 +219,25 @@ npm test
 The normal suite is hermetic: it uses a fake Codex process, a temporary
 `CODEX_HOME`, and the real SDK process boundary. It does not contact OpenAI,
 spend a model turn, or read a real Codex account.
+
+The optional compatibility smoke check is manual-only. It launches the selected
+Codex account's app-server with the telemetry safety profile, verifies the
+pinned protocol contract, initializes it, reads account state without refreshing
+credentials, reads rate limits, observes only naturally occurring notifications
+for a short bounded period, and shuts it down. It never creates or reads a
+thread, starts a turn, refreshes auth, consumes reset credits, or produces
+usage:
+
+```bash
+npm run evaluate:codex-telemetry
+```
+
+Its one-line JSON output is intentionally redacted: it records only safe
+compatibility evidence such as window presence and reset-timestamp magnitude,
+not email addresses, tokens, raw provider responses, machine identifiers,
+paths, or account environment values. Running it against a real configured
+account is optional and requires separate operator intent; it is not part of
+`npm test`.
 
 ## Limits
 

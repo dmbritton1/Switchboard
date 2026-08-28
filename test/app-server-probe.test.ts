@@ -6,6 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import { probeAppServer } from '../scripts/codex-app-server-probe.ts';
+import { runCodexTelemetrySmoke } from '../scripts/codex-telemetry-smoke.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 
@@ -159,6 +160,109 @@ test('non-fixture evaluation generates matching types and performs no turn', asy
       { operation: 'eof' },
     ],
   );
+});
+
+test('telemetry smoke records only safe no-turn evidence for a supported account', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'switchboard-codex-telemetry-smoke-'));
+  const callLog = join(dir, 'calls.jsonl');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const evidence = await runCodexTelemetrySmoke({
+    command: fakeCommand,
+    version: '0.145.0',
+    env: env({ FAKE_APP_SERVER_CALL_LOG: callLog }),
+    observationMs: 20,
+  });
+
+  assert.deepEqual(evidence, {
+    version: '0.145.0',
+    contractMatches: true,
+    safeLaunchProfile: true,
+    accountKind: 'chatgpt',
+    observedAuthMode: 'chatgpt',
+    planVisible: false,
+    usableWindows: true,
+    blockState: 'none',
+    resetTimestampBand: 'seconds-band',
+    observedNotifications: ['account/updated'],
+    noForbiddenMethods: true,
+    cleanShutdown: true,
+  });
+  const calls = (await readFile(callLog, 'utf8')).trim().split('\n')
+    .map((line) => JSON.parse(line) as { method?: string; operation?: string; params?: unknown })
+    .filter((entry) => entry.method !== undefined || entry.operation === 'eof');
+  assert.deepEqual(calls, [
+    {
+      method: 'initialize',
+      params: {
+        clientInfo: { name: 'switchboard_telemetry_smoke', title: 'Switchboard telemetry smoke', version: '0.1.0' },
+        capabilities: null,
+      },
+    },
+    { method: 'initialized' },
+    { method: 'account/read', params: { refreshToken: false } },
+    { method: 'account/rateLimits/read' },
+    { operation: 'eof' },
+  ]);
+});
+
+test('telemetry smoke fails closed for the pinned logged-out account/read and rate-limit pair', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'switchboard-codex-telemetry-logged-out-'));
+  const callLog = join(dir, 'calls.jsonl');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  await assert.rejects(
+    runCodexTelemetrySmoke({
+      command: fakeCommand,
+      version: '0.145.0',
+      env: env({
+        FAKE_APP_SERVER_CALL_LOG: callLog,
+        FAKE_APP_SERVER_ACCOUNT_RESPONSE: JSON.stringify({ account: null, requiresOpenaiAuth: true }),
+        FAKE_APP_SERVER_RATE_LIMITS_ERROR: JSON.stringify({
+          code: -32600,
+          message: 'codex account authentication required to read rate limits',
+        }),
+      }),
+      observationMs: 0,
+    }),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex telemetry smoke did not produce usable telemetry.'
+      && 'evidence' in error
+      && (error as Error & { evidence?: unknown }).evidence !== null
+      && typeof (error as Error & { evidence?: unknown }).evidence === 'object'
+      && (error as Error & { evidence: { accountKind?: unknown } }).evidence.accountKind === 'signed-out',
+  );
+  assert.deepEqual(
+    (await readFile(callLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      .filter((entry: { method?: string; operation?: string }) => entry.method !== undefined || entry.operation === 'eof'),
+    [
+      {
+        method: 'initialize',
+        params: {
+          clientInfo: { name: 'switchboard_telemetry_smoke', title: 'Switchboard telemetry smoke', version: '0.1.0' },
+          capabilities: null,
+        },
+      },
+      { method: 'initialized' },
+      { method: 'account/read', params: { refreshToken: false } },
+      { method: 'account/rateLimits/read' },
+      { operation: 'eof' },
+    ],
+  );
+});
+
+test('telemetry smoke excludes private remote-control notification canaries', async () => {
+  const canaries = ['private-server-name', 'private-installation-id', 'private-environment-id'];
+  const evidence = await runCodexTelemetrySmoke({
+    command: fakeCommand,
+    version: '0.145.0',
+    env: env({ FAKE_APP_SERVER_MODE: 'telemetry-private-notification' }),
+    observationMs: 25,
+  });
+
+  const encoded = JSON.stringify(evidence);
+  for (const canary of canaries) assert.equal(encoded.includes(canary), false);
+  assert.deepEqual(evidence.observedNotifications, ['account/updated']);
 });
 
 test('schema evidence fails when any stable lifecycle notification is absent', async (t) => {
