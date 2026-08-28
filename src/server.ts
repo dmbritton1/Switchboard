@@ -19,20 +19,15 @@ import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
+import { type Account, loadAccounts } from './accounts.ts';
 import type {
   AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
   CodexThreadSettings, NotifyOn, Session, Settings, SortMode, Trigger,
 } from './types.ts';
 
-const run = promisify(execFile);
+export type { Account } from './accounts.ts';
 
-export type Account = {
-  name: string;
-  provider: 'claude' | 'codex';
-  budget: number;
-  env: Record<string, string>;
-  bin?: string;
-};
+const run = promisify(execFile);
 
 type PreparedProvider = {
   adapter: Adapter;
@@ -1184,9 +1179,8 @@ export function createServer(opts: {
 // Entry point: only when run directly, so tests can import createServer freely.
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   const statePath = new URL('../state.json', import.meta.url).pathname;
-  const accounts = JSON.parse(
-    await readFile(new URL('../accounts.json', import.meta.url), 'utf8'),
-  ) as Account[];
+  const accountsPath = new URL('../accounts.json', import.meta.url).pathname;
+  const accounts = await loadAccounts(accountsPath);
   const usage = new Usage();
   const scheduler = new Scheduler();
   const registry = await Registry.load(statePath, usage, scheduler);
