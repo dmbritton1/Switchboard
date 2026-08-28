@@ -70,10 +70,11 @@ time, not closure time, so in-place `push`/`splice` makes every one correct with
 no edits. Wrapping the array in a class would mean touching all five to gain
 nothing they do not already do.
 
-A new `src/accounts.ts` holds two functions: `loadAccounts(path)` and
-`saveAccounts(path, accounts)`, the latter writing to a temp file and renaming,
-serialized behind a save chain — copied from `Registry`, whose comment at
-`src/sessions.ts:483-492` explains why chaining beats unique temp names.
+A new `src/accounts.ts` holds `loadAccounts(path)` and a
+`createAccountStore(path)` returning `{append, remove}`. Both mutators are
+read-modify-write and both write to a temp file then rename, serialized behind a
+save chain — copied from `Registry`, whose comment at `src/sessions.ts:483-492`
+explains why chaining beats unique temp names.
 
 **A missing `accounts.json` is now legal** and loads as `[]`. The entry point
 currently throws. This is what makes first-run work and retires the `cp
