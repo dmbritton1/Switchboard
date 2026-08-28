@@ -6,6 +6,10 @@ export type Account = {
   budget: number;
   env: Record<string, string>;
   bin?: string;
+  /** Who this account belongs to, when the provider told us. Used only to stop
+   *  the same account being linked twice under two names. Absent for
+   *  hand-written entries and for auth modes that expose no identity. */
+  identity?: string;
 };
 
 export const DEFAULT_BUDGET = 2_000_000;

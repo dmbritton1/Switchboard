@@ -1,8 +1,12 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm, mkdir } from 'node:fs/promises';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { mkdtemp, rm, mkdir, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { prepareCodexRuntime } from './agents/codex-runtime.ts';
+import type { Account } from './accounts.ts';
+
+const runFile = promisify(execFile);
 
 export type LinkProvider = 'claude' | 'codex';
 export type LinkPhase = 'starting' | 'awaiting-user' | 'verifying' | 'naming' | 'error';
@@ -22,7 +26,14 @@ export type SpawnLogin = (provider: LinkProvider, env: Record<string, string>) =
 
 export type LinkerOptions = {
   accountsRoot: string;
+  /** Read at commit and suggest time, not captured at construction: the array
+   *  is mutated in place as accounts are linked and unlinked. */
+  accounts: () => readonly Account[];
   spawnLogin?: SpawnLogin;
+  /** The `claude` binary to run for identity readback. Defaults to the bare
+   *  name resolved from PATH; tests point this at a fake CLI so no real
+   *  `claude` process is ever spawned. */
+  claudeBin?: string;
   urlTimeoutMs?: number;
   overallTimeoutMs?: number;
 };
@@ -47,6 +58,86 @@ export const CREDENTIAL_ENV: Record<LinkProvider, string> = {
   claude: 'CLAUDE_CONFIG_DIR',
   codex: 'CODEX_HOME',
 };
+
+/** A bounded, whitespace-collapsed tail of child output, for error messages
+ *  only. Mirrors detailSuffix() in agents/codex-runtime.ts. */
+function tailSuffix(tail: string): string {
+  const safe = tail.replace(/\s+/g, ' ').trim();
+  return safe ? ` ${safe.slice(-400)}` : '';
+}
+
+function emailFromIdToken(idToken: unknown): string | null {
+  if (typeof idToken !== 'string') return null;
+  const payload = idToken.split('.')[1];
+  if (!payload) return null;
+  try {
+    // Decoded, never verified: this labels a file we just wrote, it does
+    // not authenticate a request. Only `email` is read.
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as
+      { email?: unknown };
+    return typeof claims.email === 'string' ? claims.email : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Who was just linked, or null when the provider exposes nobody.
+ *
+ * Null is not an error: a Codex auth.json can hold an API key with no
+ * id_token, and a Console-authenticated Claude account reports no email. The
+ * credentials are still valid, which is what matters — the caller falls back to
+ * a numbered name and skips the duplicate check.
+ */
+export async function readIdentity(
+  provider: LinkProvider,
+  dir: string,
+  claudeBin: string,
+): Promise<LinkIdentity | null> {
+  if (provider === 'codex') {
+    try {
+      const auth = JSON.parse(await readFile(join(dir, 'auth.json'), 'utf8')) as
+        { tokens?: { id_token?: unknown } };
+      const email = emailFromIdToken(auth.tokens?.id_token);
+      // Codex has no equivalent of subscriptionType, at any auth mode.
+      return email ? { email, subscription: null } : null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const { stdout } = await runFile(claudeBin, ['auth', 'status', '--json'], {
+      env: { ...process.env, [CREDENTIAL_ENV.claude]: dir },
+    });
+    const status = JSON.parse(stdout) as { email?: unknown; subscriptionType?: unknown };
+    if (typeof status.email !== 'string') return null;
+    return {
+      email: status.email,
+      subscription: typeof status.subscriptionType === 'string' ? status.subscriptionType : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** `dwight@example.com` on claude becomes `claude-dwight`. Falls back to the
+ *  bare provider, then a numeric suffix, when there is no identity to derive
+ *  from or the derived name is taken. */
+export function suggestName(
+  provider: LinkProvider,
+  identity: LinkIdentity | null,
+  existing: readonly { name: string }[],
+): string {
+  const local = identity?.email.split('@')[0]?.toLowerCase().replace(/[^a-z0-9-]/g, '-') ?? '';
+  const base = local ? `${provider}-${local}`.slice(0, 32) : provider;
+  const taken = new Set(existing.map((a) => a.name));
+  if (!taken.has(base)) return base;
+  for (let n = 2; n < 100; n += 1) {
+    const candidate = `${base}-${n}`.slice(0, 32);
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}`.slice(0, 32);
+}
 
 async function defaultSpawnLogin(
   provider: LinkProvider,
@@ -87,12 +178,16 @@ export class Linker {
   #pending: Pending | null = null;
   readonly #root: string;
   readonly #spawn: SpawnLogin | undefined;
+  readonly #accounts: () => readonly Account[];
+  readonly #claudeBin: string;
   readonly #urlTimeoutMs: number;
   readonly #overallTimeoutMs: number;
 
   constructor(options: LinkerOptions) {
     this.#root = options.accountsRoot;
     this.#spawn = options.spawnLogin;
+    this.#accounts = options.accounts;
+    this.#claudeBin = options.claudeBin ?? 'claude';
     this.#urlTimeoutMs = options.urlTimeoutMs ?? 30_000;
     this.#overallTimeoutMs = options.overallTimeoutMs ?? 300_000;
   }
@@ -203,8 +298,18 @@ export class Linker {
     if (changed) this.#notify();
   }
 
-  /** Overridden in Task 5 to run identity readback. Here it only marks the
-   *  terminal phases so the state machine is observable. */
+  submitCode(code: string): { error?: string } {
+    const p = this.#pending;
+    if (!p || p.phase !== 'awaiting-user' || !p.codeRequested) {
+      return { error: 'the sign-in is not waiting for a code' };
+    }
+    if (typeof code !== 'string' || !code.trim()) return { error: 'code is required' };
+    // Straight to the child's stdin and nowhere else: never stored on the
+    // pending link, never logged, never in snapshot().
+    p.child.stdin?.write(`${code.trim()}\n`);
+    return {};
+  }
+
   #onClose(code: number | null): void {
     const p = this.#pending;
     if (!p || p.settled) return;
@@ -214,10 +319,34 @@ export class Linker {
       // under a link that already finished.
       this.#clearTimers(p);
       p.phase = 'verifying';
+      // A prompt still on screen must go away: the child is done either way.
+      p.codeRequested = false;
       this.#notify();
+      void this.#verify(p);
       return;
     }
-    void this.#fail(this.redact(`The sign-in command exited with code ${code}.`));
+    void this.#fail(this.redact(
+      `The sign-in command exited with code ${code}.${tailSuffix(this.redact(p.tail))}`,
+    ));
+  }
+
+  async #verify(p: Pending): Promise<void> {
+    const identity = await readIdentity(p.provider, p.staging, this.#claudeBin);
+    if (this.#pending !== p) return;   // cancelled while readback was running
+    if (identity) {
+      const clash = this.#accounts().find(
+        (a) => a.provider === p.provider && a.identity === identity.email,
+      );
+      if (clash) {
+        await this.#fail(`That account is already linked as ${clash.name}.`);
+        return;
+      }
+    }
+    this.#clearTimers(p);
+    p.identity = identity;
+    p.suggestedName = suggestName(p.provider, identity, this.#accounts());
+    p.phase = 'naming';
+    this.#notify();
   }
 
   /** Removes any value that could identify the staging directory before text

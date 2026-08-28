@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { Linker, type SpawnLogin } from '../src/link.ts';
+import type { Account } from '../src/accounts.ts';
 import { writeFakeLoginCli } from './helpers/fake-login.ts';
 
 async function harness(options: {
@@ -21,13 +22,16 @@ async function harness(options: {
     spawn(bin, provider === 'claude' ? ['auth', 'login'] : ['login'], {
       env: { ...process.env, ...env },
     });
+  const accounts: Account[] = [];
   const linker = new Linker({
     accountsRoot: join(dir, 'accounts'),
+    accounts: () => accounts,
     spawnLogin,
+    claudeBin: bin,
     urlTimeoutMs: options.urlTimeoutMs ?? 5000,
     overallTimeoutMs: options.overallTimeoutMs ?? 10_000,
   });
-  return { dir, linker, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  return { dir, linker, accounts, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
 /** Resolves when the snapshot satisfies `predicate`, or rejects after 5s. */
@@ -113,5 +117,77 @@ test('subscribers are notified on every phase change and stop after unsubscribe'
   const before = calls;
   await h.linker.cancel();
   assert.equal(calls, before);
+  await h.cleanup();
+});
+
+test('pasting a code completes a claude link and proposes a name', async () => {
+  const h = await harness({ provider: 'claude', email: 'dwight@example.com' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.codeRequested === true);
+  assert.equal(h.linker.submitCode('good-code').error, undefined);
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const link = h.linker.snapshot();
+  assert.equal(link?.identity?.email, 'dwight@example.com');
+  assert.equal(link?.suggestedName, 'claude-dwight');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('a CLI that never prompts goes straight to naming', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  assert.equal(h.linker.snapshot()?.codeRequested, false);
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('a codex link decodes the email out of the id_token', async () => {
+  const h = await harness({ provider: 'codex', email: 'dwight@example.com' });
+  await h.linker.start('codex');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const link = h.linker.snapshot();
+  assert.equal(link?.identity?.email, 'dwight@example.com');
+  assert.equal(link?.identity?.subscription, null);
+  assert.equal(link?.suggestedName, 'codex-dwight');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('an auth.json with no id_token still links, with a bare provider name', async () => {
+  const h = await harness({ provider: 'codex', email: null });
+  await h.linker.start('codex');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const link = h.linker.snapshot();
+  assert.equal(link?.identity, null);
+  assert.equal(link?.suggestedName, 'codex');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('a bad code fails the link and leaves no staging directory', async () => {
+  const h = await harness({ provider: 'claude', mode: 'bad-code' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.codeRequested === true);
+  h.linker.submitCode('wrong');
+  await until(h.linker, (l) => l?.phase === 'error');
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(join(h.dir, 'accounts')).catch(() => []), []);
+  await h.cleanup();
+});
+
+test('submitCode is refused before the CLI has asked for one', async () => {
+  const h = await harness({ provider: 'codex' });
+  assert.match(h.linker.submitCode('x').error ?? '', /not waiting for a code/);
+  await h.cleanup();
+});
+
+test('the submitted code never appears in the snapshot', async () => {
+  const h = await harness({ provider: 'claude', mode: 'bad-code' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.codeRequested === true);
+  h.linker.submitCode('sentinel-secret-code');
+  await until(h.linker, (l) => l?.phase === 'error');
+  assert.ok(!JSON.stringify(h.linker.snapshot()).includes('sentinel-secret-code'));
   await h.cleanup();
 });
