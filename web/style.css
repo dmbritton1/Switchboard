@@ -661,11 +661,11 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 /* ---- New worktree dialog ---------------------------------------------- */
 /* Wide enough that an absolute repo path fits on one line: the whole point of
    replacing the native datalist, which clipped to the input's width. */
-/* #when-dialog (the composer's schedule picker) and #settings share this shell
-   rather than carrying their own copy — one dialog's chrome, three dialogs, so
-   they cannot drift apart the way #when-dialog did when only its datetime
-   input had a rule. */
-#new, #when-dialog, #settings { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--hairline);
+/* #when-dialog (the composer's schedule picker), #settings and #link share
+   this shell rather than each carrying their own copy — one dialog's chrome,
+   four dialogs, so they cannot drift apart the way #when-dialog did when
+   only its datetime input had a rule. */
+#new, #when-dialog, #settings, #link { width: min(38rem, 92vw); padding: 0; border: 1px solid var(--hairline);
   border-radius: 16px; background: var(--surface); color: var(--ink); }
 /* #settings alone: it has more content than #new/#when-dialog ever do (seven
    groups of controls vs. up to five fields) and can outgrow the viewport —
@@ -674,9 +674,9 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
    retune #new's or #when-dialog's overflow, which neither needs nor was
    asked for. */
 #settings { max-height: calc(100% - 6em); overflow-y: auto; }
-#new::backdrop, #when-dialog::backdrop, #settings::backdrop { background: #0007; }
-#new form, #when-dialog form, #settings form { display: grid; gap: 1.1rem; padding: 1.5rem; }
-#new h2, #when-dialog h2, #settings h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
+#new::backdrop, #when-dialog::backdrop, #settings::backdrop, #link::backdrop { background: #0007; }
+#new form, #when-dialog form, #settings form, #link form { display: grid; gap: 1.1rem; padding: 1.5rem; }
+#new h2, #when-dialog h2, #settings h2, #link h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
 .field { display: grid; gap: .4rem; }
 .field > label { color: var(--muted); font-size: 12px; font-weight: 500;
   letter-spacing: 1.5px; text-transform: uppercase; }
@@ -687,7 +687,7 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
    those to width:100% too, blowing out the checkbox layout. */
 #new input, #new textarea, #new select, #when-dialog input, #when-dialog select,
 #codex-settings-dialog input, #codex-settings-dialog select,
-#settings .field input, #settings select {
+#settings .field input, #settings select, #link input {
   width: 100%; box-sizing: border-box; padding: .55rem .7rem; background: var(--well);
   color: var(--ink); border: 1px solid var(--hairline); border-radius: 8px;
   font: inherit; }
@@ -696,7 +696,8 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #new :is(input, textarea, select):focus-visible,
 #when-dialog :is(input, select):focus-visible,
 #codex-settings-dialog :is(input, select):focus-visible,
-#settings :is(.field input, select):focus-visible {
+#settings :is(.field input, select):focus-visible,
+#link input:focus-visible {
   outline: none; border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--surface-2), 0 0 0 4px var(--accent-line); }
 
@@ -748,16 +749,19 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .combo-list li[aria-selected=true] mark { color: var(--body); }
 .combo-empty { padding: .5rem .55rem; color: var(--muted); font-size: .85rem; }
 
-#new menu, #when-dialog menu, #settings menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
-#new menu button, #when-dialog menu button, #settings menu button {
+#new menu, #when-dialog menu, #settings menu, #link menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
+#new menu button, #when-dialog menu button, #settings menu button, #link menu button {
   padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
-#new menu button#create { background: var(--accent-deep); border-color: var(--accent-deep);
+#new menu button#create, #link menu button#link-go { background: var(--accent-deep); border-color: var(--accent-deep);
   color: #ffffff; font-weight: 650; }
-#new menu button:focus-visible, #when-dialog menu button:focus-visible, #settings menu button:focus-visible {
+#new menu button:focus-visible, #when-dialog menu button:focus-visible, #settings menu button:focus-visible,
+#link menu button:focus-visible {
   outline: 2px solid var(--accent-line); outline-offset: 2px; }
-#new-error, #when-error, #settings-error { margin: 0; color: var(--error); font-size: .85rem; }
-#new-error:empty, #when-error:empty, #settings-error:empty { display: none; }
+#new-error, #when-error, #settings-error, #link-error, #unlink-error { margin: 0; color: var(--error); font-size: .85rem; }
+#new-error:empty, #when-error:empty, #settings-error:empty, #link-error:empty, #unlink-error:empty { display: none; }
+#link-identity, #link-url-wrap { margin: 0; }
+#link-url { color: var(--accent-text); font-weight: 600; }
 
 /* ---- Settings dialog ---------------------------------------------------- */
 #settings h3 { margin: 1.2rem 0 0.4rem; font-size: 0.85rem; color: var(--muted); }
@@ -786,7 +790,7 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
    accent: it sits next to + New as a secondary icon button, not a second
    primary action. Without this rule it rendered as an unstyled native button
    in an otherwise fully hand-styled header. */
-#queue-badge, #new-btn, #settings-btn { padding: .35rem .75rem; border-radius: 8px;
+#queue-badge, #new-btn, #settings-btn, #link-chip { padding: .35rem .75rem; border-radius: 8px;
   border: 1px solid var(--hairline); background: var(--surface); color: var(--ink);
   font: inherit; font-size: 15px; cursor: pointer; white-space: nowrap; }
 #queue-badge.open { border-color: var(--accent-line); }
@@ -838,17 +842,17 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .stopped-detail span { color: var(--muted); }
 
 /* ---- Delete dialog ----------------------------------------------------- */
-#del { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--hairline);
+#del, #unlink { width: min(28rem, 92vw); padding: 0; border: 1px solid var(--hairline);
   border-radius: 16px; background: var(--surface); color: var(--ink); }
-#del::backdrop { background: #0007; }
-#del form { display: grid; gap: .9rem; padding: 1.4rem; }
-#del h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
-#del-branch { margin: 0; font-weight: 700; word-break: break-word; }
+#del::backdrop, #unlink::backdrop { background: #0007; }
+#del form, #unlink form { display: grid; gap: .9rem; padding: 1.4rem; }
+#del h2, #unlink h2 { margin: 0; font: 500 22px/1.25 var(--display); letter-spacing: -.02em; }
+#del-branch, #unlink-name { margin: 0; font-weight: 700; word-break: break-word; }
 .del-wt { display: flex; align-items: center; gap: .5rem; cursor: pointer; }
-#del menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
-#del menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
+#del menu, #unlink menu { display: flex; justify-content: flex-end; gap: .5rem; margin: 0; padding: 0; }
+#del menu button, #unlink menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
-#del menu button#del-go { background: var(--error); border-color: var(--error); color: var(--canvas);
+#del menu button#del-go, #unlink menu button#unlink-go { background: var(--error); border-color: var(--error); color: var(--canvas);
   font-weight: 650; }
 
 /* ---- Inline interrupt -------------------------------------------------- */
@@ -882,3 +886,20 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
   border-radius: 999px; background: none; cursor: pointer; }
 .swatch-btn.on { border-color: var(--accent-line); }
 .menu button.on { background: var(--hover); }
+
+/* ---- Welcome and account-linking chrome --------------------------------- */
+/* Layout only — every color here is an existing token, because
+   test/palette.test.ts parses this file and asserts contrast across every
+   accent x canvas combination. */
+#welcome { max-width: 34rem; margin: 6rem auto; text-align: center; }
+#welcome h1 { margin: 0 0 .75rem; font: 500 28px/1.25 var(--display); letter-spacing: -.02em; }
+#welcome menu { display: flex; gap: .75rem; justify-content: center; padding: 0; margin-top: 1.5rem; }
+/* Not scoped to a dialog, so it needs the same pill styling #new/#when-dialog/
+   #settings' shared menu-button rule gives theirs. */
+#welcome menu button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
+#settings-accounts { display: grid; gap: .5rem; }
+.settings-account { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: .75rem; }
+.settings-account button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
+  background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
+menu.inline { display: flex; gap: .5rem; padding: 0; }
