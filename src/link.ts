@@ -225,6 +225,13 @@ export class Linker {
     return this.#root;
   }
 
+  /** The `claude` binary this Linker was configured with — tests point it at
+   *  a fake CLI. Reused for logout so unlink never spawns a real binary that
+   *  the login flow itself was careful to avoid. */
+  get claudeBin(): string {
+    return this.#claudeBin;
+  }
+
   async start(provider: LinkProvider): Promise<{ error?: string }> {
     if (this.#pending) return { error: 'a link is already in progress' };
     if (provider !== 'claude' && provider !== 'codex') return { error: 'unknown provider' };

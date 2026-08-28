@@ -4,7 +4,7 @@ import { readFile, readdir, rm, stat, lstat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
-import { join, extname, basename } from 'node:path';
+import { join, extname, basename, resolve } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { Scheduler, type Ctx } from './schedule.ts';
@@ -19,8 +19,10 @@ import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
-import { createAccountStore, loadAccounts, type Account, type AccountStore } from './accounts.ts';
-import { Linker, type PublicLink } from './link.ts';
+import {
+  createAccountStore, loadAccounts, ACCOUNT_NAME_RE, type Account, type AccountStore,
+} from './accounts.ts';
+import { Linker, CREDENTIAL_ENV, type PublicLink } from './link.ts';
 import type {
   AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
   CodexThreadSettings, NotifyOn, Session, Settings, SortMode, Trigger,
@@ -38,6 +40,41 @@ async function prepareProvider(account: Account): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
   const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
   return { adapter: createCodexAdapter(runtime) };
+}
+
+/** Does this account have a live agent? `needs-you` counts: it is not
+ *  computing, but it is a running child process parked on an approval prompt,
+ *  so unlinking under it strands a real process rather than a record. */
+export function accountBusy(registry: Registry, name: string): boolean {
+  return registry.all().some(
+    (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+  );
+}
+
+/**
+ * Best-effort provider logout before a credential dir is deleted, so the
+ * refresh token is revoked rather than orphaned. Callers must swallow any
+ * rejection: the account may already be logged out, or offline, and neither
+ * should block removing the account.
+ *
+ * Resolves the claude binary through `claudeBin` (Linker's own seam — tests
+ * point it at a fake CLI, exactly like the link flow) rather than a bare
+ * `'claude'` literal, so this never spawns a real binary under test. Codex
+ * resolves through the same `prepareCodexRuntime` path the rest of the app
+ * uses, with `requireAuth: false`: the account may already be logged out,
+ * which would otherwise fail the preflight this runs before the logout call.
+ */
+async function revokeLogin(account: Account, claudeBin: string): Promise<void> {
+  const env = { ...process.env, ...account.env } as NodeJS.ProcessEnv;
+  if (account.provider === 'claude') {
+    await run(claudeBin, ['auth', 'logout'], { env });
+    return;
+  }
+  const runtime = await prepareCodexRuntime(
+    { bin: account.bin, env: account.env },
+    { requireAuth: false },
+  );
+  await run(runtime.commandPath, ['logout'], { env });
 }
 
 /**
@@ -883,6 +920,57 @@ export function createServer(opts: {
         return { status: 200, json: { ok: true } };
       }
 
+      case 'unlink': {
+        if (!accountStore || !linker) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        const name = String(body.name);
+        const index = accounts.findIndex((a) => a.name === name);
+        if (index === -1) return { status: 404, json: { error: `unknown account: ${name}` } };
+
+        if (accountBusy(registry, name)) {
+          return { status: 409, json: { error: `${name} has a running session` } };
+        }
+        const queued = scheduler.all().filter((item) =>
+          (item.trigger.kind === 'reset' && item.trigger.account === name)
+          || (item.action.kind === 'create' && item.action.account === name));
+        if (queued.length > 0) {
+          return {
+            status: 409,
+            json: { error: `${name} has ${queued.length} queued item(s). Remove them first.` },
+          };
+        }
+
+        const account = accounts[index];
+        // Durable record first. A failed rm then leaves a stray directory,
+        // which is harmless and sweepable; the reverse order can delete
+        // credentials and then fail to persist, leaving a live entry pointing
+        // at nothing.
+        await accountStore.remove(name);
+        accounts.splice(index, 1);
+
+        // Only ever delete a directory that is exactly <accountsRoot>/<name>.
+        // A hand-written accounts.json entry can point its credential dir
+        // anywhere — real user data this app did not create and does not own
+        // (see the README's claude-alt example). Checked two ways: the name
+        // itself must be shaped like something the app could only have
+        // produced honestly (ACCOUNT_NAME_RE bars `.` and `/`, so join() can
+        // never be walked out of the root by the name), and the resolved
+        // directory must equal the resolved managed path exactly — not
+        // merely share a string prefix with it.
+        const dir = account.env[CREDENTIAL_ENV[account.provider]];
+        const managed = ACCOUNT_NAME_RE.test(name) && dir !== undefined
+          && resolve(dir) === resolve(join(linker.root, name));
+        if (managed) {
+          // Best-effort revoke, so the refresh token dies rather than being
+          // orphaned. A network hiccup must not block removing an account.
+          await revokeLogin(account, linker.claudeBin).catch(() => {});
+          await rm(dir, { recursive: true, force: true });
+        }
+        registry.touch();
+        return { status: 200, json: { ok: true, removedDirectory: managed } };
+      }
+
       default:
         return { status: 400, json: { error: `unknown cmd: ${String(body.cmd)}` } };
     }
@@ -923,9 +1011,7 @@ export function createServer(opts: {
           // cannot run at all, and command() will say so if the item ever fires.
           return a ? usage.free(a.name, a.budget) : false;
         },
-        busy: (name) => registry.all().some(
-          (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
-        ),
+        busy: (name) => accountBusy(registry, name),
       };
 
       for (const item of scheduler.due(Date.now(), ctx)) {

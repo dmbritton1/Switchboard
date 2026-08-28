@@ -113,8 +113,13 @@ async function bootLinking(
     overallTimeoutMs: 10_000,
   });
   const accountStore = createAccountStore(accountsPath);
+  // Sessions started against a linked account (unlink's in-use tests) must
+  // never spawn a real claude/codex binary — reuses the same fakeAdapter()
+  // boot() uses below, just wired through the `prepare` seam instead.
+  const { adapter } = fakeAdapter();
   const server = createServer({
     registry, usage, scheduler, accounts: linkAccounts, accountStore, linker,
+    prepare: async () => ({ adapter }),
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
@@ -122,6 +127,7 @@ async function bootLinking(
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   return {
     base, registry, usage, scheduler, server, linker, accountsPath, accountsRoot, accounts: linkAccounts,
+    accountStore, tmp: dir,
   };
 }
 
@@ -2398,4 +2404,129 @@ test('the snapshot never contains the staging path or the submitted code', async
   const serialized = JSON.stringify(await firstSnapshot(base));
   assert.ok(!serialized.includes('sentinel-secret-code'));
   assert.ok(!serialized.includes(staging));
+});
+
+// ---- unlink -------------------------------------------------------------
+
+/** Full link-start + link-confirm against a fake login CLI, producing a real
+ *  account entry in accounts.json and a real credential dir under the root. */
+async function linkAccount(
+  h: { base: string; linker: Linker },
+  name: string,
+): Promise<void> {
+  await post(h.base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(h.linker, (l) => l?.phase === 'naming');
+  const res = await post(h.base, { cmd: 'link-confirm', name });
+  assert.equal(res.status, 200);
+}
+
+/** Starts a real session (through a fake adapter — see bootLinking) on
+ *  `account`, inside a scratch git repo, for unlink's in-use tests. */
+async function startSession(h: { base: string }, account: string): Promise<string> {
+  const repo = await makeRepo();
+  const res = await post(h.base, {
+    cmd: 'create', repo, branch: 'wip', account, prompt: 'hi',
+  });
+  assert.equal(res.status, 200);
+  return (await res.json()).id as string;
+}
+
+test('unlink refuses while a session on the account is running', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  await startSession(h, 'claude-x');
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /running/);
+});
+
+test('unlink refuses while a create is queued for the account', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const repo = await makeRepo();
+  await post(h.base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3_600_000 },
+    action: { kind: 'create', repo, branch: 'feat/x', account: 'claude-x', prompt: 'hi' },
+  });
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+});
+
+test('unlink succeeds over a stopped session, which then cannot resume', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const id = await startSession(h, 'claude-x');
+  await post(h.base, { cmd: 'stop', id });
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'claude-x' })).status, 200);
+  const resumed = await post(h.base, { cmd: 'resume', id, prompt: 'again' });
+  assert.equal(resumed.status, 400);
+  assert.match((await resumed.json()).error, /no longer configured/);
+  // The transcript is still readable — an unlinked account leaves a
+  // read-only archive, it does not delete history.
+  const snap = await firstSnapshot(h.base);
+  assert.ok(snap.sessions.some((s: { id: string }) => s.id === id));
+});
+
+test('unlink removes the entry from accounts.json and its credential dir', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const dir = join(h.accountsRoot, 'claude-x');
+  assert.ok(await stat(dir));
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'claude-x' })).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(h.accountsPath, 'utf8')), []);
+  await assert.rejects(() => stat(dir));
+});
+
+// The test standing between a bug and a user's real credentials.
+test('unlink never deletes a directory outside the accounts root', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(h.tmp, 'my-own-claude-dir');
+  await mkdir(outside, { recursive: true });
+  // A hand-written entry, exactly like the README's claude-alt example.
+  h.accounts.push({
+    name: 'hand-written', provider: 'claude', budget: 1,
+    env: { CLAUDE_CONFIG_DIR: outside },
+  });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'hand-written' })).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(h.accountsPath, 'utf8')), []);
+  assert.ok(await stat(outside), "the user's own directory must survive");
+});
+
+// `join(root, name)` collapses `..` in `name`, so a hand-written entry named
+// `../evil` whose env happens to equal that collapsed path must not pass the
+// guard just because the two sides of the naive comparison are identical
+// expressions. The guard must reject the *name* shape outright.
+test('unlink guard rejects a name that could traverse outside the root via join()', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(h.accountsRoot, '..', 'evil'); // == join(accountsRoot, '../evil')
+  await mkdir(outside, { recursive: true });
+  h.accounts.push({
+    name: '../evil', provider: 'claude', budget: 1,
+    env: { CLAUDE_CONFIG_DIR: outside },
+  });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  const res = await post(h.base, { cmd: 'unlink', name: '../evil' });
+  assert.equal(res.status, 200);
+  assert.ok(await stat(outside), 'a directory outside the root must survive even when it equals join(root, name)');
+});
+
+// A directory whose path merely starts with the accounts root string (a
+// sibling directory like `<root>-evil/`) must not pass a guard that only
+// checks a prefix — the guard has to compare full resolved paths.
+test('unlink guard is not fooled by a sibling directory sharing a path prefix', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(`${h.accountsRoot}-evil`, 'claude-x');
+  await mkdir(outside, { recursive: true });
+  h.accounts.push({ name: 'claude-x', provider: 'claude', budget: 1, env: { CLAUDE_CONFIG_DIR: outside } });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 200);
+  assert.ok(await stat(outside), 'a sibling directory sharing only a string prefix must survive');
+});
+
+test('unlink of an unknown account is a 404', async (t) => {
+  const h = await bootLinking(t);
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'nope' })).status, 404);
 });
