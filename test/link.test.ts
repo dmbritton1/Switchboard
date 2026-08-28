@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { Linker, type SpawnLogin } from '../src/link.ts';
-import type { Account } from '../src/accounts.ts';
+import { DEFAULT_BUDGET, type Account } from '../src/accounts.ts';
 import { writeFakeLoginCli } from './helpers/fake-login.ts';
 
 async function harness(options: {
@@ -189,5 +189,40 @@ test('the submitted code never appears in the snapshot', async () => {
   h.linker.submitCode('sentinel-secret-code');
   await until(h.linker, (l) => l?.phase === 'error');
   assert.ok(!JSON.stringify(h.linker.snapshot()).includes('sentinel-secret-code'));
+  await h.cleanup();
+});
+
+test('linking an identity that is already linked fails and leaves no staging directory', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt', email: 'dwight@example.com' });
+  h.accounts.push({
+    name: 'existing-claude',
+    provider: 'claude',
+    budget: DEFAULT_BUDGET,
+    env: {},
+    identity: 'dwight@example.com',
+  });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'error');
+  const link = h.linker.snapshot();
+  assert.match(link?.error ?? '', /already linked as/);
+  assert.ok(link?.error?.includes('existing-claude'));
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(join(h.dir, 'accounts')).catch(() => []), []);
+  await h.cleanup();
+});
+
+test('linking a different identity than an existing account still reaches naming', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt', email: 'dwight@example.com' });
+  h.accounts.push({
+    name: 'someone-else',
+    provider: 'claude',
+    budget: DEFAULT_BUDGET,
+    env: {},
+    identity: 'other@example.com',
+  });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  assert.equal(h.linker.snapshot()?.identity?.email, 'dwight@example.com');
+  await h.linker.cancel();
   await h.cleanup();
 });

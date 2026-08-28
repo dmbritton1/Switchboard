@@ -338,7 +338,7 @@ export class Linker {
         (a) => a.provider === p.provider && a.identity === identity.email,
       );
       if (clash) {
-        await this.#fail(`That account is already linked as ${clash.name}.`);
+        await this.#fail(this.redact(`That account is already linked as ${clash.name}.`));
         return;
       }
     }
