@@ -251,6 +251,55 @@ test('reconcile joins a pending initialize before reading auth state', async (t)
   assert.deepEqual(observed.stale, []);
 });
 
+test('token refresh denial during initialize stays unsupported until a managed auth update', async (t) => {
+  const initialize = deferred<unknown>();
+  const observed = callbacks();
+  const requests: string[] = [];
+  let protocol!: AppServerClientOptions;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return {
+        request: async <T>(method: string): Promise<T> => {
+          requests.push(method);
+          if (method === 'initialize') return initialize.promise as Promise<T>;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  const startup = supervisor.start();
+  await waitFor(() => requests.includes('initialize'));
+  protocol.onServerRequest(8_001, 'account/chatgptAuthTokens/refresh', {
+    refreshToken: 'private-refresh-token',
+  });
+  initialize.resolve({ initialized: true });
+  await startup;
+
+  assert.deepEqual(observed.stale, [externalTokens]);
+  assert.equal(observed.snapshots.length, 0);
+  await assert.rejects(
+    supervisor.reconcile(),
+    (error: unknown) => error instanceof Error && error.message === externalTokens,
+  );
+
+  protocol.onNotification('account/updated', { authMode: 'chatgpt', planType: 'pro' });
+  await waitFor(() => observed.snapshots.length === 1);
+  assert.equal(observed.snapshots[0]?.plan, 'pro');
+});
+
 test('token refresh denial during startup account read stays unsupported until a managed auth update', async (t) => {
   const accountRead = deferred<unknown>();
   const observed = callbacks();
@@ -473,7 +522,8 @@ test('denies the complete server-request surface without issuing session RPCs', 
 
   await supervisor.start();
 
-  assert.equal(observed.snapshots.length, 1);
+  assert.equal(observed.snapshots.length, 0);
+  assert.deepEqual(observed.stale, [externalTokens]);
   const log = await calls(callLog);
   assert.equal(log.some((entry) => /^(thread|turn)\//.test(String(entry.method))), false);
 });
@@ -657,6 +707,54 @@ test('a successful restarted read resets backoff to one second', async (t) => {
   assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 1_000]);
   assert.equal(observed.snapshots.length, 2);
   assert.deepEqual(observed.stale, [unavailable, unavailable]);
+});
+
+test('restart preserves unsupported auth until the restarted client reports a managed update', async (t) => {
+  const observed = callbacks();
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const clients: ScriptedClient[] = [];
+  const protocols: AppServerClientOptions[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocols.push(options);
+      const client = scriptedClient(options);
+      clients.push(client);
+      return client;
+    },
+    setTimer: (callback, delay) => {
+      scheduled.push({ callback, delay });
+      return { callback, delay };
+    },
+    clearTimer: () => {},
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  assert.equal(observed.snapshots.length, 1);
+  protocols[0]!.onServerRequest(9_001, 'account/chatgptAuthTokens/refresh', {
+    refreshToken: 'private-refresh-token',
+  });
+  clients[0]!.crash();
+  await waitFor(() => scheduled.length === 1);
+  scheduled[0]!.callback();
+  await waitFor(() => clients.length === 2);
+  await supervisor.start();
+
+  assert.equal(observed.snapshots.length, 1);
+  assert.equal(observed.stale.at(-1), externalTokens);
+  await assert.rejects(
+    supervisor.reconcile(),
+    (error: unknown) => error instanceof Error && error.message === externalTokens,
+  );
+
+  protocols[1]!.onNotification('account/updated', { authMode: 'chatgpt', planType: 'team' });
+  await waitFor(() => observed.snapshots.length === 2);
+  assert.equal(observed.snapshots[1]?.plan, 'team');
 });
 
 test('close is bounded and idempotent even when the child ignores EOF and SIGTERM', async () => {

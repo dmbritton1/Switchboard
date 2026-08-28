@@ -24,6 +24,7 @@ const MAX_RESTART_DELAY_MS = 30_000;
 
 type TimerHandle = unknown;
 type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError' | 'close'>;
+type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: false }>;
 
 export type CodexAppServerSupervisorOptions = {
   runtime: PreparedCodexRuntime;
@@ -64,6 +65,7 @@ export class CodexAppServerSupervisor {
   #launch: Promise<void> | null = null;
   #read: Promise<AccountLimitSnapshot> | null = null;
   #auth: CodexTelemetryAuth | null = null;
+  #unsupportedAuthLatch: UnsupportedCodexTelemetryAuth | null = null;
   #authRevision = 0;
   #staleReason: string | null = null;
   #restartTimer: TimerHandle | null = null;
@@ -133,6 +135,12 @@ export class CodexAppServerSupervisor {
       const authRevision = this.#authRevision;
       const accountInput = await client.request('account/read', { refreshToken: false });
       this.#assertActive(client);
+      if (this.#unsupportedAuthLatch) {
+        this.#auth = this.#unsupportedAuthLatch;
+        this.#restartAttempt = 0;
+        this.#markStale(this.#unsupportedAuthLatch.reason);
+        return;
+      }
       if (this.#authRevision !== authRevision) return;
       const account = normalizeCodexAccountRead(accountInput);
       this.#auth = account;
@@ -173,6 +181,7 @@ export class CodexAppServerSupervisor {
     if (method === 'account/updated') {
       const auth = normalizeCodexAuthUpdate(params);
       this.#authRevision += 1;
+      this.#unsupportedAuthLatch = auth.supported ? null : auth;
       this.#auth = auth;
       if (!auth.supported) {
         this.#markStale(auth.reason);
@@ -197,13 +206,15 @@ export class CodexAppServerSupervisor {
         : 'Unknown to the Switchboard telemetry client.',
     );
     if (method === 'account/chatgptAuthTokens/refresh') {
-      this.#authRevision += 1;
-      this.#auth = {
+      const auth: UnsupportedCodexTelemetryAuth = {
         supported: false,
         plan: null,
         reason: CODEX_TELEMETRY_REASONS.externalTokens,
       };
-      this.#markStale(CODEX_TELEMETRY_REASONS.externalTokens);
+      this.#authRevision += 1;
+      this.#unsupportedAuthLatch = auth;
+      this.#auth = auth;
+      this.#markStale(auth.reason);
       return;
     }
   }
