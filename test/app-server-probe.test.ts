@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
+import { normalizeCodexRateLimits } from '../src/agents/codex-limits.ts';
 import { probeAppServer } from '../scripts/codex-app-server-probe.ts';
 import { runCodexTelemetrySmoke } from '../scripts/codex-telemetry-smoke.ts';
 
@@ -263,6 +264,202 @@ test('telemetry smoke excludes private remote-control notification canaries', as
   const encoded = JSON.stringify(evidence);
   for (const canary of canaries) assert.equal(encoded.includes(canary), false);
   assert.deepEqual(evidence.observedNotifications, ['account/updated']);
+});
+
+test('telemetry smoke fails after a valid read when the child exits during observation', async () => {
+  const secret = 'terminal-exit-secret';
+  await rejectsWithin(
+    runCodexTelemetrySmoke({
+      command: fakeCommand,
+      version: '0.145.0',
+      env: env({
+        FAKE_APP_SERVER_MODE: 'telemetry-exit-after-rate-read',
+        PROBE_TOKEN: secret,
+      }),
+      observationMs: 30,
+    }),
+    1_500,
+    (error) => {
+      const evidence = error instanceof Error && 'evidence' in error
+        ? (error as Error & { evidence: { cleanShutdown?: unknown } }).evidence
+        : null;
+      return evidence?.cleanShutdown === false && !JSON.stringify(error).includes(secret);
+    },
+  );
+});
+
+test('telemetry smoke fails after a valid read when malformed output arrives during observation', async () => {
+  const secret = 'malformed-after-read-secret';
+  await rejectsWithin(
+    runCodexTelemetrySmoke({
+      command: fakeCommand,
+      version: '0.145.0',
+      env: env({
+        FAKE_APP_SERVER_MODE: 'telemetry-malformed-after-rate-read',
+        PROBE_TOKEN: secret,
+      }),
+      observationMs: 30,
+    }),
+    1_500,
+    (error) => {
+      const evidence = error instanceof Error && 'evidence' in error
+        ? (error as Error & { evidence: { cleanShutdown?: unknown } }).evidence
+        : null;
+      return evidence?.cleanShutdown === false && !JSON.stringify(error).includes(secret);
+    },
+  );
+});
+
+test('telemetry smoke follows normalizer precedence for empty and unusable keyed maps', async (t) => {
+  const cases = [
+    { name: 'empty keyed map', keyed: {} },
+    {
+      name: 'unusable keyed map',
+      keyed: {
+        ignored: {
+          limitId: 'ignored',
+          limitName: null,
+          primary: null,
+          secondary: null,
+          spendControlReached: false,
+          rateLimitReachedType: null,
+        },
+      },
+    },
+  ];
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const response = {
+        rateLimits: {
+          limitId: null,
+          limitName: null,
+          primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 2_000_000_000 },
+          secondary: null,
+          spendControlReached: false,
+          rateLimitReachedType: null,
+        },
+        rateLimitsByLimitId: fixture.keyed,
+        rateLimitResetCredits: null,
+      };
+      const normalized = normalizeCodexRateLimits(response, null, 1_000);
+      assert.equal(normalized.windows[0]?.id, 'default:primary');
+      assert.equal(normalized.windows[0]?.resetsAt, 2_000_000_000_000);
+
+      const evidence = await runCodexTelemetrySmoke({
+        command: fakeCommand,
+        version: '0.145.0',
+        env: env({ FAKE_APP_SERVER_RATE_LIMITS_RESPONSE: JSON.stringify(response) }),
+        observationMs: 0,
+      });
+      assert.equal(evidence.usableWindows, true);
+      assert.equal(evidence.resetTimestampBand, 'seconds-band');
+    });
+  }
+});
+
+test('telemetry smoke denies the complete server-request fixture and emits only safe failure evidence', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'switchboard-codex-telemetry-denial-'));
+  const callLog = join(dir, 'calls.jsonl');
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const privateValues = [
+    'private-account@example.com',
+    'private-env-secret',
+    '/private/absolute/account/path',
+    'private-raw-response',
+    'private-stderr-output',
+    'private-server-name',
+    'private-installation-id',
+  ];
+  let serializedFailure = '';
+  await rejectsWithin(
+    runCodexTelemetrySmoke({
+      command: fakeCommand,
+      version: '0.145.0',
+      env: env({
+        FAKE_APP_SERVER_MODE: 'deny-server-requests',
+        FAKE_APP_SERVER_CALL_LOG: callLog,
+        FAKE_APP_SERVER_PRIVATE_NOTIFICATION: '1',
+        FAKE_APP_SERVER_STDERR_AFTER_RATE: 'private-stderr-output',
+        ACCOUNT_TOKEN: 'private-env-secret',
+        FAKE_APP_SERVER_ACCOUNT_RESPONSE: JSON.stringify({
+          account: {
+            type: 'chatgpt',
+            email: 'private-account@example.com',
+            planType: 'pro',
+            absolutePath: '/private/absolute/account/path',
+          },
+          requiresOpenaiAuth: true,
+          rawResponse: 'private-raw-response',
+        }),
+      }),
+      observationMs: 30,
+    }),
+    1_500,
+    (error) => {
+      serializedFailure = JSON.stringify(error);
+      const evidence = error instanceof Error && 'evidence' in error
+        ? (error as Error & { evidence: { noForbiddenMethods?: unknown } }).evidence
+        : null;
+      return evidence?.noForbiddenMethods === false;
+    },
+  );
+  for (const value of privateValues) assert.equal(serializedFailure.includes(value), false);
+
+  const expectedDeniedMethods = [
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+    'item/permissions/requestApproval',
+    'item/tool/call',
+    'account/chatgptAuthTokens/refresh',
+    'attestation/generate',
+    'applyPatchApproval',
+    'execCommandApproval',
+  ];
+  const responses = (await readFile(callLog, 'utf8')).trim().split('\n')
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry.operation === 'server-response');
+  assert.deepEqual(responses, expectedDeniedMethods.map((method) => ({
+    operation: 'server-response',
+    method,
+    code: -32601,
+    message: 'Unsupported by the Switchboard telemetry smoke client.',
+  })));
+});
+
+test('telemetry smoke success evidence excludes account, process, and response canaries', async () => {
+  const privateValues = [
+    'private-success@example.com',
+    'private-success-env',
+    '/private/success/path',
+    'private-success-response',
+    'private-success-stderr',
+    'private-server-name',
+    'private-installation-id',
+  ];
+  const evidence = await runCodexTelemetrySmoke({
+    command: fakeCommand,
+    version: '0.145.0',
+    env: env({
+      FAKE_APP_SERVER_PRIVATE_NOTIFICATION: '1',
+      FAKE_APP_SERVER_STDERR_AFTER_RATE: 'private-success-stderr',
+      ACCOUNT_TOKEN: 'private-success-env',
+      FAKE_APP_SERVER_ACCOUNT_RESPONSE: JSON.stringify({
+        account: {
+          type: 'chatgpt',
+          email: 'private-success@example.com',
+          planType: 'pro',
+          absolutePath: '/private/success/path',
+        },
+        requiresOpenaiAuth: true,
+        rawResponse: 'private-success-response',
+      }),
+    }),
+    observationMs: 30,
+  });
+  const serialized = JSON.stringify(evidence);
+  for (const value of privateValues) assert.equal(serialized.includes(value), false);
 });
 
 test('schema evidence fails when any stable lifecycle notification is absent', async (t) => {

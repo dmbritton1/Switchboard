@@ -41,6 +41,15 @@ are absent from serialized smoke evidence. These results validate the fake and
 the pinned offline contract; they do **not** establish how a real account will
 behave.
 
+Review-round regressions additionally prove that a child exit or malformed
+output after a valid rate-limit read remains a terminal failure and cannot be
+reported as a clean success. Empty and unusable keyed maps follow the same
+legacy-bucket fallback precedence as the production normalizer. The complete
+ten-method server-request fixture is driven through the smoke client itself;
+every request receives `-32601`, the smoke fails closed, and serialized success
+and failure evidence excludes injected email, environment-secret, absolute-path,
+stderr, raw-response, hostname, and installation canaries.
+
 ## Live-account result
 
 **Not run.** The optional `npm run evaluate:codex-telemetry` probe has not been

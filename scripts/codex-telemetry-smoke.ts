@@ -82,10 +82,17 @@ function accountKind(input: unknown): CodexTelemetrySmokeEvidence['accountKind']
   }
 }
 
+function hasUsableKeyedWindow(value: unknown): boolean {
+  const bucket = object(value);
+  return bucket !== null && (object(bucket.primary) !== null || object(bucket.secondary) !== null);
+}
+
 function resetTimestampBand(input: unknown): CodexTelemetrySmokeEvidence['resetTimestampBand'] {
   const response = object(input);
-  const buckets = object(response?.rateLimitsByLimitId)
-    ? Object.values(response!.rateLimitsByLimitId as Record<string, unknown>)
+  const keyed = object(response?.rateLimitsByLimitId);
+  const keyedBuckets = keyed ? Object.values(keyed) : [];
+  const buckets = keyedBuckets.some(hasUsableKeyedWindow)
+    ? keyedBuckets
     : [response?.rateLimits];
   const values = buckets.flatMap((bucket) => {
     const parsed = object(bucket);
@@ -135,6 +142,7 @@ export async function runCodexTelemetrySmoke(options: SmokeOptions): Promise<Cod
   const runtime = testRuntime(options);
   let client: AppServerClient | null = null;
   let cleanShutdown = false;
+  let terminalFailure = false;
   let forbidden = false;
   let observedAuthMode: string | null = null;
   const observedNotifications = new Set<string>();
@@ -168,7 +176,10 @@ export async function runCodexTelemetrySmoke(options: SmokeOptions): Promise<Cod
             : 'Unknown to the Switchboard telemetry smoke client.',
         );
       },
-      onExit: () => {},
+      onExit: () => {
+        terminalFailure = true;
+        evidence.cleanShutdown = false;
+      },
     });
     await client.request('initialize', {
       clientInfo: {
@@ -209,7 +220,7 @@ export async function runCodexTelemetrySmoke(options: SmokeOptions): Promise<Cod
       : OBSERVATION_MS;
     if (wait > 0) await delay(wait);
     await client.close();
-    cleanShutdown = true;
+    cleanShutdown = !terminalFailure;
     evidence.observedAuthMode = observedAuthMode;
     evidence.planVisible = snapshot?.plan !== null && snapshot?.plan !== undefined;
     evidence.usableWindows = Boolean(snapshot && snapshot.windows.length > 0);
@@ -220,11 +231,12 @@ export async function runCodexTelemetrySmoke(options: SmokeOptions): Promise<Cod
           : snapshot.blocks.every((block) => block.resettable)
             ? 'resettable'
             : 'blocking',
-    evidence.resetTimestampBand = resetTimestampBand(rateLimitInput);
+    evidence.resetTimestampBand = snapshot ? resetTimestampBand(rateLimitInput) : 'none';
     evidence.observedNotifications = [...observedNotifications].sort();
     evidence.noForbiddenMethods = !forbidden;
     evidence.cleanShutdown = cleanShutdown;
-    if (!auth?.supported || !evidence.usableWindows || !evidence.noForbiddenMethods || !evidence.cleanShutdown) {
+    if (terminalFailure || !auth?.supported || !evidence.usableWindows
+      || !evidence.noForbiddenMethods || !evidence.cleanShutdown) {
       throw new SmokeFailure(evidence);
     }
     return evidence;
@@ -235,7 +247,7 @@ export async function runCodexTelemetrySmoke(options: SmokeOptions): Promise<Cod
     if (client && !cleanShutdown) {
       try {
         await client.close();
-        evidence.cleanShutdown = true;
+        evidence.cleanShutdown = !terminalFailure;
       } catch {
         // A failed close remains a failed smoke without surfacing private diagnostics.
       }

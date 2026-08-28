@@ -249,6 +249,32 @@ function accountRead(message: Message): void {
 
 function notifyAfterRateLimitRead(): void {
   if (rateLimitReads !== 1) return;
+  const stderrAfterRate = process.env.FAKE_APP_SERVER_STDERR_AFTER_RATE;
+  if (stderrAfterRate) process.stderr.write(`${stderrAfterRate}\n`);
+  if (process.env.FAKE_APP_SERVER_PRIVATE_NOTIFICATION === '1') {
+    setTimeout(() => {
+      send({
+        method: 'remoteControl/status/changed',
+        params: {
+          serverName: 'private-server-name',
+          installationId: 'private-installation-id',
+          environmentId: 'private-environment-id',
+        },
+      });
+    }, 5);
+  }
+  if (mode === 'telemetry-exit-after-rate-read') {
+    setTimeout(() => {
+      process.stderr.write(`terminal after rate read ${process.env.PROBE_TOKEN ?? ''}\n`);
+      process.exit(31);
+    }, 5);
+  }
+  if (mode === 'telemetry-malformed-after-rate-read') {
+    setTimeout(() => {
+      process.stderr.write(`malformed after rate read ${process.env.PROBE_TOKEN ?? ''}\n`);
+      process.stdout.write(`{malformed ${process.env.PROBE_TOKEN ?? ''}\n`);
+    }, 5);
+  }
   if (mode === 'telemetry-rate-burst') {
     setTimeout(() => {
       const sparse = {
@@ -360,6 +386,13 @@ async function handleDeniedServerRequests(message: Message): Promise<boolean> {
   for (const [index, method] of DENIED_SERVER_METHODS.entries()) {
     const response = await serverRequest(1_000 + index, method, { fixture: true });
     if (!denied(response)) fail(`server request ${method} was not denied`);
+    const error = response.error as Record<string, unknown>;
+    record({
+      operation: 'server-response',
+      method,
+      code: error.code,
+      message: error.message,
+    });
   }
   send({
     id: message.id,
