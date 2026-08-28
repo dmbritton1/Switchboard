@@ -11,7 +11,7 @@ import { request as httpRequest } from 'node:http';
 import { Registry, type RegistryOptions } from '../src/sessions.ts';
 import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
-import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch } from '../src/server.ts';
+import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch, type Account } from '../src/server.ts';
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree } from '../src/worktree.ts';
 import type { AccountLimitCoordinator } from '../src/account-limits.ts';
@@ -46,6 +46,24 @@ const accounts = [
   { name: 'claude-main', provider: 'claude' as const, budget: 1000, env: {} },
   { name: 'codex', provider: 'codex' as const, budget: 1000, env: {} },
 ];
+
+function fakeLimitCoordinator(options: {
+  eligibility?: ReturnType<AccountLimitCoordinator['codexResetEligibility']>;
+  release?: (account: string) => Promise<{ ready: boolean; reason: string }>;
+} = {}): AccountLimitCoordinator & { reads: string[] } {
+  const reads: string[] = [];
+  return {
+    reads,
+    start: async () => {},
+    reconcile: async () => {},
+    codexResetEligibility: () => options.eligibility ?? { eligible: false, reason: 'no fresh Codex usage window' },
+    releaseCodexAfterFreshRead: async (account) => {
+      reads.push(account);
+      return options.release ? options.release(account) : { ready: false, reason: 'still limited' };
+    },
+    close: async () => {},
+  };
+}
 
 test('account telemetry starts asynchronously after HTTP listen and cleans up with server close', async () => {
   const registry = new Registry('/tmp/switchboard-coordinator-test.json');
@@ -135,6 +153,8 @@ async function boot(
     beforeUploadRootPin?: () => Promise<void>;
     beforeUploadWrite?: (target: string) => Promise<void>;
     beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
+    limitCoordinator?: AccountLimitCoordinator;
+    accounts?: Account[];
   } = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'sb-'));
@@ -150,7 +170,8 @@ async function boot(
   // `prepare` step instead of a lookup table, and a test that injects here
   // wants to observe launch()'s emit wiring, not provider selection.
   const prepare = adapter ? async () => ({ adapter }) : undefined;
-  const server = createServer({ registry, usage, scheduler, accounts, prepare, ...serverHooks });
+  const testAccounts = serverHooks.accounts ?? accounts;
+  const server = createServer({ registry, usage, scheduler, accounts: testAccounts, prepare, ...serverHooks });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
@@ -1711,13 +1732,61 @@ test('scheduling a Codex create preserves its inherited-by-default thread settin
 });
 
 test('a reset trigger takes its account from the action, not the client', async (t) => {
-  const { base, scheduler } = await boot(t);
+  const { base, scheduler } = await boot(t, undefined, {
+    limitCoordinator: fakeLimitCoordinator({ eligibility: { eligible: true, resetsAt: Date.now() + 3600_000 } }),
+  });
   await post(base, {
     cmd: 'schedule',
     trigger: { kind: 'reset', account: 'attacker-supplied' },
     action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'codex', prompt: 'go' },
   });
   assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+});
+
+test('a Codex reset schedule requires fresh provider eligibility while Claude reset schedules remain available', async (t) => {
+  const unavailable = fakeLimitCoordinator({ eligibility: { eligible: false, reason: 'no fresh Codex usage window' } });
+  const { base, scheduler } = await boot(t, undefined, { limitCoordinator: unavailable });
+
+  const codex = await post(base, {
+    cmd: 'schedule', trigger: { kind: 'reset' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'codex-reset', account: 'codex', prompt: 'go' },
+  });
+  assert.equal(codex.status, 400);
+  assert.deepEqual(await codex.json(), {
+    error: 'Codex reset scheduling is unavailable: no fresh Codex usage window',
+  });
+
+  const claude = await post(base, {
+    cmd: 'schedule', trigger: { kind: 'reset' },
+    action: { kind: 'create', repo: process.cwd(), branch: 'claude-reset', account: 'claude-main', prompt: 'go' },
+  });
+  assert.equal(claude.status, 200);
+  assert.deepEqual(scheduler.all().map((item) => item.trigger), [{ kind: 'reset', account: 'claude-main' }]);
+});
+
+test('Codex reset schedule reports each authoritative ineligibility without accepting a browser reset time', async (t) => {
+  const reasons = [
+    'no fresh Codex usage window',
+    'Codex telemetry is stale',
+    'Codex telemetry is unsupported',
+    'no Codex usage window is reached',
+    'a reached Codex window has no reset time',
+    'a reached Codex window reset is in the past',
+    'Codex account is blocked by credits',
+    'Codex account is blocked by workspace usage',
+    'Codex account is blocked by spend control',
+  ];
+  for (const reason of reasons) {
+    const limitCoordinator = fakeLimitCoordinator({ eligibility: { eligible: false, reason } });
+    const { base, scheduler } = await boot(t, undefined, { limitCoordinator });
+    const res = await post(base, {
+      cmd: 'schedule', trigger: { kind: 'reset', time: Date.now() + 3600_000 },
+      action: { kind: 'create', repo: process.cwd(), branch: `blocked-${reasons.indexOf(reason)}`, account: 'codex', prompt: 'go' },
+    });
+    assert.equal(res.status, 400, reason);
+    assert.deepEqual(await res.json(), { error: `Codex reset scheduling is unavailable: ${reason}` });
+    assert.equal(scheduler.all().length, 0, 'no browser-supplied reset time can create Codex reset work');
+  }
 });
 
 test('scheduling rejects an unknown account', async (t) => {
@@ -1824,7 +1893,9 @@ test('scheduling a send rejects an unknown session', async (t) => {
 // same rule as the create case, covered here so it isn't only proven for one
 // of the two action shapes that can carry a reset trigger.
 test('a reset trigger on a send takes its account from the target session, not the client', async (t) => {
-  const { base, registry, scheduler } = await boot(t);
+  const { base, registry, scheduler } = await boot(t, undefined, {
+    limitCoordinator: fakeLimitCoordinator({ eligibility: { eligible: true, resetsAt: Date.now() + 3600_000 } }),
+  });
   const s = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
     cwd: '/r/wt', branch: 'b', title: 't',
@@ -2007,6 +2078,98 @@ test('a reset item waits while its account has a working session', async (t) => 
   registry.apply(busy.id, { type: 'stopped', reason: 'done' });
   await server.tick();
   assert.equal(scheduler.all()[0].state, 'failed', 'fired once the account went idle');
+});
+
+test('a restored Codex reset item waits for a current-process boundary read before firing', async (t) => {
+  const releases = [{ ready: false, reason: 'read failed' }, { ready: true, reason: 'available' }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => releases.shift()! });
+  const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
+  const target = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'restore', title: 'restore',
+  });
+  registry.apply(target.id, { type: 'stopped', reason: 'restored' });
+  scheduler.restore([{
+    id: 'restored-codex-reset', trigger: { kind: 'reset', account: 'codex' },
+    action: { kind: 'send', sessionId: target.id, text: 'continue' }, createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, ['codex']);
+  assert.equal(scheduler.all()[0].state, 'waiting', 'a failed boundary read leaves persisted work retryable');
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, ['codex', 'codex']);
+  assert.equal(scheduler.all()[0].state, 'failed', 'only a ready post-read state releases the action');
+});
+
+test('Codex reset boundary reads batch by account and release only the oldest waiting item', async (t) => {
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
+  const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
+  const first = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/one', branch: 'one', title: 'one' });
+  const second = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/two', branch: 'two', title: 'two' });
+  registry.apply(first.id, { type: 'stopped', reason: 'parked' });
+  registry.apply(second.id, { type: 'stopped', reason: 'parked' });
+  const oldest = scheduler.add({ kind: 'reset', account: 'codex' }, { kind: 'send', sessionId: first.id, text: 'one' }, 0);
+  const newest = scheduler.add({ kind: 'reset', account: 'codex' }, { kind: 'send', sessionId: second.id, text: 'two' }, 1);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, ['codex']);
+  assert.equal(scheduler.all().find((item) => item.id === oldest.id)!.state, 'failed');
+  assert.equal(scheduler.all().find((item) => item.id === newest.id)!.state, 'waiting');
+});
+
+test('Codex reset reads run concurrently across accounts and skip busy accounts', async (t) => {
+  let releaseReads!: () => void;
+  const readsStarted = new Promise<void>((resolve) => { releaseReads = resolve; });
+  const readOrder: string[] = [];
+  const limitCoordinator = fakeLimitCoordinator({ release: async (account) => {
+    readOrder.push(account);
+    if (readOrder.length === 2) releaseReads();
+    await readsStarted;
+    return { ready: false, reason: 'still limited' };
+  } });
+  const twoCodex: Account[] = [
+    { name: 'codex-a', provider: 'codex', budget: 1000, env: {} },
+    { name: 'codex-b', provider: 'codex', budget: 1000, env: {} },
+  ];
+  const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator, accounts: twoCodex });
+  const first = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/a', branch: 'a', title: 'a' });
+  const second = registry.create({ provider: 'codex', account: 'codex-b', repo: '/r', cwd: '/r/b', branch: 'b', title: 'b' });
+  registry.apply(first.id, { type: 'stopped', reason: 'parked' });
+  registry.apply(second.id, { type: 'stopped', reason: 'parked' });
+  scheduler.add({ kind: 'reset', account: 'codex-a' }, { kind: 'send', sessionId: first.id, text: 'a' });
+  scheduler.add({ kind: 'reset', account: 'codex-b' }, { kind: 'send', sessionId: second.id, text: 'b' });
+
+  await server.tick();
+  assert.deepEqual(readOrder, ['codex-a', 'codex-b']);
+
+  const busy = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/busy', branch: 'busy', title: 'busy' });
+  scheduler.add({ kind: 'reset', account: 'codex-a' }, { kind: 'send', sessionId: busy.id, text: 'later' });
+  // The waiting item above shares an account that has just become busy.
+  await server.tick();
+  assert.equal(readOrder.filter((name) => name === 'codex-a').length, 1, 'busy accounts do not spend a boundary read');
+});
+
+test('timed work dispatches before a hung Codex boundary read and the reset item remains waiting', async (t) => {
+  let startRead!: () => void;
+  const readStarted = new Promise<void>((resolve) => { startRead = resolve; });
+  let settleRead!: () => void;
+  const hungRead = new Promise<{ ready: boolean; reason: string }>((resolve) => { settleRead = () => resolve({ ready: false, reason: 'timed out' }); });
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => { startRead(); return hungRead; } });
+  const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
+  const timed = registry.create({ provider: 'claude', account: 'claude-main', repo: '/r', cwd: '/r/timed', branch: 'timed', title: 'timed' });
+  const reset = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/reset', branch: 'reset', title: 'reset' });
+  registry.apply(timed.id, { type: 'stopped', reason: 'parked' });
+  registry.apply(reset.id, { type: 'stopped', reason: 'parked' });
+  const timedItem = scheduler.add({ kind: 'at', time: Date.now() - 1 }, { kind: 'send', sessionId: timed.id, text: 'now' });
+  const resetItem = scheduler.add({ kind: 'reset', account: 'codex' }, { kind: 'send', sessionId: reset.id, text: 'later' });
+
+  const ticking = server.tick();
+  await readStarted;
+  assert.equal(scheduler.all().find((item) => item.id === timedItem.id)!.state, 'failed');
+  assert.equal(scheduler.all().find((item) => item.id === resetItem.id)!.state, 'waiting');
+  settleRead();
+  await ticking;
 });
 
 test('overlapping ticks consult the scheduler once, not twice', async (t) => {
@@ -2222,6 +2385,24 @@ test('a session stopped via the stop command is never requeued, even past the li
   assert.equal(stopRes.status, 200);
 
   assert.deepEqual(scheduler.all(), [], 'a deliberate Stop must not resurrect the session');
+});
+
+test('a Codex SDK failure never creates reset recovery work from a fresh provider snapshot or UsageLimitExceeded text', async (t) => {
+  const { adapter, emit } = fakeAdapter();
+  const { base, scheduler, usage } = await boot(t, adapter);
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  usage.setLimitSnapshot('codex', {
+    plan: 'pro', fetchedAt: Date.now(), authoritative: true, fresh: true, blocks: [],
+    windows: [{ id: 'five-hour', label: '5h', usedPercent: 100, windowDurationMins: 300, resetsAt: Date.now() + 3600_000, reached: true }],
+  });
+
+  const res = await post(base, {
+    cmd: 'create', repo, branch: 'codex-no-recovery', account: 'codex', prompt: 'go',
+  });
+  assert.equal(res.status, 200);
+  emit({ type: 'stopped', reason: 'UsageLimitExceeded: provider said no' });
+  assert.deepEqual(scheduler.all(), [], 'SDK error text and snapshots must not become automatic Codex recovery');
 });
 
 // ---- refreshLimits / accountLoad / generic snapshot fields ----------------

@@ -8,7 +8,7 @@ import { join, extname, basename } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from './account-limits.ts';
-import { Scheduler, type Ctx } from './schedule.ts';
+import { Scheduler } from './schedule.ts';
 import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
@@ -528,7 +528,7 @@ export function createServer(opts: {
         registry.apply(sessionId, safeEvent);
         // Before stop(), for the same reason apply() is: stop() re-enters this
         // callback, and by then `dead` is gone and the requeue would be skipped.
-        if (shouldRequeue(
+        if (account.provider === 'claude' && shouldRequeue(
           Boolean(dead), usage.resetAt(account.name), Date.now(), registry.settings().autoRequeue,
         )) {
           scheduler.add(
@@ -637,7 +637,18 @@ export function createServer(opts: {
       }
       return { trigger: { kind: 'at', time: t.time }, action };
     }
-    if (t.kind === 'reset') return { trigger: { kind: 'reset', account }, action };
+    if (t.kind === 'reset') {
+      const selected = accounts.find((candidate) => candidate.name === account);
+      if (selected?.provider === 'codex') {
+        const eligibility = limitCoordinator?.codexResetEligibility(account);
+        if (!eligibility?.eligible) {
+          return {
+            error: `Codex reset scheduling is unavailable: ${eligibility?.reason ?? 'no fresh Codex usage window'}`,
+          };
+        }
+      }
+      return { trigger: { kind: 'reset', account }, action };
+    }
     return { error: `unknown trigger: ${String(t.kind)}` };
   }
 
@@ -936,41 +947,63 @@ export function createServer(opts: {
     if (ticking) return;
     ticking = true;
     try {
-      const ctx: Ctx = {
-        free: (name) => {
-          const a = accounts.find((x) => x.name === name);
-          // An account dropped from accounts.json can never be free — its work
-          // cannot run at all, and command() will say so if the item ever fires.
-          return a ? usage.free(a.name, a.budget) : false;
-        },
-        busy: (name) => registry.all().some(
-          (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
-        ),
+      const now = Date.now();
+      const busy = (name: string) => registry.all().some(
+        (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+      );
+
+      const dispatch = async (items: ReturnType<Scheduler['due']>): Promise<void> => {
+        for (const item of items) {
+          let action = item.action;
+          // A queued `send` can only be decided against the session's status at
+          // schedule time — but the headline use of this feature is scheduling a
+          // send hours out against a session that is live *right now*. By fire
+          // time the server has very likely restarted, and Registry.load marks
+          // every session `stopped` on load (see GRACE_MS's own restart-survival
+          // reasoning above). Deciding at schedule time would then queue a `send`
+          // that 404s at fire time — the message silently never reaches anyone.
+          // Only fire time knows the real answer, so the downgrade happens here,
+          // not in the client.
+          if (action.kind === 'send' && registry.get(action.sessionId)?.status === 'stopped') {
+            action = { kind: 'resume', sessionId: action.sessionId, prompt: action.text };
+          }
+          let result: { status: number; json: unknown };
+          try {
+            result = await command(toCommand(action));
+          } catch (err) {
+            result = { status: 500, json: { error: String((err as Error).message ?? err) } };
+          }
+          if (result.status === 200) scheduler.remove(item.id);
+          else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
+        }
       };
 
-      for (const item of scheduler.due(Date.now(), ctx)) {
-        let action = item.action;
-        // A queued `send` can only be decided against the session's status at
-        // schedule time — but the headline use of this feature is scheduling a
-        // send hours out against a session that is live *right now*. By fire
-        // time the server has very likely restarted, and Registry.load marks
-        // every session `stopped` on load (see GRACE_MS's own restart-survival
-        // reasoning above). Deciding at schedule time would then queue a `send`
-        // that 404s at fire time — the message silently never reaches anyone.
-        // Only fire time knows the real answer, so the downgrade happens here,
-        // not in the client.
-        if (action.kind === 'send' && registry.get(action.sessionId)?.status === 'stopped') {
-          action = { kind: 'resume', sessionId: action.sessionId, prompt: action.text };
-        }
-        let result: { status: number; json: unknown };
-        try {
-          result = await command(toCommand(action));
-        } catch (err) {
-          result = { status: 500, json: { error: String((err as Error).message ?? err) } };
-        }
-        if (result.status === 200) scheduler.remove(item.id);
-        else scheduler.fail(item.id, String((result.json as { error?: string }).error ?? 'failed'));
+      // Timed work is a user-named deadline and must not wait behind an
+      // app-server boundary read. `free: false` leaves reset work untouched.
+      await dispatch(scheduler.due(now, { free: () => false, busy }));
+
+      const codexReady = new Map<string, boolean>();
+      if (limitCoordinator) {
+        const candidates = scheduler.waitingResetAccounts()
+          .map((name) => accounts.find((account) => account.name === name))
+          .filter((account): account is Account => Boolean(account)
+            && account.provider === 'codex' && !busy(account.name));
+        await Promise.all(candidates.map(async (account) => {
+          const release = await limitCoordinator.releaseCodexAfterFreshRead(account.name, now);
+          codexReady.set(account.name, release.ready);
+        }));
       }
+
+      await dispatch(scheduler.due(now, {
+        busy,
+        free: (name) => {
+          const account = accounts.find((candidate) => candidate.name === name);
+          if (!account) return false;
+          return account.provider === 'claude'
+            ? usage.free(account.name, account.budget, now)
+            : codexReady.get(account.name) === true;
+        },
+      }));
     } finally {
       ticking = false;
     }

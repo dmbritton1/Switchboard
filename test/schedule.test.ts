@@ -82,6 +82,22 @@ test('two reset-items on one account drain one at a time, oldest first', () => {
   assert.equal(s.due(2 * HOUR, ctx())[0].id, second.id);
 });
 
+test('waitingResetAccounts is stable, deduplicated, and read-only', () => {
+  const s = new Scheduler();
+  let notifications = 0;
+  s.subscribe(() => { notifications += 1; });
+  s.add({ kind: 'reset', account: 'b' }, CREATE, 0);
+  s.add({ kind: 'at', time: HOUR }, CREATE, 1);
+  s.add({ kind: 'reset', account: 'a' }, CREATE, 2);
+  s.add({ kind: 'reset', account: 'b' }, CREATE, 3);
+  const before = notifications;
+
+  assert.deepEqual(s.waitingResetAccounts(), ['b', 'a']);
+  assert.equal(notifications, before, 'discovering reset accounts must not publish an SSE update');
+  s.fail(s.all()[0].id, 'cancelled');
+  assert.deepEqual(s.waitingResetAccounts(), ['a', 'b']);
+});
+
 test('reset-items on different accounts drain in the same pass', () => {
   const s = new Scheduler();
   s.add({ kind: 'reset', account: 'a' }, { ...CREATE, account: 'a' }, 0);

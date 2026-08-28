@@ -62,6 +62,19 @@ export class Scheduler {
   }
 
   /**
+   * Accounts with reset work that is still eligible to be considered. This is
+   * deliberately a read-only, insertion-ordered view: the server uses it to
+   * batch one authoritative Codex boundary read per account before draining.
+   */
+  waitingResetAccounts(): string[] {
+    const accounts = new Set<string>();
+    for (const item of this.#items.values()) {
+      if (item.state === 'waiting' && item.trigger.kind === 'reset') accounts.add(item.trigger.account);
+    }
+    return [...accounts];
+  }
+
+  /**
    * The items that should fire now. Marks overdue timed items `missed` as it
    * scans — the one piece of state it mutates.
    *
