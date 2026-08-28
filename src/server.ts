@@ -948,6 +948,24 @@ export function createServer(opts: {
     ticking = true;
     try {
       const now = Date.now();
+      // Persisted scheduler data is untrusted. Reset routing must be derived
+      // from the action's current account, never from a restored trigger that
+      // could mislabel Codex work as Claude and bypass the boundary read.
+      for (const item of scheduler.all()) {
+        if (item.state !== 'waiting' || item.trigger.kind !== 'reset') continue;
+        let actionAccount: string | null = null;
+        if (item.action.kind === 'create') {
+          actionAccount = typeof item.action.account === 'string' ? item.action.account : null;
+        } else if (item.action.kind === 'send' || item.action.kind === 'resume') {
+          actionAccount = registry.get(item.action.sessionId)?.account ?? null;
+        }
+        if (!actionAccount || !accounts.some((account) => account.name === actionAccount)) {
+          scheduler.fail(item.id, 'scheduled reset action no longer has an account');
+        } else if (item.trigger.account !== actionAccount) {
+          scheduler.fail(item.id, 'scheduled reset account no longer matches its action');
+        }
+      }
+
       const busy = (name: string) => registry.all().some(
         (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
       );
