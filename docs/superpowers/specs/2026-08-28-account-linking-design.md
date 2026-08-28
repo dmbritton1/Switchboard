@@ -132,8 +132,12 @@ succeeding or failing based on which file an account came from.
 `createServer` gains two options alongside the existing `prepare`,
 `resolvePrompt` and `beforeUpload*` seams:
 
-- `saveAccounts?: (accounts: Account[]) => Promise<void>` — linking is disabled
-  when absent, so every existing server test keeps its behavior unmodified.
+- `accountStore?: { append(entry: Account): Promise<void>; remove(name: string):
+  Promise<void> }` — linking is disabled when absent, so every existing server
+  test keeps its behavior unmodified. Two methods rather than one
+  `save(accounts)`, because the read-modify-write has to happen *inside* the
+  store: handing it a whole array from memory is exactly the blind write the
+  append-only rule forbids.
 - `accountsRoot?: string` — the directory holding per-account credential dirs,
   defaulting to `~/.switchboard/accounts`. **Required for tests to be safe:**
   without it, an unlink test would target a real path under the developer's home
@@ -191,14 +195,28 @@ available*, and when it is not:
 `identity.subscription` is independently nullable — Codex has no equivalent of
 `subscriptionType` even when the email resolves.
 
-**Binary resolution reuses what exists.** For Codex, the login child is spawned
-with the path `prepareCodexRuntime` already selects — explicit account `bin`,
-then a version-matched ChatGPT.app binary, then the SDK-bundled CLI
-(`src/agents/codex-runtime.ts:320-360`) — rather than a second hardcoded path
-that could drift from the one sessions actually use. Its failures are already
-actionable `CodexRuntimeError`s and surface unchanged. For Claude, the CLI is
-`claude` on `PATH`; the adapter goes through the SDK and never needed a path
-before, so a missing binary is a distinct, plainly worded link error.
+**Binary resolution reuses what exists, with one change to it.** For Codex, the
+login child is spawned with the path `prepareCodexRuntime` already selects —
+explicit account `bin`, then a version-matched ChatGPT.app binary, then the
+SDK-bundled CLI (`src/agents/codex-runtime.ts:318-360`) — rather than a second
+hardcoded path that could drift from the one sessions actually use.
+
+That function cannot be reused as-is. `prepareCandidate` calls
+`assertAuthentication` on all three paths (`:293`), so against the fresh, empty
+`CODEX_HOME` every link starts with, it throws `codex_auth_unavailable` — the
+one state linking exists to fix. The ChatGPT fallback rethrows that code rather
+than continuing to the SDK binary (`:355`), so it cannot recover either.
+
+`CodexRuntimeDeps` therefore gains `requireAuth?: boolean`, defaulting to
+`true`, threaded to `prepareCandidate` to skip `assertAuthentication` when
+false. Linking passes `false`; every existing caller is unchanged by the
+default. Version and executability checks still run, so a mismatched binary
+still fails before a browser opens. Its other failures remain actionable
+`CodexRuntimeError`s and surface unchanged.
+
+For Claude, the CLI is `claude` on `PATH`; the adapter goes through the SDK and
+never needed a path before, so a missing binary is a distinct, plainly worded
+link error.
 
 **Staging and commit.** The child writes into
 `~/.switchboard/accounts/.pending-<id>/`. On confirm, `rename()` to
@@ -446,7 +464,7 @@ already does (`src/agents/claude.ts:435-437`).
 - **`server.test.ts`** — each 409 out of phase; unlink refused with a live
   session and with each queued shape; unlink allowed over `done`/`stopped`,
   after which `resume` returns "account no longer configured"; linking disabled
-  when the `saveAccounts` seam is absent.
+  when the `accountStore` seam is absent.
 - **`ui.test.ts`** — `linkView` per phase, no DOM.
 
 Two tests to write first:
