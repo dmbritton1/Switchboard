@@ -345,3 +345,35 @@ test('redactValues deduplicates and orders every supplied value longest first', 
     'label=[REDACTED] short=[REDACTED]',
   );
 });
+
+test('requireAuth false resolves a logged-out binary instead of throwing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-runtime-'));
+  const bin = await writeFakeCodex(dir, { login: 'logged-out' });
+  const runtime = await prepareCodexRuntime(
+    { bin, env: {} },
+    { platform: 'darwin', sdkVersion: '0.145.0', requireAuth: false },
+  );
+  assert.equal(runtime.commandPath, bin);
+  assert.equal(runtime.source, 'explicit');
+});
+
+test('requireAuth false still rejects a version-mismatched binary', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-runtime-'));
+  const bin = await writeFakeCodex(dir, { version: '0.146.0', login: 'logged-out' });
+  await assert.rejects(
+    () => prepareCodexRuntime(
+      { bin, env: {} },
+      { platform: 'darwin', sdkVersion: '0.145.0', requireAuth: false },
+    ),
+    (error: Error) => (error as CodexRuntimeError).code === 'codex_version_mismatch',
+  );
+});
+
+test('requireAuth defaults to true, so a logged-out binary still fails', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-runtime-'));
+  const bin = await writeFakeCodex(dir, { login: 'logged-out' });
+  await assert.rejects(
+    () => prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    (error: Error) => (error as CodexRuntimeError).code === 'codex_auth_unavailable',
+  );
+});
