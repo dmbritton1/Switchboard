@@ -954,13 +954,21 @@ export function createServer(opts: {
       for (const item of scheduler.all()) {
         if (item.state !== 'waiting' || item.trigger.kind !== 'reset') continue;
         let actionAccount: string | null = null;
+        let actionProvider: Account['provider'] | null = null;
         if (item.action.kind === 'create') {
           actionAccount = typeof item.action.account === 'string' ? item.action.account : null;
         } else if (item.action.kind === 'send' || item.action.kind === 'resume') {
-          actionAccount = registry.get(item.action.sessionId)?.account ?? null;
+          const session = registry.get(item.action.sessionId);
+          actionAccount = session?.account ?? null;
+          actionProvider = session?.provider ?? null;
         }
-        if (!actionAccount || !accounts.some((account) => account.name === actionAccount)) {
+        const configuredAccount = actionAccount
+          ? accounts.find((account) => account.name === actionAccount)
+          : undefined;
+        if (!actionAccount || !configuredAccount) {
           scheduler.fail(item.id, 'scheduled reset action no longer has an account');
+        } else if (actionProvider && configuredAccount.provider !== actionProvider) {
+          scheduler.fail(item.id, 'scheduled reset provider no longer matches its action');
         } else if (item.trigger.account !== actionAccount) {
           scheduler.fail(item.id, 'scheduled reset account no longer matches its action');
         }

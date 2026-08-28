@@ -2222,6 +2222,65 @@ test('restored reset items fail closed when create or send/resume accounts misma
   ]);
 });
 
+test('restored Codex session fails closed when the same account name is now configured as Claude', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'claude', budget: 1000, env: {} }];
+  const { registry, scheduler, server } = await boot(t, undefined, { accounts: configured });
+  const session = registry.create({
+    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex',
+  });
+  registry.apply(session.id, { type: 'stopped', reason: 'restored' });
+  scheduler.restore([{
+    id: 'codex-now-claude', trigger: { kind: 'reset', account: 'shared' },
+    action: { kind: 'send', sessionId: session.id, text: 'continue' },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [
+    ['failed', 'scheduled reset provider no longer matches its action'],
+  ]);
+});
+
+test('restored Claude session fails closed when the same account name is now configured as Codex', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'codex', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
+  const { registry, scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  const session = registry.create({
+    provider: 'claude', account: 'shared', repo: '/r', cwd: '/r/claude', branch: 'claude', title: 'claude',
+  });
+  registry.apply(session.id, { type: 'stopped', reason: 'restored' });
+  scheduler.restore([{
+    id: 'claude-now-codex', trigger: { kind: 'reset', account: 'shared' },
+    action: { kind: 'resume', sessionId: session.id, prompt: 'continue' },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, [], 'a provider mismatch must fail before the Codex boundary read');
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [
+    ['failed', 'scheduled reset provider no longer matches its action'],
+  ]);
+});
+
+test('restored send remains waiting after the correct same-provider Codex boundary path', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'codex', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: false, reason: 'still limited' }) });
+  const { registry, scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  const session = registry.create({
+    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex',
+  });
+  registry.apply(session.id, { type: 'stopped', reason: 'restored' });
+  scheduler.restore([{
+    id: 'codex-still-codex', trigger: { kind: 'reset', account: 'shared' },
+    action: { kind: 'send', sessionId: session.id, text: 'continue' },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, ['shared']);
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [['waiting', null]]);
+});
+
 test('Codex reset boundary reads batch by account and release only the oldest waiting item', async (t) => {
   const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
