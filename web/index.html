@@ -189,6 +189,7 @@
         <option value="at">At a time…</option>
         <option value="reset">When usage resets</option>
       </select></div>
+      <p id="new-reset-note" class="reset-note" aria-live="polite" hidden></p>
       <!-- Native picker: no date library, and it hands back a local wall-clock
            string that `new Date()` parses as local time, which is what the user
            meant. -->
@@ -246,6 +247,7 @@
         <option value="at">At a time…</option>
         <option value="reset">When usage resets</option>
       </select></div>
+      <p id="when2-reset-note" class="reset-note" aria-live="polite" hidden></p>
       <input id="when2-at" name="at" type="datetime-local">
     </div>
     <p id="when-error"></p>

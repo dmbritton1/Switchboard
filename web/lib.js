@@ -675,9 +675,11 @@ export async function fetchToolDetail(sessionId, itemId, fetchImpl = fetch) {
  * back to load.
  */
 export function freestAccount(accounts) {
-  return [...accounts].sort(
-    (a, b) => Number(Boolean(b.limits)) - Number(Boolean(a.limits)) || a.load - b.load,
-  )[0];
+  return [...accounts].sort((a, b) => {
+    const av = accountView(a);
+    const bv = accountView(b);
+    return Number(bv.real) - Number(av.real) || av.load - bv.load || a.name.localeCompare(b.name);
+  })[0];
 }
 
 /**
@@ -703,52 +705,98 @@ export function newlyNotifiable(sessions, notifyOn, seen, seed = false) {
   return { fire, seen: next };
 }
 
+const durationLabel = (mins) => (mins % 1440 === 0 ? `${mins / 1440}d`
+  : mins % 60 === 0 ? `${mins / 60}h` : `${mins}m`);
+
+function viewWindow(value, stale) {
+  if (!value || typeof value.id !== 'string' || !value.id
+    || !Number.isFinite(value.usedPercent) || !Number.isFinite(value.windowDurationMins)
+    || value.windowDurationMins <= 0) return null;
+  return {
+    id: value.id,
+    label: typeof value.label === 'string' && value.label ? value.label : value.id,
+    pct: Math.round(Math.max(0, Math.min(100, value.usedPercent))),
+    windowDurationMins: value.windowDurationMins,
+    resetsAt: Number.isFinite(value.resetsAt) ? value.resetsAt : null,
+    reached: value.reached === true,
+    stale,
+  };
+}
+
+function viewBlocks(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((block) => (block && typeof block.id === 'string' && block.id
+    && typeof block.reason === 'string' && block.reason
+    && typeof block.resettable === 'boolean'
+    ? [{ id: block.id, reason: block.reason, resettable: block.resettable }] : []));
+}
+
+/** The compact, local-time ledger line for one already-normalized window. */
+export function usageWindowLine(window) {
+  return `${window.label} · ${window.pct}%${window.reached ? ' · reached' : ''}`
+    + `${window.resetsAt === null ? '' : ` · resets ${new Date(window.resetsAt).toLocaleString()}`}`
+    + `${window.stale ? ' · stale' : ''}`;
+}
+
 /**
- * Everything the meter and the account panel need to decide *what* to say,
- * with no DOM. The two branches are the point: an account with real plan
- * limits and one falling back to the local budget estimate must not be worded
- * the same, or an estimate reads as fact.
- *
- * The headline number is always the 5-hour window when the plan reports one:
- * it is the window that resets every few hours, so it is the one worth a
- * reflex check at a glance. Weekly utilization is still visible — both windows
- * are in `windows`, which the tap-open panel lists in full — it just does not
- * get to replace the badge's number. (`load`, used for the bar fill/color and
- * the New Session picker, is unrelated: it stays the worse-of-both-windows
- * fraction the server computes, so a nearly-exhausted week still ranks that
- * account as less free even though the badge reads 5h.)
+ * Everything the meter and account panel need to decide what to say, without
+ * retaining raw provider data. A snapshot is real only while it is authoritative,
+ * fresh, and carries at least one usable window; stale windows remain available
+ * for the expanded ledger but the collapsed meter deliberately falls back to
+ * Switchboard's local estimate.
  */
 export function accountView(a) {
-  const l = a.limits;
-  if (!l) {
-    const pct = Math.round(a.pace * 100);
-    return {
-      load: a.load ?? a.pace,
-      pct,
-      real: false,
-      title: `${a.name} — ~${pct}% of its 5h budget (estimate)`,
-      budgetLine: `${a.provider} · ~${pct}% of a ${a.budget.toLocaleString()} token budget · estimate`,
-      note: 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.',
-      windows: [],
-    };
-  }
-  const windows = [
-    l.fiveHour && { label: '5h', pct: l.fiveHour.utilization, resetsAt: l.fiveHour.resetsAt },
-    l.sevenDay && { label: '7d', pct: l.sevenDay.utilization, resetsAt: l.sevenDay.resetsAt },
-  ].filter(Boolean);
-  // Fall back to whatever is there (7d only) for a plan that does not report a
-  // 5h window at all. windows[0] is a safe fallback, not a guess: probeLimits()
-  // rejects rather than resolving when both windows are empty, so `limits`
-  // non-null guarantees at least one entry here.
-  const primary = windows.find((w) => w.label === '5h') ?? windows[0];
-  return {
-    load: a.load,
-    pct: primary.pct,
-    real: true,
-    title: `${a.name} — ${primary.pct}% of the ${primary.label} limit`,
-    budgetLine: `${a.provider} · ${l.subscription ?? 'unknown'} plan`,
-    note: '',
+  // Task 7's browser shape names these `limits`; accept the current generic
+  // SSE aliases during the rollout so an older server cannot make the meter
+  // silently fall back to its estimate.
+  const l = a.limits ?? a.limitSnapshot;
+  const fresh = l?.authoritative === true && l?.fresh === true;
+  const windows = Array.isArray(l?.windows)
+    ? l.windows.map((w) => viewWindow(w, !fresh)).filter(Boolean).sort(
+      (x, y) => x.windowDurationMins - y.windowDurationMins || x.id.localeCompare(y.id),
+    )
+    : [];
+  const real = fresh && windows.length > 0;
+  const estimatedLoad = Number.isFinite(a.pace) ? a.pace : 0;
+  const load = real && Number.isFinite(a.load) ? a.load : estimatedLoad;
+  const pct = real ? windows[0].pct : Math.round(estimatedLoad * 100);
+  const plan = typeof l?.plan === 'string' && l.plan && l.plan !== 'unknown' ? l.plan : null;
+  const error = typeof (a.limitsError ?? a.limitSnapshotError) === 'string'
+    ? (a.limitsError ?? a.limitSnapshotError) : '';
+
+  if (!real) return {
+    load, pct, real: false,
+    title: `${a.name} — ~${pct}% of its 5h budget (estimate)`,
+    budgetLine: `${a.provider} · ~${pct}% of a ${a.budget.toLocaleString()} token budget · estimate`,
+    note: l && windows.length ? 'Provider limits are stale; the meter uses a local estimate.'
+      : 'Estimated from observed token spend against the budget in accounts.json — not a real plan limit.',
     windows,
+    blocks: viewBlocks(l?.blocks),
+    plan,
+    error,
+  };
+
+  const primary = windows[0];
+  return {
+    load, pct, real: true,
+    title: `${a.name} — ${primary.pct}% of the ${durationLabel(primary.windowDurationMins)} limit`,
+    budgetLine: `${a.provider}${plan ? ` · ${plan} plan` : ''}`,
+    note: '', windows,
+    blocks: viewBlocks(l.blocks),
+    plan,
+    error,
+  };
+}
+
+/** Reset scheduling is a Codex freshness boundary; timed work is always separate. */
+export function resetScheduleView(account) {
+  if (account?.provider !== 'codex') return { enabled: true, reason: '' };
+  if (account.resetScheduling?.eligible === true) return { enabled: true, reason: '' };
+  return {
+    enabled: false,
+    reason: typeof account?.resetScheduling?.reason === 'string' && account.resetScheduling.reason
+      ? account.resetScheduling.reason
+      : 'Codex limits are temporarily unavailable.',
   };
 }
 

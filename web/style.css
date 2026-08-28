@@ -796,6 +796,14 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
   border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
 #panel h3 { margin: 0 0 .6rem; font: 500 18px/1.3 var(--display); letter-spacing: -.02em; }
 #panel .meta { margin: .2rem 0; }
+/* Provider windows form a quiet ledger beneath the account summary: the
+   existing meter stays compact, while each reported window remains readable. */
+.usage-ledger { margin: .55rem 0; padding: .35rem 0; border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline); }
+.usage-window { font-variant-numeric: tabular-nums; }
+.usage-window.stale { color: var(--muted); }
+.usage-block { color: var(--needs); }
+.reset-note { margin: .35rem 0 0; color: var(--muted); font-size: .85em; }
 #grid-empty { grid-column: 1 / -1; display: grid; place-items: center; gap: .3rem;
   padding: 4rem 1rem; color: var(--muted); text-align: center;
   font: 500 28px/1.2 var(--display); letter-spacing: -.3px; }

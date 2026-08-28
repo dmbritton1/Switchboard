@@ -10,7 +10,7 @@ import {
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
   codexSettingsFromForm, codexSettingsSummary, usageLines,
-  accountView, freestAccount, newlyNotifiable,
+  accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
@@ -169,7 +169,7 @@ function accountMeter(a) {
   bar.append(fill);
 
   const num = document.createElement('span');
-  num.textContent = `${v.pct}%`;
+  num.textContent = `${v.real ? '' : '~'}${v.pct}%`;
 
   b.append(name, bar, num);
   b.onclick = () => setPanel(a.name);
@@ -187,13 +187,15 @@ function accountPanel(a) {
   line.textContent = v.budgetLine;
   box.append(h, line);
 
+  const ledger = document.createElement('div');
+  ledger.className = 'usage-ledger';
   for (const w of v.windows) {
     const row = document.createElement('p');
-    row.className = 'meta';
-    // Local time: a UTC reset timestamp is a small puzzle every single glance.
-    row.textContent = `${w.label} · ${w.pct}% · resets ${new Date(w.resetsAt).toLocaleString()}`;
-    box.append(row);
+    row.className = `meta usage-window${w.stale ? ' stale' : ''}`;
+    row.textContent = usageWindowLine(w);
+    ledger.append(row);
   }
+  if (v.windows.length) box.append(ledger);
 
   if (v.note) {
     const note = document.createElement('p');
@@ -203,10 +205,16 @@ function accountPanel(a) {
   }
   // Panel only: the meter stays a number, and a logged-out alt account should
   // not make every glance at the header look like a failure.
-  if (a.limitsError) {
+  for (const block of v.blocks) {
+    const row = document.createElement('p');
+    row.className = 'meta usage-block';
+    row.textContent = `${block.reason}${block.resettable ? ' · resets with usage' : ''}`;
+    box.append(row);
+  }
+  if (v.error) {
     const err = document.createElement('p');
     err.className = 'meta';
-    err.textContent = `No real plan limits: ${a.limitsError}`;
+    err.textContent = `No real plan limits: ${v.error}`;
     box.append(err);
   }
   return box;
@@ -376,6 +384,7 @@ function renderTheme() {
 }
 
 function render() {
+  updateResetScheduleAvailability();
   renderHeader();
   renderCommandError();
   openId ? renderSession() : renderGrid();
@@ -1632,6 +1641,31 @@ function bindWhen(selectSel, inputSel) {
 const syncWhen = bindWhen('#when-select', '#when-at');
 const syncWhen2 = bindWhen('#when2-select', '#when2-at');
 
+function resetOption(selectSel, noteSel, account, sync) {
+  const select = $(selectSel);
+  const option = select.querySelector('option[value=reset]');
+  const note = $(noteSel);
+  const view = resetScheduleView(account);
+  option.disabled = !view.enabled;
+  option.title = view.reason;
+  note.hidden = view.enabled;
+  note.textContent = view.reason;
+  // A snapshot or account change can make an already-selected reset option
+  // unavailable. Move to timed work, which is intentionally always usable.
+  if (!view.enabled && select.value === 'reset') {
+    select.value = 'at';
+    sync();
+  }
+}
+
+function updateResetScheduleAvailability() {
+  const newAccount = state.accounts.find((a) => a.name === $('#account-select').value);
+  resetOption('#when-select', '#new-reset-note', newAccount, syncWhen);
+  const session = state.sessions.find((s) => s.id === openId);
+  const sessionAccount = session && state.accounts.find((a) => a.name === session.account);
+  resetOption('#when2-select', '#when2-reset-note', sessionAccount, syncWhen2);
+}
+
 // The server derives a reset trigger's account from the action, so the client
 // never sends one. An invalid or empty datetime yields NaN, which the server
 // rejects with a message the dialog already knows how to show.
@@ -1912,6 +1946,7 @@ $('#schedule-btn').onclick = () => {
   // stays hidden to match) for an unrelated later message.
   dialog.querySelector('form').reset();
   syncWhen2();
+  updateResetScheduleAvailability();
   $('#when-error').textContent = '';
   dialog.showModal();
 };
@@ -2288,6 +2323,7 @@ async function openNew() {
     return o;
   }));
   updateNewCodexSettings();
+  updateResetScheduleAvailability();
 
   $('#new-error').textContent = '';
   dialog.showModal();
@@ -2298,7 +2334,10 @@ function updateNewCodexSettings() {
   $('#new-codex-settings').hidden = account?.provider !== 'codex';
 }
 
-$('#account-select').addEventListener('change', updateNewCodexSettings);
+$('#account-select').addEventListener('change', () => {
+  updateNewCodexSettings();
+  updateResetScheduleAvailability();
+});
 
 $('#new').addEventListener('close', async (e) => {
   const dialog = e.target;

@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
-  accountView, freestAccount, newlyNotifiable,
+  accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
   attributeBranches, branchHues, HUES, readTheme, ACCENTS, CANVASES,
   pastedName, composeMessage, diffSummary, patchLineClass,
@@ -819,109 +819,165 @@ test('fetchToolDetail sanitizes HTTP, network, and malformed response failures',
 });
 
 const acct = (over = {}) => ({
-  name: 'claude-main', provider: 'claude', budget: 2000000,
-  pace: 0.4, limits: null, limitsError: null, load: 0.4, ...over,
+  name: 'claude-main', provider: 'claude', budget: 2_000_000,
+  pace: 0.4, limits: null, limitsError: null, load: 0.4,
+  resetScheduling: { eligible: true, resetsAt: null, reason: '' }, ...over,
 });
 
-test('accountView without limits reproduces the estimate wording exactly', () => {
-  const v = accountView(acct());
-  assert.equal(v.real, false);
-  assert.equal(v.pct, 40);
-  assert.equal(v.title, 'claude-main — ~40% of its 5h budget (estimate)');
-  assert.equal(v.budgetLine, 'claude · ~40% of a 2,000,000 token budget · estimate');
-  assert.match(v.note, /not a real plan limit/);
-  assert.deepEqual(v.windows, []);
+const window = (over = {}) => ({
+  id: 'primary', label: 'Primary', usedPercent: 11, windowDurationMins: 300,
+  resetsAt: Date.parse('2026-08-03T19:10:00Z'), reached: false, ...over,
 });
 
-test('accountView with limits drops the estimate wording', () => {
+const limits = (over = {}) => ({
+  plan: 'pro', windows: [window()], blocks: [], fetchedAt: 1,
+  authoritative: true, fresh: true, ...over,
+});
+
+test('accountView renders a fresh Codex five-hour window as a real limit', () => {
   const v = accountView(acct({
-    limits: {
-      fiveHour: { utilization: 11, resetsAt: '2026-08-03T19:10:00Z' },
-      sevenDay: { utilization: 1, resetsAt: '2026-08-10T08:00:00Z' },
-      subscription: 'pro',
-    },
-    load: 0.11,
+    name: 'codex-main', provider: 'codex', load: 0.11, limits: limits(),
   }));
   assert.equal(v.real, true);
   assert.equal(v.pct, 11);
-  assert.equal(v.title, 'claude-main — 11% of the 5h limit');
-  assert.equal(v.budgetLine, 'claude · pro plan');
-  assert.equal(v.note, '');
-  assert.deepEqual(v.windows.map((w) => [w.label, w.pct]), [['5h', 11], ['7d', 1]]);
+  assert.equal(v.title, 'codex-main — 11% of the 5h limit');
+  assert.equal(v.budgetLine, 'codex · pro plan');
+  assert.deepEqual(v.windows.map((w) => [w.id, w.label, w.pct, w.stale]),
+    [['primary', 'Primary', 11, false]]);
 });
 
-test('accountView headlines the 5h window even when 7d is far worse', () => {
+test('usageWindowLine renders a local reset and stale state for the expanded ledger', () => {
+  const resetsAt = Date.parse('2026-08-03T19:10:00Z');
+  assert.equal(usageWindowLine({
+    id: 'five', label: 'Five hour', pct: 8, resetsAt, reached: false, stale: true,
+  }), `Five hour · 8% · resets ${new Date(resetsAt).toLocaleString()} · stale`);
+  assert.equal(usageWindowLine({
+    id: 'block', label: 'Blocked', pct: 100, resetsAt: null, reached: true, stale: false,
+  }), 'Blocked · 100% · reached');
+});
+
+test('accountView accepts the current SSE limitSnapshot aliases without retaining provider payloads', () => {
   const v = accountView(acct({
-    limits: {
-      fiveHour: { utilization: 5, resetsAt: '2026-08-03T19:10:00Z' },
-      sevenDay: { utilization: 96, resetsAt: '2026-08-10T08:00:00Z' },
-      subscription: 'max',
-    },
-    load: 0.96,
+    limits: undefined,
+    limitSnapshot: limits({ plan: 'plus' }),
+    limitsError: undefined,
+    limitSnapshotError: 'Unable to refresh account limits. Check that this account is signed in.',
   }));
-  // The badge stays on 5h — a nearly-exhausted week does not get to steal the
-  // headline number, it only shows up in the tap-open panel's windows list.
-  assert.equal(v.pct, 5);
-  assert.equal(v.title, 'claude-main — 5% of the 5h limit');
-  // `load` is untouched: it still ranks this account as nearly out of room for
-  // the bar color and the New Session picker, even though the badge reads 5%.
-  assert.equal(v.load, 0.96);
-  assert.deepEqual(v.windows.map((w) => [w.label, w.pct]), [['5h', 5], ['7d', 96]]);
+  assert.equal(v.real, true);
+  assert.equal(v.plan, 'plus');
+  assert.match(v.error, /signed in/);
 });
 
-test('accountView falls back to 7d as the headline when the plan does not report 5h', () => {
-  const v = accountView(acct({
-    limits: { fiveHour: null, sevenDay: { utilization: 42, resetsAt: '2026-08-10T08:00:00Z' }, subscription: 'pro' },
-    load: 0.42,
-  }));
-  assert.equal(v.pct, 42);
-  assert.equal(v.title, 'claude-main — 42% of the 7d limit');
-  assert.deepEqual(v.windows.map((w) => w.label), ['7d']);
-});
-
-test('accountView omits a window the plan does not report', () => {
-  const v = accountView(acct({
-    limits: { fiveHour: { utilization: 8, resetsAt: '2026-08-03T19:10:00Z' }, sevenDay: null, subscription: 'pro' },
-    load: 0.08,
-  }));
-  assert.deepEqual(v.windows.map((w) => w.label), ['5h']);
-  // A single-element windows array is exactly the case the reduce seed used to
-  // get wrong (windows[0] ?? {label:'5h', pct:0}) — assert on the actual value,
-  // not just its presence.
-  assert.equal(v.pct, 8);
-  assert.equal(v.title, 'claude-main — 8% of the 5h limit');
-});
-
-test('accountView keeps a probe error out of the meter title', () => {
-  const v = accountView(acct({ limitsError: 'logged out' }));
-  assert.equal(v.real, false);
-  assert.ok(!v.title.includes('logged out'), 'the error belongs in the panel, not the meter');
-});
-
-const withLimits = (name: string, pct: number) => acct({
-  name,
-  limits: { fiveHour: { utilization: pct, resetsAt: '2026-08-03T19:10:00Z' }, sevenDay: null, subscription: 'max' },
-  load: pct / 100,
-});
-
-test('freestAccount does not let an unprobed account outrank a real number', () => {
-  // The regression: codex has no plan limits, so its estimate reads 0% and the
-  // dialog defaulted to it over every Claude account with a real utilization.
-  const accounts = [
-    withLimits('claude-main', 83),
-    withLimits('claude-alt', 58),
-    acct({ name: 'codex', provider: 'codex', pace: 0, load: 0 }),
+test('accountView sorts copied provider windows by shortest duration then stable id', () => {
+  const source = [
+    window({ id: 'z', label: 'Weekly', usedPercent: 3, windowDurationMins: 10080 }),
+    window({ id: 'b', label: 'Burst B', usedPercent: 71, windowDurationMins: 300 }),
+    window({ id: 'a', label: 'Burst A', usedPercent: 12, windowDurationMins: 300 }),
   ];
-  assert.equal(freestAccount(accounts).name, 'claude-alt');
+  const v = accountView(acct({ load: 0.71, limits: limits({ windows: source }) }));
+  assert.deepEqual(v.windows.map((w) => w.id), ['a', 'b', 'z']);
+  assert.equal(v.pct, 12, 'the stable id tie-break chooses the headline');
+  assert.deepEqual(source.map((w) => w.id), ['z', 'b', 'a'], 'SSE data is not sorted in place');
 });
 
-test('freestAccount falls back to load when nobody has real limits', () => {
-  const accounts = [acct({ name: 'a', load: 0.7 }), acct({ name: 'b', load: 0.2 })];
+test('accountView preserves arbitrary labels and every valid provider window in the expanded ledger', () => {
+  const v = accountView(acct({ limits: limits({ windows: [
+    window({ id: 'slow', label: 'Monthly reserve', windowDurationMins: 43200, usedPercent: 2 }),
+    window({ id: 'quick', label: 'Burst', windowDurationMins: 30, usedPercent: 29 }),
+  ] }) }));
+  assert.equal(v.title, 'claude-main — 29% of the 30m limit');
+  assert.deepEqual(v.windows.map((w) => w.label), ['Burst', 'Monthly reserve']);
+});
+
+test('accountView keeps a fresh Claude five-hour and seven-day pair and can headline seven days alone', () => {
+  const paired = accountView(acct({ limits: limits({ windows: [
+    window({ id: 'week', label: '7d', usedPercent: 3, windowDurationMins: 10080 }),
+    window({ id: 'five', label: '5h', usedPercent: 52, windowDurationMins: 300 }),
+  ] }) }));
+  assert.equal(paired.title, 'claude-main — 52% of the 5h limit');
+  assert.deepEqual(paired.windows.map((w) => w.label), ['5h', '7d']);
+  const weeklyOnly = accountView(acct({ limits: limits({ windows: [
+    window({ id: 'week', label: '7d', usedPercent: 42, windowDurationMins: 10080 }),
+  ] }) }));
+  assert.equal(weeklyOnly.title, 'claude-main — 42% of the 7d limit');
+});
+
+test('accountView keeps blocks, plan, and soft errors panel-only', () => {
+  const v = accountView(acct({
+    limits: limits({
+      plan: 'team',
+      blocks: [{ id: 'spend', reason: 'Spend control reached', resettable: false }],
+    }),
+    limitsError: 'Unable to refresh account limits. Check that this account is signed in.',
+  }));
+  assert.deepEqual(v.blocks, [{ id: 'spend', reason: 'Spend control reached', resettable: false }]);
+  assert.equal(v.plan, 'team');
+  assert.match(v.error, /signed in/);
+  assert.ok(!v.title.includes('Spend control') && !v.title.includes('signed in'));
+});
+
+test('accountView treats unknown plan and malformed optional fields as absent', () => {
+  const v = accountView(acct({ limits: limits({
+    plan: 'unknown', blocks: [{ id: 9, reason: { secret: 'nope' }, resettable: 'no' }],
+    windows: [window({ id: null }), { id: 'bad', label: 'Bad', usedPercent: 50 }],
+  }) }));
+  assert.equal(v.real, false, 'no valid provider window means no real reading');
+  assert.equal(v.plan, null);
+  assert.deepEqual(v.blocks, []);
+  assert.deepEqual(v.windows, []);
+});
+
+test('accountView displays stale provider history only in the expanded ledger', () => {
+  const v = accountView(acct({ limits: limits({ fresh: false, windows: [
+    window({ id: 'five', label: 'Five hour', usedPercent: 8 }),
+    window({ id: 'week', label: 'Week', usedPercent: 92, windowDurationMins: 10080 }),
+  ] }) }));
+  assert.equal(v.real, false);
+  assert.equal(v.pct, 40, 'collapsed meter falls back to local pace');
+  assert.match(v.title, /~40%.*estimate/);
+  assert.deepEqual(v.windows.map((w) => [w.id, w.pct, w.stale]), [['five', 8, true], ['week', 92, true]]);
+});
+
+test('accountView uses the local estimate when no authoritative provider window exists', () => {
+  const v = accountView(acct({
+    name: 'local', pace: 0.236, load: 0.236, limits: limits({ authoritative: false }),
+  }));
+  assert.equal(v.real, false);
+  assert.equal(v.title, 'local — ~24% of its 5h budget (estimate)');
+  assert.match(v.budgetLine, /estimate/);
+});
+
+const withRealLimits = (name: string, pct: number, over = {}) => acct({
+  name, limits: limits({ windows: [window({ usedPercent: pct })] }), load: pct / 100, ...over,
+});
+
+test('freestAccount ranks fresh authoritative accounts by load ahead of stale estimates', () => {
+  const accounts = [
+    withRealLimits('fresh-busy', 58),
+    withRealLimits('fresh-free', 12),
+    acct({ name: 'stale-ten', pace: 0.1, load: 0.1, limits: limits({ fresh: false }) }),
+  ];
+  assert.equal(freestAccount(accounts).name, 'fresh-free');
+});
+
+test('freestAccount falls back to estimate ordering when every provider reading is stale or unavailable', () => {
+  const accounts = [
+    acct({ name: 'a', pace: 0.7, load: 0.7, limits: limits({ fresh: false }) }),
+    acct({ name: 'b', pace: 0.2, load: 0.2 }),
+  ];
   assert.equal(freestAccount(accounts).name, 'b');
 });
 
-test('freestAccount picks the lowest load among accounts that all have limits', () => {
-  assert.equal(freestAccount([withLimits('a', 90), withLimits('b', 12)]).name, 'b');
+test('reset scheduling disables only unsupported Codex reset work and keeps timed scheduling available', () => {
+  assert.deepEqual(resetScheduleView(acct({
+    provider: 'codex', resetScheduling: { eligible: false, resetsAt: null, reason: 'Refresh Codex limits first.' },
+  })), { enabled: false, reason: 'Refresh Codex limits first.' });
+  assert.deepEqual(resetScheduleView(acct({
+    provider: 'codex', resetScheduling: { eligible: true, resetsAt: 123, reason: '' },
+  })), { enabled: true, reason: '' });
+  assert.deepEqual(resetScheduleView(acct({
+    provider: 'claude', resetScheduling: { eligible: false, resetsAt: null, reason: 'irrelevant' },
+  })), { enabled: true, reason: '' });
 });
 
 test('sortSessions defaults to blocked-first', () => {

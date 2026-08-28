@@ -1,8 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  CODEX_FAILURE_LABEL, commandErrorText, commandFailure, postCommand, retainedSessionError,
+  CODEX_FAILURE_LABEL, commandErrorText, commandFailure, postCommand, resetScheduleView, retainedSessionError,
 } from '../web/lib.js';
+
+test('reset schedule view changes with the selected Codex account without disabling timed work', () => {
+  const unavailable = resetScheduleView({
+    provider: 'codex', resetScheduling: {
+      eligible: false, resetsAt: null, reason: 'Codex limits are temporarily unavailable.',
+    },
+  });
+  const ready = resetScheduleView({
+    provider: 'codex', resetScheduling: { eligible: true, resetsAt: 1, reason: '' },
+  });
+  assert.deepEqual(unavailable, {
+    enabled: false, reason: 'Codex limits are temporarily unavailable.',
+  });
+  assert.deepEqual(ready, { enabled: true, reason: '' });
+});
 
 test('every stable Codex failure has a user-facing label', () => {
   assert.deepEqual(Object.keys(CODEX_FAILURE_LABEL).sort(), [
