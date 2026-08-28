@@ -64,3 +64,26 @@ test('email: null produces an api-key style auth.json with no id_token', async (
   assert.equal(auth.auth_mode, 'apikey');
   await rm(d, { recursive: true, force: true });
 });
+
+test('claude no-prompt completes without ever asking for a code', async () => {
+  const d = await mkdtemp(join(tmpdir(), 'fake-login-'));
+  const bin = await writeFakeLoginCli(d, { provider: 'claude', mode: 'no-prompt' });
+  const home = join(d, 'cfg');
+  const r = await collect(bin, ['auth', 'login'], { CLAUDE_CONFIG_DIR: home });
+  assert.equal(r.code, 0);
+  assert.match(r.out, /https:\/\/claude\.com\/cai\/oauth\/authorize/);
+  assert.doesNotMatch(r.out, /Paste code here/);
+  assert.ok(JSON.parse(await readFile(join(home, '.claude.json'), 'utf8')).oauthAccount.emailAddress);
+  await rm(d, { recursive: true, force: true });
+});
+
+test('codex slow keeps the URL on stderr, never stdout', async () => {
+  const d = await mkdtemp(join(tmpdir(), 'fake-login-'));
+  const bin = await writeFakeLoginCli(d, { provider: 'codex', mode: 'slow' });
+  const home = join(d, 'cfg');
+  const r = await collect(bin, ['login'], { CODEX_HOME: home });
+  assert.equal(r.code, 0);
+  assert.equal(r.out, '');
+  assert.match(r.err, /https:\/\/auth\.openai\.com\/oauth\/authorize/);
+  await rm(d, { recursive: true, force: true });
+});

@@ -38,6 +38,13 @@ const url = ${JSON.stringify(url)};
 
 const home = provider === 'claude' ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
 
+// codex writes its login chatter to stderr; claude writes to stdout. Every
+// mode below must route through this so the per-provider stream asymmetry
+// can never be broken by a mode that forgets to check provider itself.
+function out(text) {
+  (provider === 'codex' ? process.stderr : process.stdout).write(text);
+}
+
 function b64url(value) {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
 }
@@ -90,27 +97,27 @@ if (!home) {
 
 if (mode === 'no-url') {
   // Emits a decoy on a host the scraper must ignore, then hangs.
-  process.stdout.write('visit https://example.com/not-oauth for help\\n');
+  out('visit https://example.com/not-oauth for help\\n');
   setInterval(() => {}, 1000);
 } else if (mode === 'slow') {
   setTimeout(() => {
-    process.stdout.write(url + '\\n');
+    out(url + '\\n');
     writeCredentials();
     process.exit(0);
   }, 2000);
 } else if (provider === 'codex') {
-  process.stderr.write('Starting local login server on http://localhost:1455.\\n');
-  process.stderr.write('If your browser did not open, navigate to this URL:\\n\\n' + url + '\\n');
+  out('Starting local login server on http://localhost:1455.\\n');
+  out('If your browser did not open, navigate to this URL:\\n\\n' + url + '\\n');
   writeCredentials();
   process.exit(0);
 } else {
-  process.stdout.write('Opening browser to sign in\\u2026\\n');
-  process.stdout.write("If the browser didn't open, visit: " + url + '\\n');
+  out('Opening browser to sign in\\u2026\\n');
+  out("If the browser didn't open, visit: " + url + '\\n');
   if (mode === 'no-prompt') {
     writeCredentials();
     process.exit(0);
   }
-  process.stdout.write('Paste code here if prompted > ');
+  out('Paste code here if prompted > ');
   let buf = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
