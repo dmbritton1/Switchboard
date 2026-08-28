@@ -408,7 +408,13 @@ export class Linker {
     try {
       await rename(p.staging, target);
     } catch (error) {
-      return { error: this.redact(String((error as Error).message ?? error)) };
+      // Redact against the captured local `p.staging`, not `this.redact()`:
+      // a racing second commit() on the same link can null #pending between
+      // this call's entry and this catch (the first call's success clears
+      // it), at which point this.redact() becomes a no-op and the raw
+      // staging path would reach the browser. Mirrors start()'s catch above.
+      const message = String((error as Error).message ?? error);
+      return { error: message.split(p.staging).join('[credential dir]') };
     }
 
     const account: Account = {
@@ -429,6 +435,10 @@ export class Linker {
    * Removes staging dirs left by a crash or a kill. Deliberately narrow: only
    * `.pending-*` entries. A sweep that deleted any unrecognised directory under
    * the accounts root would eat real credentials after an unrelated bug.
+   *
+   * Also excludes the currently active staging dir, if any — a live link's
+   * credentials must survive a sweep regardless of when the caller invokes
+   * it, not merely because callers today only call this at boot.
    */
   async sweep(): Promise<void> {
     let entries: string[];
@@ -437,8 +447,9 @@ export class Linker {
     } catch {
       return;
     }
+    const active = this.#pending?.staging;
     await Promise.all(entries
-      .filter((entry) => entry.startsWith('.pending-'))
+      .filter((entry) => entry.startsWith('.pending-') && join(this.#root, entry) !== active)
       .map((entry) => rm(join(this.#root, entry), { recursive: true, force: true })));
   }
 }

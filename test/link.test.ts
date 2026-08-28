@@ -288,3 +288,24 @@ test('sweep removes leftover staging dirs and nothing else', async () => {
   assert.deepEqual((await readdir(root)).sort(), ['claude-keep']);
   await h.cleanup();
 });
+
+test('sweep leaves an in-progress link\'s own staging directory alone', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'awaiting-user');
+  const staging = h.linker.stagingDir();
+  assert.ok(staging);
+  await h.linker.sweep();
+  const { readdir } = await import('node:fs/promises');
+  const root = join(h.dir, 'accounts');
+  assert.ok((await readdir(root)).some((entry) => join(root, entry) === staging));
+  await until(h.linker, (l) => l?.phase === 'naming');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+test('sweep resolves without throwing when the accounts root does not exist', async () => {
+  const h = await harness();
+  await assert.doesNotReject(() => h.linker.sweep());
+  await h.cleanup();
+});
