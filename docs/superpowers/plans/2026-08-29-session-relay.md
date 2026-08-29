@@ -746,7 +746,9 @@ git commit -m "feat: expose relay tools to Claude sessions with a readable appro
 Pure autocomplete. The decision — which sessions can be mentioned, and what text a pick inserts — is a function with no DOM in it, tested the way `commandMenu` and `handoffTargets` already are.
 
 **Files:**
-- Modify: `web/lib.js` (a new export beside `handoffTargets`), `web/app.js` (its `lib.js` import block and the composer's input handler)
+- Modify: `web/lib.js` (two new exports beside `handoffTargets`)
+- Modify: `web/index.html:121` (a menu element beside `#cmd-menu`)
+- Modify: `web/app.js` (its `lib.js` import block, plus a `wireMentionMenu` factory beside `wireCommandMenu` at line 1756 and one call beside line 1891)
 - Test: `test/ui.test.ts`
 
 **Interfaces:**
@@ -827,69 +829,157 @@ export function mentionInsert(session) {
 Run: `node --test test/ui.test.ts`
 Expected: PASS — the three new tests, plus the pre-existing export-wiring test now covering both names.
 
-- [ ] **Step 5: Wire the menu into the composer**
+- [ ] **Step 5: Add the menu element**
 
-The composer already owns a menu closure for slash commands in `web/app.js` —
-`render()` at line 1826 calls `commandMenu`, `apply()` at 1813 inserts the pick,
-and one `keydown` handler drives arrow keys and Enter for both. Do **not** build
-a second closure. Teach the existing one about a second kind of match.
+`web/index.html:121` holds the slash-command menu for the chat composer. Add a
+sibling immediately after it:
 
-In `render()`, try the mention menu when the command menu declines:
-
-```js
-  function render() {
-    const caret = field.selectionStart ?? 0;
-    const cmd = commandMenu(field.value, caret, state.commands ?? []);
-    const mention = cmd ? null : mentionMenu(
-      field.value, caret,
-      state.sessions.filter((x) => x.id !== s.id && x.repo === s.repo),
-    );
-    const found = cmd ?? mention;
-    if (!found) { close(); return; }
-    kind = cmd ? 'command' : 'mention';
+```html
+            <ul id="mention-menu" class="cmd-menu" role="listbox" aria-label="Sessions" hidden></ul>
 ```
 
-`matches` currently holds strings and is compared with `.join('\n')`. Mention
-matches are session objects, so key them for that comparison and for rendering:
+It reuses the `cmd-menu` class deliberately: this is the same kind of popup in
+the same place, and a second stylesheet rule for it would drift.
+
+Only the chat composer gets one. The new-session dialog (`#new-cmd-menu`,
+`web/index.html:219`) has no session to be relative to, so `@` means nothing
+there.
+
+- [ ] **Step 6: Wire a mention menu beside the command menu**
+
+`wireCommandMenu({ field, box, mirror, menu, ids })` (`web/app.js:1756`) is
+already a factory with two instances — the chat composer and the new-session
+prompt. A sibling factory is this file's own pattern, not a workaround for it.
+
+Write `wireMentionMenu` beside it. It is the command menu with the mirror
+machinery removed: mentions need no coloured repaint behind the field, which is
+what `box`, `mirror` and `paint` exist for.
 
 ```js
-    const keys = found.matches.map((m) => (kind === 'command' ? m : m.branch));
-    if (keys.join('\n') !== lastKeys.join('\n')) index = 0;
-    lastKeys = keys;
-    matches = found.matches;
-```
+/**
+ * Session autocomplete for the chat composer.
+ *
+ * A sibling of wireCommandMenu rather than a second mode inside it. The two
+ * menus share a shape but nothing else, and folding them together would mean
+ * editing a working, untested closure to add a case — where a mistake breaks
+ * slash commands silently, since no test loads this file.
+ *
+ * `sessions()` is supplied by the caller because this factory must not know how
+ * the grid stores state; it returns the sessions the open one may mention.
+ */
+function wireMentionMenu({ field, menu, ids, sessions }) {
+  let matches = [];
+  let index = 0;
 
-Declare `kind` and `lastKeys` beside the closure's existing `index` and
-`matches`. In the `replaceChildren` map, render a mention as its branch name
-with the account as a muted suffix, mirroring how a namespaced command renders
-its prefix. In `apply()`, branch on `kind`: a command keeps today's behaviour,
-and a mention replaces the `@…` token under the caret with `mentionInsert(m)`.
+  function close() {
+    menu.hidden = true;
+    matches = [];
+    field.removeAttribute('aria-activedescendant');
+    field.setAttribute('aria-expanded', 'false');
+  }
 
-```js
-  function applyMention(session) {
+  function highlight() {
+    [...menu.children].forEach((li, i) => li.setAttribute('aria-selected', String(i === index)));
+    field.setAttribute('aria-activedescendant', `${ids}-${index}`);
+    menu.children[index]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function apply(session) {
     const caret = field.selectionStart ?? 0;
     const at = field.value.slice(0, caret).lastIndexOf('@');
-    field.value = field.value.slice(0, at) + mentionInsert(session) + field.value.slice(caret);
-    const end = at + mentionInsert(session).length;
+    const inserted = mentionInsert(session);
+    field.value = field.value.slice(0, at) + inserted + field.value.slice(caret);
+    const end = at + inserted.length;
     field.setSelectionRange(end, end);
     close();
-    paint();
     field.focus();
   }
+
+  function render() {
+    const found = mentionMenu(field.value, field.selectionStart ?? 0, sessions());
+    if (!found || !found.matches.length) { close(); return; }
+    // Only reset the highlight when the list itself changed, so a caret move
+    // does not throw away an arrow-key selection.
+    const keys = found.matches.map((m) => m.id).join('\n');
+    if (keys !== matches.map((m) => m.id).join('\n')) index = 0;
+    matches = found.matches;
+
+    menu.replaceChildren(...matches.map((session, i) => {
+      const li = document.createElement('li');
+      li.id = `${ids}-${i}`;
+      li.setAttribute('role', 'option');
+      const account = document.createElement('span');
+      account.className = 'ns';
+      account.textContent = ` ${session.account}`;
+      li.append(`@${session.branch}`, account);
+      // mousedown, not click: preventDefault keeps focus in the field so the
+      // menu never races its own blur handler.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); apply(session); });
+      return li;
+    }));
+    menu.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    highlight();
+  }
+
+  for (const evt of ['input', 'click', 'keyup']) field.addEventListener(evt, render);
+  field.addEventListener('blur', close);
+
+  field.addEventListener('keydown', (e) => {
+    if (!matches.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      index = (index + (e.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length;
+      highlight();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      apply(matches[index]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+}
 ```
 
-There is no test for this step — `test/ui.test.ts` never loads `app.js` as code
-(see the comment at its line 20). The tested part is `mentionMenu` and
-`mentionInsert`; this step is the DOM that calls them, verified by reading and
-by using the composer.
+Add `mentionMenu` and `mentionInsert` to the `lib.js` import block at the top of
+`web/app.js`, and call the factory once beside the existing `wireCommandMenu`
+calls (`web/app.js:1891`):
 
-- [ ] **Step 6: Run the full suite and commit**
+```js
+wireMentionMenu({
+  field: $('#prompt'), menu: $('#mention-menu'), ids: 'mention-opt',
+  sessions: () => {
+    const open = state.sessions.find((x) => x.id === state.selected);
+    return open
+      ? state.sessions.filter((x) => x.id !== open.id && x.repo === open.repo)
+      : [];
+  },
+});
+```
+
+Check the name the composer's open session is actually held under before using
+`state.selected` — read the surrounding code and use whatever the file already
+uses for "the session the composer is writing to".
+
+Both menus listen on the same field. They cannot both be open: `commandMenu`
+returns null unless the caret is in a `/` token and `mentionMenu` returns null
+unless it is in an `@` token, and a caret is in at most one of those.
+
+There is no test for either step. `test/ui.test.ts` never loads `app.js` as
+code — see the comment at its line 20. The tested part is `mentionMenu` and
+`mentionInsert`; this is the DOM that calls them, verified by reading and by
+using the composer. Check both menus by hand before committing: type `/` and
+confirm commands still list, then type `@` and confirm sessions do.
+
+- [ ] **Step 7: Run the full suite and commit**
 
 Run: `npm test`
 Expected: PASS.
 
 ```bash
-git add web/lib.js web/app.js test/ui.test.ts
+git add web/lib.js web/index.html web/app.js test/ui.test.ts
 git commit -m "feat: @ mention menu for naming another session in the composer"
 ```
 
