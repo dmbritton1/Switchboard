@@ -98,6 +98,23 @@ credential directory only when it is exactly the one Switchboard created for
 that name (`~/.switchboard/accounts/<name>/`) — a hand-written entry like the
 `claude-alt` one above, pointing at `~/.claude-alt`, is never touched.
 
+"Hand off…" (in a session's menu) moves work to another account. It is offered
+on `done` and `stopped` sessions only — handing off commits the source
+worktree, and a `working` agent's half-written files must not be captured
+underneath it. Pick a target account and a branch name, and Switchboard commits
+whatever the source left outstanding, branches the new session's worktree from
+the source branch, and opens the new session onto
+`.switchboard/handoff.md` — the previous session's prompts, actions and replies,
+rendered to markdown. The successor reads that for itself, so the account being
+handed away from spends nothing; it works when that account is out of budget,
+which is the case handoff exists for.
+
+Reasoning is never written to that file, and `.switchboard/` is excluded from
+the outstanding-work commit the same way `uploads/` is, so a handoff document
+can never reach a merge target. The source session is stopped — Resume still
+works, but leaving it running would let it edit a branch the new session is
+already based on.
+
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one
 write every two seconds, on any other state change — so a session that runs to
