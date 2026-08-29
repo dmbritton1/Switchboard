@@ -660,7 +660,10 @@ export function createServer(opts: {
           };
         }
       }
-      return { trigger: { kind: 'reset', account }, action };
+      const resetAction = action.kind === 'create' && selected
+        ? { ...action, resetProvider: selected.provider }
+        : action;
+      return { trigger: { kind: 'reset', account }, action: resetAction };
     }
     return { error: `unknown trigger: ${String(t.kind)}` };
   }
@@ -970,6 +973,9 @@ export function createServer(opts: {
         let actionProvider: Account['provider'] | null = null;
         if (item.action.kind === 'create') {
           actionAccount = typeof item.action.account === 'string' ? item.action.account : null;
+          actionProvider = item.action.resetProvider === 'claude' || item.action.resetProvider === 'codex'
+            ? item.action.resetProvider
+            : null;
         } else if (item.action.kind === 'send' || item.action.kind === 'resume') {
           const session = registry.get(item.action.sessionId);
           actionAccount = session?.account ?? null;
@@ -980,6 +986,9 @@ export function createServer(opts: {
           : undefined;
         if (!actionAccount || !configuredAccount) {
           scheduler.fail(item.id, 'scheduled reset action no longer has an account');
+        } else if (item.action.kind === 'create'
+          && (!actionProvider || configuredAccount.provider !== actionProvider)) {
+          scheduler.fail(item.id, 'scheduled reset provider changed or is missing — reschedule this item');
         } else if (actionProvider && configuredAccount.provider !== actionProvider) {
           scheduler.fail(item.id, 'scheduled reset provider no longer matches its action');
         } else if (item.trigger.account !== actionAccount) {

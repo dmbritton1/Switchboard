@@ -1759,6 +1759,7 @@ test('a reset trigger takes its account from the action, not the client', async 
     action: { kind: 'create', repo: process.cwd(), branch: 'b', account: 'codex', prompt: 'go' },
   });
   assert.deepEqual(scheduler.all()[0].trigger, { kind: 'reset', account: 'codex' });
+  assert.equal((scheduler.all()[0].action as unknown as { resetProvider?: string }).resetProvider, 'codex');
 });
 
 test('a Codex reset schedule requires fresh provider eligibility while Claude reset schedules remain available', async (t) => {
@@ -1780,6 +1781,7 @@ test('a Codex reset schedule requires fresh provider eligibility while Claude re
   });
   assert.equal(claude.status, 200);
   assert.deepEqual(scheduler.all().map((item) => item.trigger), [{ kind: 'reset', account: 'claude-main' }]);
+  assert.equal((scheduler.all()[0].action as unknown as { resetProvider?: string }).resetProvider, 'claude');
 });
 
 test('Codex reset schedule reports real authoritative ineligibility states', async (t) => {
@@ -2193,7 +2195,9 @@ test('restored reset items fail closed when create or send/resume accounts misma
   scheduler.restore([
     {
       id: 'create-mismatch', trigger: { kind: 'reset', account: 'claude-main' },
-      action: { kind: 'create', repo: '/r', branch: 'create', account: 'codex', prompt: 'go' },
+      action: {
+        kind: 'create', repo: '/r', branch: 'create', account: 'codex', prompt: 'go', resetProvider: 'codex',
+      },
       createdAt: 0, state: 'waiting', error: null,
     },
     {
@@ -2220,6 +2224,78 @@ test('restored reset items fail closed when create or send/resume accounts misma
     ['send-mismatch', 'failed', 'scheduled reset account no longer matches its action'],
     ['resume-mismatch', 'failed', 'scheduled reset account no longer matches its action'],
     ['missing-session', 'failed', 'scheduled reset action no longer has an account'],
+  ]);
+});
+
+test('restored reset-create fails closed when Codex origin now maps to same-name Claude config', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'claude', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
+  const { scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  scheduler.restore([{
+    id: 'create-codex-now-claude', trigger: { kind: 'reset', account: 'shared' },
+    action: {
+      kind: 'create', repo: '/r', branch: 'codex', account: 'shared', prompt: 'go', resetProvider: 'codex',
+    },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, []);
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [
+    ['failed', 'scheduled reset provider changed or is missing — reschedule this item'],
+  ]);
+});
+
+test('restored reset-create fails closed when Claude origin now maps to same-name Codex config', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'codex', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: false, reason: 'still limited' }) });
+  const { scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  scheduler.restore([{
+    id: 'create-claude-now-codex', trigger: { kind: 'reset', account: 'shared' },
+    action: {
+      kind: 'create', repo: '/r', branch: 'claude', account: 'shared', prompt: 'go', resetProvider: 'claude',
+    },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, [], 'provider mismatch must fail before the Codex boundary read');
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [
+    ['failed', 'scheduled reset provider changed or is missing — reschedule this item'],
+  ]);
+});
+
+test('restored same-provider reset-create reaches the Codex boundary path', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'codex', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: false, reason: 'still limited' }) });
+  const { scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  scheduler.restore([{
+    id: 'create-codex-still-codex', trigger: { kind: 'reset', account: 'shared' },
+    action: {
+      kind: 'create', repo: '/r', branch: 'codex', account: 'shared', prompt: 'go', resetProvider: 'codex',
+    },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, ['shared']);
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [['waiting', null]]);
+});
+
+test('legacy restored reset-create without provider identity fails closed with reschedule guidance', async (t) => {
+  const configured: Account[] = [{ name: 'shared', provider: 'codex', budget: 1000, env: {} }];
+  const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: false, reason: 'still limited' }) });
+  const { scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
+  scheduler.restore([{
+    id: 'legacy-create', trigger: { kind: 'reset', account: 'shared' },
+    action: { kind: 'create', repo: '/r', branch: 'legacy', account: 'shared', prompt: 'go' },
+    createdAt: 0, state: 'waiting', error: null,
+  }]);
+
+  await server.tick();
+  assert.deepEqual(limitCoordinator.reads, []);
+  assert.deepEqual(scheduler.all().map((item) => [item.state, item.error]), [
+    ['failed', 'scheduled reset provider changed or is missing — reschedule this item'],
   ]);
 });
 

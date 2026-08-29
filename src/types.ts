@@ -272,7 +272,10 @@ export type Trigger =
 
 export type Action =
   | { kind: 'create'; repo: string; branch: string; account: string; prompt: string;
-      codexSettings?: CodexThreadSettings }
+      codexSettings?: CodexThreadSettings;
+      /** Present only for reset-triggered creates so restored work can detect
+       *  a same-name account changing providers. Timed creates omit it. */
+      resetProvider?: 'claude' | 'codex' }
   | { kind: 'send'; sessionId: string; text: string }
   | { kind: 'resume'; sessionId: string; prompt: string };
 

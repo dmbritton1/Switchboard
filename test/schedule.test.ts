@@ -134,6 +134,25 @@ test('toJSON/restore round-trips the queue', () => {
   assert.equal(back.due(10 * HOUR, ctx()).length, 1);
 });
 
+test('reset-create provider identity round-trips without changing timed create data', () => {
+  const s = new Scheduler();
+  s.add(
+    { kind: 'reset', account: 'main' },
+    { ...CREATE, resetProvider: 'codex' } as Action,
+    0,
+  );
+  s.add({ kind: 'at', time: HOUR }, CREATE, 1);
+
+  const stored = JSON.parse(JSON.stringify(s.toJSON()));
+  assert.equal(stored[0].action.resetProvider, 'codex');
+  assert.equal(Object.hasOwn(stored[1].action, 'resetProvider'), false);
+
+  const restored = new Scheduler();
+  restored.restore(stored);
+  assert.equal((restored.all()[0].action as unknown as { resetProvider?: string }).resetProvider, 'codex');
+  assert.equal(Object.hasOwn(restored.all()[1].action, 'resetProvider'), false);
+});
+
 test('restore drops malformed items rather than throwing', () => {
   // state.json is hand-editable, so treat it as untrusted.
   const s = new Scheduler();
