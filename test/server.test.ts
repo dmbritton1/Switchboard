@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
+  access, chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -274,7 +274,10 @@ function untilLink(linker: Linker, predicate: (link: PublicLink | null) => boole
  * so a test can assert on what launch() actually passed (e.g. `auto`) rather
  * than just the registry's end state. `stop()` emits `stopped` itself,
  * matching the real adapters (both re-enter the emit callback from their
- * own stop()).
+ * own stop()) — via the `emit` captured by that specific `start()` call, not
+ * the shared `cb`, so a handoff test that keeps two sessions live on one
+ * fakeAdapter instance and stops the older one after the newer one starts
+ * still notifies the right session.
  */
 function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; starts: StartOpts[] } {
   let cb: ((e: AdapterEvent) => void) | null = null;
@@ -287,7 +290,7 @@ function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; sta
         send() {},
         decide() {},
         setAuto() {},
-        stop() { cb?.({ type: 'stopped', reason: 'stopped by handle' }); },
+        stop() { emit({ type: 'stopped', reason: 'stopped by handle' }); },
       };
     },
   };
@@ -1528,6 +1531,86 @@ test('POST /command push rejects worktrees selected from two different repos', a
 
   assert.equal(res.status, 400);
   assert.match((await res.json()).error, /different repos/i);
+});
+
+test('handoff branches from the source, writes the transcript, and stops the source', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/src', account: 'claude-main', prompt: 'do the thing' }),
+  }).then((r) => r.json());
+  const source = registry.get(created.id)!;
+  await writeFile(join(source.cwd, 'work.txt'), 'uncommitted work\n');
+  registry.apply(created.id, { type: 'status', status: 'done' });
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/dest' }),
+  });
+  const { id } = await res.json();
+
+  assert.equal(res.status, 200);
+  const dest = registry.get(id)!;
+  assert.equal(dest.account, 'codex');
+  assert.equal(dest.branch, 'feat/dest');
+  assert.equal(
+    await readFile(join(dest.cwd, 'work.txt'), 'utf8'), 'uncommitted work\n',
+    'the source\'s uncommitted work should have been committed and inherited',
+  );
+  const doc = await readFile(join(dest.cwd, '.switchboard', 'handoff.md'), 'utf8');
+  assert.match(doc, /do the thing/);
+  await run('git', ['merge-base', '--is-ancestor', 'feat/src', 'feat/dest'], { cwd: repo });
+  assert.equal(registry.get(created.id)!.status, 'stopped');
+});
+
+test('handoff refuses a working source and creates nothing', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/busy', account: 'claude-main', prompt: 'go' }),
+  }).then((r) => r.json());
+  assert.equal(registry.get(created.id)!.status, 'working');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/nope' }),
+  });
+
+  assert.equal(res.status, 409);
+  assert.equal(registry.all().length, 1, 'no session should have been created');
+  await assert.rejects(access(join(repo, '.claude', 'worktrees', 'feat-nope')));
+});
+
+test('handoff rejects an unknown target account before touching the source worktree', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/keep', account: 'claude-main', prompt: 'go' }),
+  }).then((r) => r.json());
+  registry.apply(created.id, { type: 'status', status: 'done' });
+  await writeFile(join(registry.get(created.id)!.cwd, 'still-dirty.txt'), 'x\n');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'nobody', branch: 'feat/nope' }),
+  });
+
+  assert.equal(res.status, 400);
+  const { stdout } = await run('git', ['status', '--porcelain'], { cwd: registry.get(created.id)!.cwd });
+  assert.ok(stdout.includes('still-dirty.txt'), 'the source worktree should not have been committed');
+  assert.equal(registry.get(created.id)!.status, 'done', 'the source should not have been stopped');
 });
 
 test('POST /command merge then push: end to end against a real repo and remote', async (t) => {
