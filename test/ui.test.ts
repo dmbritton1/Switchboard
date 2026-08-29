@@ -841,7 +841,8 @@ test('accountView renders a fresh Codex five-hour window as a real limit', () =>
   assert.equal(v.real, true);
   assert.equal(v.pct, 11);
   assert.equal(v.title, 'codex-main — 11% of the 5h limit');
-  assert.equal(v.budgetLine, 'codex · pro plan');
+  assert.equal(v.budgetLine, 'codex', 'the panel renders the normalized plan separately');
+  assert.equal(v.plan, 'pro');
   assert.deepEqual(v.windows.map((w) => [w.id, w.label, w.pct, w.stale]),
     [['primary', 'Primary', 11, false]]);
 });
@@ -1168,7 +1169,9 @@ test('real DOM and SSE rendering keeps usage detail scoped and reset options rea
   const when2 = document.select('when2-select', ['at', 'reset']);
   document.element('when-at', 'input');
   document.element('when2-at', 'input');
-  const accountSelect = document.select('account-select', ['codex-ready', 'codex-wait', 'claude-main']);
+  const accountSelect = document.select('account-select', [
+    'codex-ready', 'codex-wait', 'codex-untimed', 'codex-no-plan', 'claude-main',
+  ]);
   document.element('new-reset-note', 'p');
   document.element('when2-reset-note', 'p');
 
@@ -1234,8 +1237,22 @@ test('real DOM and SSE rendering keeps usage detail scoped and reset options rea
         rawProvider: { host: 'must-not-render' },
       }),
       account('codex-wait', 'codex', {
-        limits: limits({ fresh: false }),
+        limits: limits({ plan: 'team', fresh: false }),
         resetScheduling: { eligible: false, resetsAt: null, reason: 'Wait for a fresh Codex window.' },
+      }),
+      account('codex-untimed', 'codex', {
+        limits: limits({
+          plan: 'business',
+          windows: [
+            window({
+              id: 'untimed:secondary', label: 'Secondary', usedPercent: 7,
+              windowDurationMins: null, resetsAt: null,
+            }),
+          ],
+        }),
+      }),
+      account('codex-no-plan', 'codex', {
+        limits: limits({ plan: 'unknown' }),
       }),
       account('claude-main', 'claude', {
         limits: null,
@@ -1252,8 +1269,13 @@ test('real DOM and SSE rendering keeps usage detail scoped and reset options rea
     const meters = document.element('meters');
     const readyMeter = meters.children.find((child) => child.textContent.includes('codex-ready'))!;
     const staleMeter = meters.children.find((child) => child.textContent.includes('codex-wait'))!;
+    const untimedMeter = meters.children.find((child) => child.textContent.includes('codex-untimed'))!;
+    const noPlanMeter = meters.children.find((child) => child.textContent.includes('codex-no-plan'))!;
+    const claudeMeter = meters.children.find((child) => child.textContent.includes('claude-main'))!;
     assert.match(readyMeter.title, /20% of the 5h limit/);
     assert.equal(readyMeter.textContent.includes('pro'), false, 'plan is panel-only');
+    assert.equal(staleMeter.textContent.includes('team'), false, 'stale plan is panel-only');
+    assert.equal(untimedMeter.textContent.includes('business'), false, 'untimed plan is panel-only');
     assert.equal(readyMeter.textContent.includes('Spend control'), false, 'blocks are panel-only');
     assert.equal(readyMeter.textContent.includes('signed in'), false, 'sanitized errors are panel-only');
     assert.match(staleMeter.textContent, /~40%/);
@@ -1261,7 +1283,7 @@ test('real DOM and SSE rendering keeps usage detail scoped and reset options rea
 
     readyMeter.onclick?.();
     const panel = document.element('panel').textContent;
-    assert.match(panel, /pro plan/);
+    assert.equal(panel.match(/pro plan/g)?.length, 1, 'fresh plan renders exactly once');
     assert.match(panel, /5h · 20% · resets/);
     assert.match(panel, /Secondary · 7%/);
     assert.match(panel, /Spend control reached/);
@@ -1269,7 +1291,20 @@ test('real DOM and SSE rendering keeps usage detail scoped and reset options rea
     assert.doesNotMatch(panel, /must-not-render/);
 
     staleMeter.onclick?.();
-    assert.match(document.element('panel').textContent, /stale/);
+    const stalePanel = document.element('panel').textContent;
+    assert.match(stalePanel, /stale/);
+    assert.equal(stalePanel.match(/team plan/g)?.length, 1, 'stale plan renders exactly once');
+
+    untimedMeter.onclick?.();
+    const untimedPanel = document.element('panel').textContent;
+    assert.match(untimedPanel, /no timed window/i);
+    assert.equal(untimedPanel.match(/business plan/g)?.length, 1, 'untimed-only plan renders exactly once');
+
+    noPlanMeter.onclick?.();
+    assert.doesNotMatch(document.element('panel').textContent, /unknown plan/);
+
+    claudeMeter.onclick?.();
+    assert.doesNotMatch(document.element('panel').textContent, /null plan/);
 
     const resetOption = when.querySelector('option[value=reset]')!;
     assert.equal(resetOption.disabled, false);

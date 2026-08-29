@@ -187,6 +187,13 @@ function accountPanel(a) {
   line.textContent = v.budgetLine;
   box.append(h, line);
 
+  if (v.plan) {
+    const plan = document.createElement('p');
+    plan.className = 'meta';
+    plan.textContent = `${v.plan} plan`;
+    box.append(plan);
+  }
+
   const ledger = document.createElement('div');
   ledger.className = 'usage-ledger';
   for (const w of v.windows) {

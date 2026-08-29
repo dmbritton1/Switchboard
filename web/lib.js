@@ -782,7 +782,7 @@ export function accountView(a) {
   return {
     load, pct, real: true,
     title: `${a.name} — ${primary.pct}% of the ${durationLabel(primary.windowDurationMins)} limit`,
-    budgetLine: `${a.provider}${plan ? ` · ${plan} plan` : ''}`,
+    budgetLine: a.provider,
     note: '', windows,
     blocks: viewBlocks(l.blocks),
     plan,
