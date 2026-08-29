@@ -70,7 +70,16 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
   };
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+/**
+ * Polls until `predicate` holds. The deadline is a hang detector, not a
+ * performance assertion: a passing test returns on the first true poll, so a
+ * generous deadline costs nothing and a tight one only measures how loaded the
+ * machine is. At 2s this was the single largest source of suite flakiness —
+ * `npm test` runs 22 files at CPU-count concurrency and several of them spawn
+ * real child processes, so a wait that takes 30ms alone can take seconds under
+ * that contention.
+ */
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error('timed out waiting for Codex adapter event');
