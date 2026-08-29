@@ -10,7 +10,7 @@ import {
   dismissAttachmentUploadError, attachmentComposerBusy,
   beginAttachmentSend, completeAttachmentSend,
   codexSettingsFromForm, codexSettingsSummary, usageLines,
-  accountView, freestAccount, newlyNotifiable,
+  accountView, freestAccount, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
@@ -40,6 +40,13 @@ let selected = new Set();
 let selectionMessage = '';
 let sessionCommandError = null;
 let queueCommandError = '';
+// The link dialog's phase always comes from state.link (see renderLink()) —
+// these two hold only what state.link cannot: a synchronous command failure
+// that leaves the phase unchanged (an empty code, a taken name), and whether
+// the user closed the dialog on a link that is still running server-side.
+// Both reset the moment a fresh link starts or the current one ends.
+let linkCommandError = '';
+let linkDismissed = false;
 // Uploads belong to the open composer, never to the global SSE snapshot. A
 // genuine navigation boundary clears them; re-rendering the same session does
 // not, so a working agent cannot shake chips loose on every streamed event.
@@ -287,6 +294,7 @@ function renderHeader() {
   badge.textContent = `⏱ ${n}`;
   badge.className = panel === 'queue' ? 'open' : '';
   badge.title = `${n} scheduled item${n === 1 ? '' : 's'}`;
+  $('#link-chip').hidden = !state.link;
   const body = panelBody();
   // A panel whose subject vanished (account renamed out of accounts.json)
   // closes itself rather than leaving an empty box open.
@@ -379,6 +387,14 @@ function render() {
   renderHeader();
   renderCommandError();
   openId ? renderSession() : renderGrid();
+  // Nothing to create a session against yet. Welcome takes over #grid's spot
+  // — never openId's, which stays reachable so an existing session survives
+  // its account being unlinked.
+  const noAccounts = state.accounts.length === 0;
+  $('#new-btn').disabled = noAccounts;
+  $('#welcome').hidden = !(noAccounts && !openId);
+  if (!openId) $('#grid').hidden = noAccounts;
+  renderLink();
 }
 
 function renderCommandError() {
@@ -2195,6 +2211,104 @@ const repoCombo = (() => {
   return { setOptions(list_) { all = list_; close(); } };
 })();
 
+/* ---- Account linking ---------------------------------------------------- */
+
+const linkDialog = $('#link');
+// Fires for every way the dialog closes — Esc included, which is native and
+// bypasses #link-close's onclick entirely. Without this, Esc closed the
+// dialog visually but left linkDismissed false, so the next render (any SSE
+// update) popped it right back open.
+linkDialog.addEventListener('close', () => { linkDismissed = true; });
+
+/** Re-renders the link dialog from state.link on every render() — the only
+ *  local state layered on top is linkCommandError (a synchronous command
+ *  failure that leaves the phase unchanged) and linkDismissed (the user
+ *  closed this dialog without cancelling the link). */
+function renderLink() {
+  const v = linkView(state.link ?? null);
+  if (!v) {
+    if (linkDialog.open) linkDialog.close();
+    linkCommandError = '';
+    linkDismissed = false;
+    return;
+  }
+  $('#link-heading').textContent = v.heading;
+  $('#link-hint').textContent = v.hint;
+  $('#link-identity').textContent = v.identityLine;
+  $('#link-error').textContent = v.error ?? linkCommandError;
+  $('#link-url-wrap').hidden = !v.showUrl;
+  if (v.showUrl) $('#link-url').href = v.url;
+  $('#link-code-field').hidden = !v.showCodeBox;
+  $('#link-name-field').hidden = !v.showNameForm;
+  // `required` toggles in lockstep with `hidden` — see bindWhen() below. A
+  // hidden input is not barred from constraint validation on its own, so an
+  // input left `required` while its wrapper is hidden aborts the whole
+  // form's submit before #link-form.onsubmit ever fires.
+  $('#link-code').required = v.showCodeBox;
+  $('#link-name').required = v.showNameForm;
+  if (v.showNameForm && !$('#link-name').value) $('#link-name').value = v.suggestedName ?? '';
+  $('#link-go').hidden = !(v.showCodeBox || v.showNameForm);
+  // Always visible, not hidden in error phase: it is the only thing that can
+  // clear a failed link's still-pending state, and #link-cancel already
+  // posts 'link-cancel', which works in every phase. Relabeled per phase via
+  // linkView so this is pinned by a test rather than living only here.
+  $('#link-cancel').textContent = v.cancelLabel;
+  // Reopening on every render (rather than only when a link first starts)
+  // would undo #link-close — see linkDismissed above.
+  if (!linkDialog.open && !linkDismissed) linkDialog.showModal();
+}
+
+async function startLink(provider) {
+  $('#link-code').value = '';
+  $('#link-name').value = '';
+  linkCommandError = '';
+  linkDismissed = false;
+  $('#settings').close();
+  // Disabled for the round trip, not left disabled after: once the dialog is
+  // open it covers these buttons itself (showModal() makes the rest of the
+  // page inert), and a failure with no pending link needs them clickable
+  // again for a retry.
+  const buttons = [...document.querySelectorAll('[data-link-provider]')];
+  for (const b of buttons) b.disabled = true;
+  const result = await postCommand({ cmd: 'link-start', provider });
+  for (const b of buttons) b.disabled = false;
+  if (!result.ok) linkCommandError = commandFailure(result);
+  render();
+}
+
+for (const button of document.querySelectorAll('[data-link-provider]')) {
+  button.onclick = () => startLink(button.dataset.linkProvider);
+}
+
+// Closing does NOT cancel: the child keeps running so the user can look
+// elsewhere while the browser tab is open. #link-chip reopens it. close()
+// firing the dialog's 'close' listener above sets linkDismissed — no need to
+// set it here too.
+$('#link-close').onclick = () => { linkDialog.close(); };
+$('#link-chip').onclick = () => { linkDismissed = false; renderLink(); };
+$('#link-cancel').onclick = async () => {
+  const result = await postCommand({ cmd: 'link-cancel' });
+  if (!result.ok) { linkCommandError = commandFailure(result); render(); }
+};
+
+$('#link-form').onsubmit = async (event) => {
+  event.preventDefault();
+  const v = linkView(state.link ?? null);
+  if (!v) return;
+  linkCommandError = '';
+  if (v.showNameForm) {
+    const result = await postCommand({ cmd: 'link-confirm', name: $('#link-name').value.trim() });
+    if (!result.ok) { linkCommandError = commandFailure(result); render(); }
+    return;
+  }
+  if (v.showCodeBox) {
+    const code = $('#link-code').value.trim();
+    $('#link-code').value = '';
+    const result = await postCommand({ cmd: 'link-code', code });
+    if (!result.ok) { linkCommandError = commandFailure(result); render(); }
+  }
+};
+
 function openSettings() {
   const dialog = $('#settings');
   const form = dialog.querySelector('form');
@@ -2224,9 +2338,59 @@ function openSettings() {
     return o;
   }));
 
+  renderSettingsAccounts();
   $('#settings-error').textContent = '';
   dialog.showModal();
 }
+
+/** Rebuilt on every Settings open, same as the account <select> above —
+ *  accounts.json can change under a running server. */
+function renderSettingsAccounts() {
+  const rows = state.accounts.map((a) => {
+    const row = document.createElement('div');
+    row.className = 'settings-account';
+    const name = document.createElement('span');
+    name.textContent = a.name;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = a.provider === 'claude' ? 'Claude' : 'Codex';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Unlink';
+    button.onclick = () => askUnlink(a);
+    row.append(name, meta, button);
+    return row;
+  });
+  $('#settings-accounts').replaceChildren(...rows);
+}
+
+function askUnlink(account) {
+  const dialog = $('#unlink');
+  // Same reason startLink() closes it: two simultaneously open <dialog>s
+  // stack their backdrops rather than replacing one another.
+  $('#settings').close();
+  $('#unlink-name').textContent = account.name;
+  $('#unlink-hint').textContent =
+    'Existing sessions stay readable but can never be resumed. Credentials Switchboard created for this account are deleted.';
+  $('#unlink-error').textContent = '';
+  dialog.dataset.name = account.name;
+  dialog.returnValue = '';
+  dialog.showModal();
+}
+
+$('#unlink').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  const go = dialog.returnValue === 'unlink';
+  dialog.returnValue = '';
+  if (!go) return;
+  const result = await postCommand({ cmd: 'unlink', name: dialog.dataset.name });
+  if (!result.ok) {
+    $('#unlink-error').textContent = commandFailure(result);
+    dialog.showModal();
+    return;
+  }
+  render();
+});
 
 $('#settings-btn').onclick = openSettings;
 

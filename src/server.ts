@@ -4,7 +4,7 @@ import { readFile, readdir, rm, stat, lstat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
-import { join, extname, basename } from 'node:path';
+import { join, extname, basename, resolve } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { Scheduler, type Ctx } from './schedule.ts';
@@ -19,20 +19,18 @@ import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
 } from './agents/codex-runtime.ts';
+import {
+  createAccountStore, loadAccounts, ACCOUNT_NAME_RE, type Account, type AccountStore,
+} from './accounts.ts';
+import { Linker, CREDENTIAL_ENV, type PublicLink } from './link.ts';
 import type {
   AccountLimits, Action, Adapter, AdapterEvent, AgentHandle, AgentPrompt, CodexFailureCode,
   CodexThreadSettings, NotifyOn, Session, Settings, SortMode, Trigger,
 } from './types.ts';
 
-const run = promisify(execFile);
+export type { Account } from './accounts.ts';
 
-export type Account = {
-  name: string;
-  provider: 'claude' | 'codex';
-  budget: number;
-  env: Record<string, string>;
-  bin?: string;
-};
+const run = promisify(execFile);
 
 type PreparedProvider = {
   adapter: Adapter;
@@ -42,6 +40,41 @@ async function prepareProvider(account: Account): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
   const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
   return { adapter: createCodexAdapter(runtime) };
+}
+
+/** Does this account have a live agent? `needs-you` counts: it is not
+ *  computing, but it is a running child process parked on an approval prompt,
+ *  so unlinking under it strands a real process rather than a record. */
+export function accountBusy(registry: Registry, name: string): boolean {
+  return registry.all().some(
+    (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
+  );
+}
+
+/**
+ * Best-effort provider logout before a credential dir is deleted, so the
+ * refresh token is revoked rather than orphaned. Callers must swallow any
+ * rejection: the account may already be logged out, or offline, and neither
+ * should block removing the account.
+ *
+ * Resolves the claude binary through `claudeBin` (Linker's own seam — tests
+ * point it at a fake CLI, exactly like the link flow) rather than a bare
+ * `'claude'` literal, so this never spawns a real binary under test. Codex
+ * resolves through the same `prepareCodexRuntime` path the rest of the app
+ * uses, with `requireAuth: false`: the account may already be logged out,
+ * which would otherwise fail the preflight this runs before the logout call.
+ */
+async function revokeLogin(account: Account, claudeBin: string): Promise<void> {
+  const env = { ...process.env, ...account.env } as NodeJS.ProcessEnv;
+  if (account.provider === 'claude') {
+    await run(claudeBin, ['auth', 'logout'], { env, timeout: 10_000 });
+    return;
+  }
+  const runtime = await prepareCodexRuntime(
+    { bin: account.bin, env: account.env },
+    { requireAuth: false },
+  );
+  await run(runtime.commandPath, ['logout'], { env, timeout: 10_000 });
 }
 
 /**
@@ -340,6 +373,10 @@ export function createServer(opts: {
   /** Provider preflight seam used by the offline server tests. */
   prepare?: (account: Account) => Promise<PreparedProvider>;
   resolvePrompt?: typeof resolveAgentPrompt;
+  /** Persistence for linked accounts. Absent disables linking entirely, which
+   *  is what keeps every pre-existing server test unchanged. */
+  accountStore?: AccountStore;
+  linker?: Linker;
   // These hooks exist so tests can park a request inside a specific await and
   // drive a real interleaving, rather than racing two fetches and hoping.
   beforeUploadRootPin?: () => Promise<void>;
@@ -348,7 +385,7 @@ export function createServer(opts: {
 }): Server & { tick: () => Promise<void> } {
   const {
     registry, usage, accounts, scheduler = new Scheduler(), prepare = prepareProvider,
-    resolvePrompt = resolveAgentPrompt,
+    resolvePrompt = resolveAgentPrompt, accountStore, linker,
     beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval,
   } = opts;
   const handles = new Map<string, AgentHandle>();
@@ -373,6 +410,7 @@ export function createServer(opts: {
       sessions: registry.publicSessions(),
       queue: scheduler.all(),
       settings: registry.settings(),
+      link: linker?.snapshot() ?? null,
       accounts: accounts.map((a) => {
         const { limits, error } = usage.getLimits(a.name);
         return {
@@ -832,6 +870,107 @@ export function createServer(opts: {
         return { status: 200, json: { ok: true } };
       }
 
+      case 'link-start': {
+        if (!linker || !accountStore) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        const provider = body.provider;
+        if (provider !== 'claude' && provider !== 'codex') {
+          return { status: 400, json: { error: 'provider must be claude or codex' } };
+        }
+        const { error } = await linker.start(provider);
+        // A pending link is the only reason start() refuses, and that is a
+        // conflict rather than a malformed request.
+        if (error) return { status: 409, json: { error } };
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'link-code': {
+        if (!linker) return { status: 400, json: { error: 'account linking is not available' } };
+        if (typeof body.code !== 'string') {
+          return { status: 400, json: { error: 'code must be a string' } };
+        }
+        const { error } = linker.submitCode(body.code);
+        if (error) return { status: 409, json: { error } };
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'link-confirm': {
+        if (!linker || !accountStore) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        if (typeof body.name !== 'string') {
+          return { status: 400, json: { error: 'name must be a string' } };
+        }
+        const { account, error } = await linker.commit(body.name);
+        if (error || !account) return { status: 409, json: { error: error ?? 'link failed' } };
+        // Directory renamed, now make it durable, then admit it to the running
+        // process. Only this entry enters memory: the file on disk may have
+        // gained hand edits while the browser tab was open, and adopting those
+        // here would be an uncontrolled reload triggered by an unrelated action.
+        await accountStore.append(account);
+        accounts.push(account);
+        registry.touch();
+        return { status: 200, json: { ok: true, name: account.name } };
+      }
+
+      case 'link-cancel': {
+        if (!linker) return { status: 400, json: { error: 'account linking is not available' } };
+        await linker.cancel();
+        return { status: 200, json: { ok: true } };
+      }
+
+      case 'unlink': {
+        if (!accountStore || !linker) {
+          return { status: 400, json: { error: 'account linking is not available' } };
+        }
+        const name = String(body.name);
+        const index = accounts.findIndex((a) => a.name === name);
+        if (index === -1) return { status: 404, json: { error: `unknown account: ${name}` } };
+
+        if (accountBusy(registry, name)) {
+          return { status: 409, json: { error: `${name} has a running session` } };
+        }
+        const queued = scheduler.all().filter((item) =>
+          (item.trigger.kind === 'reset' && item.trigger.account === name)
+          || (item.action.kind === 'create' && item.action.account === name));
+        if (queued.length > 0) {
+          return {
+            status: 409,
+            json: { error: `${name} has ${queued.length} queued item(s). Remove them first.` },
+          };
+        }
+
+        const account = accounts[index];
+        // Durable record first. A failed rm then leaves a stray directory,
+        // which is harmless and sweepable; the reverse order can delete
+        // credentials and then fail to persist, leaving a live entry pointing
+        // at nothing.
+        await accountStore.remove(name);
+        accounts.splice(index, 1);
+
+        // Only ever delete a directory that is exactly <accountsRoot>/<name>.
+        // A hand-written accounts.json entry can point its credential dir
+        // anywhere — real user data this app did not create and does not own
+        // (see the README's claude-alt example). Checked two ways: the name
+        // itself must be shaped like something the app could only have
+        // produced honestly (ACCOUNT_NAME_RE bars `.` and `/`, so join() can
+        // never be walked out of the root by the name), and the resolved
+        // directory must equal the resolved managed path exactly — not
+        // merely share a string prefix with it.
+        const dir = account.env[CREDENTIAL_ENV[account.provider]];
+        const managed = ACCOUNT_NAME_RE.test(name) && dir !== undefined
+          && resolve(dir) === resolve(join(linker.root, name));
+        if (managed) {
+          // Best-effort revoke, so the refresh token dies rather than being
+          // orphaned. A network hiccup must not block removing an account.
+          await revokeLogin(account, linker.claudeBin).catch(() => {});
+          await rm(dir, { recursive: true, force: true });
+        }
+        registry.touch();
+        return { status: 200, json: { ok: true, removedDirectory: managed } };
+      }
+
       default:
         return { status: 400, json: { error: `unknown cmd: ${String(body.cmd)}` } };
     }
@@ -872,9 +1011,7 @@ export function createServer(opts: {
           // cannot run at all, and command() will say so if the item ever fires.
           return a ? usage.free(a.name, a.budget) : false;
         },
-        busy: (name) => registry.all().some(
-          (s) => s.account === name && (s.status === 'working' || s.status === 'needs-you'),
-        ),
+        busy: (name) => accountBusy(registry, name),
       };
 
       for (const item of scheduler.due(Date.now(), ctx)) {
@@ -933,11 +1070,13 @@ export function createServer(opts: {
         push();
         const unsubRegistry = registry.subscribe(push);
         const unsubScheduler = scheduler.subscribe(push);
+        const unsubLink = linker ? linker.subscribe(push) : () => {};
         // Keeps proxies and sleeping laptops from dropping an idle stream.
         const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
         req.on('close', () => {
           unsubRegistry();
           unsubScheduler();
+          unsubLink();
           clearInterval(ping);
         });
         return;
@@ -1184,9 +1323,14 @@ export function createServer(opts: {
 // Entry point: only when run directly, so tests can import createServer freely.
 if (process.argv[1] === new URL(import.meta.url).pathname) {
   const statePath = new URL('../state.json', import.meta.url).pathname;
-  const accounts = JSON.parse(
-    await readFile(new URL('../accounts.json', import.meta.url), 'utf8'),
-  ) as Account[];
+  const accountsPath = new URL('../accounts.json', import.meta.url).pathname;
+  const accounts = await loadAccounts(accountsPath);
+  const accountStore = createAccountStore(accountsPath);
+  const accountsRoot = join(homedir(), '.switchboard', 'accounts');
+  const linker = new Linker({ accountsRoot, accounts: () => accounts });
+  // Clears staging dirs left by a crash or a kill. A pending link deliberately
+  // does not survive a restart.
+  await linker.sweep();
   const usage = new Usage();
   const scheduler = new Scheduler();
   const registry = await Registry.load(statePath, usage, scheduler);
@@ -1215,6 +1359,6 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
-  createServer({ registry, usage, scheduler, accounts })
+  createServer({ registry, usage, scheduler, accounts, accountStore, linker })
     .listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }

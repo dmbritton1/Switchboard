@@ -752,6 +752,76 @@ export function accountView(a) {
   };
 }
 
+const PROVIDER_LABEL = { claude: 'Claude', codex: 'Codex' };
+
+/**
+ * What the link dialog should show, from the snapshot's `link` key alone.
+ *
+ * Pure and DOM-free so the fiddly parts — the paste box appearing only when the
+ * CLI actually prompted, the jump straight to naming when it did not — are
+ * testable without a browser. app.js only sets `hidden` flags from this.
+ */
+export function linkView(link) {
+  if (!link) return null;
+  const provider = PROVIDER_LABEL[link.provider] ?? link.provider;
+
+  if (link.phase === 'error') {
+    return {
+      heading: `Couldn't link ${provider}`,
+      hint: '', showUrl: false, url: null, showCodeBox: false, showNameForm: false,
+      suggestedName: null, identityLine: '', error: link.error ?? 'Something went wrong.',
+      busy: false,
+      // A failed link still holds #pending server-side (settled, but present)
+      // until something clears it — the button that used to hide itself here
+      // was the only thing that could. "Dismiss" rather than "Cancel sign-in":
+      // there is no longer a sign-in running to cancel.
+      cancelLabel: 'Dismiss',
+    };
+  }
+
+  if (link.phase === 'naming') {
+    const identityLine = link.identity
+      ? `Signed in as ${link.identity.email}${link.identity.subscription ? ` · ${link.identity.subscription}` : ''}`
+      : `Signed in to ${provider}.`;
+    return {
+      heading: `Name this ${provider} account`,
+      hint: 'This name appears on the account meter and in the New dialog.',
+      showUrl: false, url: null, showCodeBox: false, showNameForm: true,
+      suggestedName: link.suggestedName, identityLine, error: null, busy: false,
+      cancelLabel: 'Cancel sign-in',
+    };
+  }
+
+  if (link.phase === 'verifying') {
+    return {
+      heading: `Linking ${provider}…`, hint: 'Checking who you signed in as.',
+      showUrl: false, url: null, showCodeBox: false, showNameForm: false,
+      suggestedName: null, identityLine: '', error: null, busy: true,
+      cancelLabel: 'Cancel sign-in',
+    };
+  }
+
+  if (link.phase === 'awaiting-user' && link.url) {
+    return {
+      heading: `Sign in to ${provider}`,
+      hint: link.codeRequested
+        ? 'Approve in the tab that opened, then paste the code it gives you.'
+        : 'Approve in the tab that opened. This dialog updates on its own.',
+      showUrl: true, url: link.url,
+      showCodeBox: Boolean(link.codeRequested), showNameForm: false,
+      suggestedName: null, identityLine: '', error: null, busy: false,
+      cancelLabel: 'Cancel sign-in',
+    };
+  }
+
+  return {
+    heading: `Starting ${provider} sign-in…`, hint: '',
+    showUrl: false, url: null, showCodeBox: false, showNameForm: false,
+    suggestedName: null, identityLine: '', error: null, busy: true,
+    cancelLabel: 'Cancel sign-in',
+  };
+}
+
 /**
  * The command token at the start of `text`, or -1 if there isn't one. Ends at
  * any whitespace, not just a space: the new-session prompt is a textarea, where

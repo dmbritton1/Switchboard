@@ -3,8 +3,10 @@
 ## Setup
 
 - Use Node 22.18 or newer.
-- Run `npm install`, then copy `accounts.example.json` to `accounts.json` before
-  starting the app.
+- Run `npm install`. `accounts.json` is optional: a missing file starts the
+  app in first-run mode with a linking screen instead of the session grid.
+  Copy `accounts.example.json` to `accounts.json` only if you want
+  hand-written entries instead of (or alongside) linking through the UI.
 
 ## Required verification
 
@@ -21,6 +23,8 @@ Registry and git worktrees, then into a provider adapter.
 - `src/server.ts` owns HTTP commands and session/worktree lifecycle.
 - `src/sessions.ts` owns Registry state and persistence.
 - `src/agents/` owns provider adapters and Codex runtime preflight.
+- `src/accounts.ts` owns `accounts.json` reads and writes.
+- `src/link.ts` owns the login child process and the pending-link state machine.
 - `web/` renders browser state and command failures.
 - `test/` covers those boundaries offline.
 
@@ -51,6 +55,16 @@ Registry and git worktrees, then into a provider adapter.
   attachment behavior when an upload or send fails.
 - Treat SDK usage as last-turn data and account pace as an estimate; never
   present either as a provider rate or plan limit.
+- `accounts.json` is co-owned. The app may only append entries it creates and
+  remove entries by name; it must never write an in-memory array wholesale,
+  and must never adopt a concurrent hand edit into the running process.
+- Only ever delete a credential directory that is exactly the app-managed
+  `<accountsRoot>/<name>`. A directory named by a hand-written entry is never
+  removed.
+- The pasted authorization code goes to the login child's stdin only — never
+  logged, never in the SSE snapshot, never persisted.
+- Link tests must never bind port 1455, open a browser, or spawn a real
+  `claude`/`codex` binary.
 
 ## Test isolation
 

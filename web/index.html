@@ -23,6 +23,10 @@
   <span id="conn" hidden>reconnecting…</span>
   <div id="meters"></div>
   <button id="queue-badge" type="button" hidden></button>
+  <!-- Shown while a link is in progress and its dialog has been closed (not
+       cancelled) — the only way back in, since renderLink() will not reopen
+       a dialog the user dismissed on its own. -->
+  <button id="link-chip" type="button" hidden>Linking…</button>
   <!-- .menu-wrap so the outside-click closer in app.js recognises clicks inside
        the open menu as inside; #theme-wrap cancels that class's margin-left,
        the same way #session-menu .menu-wrap does. Filled by renderTheme(). -->
@@ -38,6 +42,16 @@
   <span id="notif-msg"></span>
   <button id="notif-btn" type="button">Enable notifications</button>
 </div>
+<section id="welcome" hidden>
+  <h1>Link an account</h1>
+  <p class="hint">Switchboard runs coding sessions against your Claude and Codex
+    subscriptions. Link at least one to get started — you'll approve it in your
+    browser, the same as signing in anywhere else.</p>
+  <menu>
+    <button type="button" data-link-provider="claude">Link Claude account</button>
+    <button type="button" data-link-provider="codex">Link Codex account</button>
+  </menu>
+</section>
 <main id="grid"></main>
 <p id="command-error" role="alert"></p>
 <section id="session" hidden>
@@ -266,6 +280,49 @@
     </menu>
   </form>
 </dialog>
+<dialog id="link">
+  <!-- Not method="dialog", unlike every other dialog here: submit ADVANCES
+       the flow (pasting a code, then confirming a name) rather than closing
+       it, and the dialog's whole content is re-derived from state.link on
+       every render rather than read once at open time. -->
+  <form id="link-form">
+    <h2 id="link-heading"></h2>
+    <div id="link-status" aria-live="polite">
+      <p class="hint" id="link-hint"></p>
+      <p class="meta" id="link-identity"></p>
+      <p id="link-error" role="alert"></p>
+    </div>
+    <p id="link-url-wrap" hidden>
+      <a id="link-url" target="_blank" rel="noopener">Open the sign-in page</a>
+    </p>
+    <div class="field" id="link-code-field" hidden>
+      <label for="link-code">Code from the sign-in page</label>
+      <input id="link-code" name="code" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field" id="link-name-field" hidden>
+      <label for="link-name">Account name</label>
+      <input id="link-name" name="name" autocomplete="off" spellcheck="false">
+      <p class="hint">Letters, digits and hyphens.</p>
+    </div>
+    <menu>
+      <button type="button" id="link-close">Close</button>
+      <button type="button" id="link-cancel">Cancel sign-in</button>
+      <button type="submit" id="link-go" hidden>Continue</button>
+    </menu>
+  </form>
+</dialog>
+<dialog id="unlink">
+  <form method="dialog">
+    <h2>Unlink account</h2>
+    <p id="unlink-name"></p>
+    <p class="hint" id="unlink-hint"></p>
+    <p id="unlink-error" role="alert"></p>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button id="unlink-go" value="unlink">Unlink</button>
+    </menu>
+  </form>
+</dialog>
 <dialog id="settings">
   <form method="dialog">
     <h2>Settings</h2>
@@ -308,6 +365,13 @@
       Resume rate-limited sessions when the window resets
     </label>
     <p class="hint">Claude accounts only — Codex reports no rate-limit signal.</p>
+
+    <h3>Accounts</h3>
+    <div id="settings-accounts"></div>
+    <menu class="inline">
+      <button type="button" data-link-provider="claude">Link Claude account</button>
+      <button type="button" data-link-provider="codex">Link Codex account</button>
+    </menu>
 
     <p id="settings-error"></p>
     <!-- formnovalidate for the same reason #new's Cancel has it; see the
