@@ -77,6 +77,10 @@ export function renderHandoff(session: Session): string {
   ].join('\n');
   const body = session.transcript
     .map(renderMsg)
-    .filter((chunk): chunk is string => chunk !== null);
+    // Loose comparison, not just a defensive style choice: there's no typecheck
+    // in this project, so a future Msg kind falling off renderMsg's switch
+    // returns undefined, not null, and `!== null` would let it through as a
+    // blank rendered gap instead of being filtered out here.
+    .filter((chunk): chunk is string => chunk != null);
   return [header, ...body].join('\n\n') + '\n';
 }
