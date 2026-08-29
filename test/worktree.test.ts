@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignLanes, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
@@ -56,6 +56,40 @@ test('createWorktree rejects a path that is not a git repo', async (t) => {
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   await assert.rejects(() => createWorktree(dir, 'x'), /not a git repository/i);
+});
+
+test('createWorktree branches from a given start point instead of repo HEAD', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const first = await createWorktree(repo, 'feat/first');
+  await writeFile(join(first, 'only-on-first.txt'), 'source work\n');
+  await run('git', ['add', '.'], { cwd: first });
+  await run('git', ['commit', '-m', 'work on first'], { cwd: first });
+
+  const second = await createWorktree(repo, 'feat/second', 'feat/first');
+
+  assert.equal(
+    await readFile(join(second, 'only-on-first.txt'), 'utf8'), 'source work\n',
+    'the new worktree should carry the start-point branch\'s commits',
+  );
+  // Exits non-zero when it is not an ancestor, which rejects and fails the test.
+  await run('git', ['merge-base', '--is-ancestor', 'feat/first', 'feat/second'], { cwd: repo });
+});
+
+test('createWorktree still branches from repo HEAD when no start point is given', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const first = await createWorktree(repo, 'feat/a');
+  await writeFile(join(first, 'only-on-a.txt'), 'x\n');
+  await run('git', ['add', '.'], { cwd: first });
+  await run('git', ['commit', '-m', 'work on a'], { cwd: first });
+
+  const second = await createWorktree(repo, 'feat/b');
+
+  await assert.rejects(
+    access(join(second, 'only-on-a.txt')),
+    'omitting the start point must keep branching from HEAD, not from the last worktree',
+  );
 });
 
 test('worktreeStatus reports clean, then dirty with line counts', async (t) => {

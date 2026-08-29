@@ -22,12 +22,15 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * `uploads/` is excluded for the same reason the add below excludes it: those
- * files are conversation inputs, not work. Counting them as dirty would ask
- * for a commit that then stages nothing and fails on "nothing to commit".
+ * `uploads/` and `.switchboard/` are excluded for the same reason the add in
+ * commitOutstanding excludes them: those files are conversation inputs, not
+ * work. Counting them as dirty would ask for a commit that then stages nothing
+ * and fails on "nothing to commit".
  */
 async function isDirty(cwd: string): Promise<boolean> {
-  const { stdout } = await run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd });
+  const { stdout } = await run(
+    'git', ['status', '--porcelain', '--', '.', ':!uploads', ':!.switchboard'], { cwd },
+  );
   return stdout.trim().length > 0;
 }
 
@@ -50,6 +53,26 @@ async function isRepoDirty(repo: string): Promise<boolean> {
 export async function currentBranch(cwd: string): Promise<string> {
   const { stdout } = await run('git', ['branch', '--show-current'], { cwd });
   return stdout.trim();
+}
+
+/**
+ * Commits everything outstanding in one worktree, so a branch point or a merge
+ * sees the agent's work rather than the last explicit commit. A clean worktree
+ * is a no-op. Throws on git failure; callers frame the message.
+ *
+ * `uploads/` is where /upload drops pasted and attached files so the agent can
+ * read them by path, and `.switchboard/` is where handoff writes the previous
+ * session's transcript. Both are inputs to the conversation, not work product,
+ * and staging them committed every screenshot and every handoff file into the
+ * branch and then permanently into the merge target.
+ * ponytail: excludes whole directories, so a repo that tracks its own
+ * `uploads/` or `.switchboard/` loses auto-commit for it. Narrow to the paths
+ * the registry recorded if that ever bites.
+ */
+export async function commitOutstanding(cwd: string, branch: string): Promise<void> {
+  if (!(await isDirty(cwd))) return;
+  await run('git', ['add', '-A', '--', '.', ':(exclude)uploads', ':(exclude).switchboard'], { cwd });
+  await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
 }
 
 export type MergeResult =
@@ -93,20 +116,10 @@ export async function mergeWorktrees(
       if (branch === target) {
         return { ok: false, merged, error: `"${branch}" is already ${repo}'s checked-out branch` };
       }
-      if (await isDirty(cwd)) {
-        try {
-          // `uploads/` is where /upload drops pasted and attached files so the
-          // agent can read them by path. They are inputs to the conversation,
-          // not work product, and staging them here committed every screenshot
-          // into the branch and then permanently into the merge target.
-          // ponytail: excludes the whole directory, so a repo that tracks its
-          // own `uploads/` loses auto-commit for it. Narrow to the paths the
-          // registry recorded if that ever bites.
-          await run('git', ['add', '-A', '--', '.', ':(exclude)uploads'], { cwd });
-          await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
-        } catch (err) {
-          return { ok: false, merged, error: `committing "${branch}" failed: ${errMsg(err)}` };
-        }
+      try {
+        await commitOutstanding(cwd, branch);
+      } catch (err) {
+        return { ok: false, merged, error: `committing "${branch}" failed: ${errMsg(err)}` };
       }
       try {
         await run(

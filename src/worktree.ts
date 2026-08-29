@@ -11,7 +11,12 @@ function slug(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-export async function createWorktree(repo: string, branch: string): Promise<string> {
+/**
+ * `from` is a commit-ish the new branch starts at, rather than the repo's
+ * current HEAD. Handoff passes the source session's branch so the successor
+ * inherits its work; every other caller wants HEAD and omits it.
+ */
+export async function createWorktree(repo: string, branch: string, from?: string): Promise<string> {
   try {
     await run('git', ['rev-parse', '--git-dir'], { cwd: repo });
   } catch {
@@ -20,7 +25,7 @@ export async function createWorktree(repo: string, branch: string): Promise<stri
 
   const path = join(repo, '.claude', 'worktrees', slug(branch));
   try {
-    await run('git', ['worktree', 'add', '-b', branch, path], { cwd: repo });
+    await run('git', ['worktree', 'add', '-b', branch, path, ...(from ? [from] : [])], { cwd: repo });
   } catch (err) {
     const msg = String((err as { stderr?: string }).stderr ?? err);
     if (/already exists/i.test(msg)) throw new Error(`branch already exists: ${branch}`);

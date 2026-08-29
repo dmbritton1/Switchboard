@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, access } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorktree } from '../src/worktree.ts';
-import { mergeWorktrees, pushRepo } from '../src/merge.ts';
+import { commitOutstanding, mergeWorktrees, pushRepo } from '../src/merge.ts';
 
 const run = promisify(execFile);
 
@@ -167,6 +167,35 @@ test('mergeWorktrees stops at the first conflicting branch and reports what alre
   assert.equal(result.ok, false);
   assert.deepEqual(result.merged, ['feat/ok'], 'the branch that merged cleanly should stay merged');
   assert.equal(await readFile(join(repo, 'ok.txt'), 'utf8'), 'fine\n');
+});
+
+test('mergeWorktrees leaves .switchboard/ out of the commit and out of the merge target', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/handed');
+  await writeFile(join(wt, 'e.txt'), 'real work\n');
+  await mkdir(join(wt, '.switchboard'), { recursive: true });
+  await writeFile(join(wt, '.switchboard', 'handoff.md'), '# Handoff\n');
+
+  const result = await mergeWorktrees(repo, [{ cwd: wt, branch: 'feat/handed' }]);
+
+  assert.equal(result.ok, true);
+  assert.equal(await readFile(join(repo, 'e.txt'), 'utf8'), 'real work\n');
+  await assert.rejects(access(join(repo, '.switchboard', 'handoff.md')));
+});
+
+test('commitOutstanding commits nothing when only a handoff file is present', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/only-handoff');
+  await mkdir(join(wt, '.switchboard'), { recursive: true });
+  await writeFile(join(wt, '.switchboard', 'handoff.md'), '# Handoff\n');
+  const before = await run('git', ['rev-parse', 'HEAD'], { cwd: wt });
+
+  await commitOutstanding(wt, 'feat/only-handoff');
+
+  const after = await run('git', ['rev-parse', 'HEAD'], { cwd: wt });
+  assert.equal(after.stdout.trim(), before.stdout.trim(), 'no commit should have been made');
 });
 
 test('pushRepo pushes the checked-out branch to origin', async (t) => {

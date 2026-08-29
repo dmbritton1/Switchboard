@@ -27,6 +27,7 @@ Registry and git worktrees, then into a provider adapter.
 - `src/link.ts` owns the login child process and the pending-link state machine.
 - `web/` renders browser state and command failures.
 - `test/` covers those boundaries offline.
+- `src/handoff.ts` owns the transcript render and the successor's opening prompt.
 
 ## Safety boundaries
 
@@ -65,6 +66,9 @@ Registry and git worktrees, then into a provider adapter.
   logged, never in the SSE snapshot, never persisted.
 - Link tests must never bind port 1455, open a browser, or spawn a real
   `claude`/`codex` binary.
+- Handoff renders a transcript to disk. Reasoning is never included, and
+  `.switchboard/` is excluded from the outstanding-work commit so a handoff
+  document can never reach a merge target.
 
 ## Test isolation
 

@@ -760,8 +760,8 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 #new menu button:focus-visible, #when-dialog menu button:focus-visible, #settings menu button:focus-visible,
 #link menu button:focus-visible {
   outline: 2px solid var(--accent-line); outline-offset: 2px; }
-#new-error, #when-error, #settings-error, #link-error, #unlink-error { margin: 0; color: var(--error); font-size: .85rem; }
-#new-error:empty, #when-error:empty, #settings-error:empty, #link-error:empty, #unlink-error:empty { display: none; }
+#new-error, #when-error, #settings-error, #link-error, #unlink-error, #handoff-error { margin: 0; color: var(--error); font-size: .85rem; }
+#new-error:empty, #when-error:empty, #settings-error:empty, #link-error:empty, #unlink-error:empty, #handoff-error:empty { display: none; }
 #link-identity, #link-url-wrap { margin: 0; }
 #link-url { color: var(--accent-text); font-weight: 600; }
 
