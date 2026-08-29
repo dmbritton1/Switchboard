@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
   sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
-  accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable,
+  accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
   attributeBranches, branchHues, HUES, readTheme, ACCENTS, CANVASES,
   pastedName, composeMessage, diffSummary, patchLineClass,
@@ -1550,7 +1550,7 @@ test('an empty composer explains itself instead of silently doing nothing', asyn
 
 const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });
 
-test('attributeBranches walks each tip back to the trunk fork point', () => {
+test('attributeBranches stops each tip at the trunk fork point, but colours trunk too', () => {
   const owner = attributeBranches([
     gc('f1', ['f0'], 'own', ['HEAD -> feat']),
     gc('f0', ['t9'], 'own', []),
@@ -1562,8 +1562,10 @@ test('attributeBranches walks each tip back to the trunk fork point', () => {
   assert.equal(owner.get('f1'), 'feat');
   assert.equal(owner.get('f0'), 'feat', 'attribution continues past the tip');
   assert.equal(owner.get('b1'), 'bugfix', 'a tag is not a branch name');
-  assert.equal(owner.get('t9'), undefined, 'the walk stops at trunk');
-  assert.equal(owner.get('t8'), undefined);
+  // feat's and bugfix's walks both reach t9 but neither may claim it: it was
+  // already seeded with its own name from its own ref, same as any other tip.
+  assert.equal(owner.get('t9'), 'main', "trunk's own ref colours it, same as any branch");
+  assert.equal(owner.get('t8'), 'main', 'attribution continues past trunk\'s own tip too');
 });
 
 test('attributeBranches gives a shared commit to the first tip that claims it', () => {
@@ -1651,4 +1653,91 @@ test('patchLineClass tells the four kinds of patch line apart', () => {
   // `---`/`+++` are stripped server-side, but a *body* line of dashes is real
   // content and must not be mistaken for a header.
   assert.equal(patchLineClass('+++ this is content'), 'add');
+});
+
+test('linkView is null when no link is in progress', () => {
+  assert.equal(linkView(null), null);
+});
+
+test('linkView asks the user to wait before a URL exists', () => {
+  const v = linkView({
+    provider: 'claude', phase: 'starting', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: null,
+  });
+  assert.equal(v.showUrl, false);
+  assert.equal(v.busy, true);
+  assert.equal(v.showCodeBox, false);
+});
+
+test('linkView offers the sign-in link once the URL arrives', () => {
+  const v = linkView({
+    provider: 'codex', phase: 'awaiting-user', url: 'https://auth.openai.com/x',
+    codeRequested: false, identity: null, suggestedName: null, error: null,
+  });
+  assert.equal(v.showUrl, true);
+  assert.equal(v.url, 'https://auth.openai.com/x');
+  assert.equal(v.showCodeBox, false);
+  assert.equal(v.showNameForm, false);
+});
+
+// The paste box follows the CLI's actual prompt, not the provider: the Claude
+// CLI hedges with "if prompted", so the no-prompt branch is real.
+test('linkView shows the code box only once the CLI asked for one', () => {
+  const base = {
+    provider: 'claude', phase: 'awaiting-user', url: 'https://claude.com/x',
+    identity: null, suggestedName: null, error: null,
+  };
+  assert.equal(linkView({ ...base, codeRequested: false }).showCodeBox, false);
+  assert.equal(linkView({ ...base, codeRequested: true }).showCodeBox, true);
+});
+
+test('linkView shows the name form with the identity once naming', () => {
+  const v = linkView({
+    provider: 'claude', phase: 'naming', url: null, codeRequested: false,
+    identity: { email: 'dwight@example.com', subscription: 'pro' },
+    suggestedName: 'claude-dwight', error: null,
+  });
+  assert.equal(v.showNameForm, true);
+  assert.equal(v.suggestedName, 'claude-dwight');
+  assert.match(v.identityLine, /dwight@example\.com/);
+  assert.match(v.identityLine, /pro/i);
+});
+
+test('linkView names the account plainly when the provider exposed no identity', () => {
+  const v = linkView({
+    provider: 'codex', phase: 'naming', url: null, codeRequested: false,
+    identity: null, suggestedName: 'codex', error: null,
+  });
+  assert.equal(v.showNameForm, true);
+  assert.equal(v.suggestedName, 'codex');
+  assert.match(v.identityLine, /Codex/);
+});
+
+test('linkView surfaces an error and hides every input', () => {
+  const v = linkView({
+    provider: 'claude', phase: 'error', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: 'The sign-in timed out.',
+  });
+  assert.equal(v.error, 'The sign-in timed out.');
+  assert.equal(v.showUrl, false);
+  assert.equal(v.showCodeBox, false);
+  assert.equal(v.showNameForm, false);
+});
+
+// C2: a failed link still holds a (settled) pending server-side until
+// something clears it. app.js keeps #link-cancel visible in every phase and
+// relabels it from this field — pinning the label here means the dismiss
+// behaviour is tested even though no test in this suite renders the DOM.
+test('linkView relabels the cancel control to Dismiss once the link has failed', () => {
+  const error = linkView({
+    provider: 'claude', phase: 'error', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: 'The sign-in timed out.',
+  });
+  assert.equal(error.cancelLabel, 'Dismiss');
+
+  const starting = linkView({
+    provider: 'claude', phase: 'starting', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: null,
+  });
+  assert.equal(starting.cancelLabel, 'Cancel sign-in');
 });

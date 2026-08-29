@@ -37,7 +37,7 @@ export async function createWorktree(repo: string, branch: string): Promise<stri
 export type Tier = 'own' | 'trunk' | 'other';
 
 export type GraphCommit = {
-  h: string; p: string[]; subject: string; author: string; when: string;
+  h: string; p: string[]; subject: string; author: string; when: string; at: number;
   refs: string[]; lane: number; row: number; tier: Tier;
 };
 
@@ -70,17 +70,38 @@ export function assignLanes<T extends { h: string; p: string[] }>(
   });
 }
 
-const GRAPH_FORMAT = '--format=%H%x00%P%x00%s%x00%an%x00%ar%x00%D';
+// %at (author Unix timestamp) is fetched alongside %ar (the human "3 days
+// ago" string) purely so the two off-trunk and trunk logs can be merged by
+// actual time below — %ar has no ordering value, it's just text for display.
+const GRAPH_FORMAT = '--format=%H%x00%P%x00%s%x00%an%x00%ar%x00%at%x00%D';
 
 function parseLog(stdout: string, tier: Tier) {
   return stdout.split('\n').filter(Boolean).map((line) => {
-    const [h, p, subject, author, when, refs] = line.split('\0');
+    const [h, p, subject, author, when, at, refs] = line.split('\0');
     return {
       h, subject, author, when, tier,
+      at: Number(at),
       p: p ? p.split(' ') : [],
       refs: refs.split(',').map((r) => r.trim()).filter(Boolean),
     };
   });
+}
+
+/**
+ * Merge two newest-first commit lists into one newest-first list, by author
+ * time. Safe to do without touching either list's internal order: `off` and
+ * `spine` are disjoint (one is defined as unreachable from trunk, the other
+ * only as reachable from it), and no trunk commit can have an off-trunk
+ * parent, or that parent would itself be reachable from trunk. So neither
+ * list ever needs a commit from the other to satisfy assignLanes' "parent
+ * follows child" requirement, and interleaving by date can only ever reorder
+ * commits that have no ordering relationship to begin with.
+ */
+function mergeByDate<T extends { at: number }>(a: T[], b: T[]): T[] {
+  const out: T[] = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) out.push(a[i].at >= b[j].at ? a[i++] : b[j++]);
+  return out.concat(a.slice(i), b.slice(j));
 }
 
 /**
@@ -92,11 +113,12 @@ function parseLog(stdout: string, tier: Tier) {
  * ref and all. Instead the budget is split — everything off-trunk, plus a
  * bounded slice of trunk — so no branch can be starved by trunk's activity.
  *
- * The two results are concatenated and deliberately NOT re-sorted. They are
- * disjoint (one set is defined as unreachable from trunk, the other only as
- * reachable from it), and no trunk commit can have an off-trunk parent, or
- * that parent would be reachable from trunk. So every parent still follows
- * its child and assignLanes' topological requirement holds.
+ * The two results are then merged by commit time (see mergeByDate), not
+ * concatenated: a stale side branch untouched for days must sink below
+ * trunk's recent activity instead of burying it, which a blind "all of off,
+ * then all of spine" concatenation did — every off-trunk branch in the repo,
+ * however old and however unrelated to this session, rendered as a single
+ * block above the entire trunk history, no matter how recent that was.
  *
  * Trunk is the base repo's checked-out branch — the same branch mergeWorktrees
  * merges into — so the graph's spine and the merge target cannot drift apart.
@@ -130,7 +152,7 @@ export async function commitGraph(
   ]);
 
   const mine = new Set(own.stdout.split('\n').filter(Boolean));
-  const commits = [...parseLog(off.stdout, 'other'), ...parseLog(spine.stdout, 'trunk')];
+  const commits = mergeByDate(parseLog(off.stdout, 'other'), parseLog(spine.stdout, 'trunk'));
   for (const c of commits) if (mine.has(c.h)) c.tier = 'own';
   return assignLanes(commits);
 }

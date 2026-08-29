@@ -54,6 +54,11 @@ export type CodexRuntimeDeps = {
   bundledPath?: string;
   sdkVersion?: string;
   preflightTimeoutMs?: number;
+  /** Skip the `login status` preflight. Account linking sets this false: it
+   *  runs against a fresh, empty credential dir, where an auth check would
+   *  always fail on the one path that exists to create those credentials.
+   *  Version and executability checks still run. */
+  requireAuth?: boolean;
   runFile?: (
     file: string,
     args: string[],
@@ -288,10 +293,11 @@ async function prepareCandidate(
   env: Record<string, string>,
   runFile: NonNullable<CodexRuntimeDeps['runFile']>,
   diagnostics: string[],
+  requireAuth: boolean,
 ): Promise<PreparedCodexRuntime> {
   await assertCandidateFile(path, source);
   const version = await readCompatibleVersion(path, source, sdkVersion, env, runFile);
-  await assertAuthentication(path, env, diagnostics, runFile);
+  if (requireAuth) await assertAuthentication(path, env, diagnostics, runFile);
   return {
     source,
     commandPath: path,
@@ -343,19 +349,20 @@ export async function prepareCodexRuntime(
   const runFile: NonNullable<CodexRuntimeDeps['runFile']> = (file, args, options) =>
     runPreflightFile(baseRunFile, file, args, options.env, timeoutMs);
   const diagnostics: string[] = [];
+  const requireAuth = deps.requireAuth ?? true;
 
   if (safeAccount.bin !== undefined) {
-    return prepareCandidate(safeAccount.bin, 'explicit', sdkVersion, env, runFile, diagnostics);
+    return prepareCandidate(safeAccount.bin, 'explicit', sdkVersion, env, runFile, diagnostics, requireAuth);
   }
 
   const chatgptPath = deps.chatgptPath ?? CHATGPT_PATH;
   try {
-    return await prepareCandidate(chatgptPath, 'chatgpt', sdkVersion, env, runFile, diagnostics);
+    return await prepareCandidate(chatgptPath, 'chatgpt', sdkVersion, env, runFile, diagnostics, requireAuth);
   } catch (error) {
     if (!(error instanceof CodexRuntimeError) || error.code === 'codex_auth_unavailable') throw error;
     diagnostics.push(chatgptDiagnostic(error, chatgptPath, sdkVersion));
   }
 
   const bundledPath = deps.bundledPath ?? defaultBundledPath();
-  return prepareCandidate(bundledPath, 'sdk', sdkVersion, env, runFile, diagnostics);
+  return prepareCandidate(bundledPath, 'sdk', sdkVersion, env, runFile, diagnostics, requireAuth);
 }

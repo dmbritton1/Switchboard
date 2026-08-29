@@ -130,11 +130,32 @@ test('capturePage reports a missing browser instead of throwing', async () => {
   assert.match((shot as { error: string }).error, /no Chromium-family browser/);
 });
 
+/**
+ * Counting `switchboard-shot-*` in the *shared* system temp dir made this test
+ * and its twin in simulator.test.ts fail each other: both create such a
+ * directory, `node --test` runs the two files as concurrent processes, and
+ * whichever sampled across the other's capture came back off by one. Pointing
+ * TMPDIR at a private directory first gives each file its own namespace, so the
+ * count only ever sees this test's own work. capture() reads os.tmpdir() per
+ * call and os.tmpdir() re-reads the env every time, so this takes effect
+ * immediately and is restored afterwards.
+ */
 test('capturePage leaves no scratch directory behind', async (t) => {
   const dir = await scratch(t);
+  const priorTmp = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  t.after(() => { process.env.TMPDIR = priorTmp; });
+
   const count = async () => (await readdir(tmpdir()))
     .filter((f) => f.startsWith('switchboard-shot-')).length;
   const before = await count();
+
+  // A concurrent sibling creating a scratch dir in the *system* temp dir must
+  // not perturb this count. Without the TMPDIR isolation above, it does, and
+  // this test fails by exactly one — which is how it failed in CI.
+  const decoy = await mkdtemp(join(priorTmp ?? '/tmp', 'switchboard-shot-'));
+  t.after(() => rm(decoy, { recursive: true, force: true }));
+
   await capturePage('http://localhost:3000', {}, await writeFakeChrome(dir));
   await capturePage('http://localhost:3000', { timeoutMs: 600 }, await writeFakeChrome(dir, 'silent'));
   assert.equal(await count(), before, 'the scratch directory must be removed on both paths');

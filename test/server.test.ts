@@ -5,7 +5,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { request as httpRequest } from 'node:http';
 import { Registry, type RegistryOptions } from '../src/sessions.ts';
@@ -17,6 +17,9 @@ import { createWorktree } from '../src/worktree.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from '../src/account-limits.ts';
 import { resetScheduleView } from '../web/lib.js';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
+import { writeFakeLoginCli } from './helpers/fake-login.ts';
+import { createAccountStore, type Account } from '../src/accounts.ts';
+import { Linker, type PublicLink } from '../src/link.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 
 const run = promisify(execFile);
@@ -194,6 +197,72 @@ async function boot(
   const { port } = server.address() as { port: number };
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   return { base: `http://127.0.0.1:${port}`, registry, usage, scheduler, server };
+}
+
+/**
+ * Like boot(), but with account linking wired up: a real Linker pointed at a
+ * fake login CLI (test/helpers/fake-login.ts) so link-start spawns a real
+ * child process and never a real `claude`/`codex` binary, and a real
+ * accountStore over a temp accounts.json.
+ *
+ * The Linker's `accounts` getter and createServer's `accounts` option share
+ * the exact same array reference — mirroring the entry point in src/server.ts
+ * — so link-confirm's `accounts.push(account)` is immediately visible to the
+ * Linker's own duplicate-identity check and suggestName().
+ */
+async function bootLinking(
+  t: { after: (fn: () => void) => void },
+  options: { mode?: 'ok' | 'no-prompt' | 'bad-code' | 'no-url' | 'slow'; email?: string | null } = {},
+) {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-link-'));
+  const accountsPath = join(dir, 'accounts.json');
+  await writeFile(accountsPath, '[]\n');
+  const bin = await writeFakeLoginCli(dir, { provider: 'claude', mode: options.mode, email: options.email });
+  const registry = new Registry(join(dir, 'state.json'));
+  const usage = new Usage();
+  const scheduler = new Scheduler();
+  const linkAccounts: Account[] = [];
+  const accountsRoot = join(dir, 'accounts');
+  const linker = new Linker({
+    accountsRoot,
+    accounts: () => linkAccounts,
+    spawnLogin: (provider, env) => spawn(bin, provider === 'claude' ? ['auth', 'login'] : ['login'], {
+      env: { ...process.env, ...env },
+    }),
+    claudeBin: bin,
+    urlTimeoutMs: 5_000,
+    overallTimeoutMs: 10_000,
+  });
+  const accountStore = createAccountStore(accountsPath);
+  // Sessions started against a linked account (unlink's in-use tests) must
+  // never spawn a real claude/codex binary — reuses the same fakeAdapter()
+  // boot() uses below, just wired through the `prepare` seam instead.
+  const { adapter } = fakeAdapter();
+  const server = createServer({
+    registry, usage, scheduler, accounts: linkAccounts, accountStore, linker,
+    prepare: async () => ({ adapter }),
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address() as { port: number };
+  const base = `http://127.0.0.1:${port}`;
+  t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
+  return {
+    base, registry, usage, scheduler, server, linker, accountsPath, accountsRoot, accounts: linkAccounts,
+    accountStore, tmp: dir,
+  };
+}
+
+/** Resolves once `linker.snapshot()` satisfies `predicate`, or rejects after 5s. */
+function untilLink(linker: Linker, predicate: (link: PublicLink | null) => boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (!predicate(linker.snapshot())) return;
+      unsub(); clearTimeout(timer); resolve();
+    };
+    const timer = setTimeout(() => { unsub(); reject(new Error('timed out waiting for link phase')); }, 5_000);
+    const unsub = linker.subscribe(check);
+    check();
+  });
 }
 
 /**
@@ -2873,4 +2942,209 @@ test('GET /diff is behind the Host guard like every other route', async (t) => {
     method: 'GET', headers: { Host: 'evil.example' },
   });
   assert.equal(res.status, 403);
+});
+
+// ---- account linking --------------------------------------------------
+
+test('link commands are rejected when the account store seam is absent', async (t) => {
+  // Every pre-existing server test constructs createServer without an
+  // accountStore. Those tests must keep passing untouched, so linking has to
+  // be off by default rather than reaching for a real accounts.json.
+  const { base } = await boot(t);
+  const res = await post(base, { cmd: 'link-start', provider: 'claude' });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /not available/);
+});
+
+test('link-start rejects an unknown provider', async (t) => {
+  const { base } = await bootLinking(t);
+  const res = await post(base, { cmd: 'link-start', provider: 'gpt' });
+  assert.equal(res.status, 400);
+});
+
+test('link-start refuses a second concurrent link', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-start', provider: 'claude' })).status, 200);
+  const second = await post(base, { cmd: 'link-start', provider: 'claude' });
+  assert.equal(second.status, 409);
+  await post(base, { cmd: 'link-cancel' });
+});
+
+test('link-code and link-confirm 409 when out of phase', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-code', code: 'x' })).status, 409);
+  assert.equal((await post(base, { cmd: 'link-confirm', name: 'a' })).status, 409);
+});
+
+test('link-cancel with nothing pending is a 200, not an error', async (t) => {
+  const { base } = await bootLinking(t);
+  assert.equal((await post(base, { cmd: 'link-cancel' })).status, 200);
+});
+
+test('a completed link appears in accounts.json and in the snapshot', async (t) => {
+  const { base, linker, accountsPath } = await bootLinking(t, { mode: 'no-prompt', email: 'dwight@example.com' });
+  await post(base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(linker, (l) => l?.phase === 'naming');
+  const res = await post(base, { cmd: 'link-confirm', name: 'claude-dwight' });
+  assert.equal(res.status, 200);
+  const written = JSON.parse(await readFile(accountsPath, 'utf8'));
+  assert.deepEqual(written.map((a: { name: string }) => a.name), ['claude-dwight']);
+  const snap = await firstSnapshot(base);
+  assert.ok(snap.accounts.some((a: { name: string }) => a.name === 'claude-dwight'));
+  assert.equal(snap.link, null);
+});
+
+// The AGENTS.md rule: account env values, which includes every credential
+// directory path, must never reach the browser.
+test('the snapshot never contains the staging path or the submitted code', async (t) => {
+  const { base, linker } = await bootLinking(t, { mode: 'bad-code' });
+  await post(base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(linker, (l) => l?.codeRequested === true);
+  const staging = linker.stagingDir();
+  assert.ok(staging, 'expected a staging dir while awaiting a code');
+  await post(base, { cmd: 'link-code', code: 'sentinel-secret-code' });
+  await untilLink(linker, (l) => l?.phase === 'error');
+  const serialized = JSON.stringify(await firstSnapshot(base));
+  assert.ok(!serialized.includes('sentinel-secret-code'));
+  assert.ok(!serialized.includes(staging));
+});
+
+// ---- unlink -------------------------------------------------------------
+
+/** Full link-start + link-confirm against a fake login CLI, producing a real
+ *  account entry in accounts.json and a real credential dir under the root. */
+async function linkAccount(
+  h: { base: string; linker: Linker },
+  name: string,
+): Promise<void> {
+  await post(h.base, { cmd: 'link-start', provider: 'claude' });
+  await untilLink(h.linker, (l) => l?.phase === 'naming');
+  const res = await post(h.base, { cmd: 'link-confirm', name });
+  assert.equal(res.status, 200);
+}
+
+/** Starts a real session (through a fake adapter — see bootLinking) on
+ *  `account`, inside a scratch git repo, for unlink's in-use tests. */
+async function startSession(h: { base: string }, account: string): Promise<string> {
+  const repo = await makeRepo();
+  const res = await post(h.base, {
+    cmd: 'create', repo, branch: 'wip', account, prompt: 'hi',
+  });
+  assert.equal(res.status, 200);
+  return (await res.json()).id as string;
+}
+
+test('unlink refuses while a session on the account is running', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  await startSession(h, 'claude-x');
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+  assert.match((await res.json()).error, /running/);
+});
+
+test('unlink refuses while a create is queued for the account', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const repo = await makeRepo();
+  await post(h.base, {
+    cmd: 'schedule',
+    trigger: { kind: 'at', time: Date.now() + 3_600_000 },
+    action: { kind: 'create', repo, branch: 'feat/x', account: 'claude-x', prompt: 'hi' },
+  });
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+});
+
+// The queued-item guard is `(trigger.kind === 'reset' && trigger.account ===
+// name) || (action.kind === 'create' && action.account === name)` — two
+// independent expressions. The test above only exercises the `create` half;
+// this one isolates the `reset` half by giving the action a different,
+// unrelated account, so it can't accidentally pass via the other clause.
+test('unlink refuses while a reset trigger is queued for the account', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  h.scheduler.add({ kind: 'reset', account: 'claude-x' }, {
+    kind: 'send', sessionId: 'unrelated-session', text: 'hi',
+  });
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+});
+
+test('unlink succeeds over a stopped session, which then cannot resume', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const id = await startSession(h, 'claude-x');
+  await post(h.base, { cmd: 'stop', id });
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'claude-x' })).status, 200);
+  const resumed = await post(h.base, { cmd: 'resume', id, prompt: 'again' });
+  assert.equal(resumed.status, 400);
+  assert.match((await resumed.json()).error, /no longer configured/);
+  // The transcript is still readable — an unlinked account leaves a
+  // read-only archive, it does not delete history.
+  const snap = await firstSnapshot(h.base);
+  assert.ok(snap.sessions.some((s: { id: string }) => s.id === id));
+});
+
+test('unlink removes the entry from accounts.json and its credential dir', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  const dir = join(h.accountsRoot, 'claude-x');
+  assert.ok(await stat(dir));
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'claude-x' })).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(h.accountsPath, 'utf8')), []);
+  await assert.rejects(() => stat(dir));
+});
+
+// The test standing between a bug and a user's real credentials.
+test('unlink never deletes a directory outside the accounts root', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(h.tmp, 'my-own-claude-dir');
+  await mkdir(outside, { recursive: true });
+  // A hand-written entry, exactly like the README's claude-alt example.
+  h.accounts.push({
+    name: 'hand-written', provider: 'claude', budget: 1,
+    env: { CLAUDE_CONFIG_DIR: outside },
+  });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'hand-written' })).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(h.accountsPath, 'utf8')), []);
+  assert.ok(await stat(outside), "the user's own directory must survive");
+});
+
+// `join(root, name)` collapses `..` in `name`, so a hand-written entry named
+// `../evil` whose env happens to equal that collapsed path must not pass the
+// guard just because the two sides of the naive comparison are identical
+// expressions. The guard must reject the *name* shape outright.
+test('unlink guard rejects a name that could traverse outside the root via join()', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(h.accountsRoot, '..', 'evil'); // == join(accountsRoot, '../evil')
+  await mkdir(outside, { recursive: true });
+  h.accounts.push({
+    name: '../evil', provider: 'claude', budget: 1,
+    env: { CLAUDE_CONFIG_DIR: outside },
+  });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  const res = await post(h.base, { cmd: 'unlink', name: '../evil' });
+  assert.equal(res.status, 200);
+  assert.ok(await stat(outside), 'a directory outside the root must survive even when it equals join(root, name)');
+});
+
+// A directory whose path merely starts with the accounts root string (a
+// sibling directory like `<root>-evil/`) must not pass a guard that only
+// checks a prefix — the guard has to compare full resolved paths.
+test('unlink guard is not fooled by a sibling directory sharing a path prefix', async (t) => {
+  const h = await bootLinking(t);
+  const outside = join(`${h.accountsRoot}-evil`, 'claude-x');
+  await mkdir(outside, { recursive: true });
+  h.accounts.push({ name: 'claude-x', provider: 'claude', budget: 1, env: { CLAUDE_CONFIG_DIR: outside } });
+  await h.accountStore.append(h.accounts.at(-1)!);
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 200);
+  assert.ok(await stat(outside), 'a sibling directory sharing only a string prefix must survive');
+});
+
+test('unlink of an unknown account is a 404', async (t) => {
+  const h = await bootLinking(t);
+  assert.equal((await post(h.base, { cmd: 'unlink', name: 'nope' })).status, 404);
 });

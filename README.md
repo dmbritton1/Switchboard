@@ -8,8 +8,40 @@ Requires Node >= 22.18 (runs TypeScript directly — there is no build step).
 
 ```bash
 npm install
+npm start   # http://127.0.0.1:4711
+```
+
+`accounts.json` is optional. With none present (or an empty one), the app
+opens on a linking screen instead of the session grid; once at least one
+account exists, add more from Settings → Accounts. Either way, linking is
+browser-driven: click "Link Claude account" or "Link Codex account", approve
+in the tab that opens, and — for Claude — paste back the code the callback
+page gives you; Codex completes on its own once you approve, because `codex
+login` runs a localhost callback server. That callback binds a fixed port
+(1455), so two Codex links can never run concurrently; Switchboard extends the
+same one-at-a-time rule to Claude too, as a deliberate simplicity choice
+rather than a port constraint, so only one link can run at a time, globally,
+regardless of provider. Once the provider confirms who you signed in as, name
+the account (a name is
+suggested from the email) and it's ready to use immediately — no restart.
+
+Linked credentials land in their own directory under
+`~/.switchboard/accounts/<name>/`, and the account's `env` is pointed at it
+(`CLAUDE_CONFIG_DIR` or `CODEX_HOME`). Account names are constrained to
+lowercase letters, digits and hyphens (max 32 characters) because the name
+becomes that directory's path segment. `budget` isn't set from the UI —
+linked accounts default to 2,000,000 and retuning it is still a file edit,
+same as everything below.
+
+`accounts.json` is co-owned: Switchboard only ever appends an entry it just
+created or removes one by name, and never rewrites the file wholesale from
+its in-memory copy — so a hand edit made while the app is running survives.
+Hand edits still take effect on restart; links take effect immediately. The
+shape below remains fully supported and is exactly what a link produces —
+`accounts.example.json` still documents it for hand-editing:
+
+```bash
 cp accounts.example.json accounts.json   # then edit the paths
-npm start                                # http://127.0.0.1:4711
 ```
 
 The second Claude account needs its own config directory. Log in once, interactively:
@@ -55,6 +87,16 @@ status with that same launch environment. Switchboard preserves user and target
 repository Codex configuration, applying only its fixed worktree safety
 overrides: `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'`.
 There are no interactive Codex approvals.
+
+Unlinking (from the account's row in Settings → Accounts) refuses while a
+session on the account is `working` or `needs-you`, or while any queued item
+names it — those are live or promised work on credentials about to disappear.
+It's allowed over `done`/`stopped` sessions, which turn into a read-only
+archive: transcripts, diffs, merge, push and delete keep working; only Resume
+stops, since there is no account left to launch into. Unlinking deletes the
+credential directory only when it is exactly the one Switchboard created for
+that name (`~/.switchboard/accounts/<name>/`) — a hand-written entry like the
+`claude-alt` one above, pointing at `~/.claude-alt`, is never touched.
 
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one

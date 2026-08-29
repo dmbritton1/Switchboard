@@ -78,12 +78,28 @@ test('captureScreenshot refuses a device name that could smuggle a flag', async 
   }
 });
 
+/**
+ * See the twin of this test in browser.test.ts. Both count `switchboard-shot-*`
+ * and both create one, so while they shared the system temp dir and ran as
+ * concurrent `node --test` processes they failed each other by exactly one.
+ * TMPDIR is repointed at a private directory so each file counts only its own.
+ */
 test('captureScreenshot leaves no temp file behind', async (t) => {
   const dir = await scratch(t);
   const { readdir } = await import('node:fs/promises');
+  const priorTmp = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  t.after(() => { process.env.TMPDIR = priorTmp; });
+
   const count = async () => (await readdir(tmpdir()))
     .filter((f) => f.startsWith('switchboard-shot-')).length;
   const before = await count();
+
+  // A concurrent sibling's scratch dir in the *system* temp dir must not move
+  // this count. Without the isolation above it does, by exactly one.
+  const decoy = await mkdtemp(join(priorTmp ?? '/tmp', 'switchboard-shot-'));
+  t.after(() => rm(decoy, { recursive: true, force: true }));
+
   await captureScreenshot('booted', await writeFakeXcrun(dir));
   await captureScreenshot('nope-not-valid!!', await writeFakeXcrun(dir));
   assert.equal(await count(), before, 'the scratch directory must be removed on both paths');
