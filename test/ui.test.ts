@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, decideSpecs, selectionState, triggerLabel, targetLabel,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
   attributeBranches, branchHues, HUES, readTheme, ACCENTS, CANVASES,
@@ -252,6 +252,29 @@ test('cardAction ignores queue items for other sessions, other kinds, and dead s
   assert.deepEqual(
     cardAction(s, [{ id: 'q', state: 'waiting', trigger: { kind: 'at', time: 1 }, action: { kind: 'resume', sessionId: 'a' } }]),
     { kind: 'resume' }, 'time-triggered, not a reset wait');
+});
+
+test('handoffTargets offers other accounts only for finished or stopped sessions', () => {
+  const accounts = [
+    { name: 'claude-main', provider: 'claude' },
+    { name: 'claude-alt', provider: 'claude' },
+    { name: 'codex', provider: 'codex' },
+  ];
+  const names = (status) =>
+    handoffTargets({ id: 's1', account: 'claude-main', status }, accounts).map((a) => a.name);
+
+  // A running agent's half-written files must not be committed underneath it —
+  // the same rule the handoff command enforces server-side.
+  assert.deepEqual(names('working'), []);
+  assert.deepEqual(names('needs-you'), []);
+  // The source's own account is excluded: handing off to it goes nowhere.
+  assert.deepEqual(names('done'), ['claude-alt', 'codex']);
+  assert.deepEqual(names('stopped'), ['claude-alt', 'codex']);
+});
+
+test('handoffTargets is empty when the only account is the session\'s own', () => {
+  const accounts = [{ name: 'claude-main', provider: 'claude' }];
+  assert.deepEqual(handoffTargets({ id: 's1', account: 'claude-main', status: 'done' }, accounts), []);
 });
 
 test('selectionState labels a single-repo selection with the repo name', () => {

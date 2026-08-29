@@ -1,5 +1,5 @@
 import {
-  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   transcriptView, requestOnce, fetchToolDetail,
   createDetailController, changeDetailSession, setDetailExpanded,
@@ -703,6 +703,10 @@ function overflowMenu(s) {
   if (s.status === 'working' || s.status === 'needs-you') {
     menu.append(menuItem('Stop', async () => { await runSessionCommand({ cmd: 'stop', id: s.id }); }));
   }
+  const handoffAccounts = handoffTargets(s, state.accounts);
+  if (handoffAccounts.length) {
+    menu.append(menuItem('Hand off…', () => openHandoff(s, handoffAccounts)));
+  }
   menu.append(
     menuItem('Graph', () => openTab(s.id, 'graph')),
     menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
@@ -721,6 +725,48 @@ function confirmDelete(s) {
   dialog.dataset.id = s.id;
   dialog.showModal();
 }
+
+let handoffSource = null;
+
+function openHandoff(s, targets) {
+  const dialog = $('#handoff');
+  $('#handoff-from').textContent = `From ${s.branch} on ${s.account}`;
+  $('#handoff-error').textContent = '';
+  $('#handoff-branch').value = state.settings.branchPrefix;
+  $('#handoff-account').replaceChildren(...targets.map((a) => {
+    const o = document.createElement('option');
+    o.value = a.name;
+    o.textContent = a.name;
+    return o;
+  }));
+  dialog.returnValue = '';
+  handoffSource = s.id;
+  dialog.showModal();
+}
+
+$('#handoff').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Consumed here for the same reason #new consumes its own: Escape closes a
+  // dialog without setting returnValue, so an unconsumed 'handoff' would make
+  // the next Escape re-POST a still-populated form — an unintended worktree and
+  // a paid agent launch from a keypress that means "cancel".
+  const go = dialog.returnValue === 'handoff';
+  dialog.returnValue = '';
+  if (!go || !handoffSource) return;
+  const result = await postCommand({
+    cmd: 'handoff',
+    id: handoffSource,
+    account: $('#handoff-account').value,
+    branch: $('#handoff-branch').value,
+  });
+  if (!result.ok) {
+    $('#handoff-error').textContent = commandFailure(result);
+    dialog.showModal();
+    return;
+  }
+  handoffSource = null;
+  render();
+});
 
 function openCodexSettings(s) {
   const dialog = $('#codex-settings-dialog');

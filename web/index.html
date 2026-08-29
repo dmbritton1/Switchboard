@@ -282,6 +282,20 @@
     </menu>
   </form>
 </dialog>
+<dialog id="handoff">
+  <form method="dialog">
+    <h2>Hand off session</h2>
+    <p class="hint" id="handoff-from"></p>
+    <label>Account <select id="handoff-account" name="account"></select></label>
+    <label>New branch <input id="handoff-branch" name="branch" required></label>
+    <p class="hint">The new session branches from this one and opens onto a written record of it. This session is stopped.</p>
+    <p class="hint" id="handoff-error"></p>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="handoff">Hand off</button>
+    </menu>
+  </form>
+</dialog>
 <dialog id="link">
   <!-- Not method="dialog", unlike every other dialog here: submit ADVANCES
        the flow (pasting a code, then confirming a name) rather than closing

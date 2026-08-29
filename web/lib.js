@@ -52,6 +52,21 @@ export function cardAction(session, queue = []) {
 }
 
 /**
+ * The accounts a session can be handed off to. Empty means the menu item is
+ * hidden; otherwise it is exactly what fills the dialog's dropdown, so the gate
+ * and the choices can never disagree.
+ *
+ * `working` and `needs-you` are excluded because handoff commits the source
+ * worktree, and a running agent's half-written files must not be captured
+ * underneath it — the same rule the server enforces. The session's own account
+ * is excluded because handing off to it goes nowhere.
+ */
+export function handoffTargets(session, accounts) {
+  if (session.status !== 'done' && session.status !== 'stopped') return [];
+  return accounts.filter((a) => a.name !== session.account);
+}
+
+/**
  * The buttons a pending request gets: `{ label, description, command }`, where
  * `command` is merged into the decide call. An AskUserQuestion carries
  * `options`, and each one answers the question outright, captioned with the
