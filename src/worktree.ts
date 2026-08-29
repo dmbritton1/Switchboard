@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, stat as fsStat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { currentBranch } from './merge.ts';
+import { CONVERSATION_INPUTS, currentBranch } from './merge.ts';
 
 const run = promisify(execFile);
 
@@ -197,14 +197,14 @@ async function readUntracked(
 export async function worktreeStatus(cwd: string): Promise<{
   branch: string; added: number; removed: number; dirty: boolean;
 }> {
+  // Excluded from all three: counting a pasted screenshot as +N added lines made
+  // the card's progress indicator report work nobody did.
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
   const [branch, stat, porcelain, others] = await Promise.all([
     run('git', ['branch', '--show-current'], { cwd }),
-    // `uploads/` is excluded from all three: /upload drops pasted and attached files
-    // there for the agent to read, and counting a screenshot as +N added lines
-    // made the card's progress indicator report work nobody did.
-    run('git', ['diff', 'HEAD', '--numstat', '--', '.', ':!uploads'], { cwd }),
-    run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd }),
-    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
+    run('git', ['diff', 'HEAD', '--numstat', ...SPEC], { cwd }),
+    run('git', ['status', '--porcelain', ...SPEC], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
   ]);
 
   let added = 0;
@@ -303,7 +303,7 @@ function parseNumstat(stdout: string): Omit<FileDiff, 'patch' | 'truncated'>[] {
  * that measured a different range would look like a bug rather than a feature.
  */
 export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
-  const SPEC = ['--', '.', ':!uploads'];
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
   const [numstat, patch, others] = await Promise.all([
     // quotePath=false keeps a non-ASCII path readable in the patch headers, which
     // is what the sanity check below matches against.
@@ -316,7 +316,7 @@ export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
       ['-c', 'core.quotePath=false', 'diff', 'HEAD', '--patch', '--no-color', '--no-ext-diff', ...SPEC],
       { cwd, maxBuffer: 32 * 1024 * 1024 },
     ).catch(() => ({ stdout: '' })),
-    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
   ]);
 
   const rows = parseNumstat(numstat.stdout);

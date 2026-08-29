@@ -137,6 +137,22 @@ test('worktreeStatus ignores uploads/, which is conversation input, not work', a
   assert.deepEqual(await worktreeStatus(wt), { branch: 'feat/up', added: 0, removed: 0, dirty: false });
 });
 
+test('worktreeStatus ignores a pasted upload, which is conversation input, not work', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/pasted');
+
+  // The name writeContainedUpload actually produces (src/upload.ts): a direct
+  // child of the worktree root, not the `uploads/` directory /upload stopped
+  // using. Counting a screenshot as +N added lines made the card's only
+  // progress indicator report work nobody did.
+  await writeFile(
+    join(wt, '.switchboard-upload-0123456789abcdef0123456789abcdef-shot.png'), 'a\nb\nc\n',
+  );
+
+  assert.deepEqual(await worktreeStatus(wt), { branch: 'feat/pasted', added: 0, removed: 0, dirty: false });
+});
+
 test('assignLanes reuses a lane once a branch has merged back', () => {
   //   D   merge of B and C
   //   |\

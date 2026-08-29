@@ -110,8 +110,8 @@ handed away from spends nothing; it works when that account is out of budget,
 which is the case handoff exists for.
 
 Reasoning is never written to that file, and `.switchboard/` is excluded from
-the outstanding-work commit the same way `uploads/` is, so a handoff document
-can never reach a merge target. The source session is stopped — Resume still
+the outstanding-work commit the same way pasted uploads are, so a handoff
+document can never reach a merge target. The source session is stopped — Resume still
 works, but leaving it running would let it edit a branch the new session is
 already based on.
 

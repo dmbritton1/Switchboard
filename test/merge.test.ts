@@ -225,3 +225,22 @@ test('pushRepo reports a clear error when no remote is configured', async (t) =>
   assert.equal(result.ok, false);
   assert.match(result.ok ? '' : result.error, /origin/i);
 });
+
+test('mergeWorktrees leaves a pasted upload out of the commit and out of the merge target', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/pasted');
+  await writeFile(join(wt, 'f.txt'), 'real work\n');
+  // The name writeContainedUpload actually produces (src/upload.ts) — a direct
+  // child of the worktree root, not the `uploads/` directory the old pathspec
+  // named and that /upload stopped using.
+  const upload = '.switchboard-upload-0123456789abcdef0123456789abcdef-shot.png';
+  await writeFile(join(wt, upload), 'pretend png\n');
+
+  const result = await mergeWorktrees(repo, [{ cwd: wt, branch: 'feat/pasted' }]);
+
+  assert.equal(result.ok, true);
+  assert.equal(await readFile(join(repo, 'f.txt'), 'utf8'), 'real work\n');
+  await assert.rejects(access(join(repo, upload)), 'a pasted upload must not reach the merge target');
+  await access(join(wt, upload));
+});

@@ -22,14 +22,34 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * `uploads/` and `.switchboard/` are excluded for the same reason the add in
- * commitOutstanding excludes them: those files are conversation inputs, not
- * work. Counting them as dirty would ask for a commit that then stages nothing
- * and fails on "nothing to commit".
+ * Paths that are inputs to the conversation rather than the agent's work, and so
+ * are kept out of every git view and every auto-commit: the files `/upload`
+ * drops for the agent to read by path, and the handoff document a successor
+ * session is pointed at. Counting them makes a card report work nobody did, and
+ * staging them commits every screenshot into the branch and then permanently
+ * into the merge target.
+ *
+ * One exported list because it used to be six inline copies across this file and
+ * worktree.ts, and they drifted: `.switchboard` was added here and not there,
+ * and `uploads` went stale everywhere. /upload has not written `uploads/` since
+ * writeContainedUpload landed — it writes `.switchboard-upload-<uuid>-<name>` as
+ * a direct child of the worktree root (upload.ts) — so the exclusion silently
+ * stopped matching and pasted files were being committed again. `uploads` stays
+ * for worktrees created before that change.
+ *
+ * ponytail: excludes by name pattern, so a repo tracking its own file that
+ * matches one of these loses auto-commit for it. Narrow to the paths the
+ * registry recorded if that ever bites.
  */
+export const CONVERSATION_INPUTS = [
+  ':(exclude)uploads',
+  ':(exclude).switchboard-upload-*',
+  ':(exclude).switchboard',
+];
+
 async function isDirty(cwd: string): Promise<boolean> {
   const { stdout } = await run(
-    'git', ['status', '--porcelain', '--', '.', ':!uploads', ':!.switchboard'], { cwd },
+    'git', ['status', '--porcelain', '--', '.', ...CONVERSATION_INPUTS], { cwd },
   );
   return stdout.trim().length > 0;
 }
@@ -60,18 +80,11 @@ export async function currentBranch(cwd: string): Promise<string> {
  * sees the agent's work rather than the last explicit commit. A clean worktree
  * is a no-op. Throws on git failure; callers frame the message.
  *
- * `uploads/` is where /upload drops pasted and attached files so the agent can
- * read them by path, and `.switchboard/` is where handoff writes the previous
- * session's transcript. Both are inputs to the conversation, not work product,
- * and staging them committed every screenshot and every handoff file into the
- * branch and then permanently into the merge target.
- * ponytail: excludes whole directories, so a repo that tracks its own
- * `uploads/` or `.switchboard/` loses auto-commit for it. Narrow to the paths
- * the registry recorded if that ever bites.
+ * What it leaves alone is CONVERSATION_INPUTS; see there for why.
  */
 export async function commitOutstanding(cwd: string, branch: string): Promise<void> {
   if (!(await isDirty(cwd))) return;
-  await run('git', ['add', '-A', '--', '.', ':(exclude)uploads', ':(exclude).switchboard'], { cwd });
+  await run('git', ['add', '-A', '--', '.', ...CONVERSATION_INPUTS], { cwd });
   await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
 }
 
