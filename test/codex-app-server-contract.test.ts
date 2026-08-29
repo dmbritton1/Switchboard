@@ -7,12 +7,17 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import {
+  appServerArgs,
   CODEX_TELEMETRY_VERSION,
+  type CodexAppServerMode,
   DENIED_SERVER_METHODS,
   PRIVATE_NOTIFICATIONS,
   TELEMETRY_CLIENT_METHODS,
   TELEMETRY_NOTIFICATIONS,
   telemetryAppServerArgs,
+  TURN_CLIENT_METHODS,
+  TURN_NOTIFICATIONS,
+  verifyAppServerContract,
   verifyTelemetryContract,
 } from '../src/agents/codex-app-server-contract.ts';
 
@@ -101,17 +106,70 @@ test('the phase-one telemetry allowlist remains exactly pinned', () => {
   }
 });
 
-test('telemetry launch arguments clear inherited hooks and MCP configuration', () => {
-  assert.deepEqual(telemetryAppServerArgs(), [
+test('the turn allowlist is pinned separately from telemetry', () => {
+  assert.deepEqual(TURN_CLIENT_METHODS, [
+    'thread/start',
+    'thread/resume',
+    'turn/start',
+    'turn/interrupt',
+  ]);
+  assert.deepEqual(TURN_NOTIFICATIONS, [
+    'error',
+    'thread/started',
+    'thread/tokenUsage/updated',
+    'turn/started',
+    'turn/plan/updated',
+    'item/started',
+    'item/completed',
+    'turn/completed',
+  ]);
+  assert.deepEqual(DENIED_SERVER_METHODS, [
+    'item/commandExecution/requestApproval',
+    'item/fileChange/requestApproval',
+    'item/tool/requestUserInput',
+    'mcpServer/elicitation/request',
+    'item/permissions/requestApproval',
+    'item/tool/call',
+    'account/chatgptAuthTokens/refresh',
+    'attestation/generate',
+    'applyPatchApproval',
+    'execCommandApproval',
+  ]);
+});
+
+test('launch profiles isolate telemetry while preserving turn hooks and MCP configuration', () => {
+  assert.deepEqual(appServerArgs('telemetry'), [
     '--strict-config',
     '-c', 'hooks={}',
     '-c', 'mcp_servers={}',
     '-c', 'otel.exporter="none"',
     'app-server', '--listen', 'stdio://',
   ]);
+  assert.deepEqual(appServerArgs('turns'), [
+    '--strict-config',
+    '-c', 'otel.exporter="none"',
+    'app-server', '--listen', 'stdio://',
+  ]);
+  assert.deepEqual(telemetryAppServerArgs(), appServerArgs('telemetry'));
 });
 
-test('launch refuses inherited hooks, MCP servers, and unknown strict configuration', async (t) => {
+test('turn launch leaves inherited hooks and MCP configuration enabled', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-turn-launch-'));
+  const recordPath = join(directory, 'launch.json');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  assert.equal(await launch(appServerArgs('turns'), env({
+    FAKE_APP_SERVER_LAUNCH_RECORD: recordPath,
+  })), 0);
+  assert.deepEqual(JSON.parse(await readFile(recordPath, 'utf8')), {
+    strict: true,
+    configs: ['otel.exporter="none"'],
+    inheritedHooks: true,
+    inheritedMcpServers: true,
+  });
+});
+
+test('launch rejects unknown strict configuration in both profiles', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-launch-'));
   const hookMarker = join(directory, 'hook-ran');
   const mcpMarker = join(directory, 'mcp-ran');
@@ -146,13 +204,11 @@ test('launch refuses inherited hooks, MCP servers, and unknown strict configurat
   ], launchEnv), 2);
   assert.equal(await readFile(join(directory, 'strict-missing'), 'utf8'), 'strict config missing');
 
-  assert.equal(await launch([
-    '--strict-config',
-    '-c', 'hooks={}',
-    '-c', 'mcp_servers={}',
-    '-c', 'unknown_option=true',
-    'app-server', '--listen', 'stdio://',
-  ], launchEnv), 2);
+  for (const mode of ['telemetry', 'turns'] as const) {
+    const args = appServerArgs(mode);
+    args.splice(args.indexOf('app-server'), 0, '-c', 'unknown_option=true');
+    assert.equal(await launch(args, launchEnv), 2, `${mode} must reject unknown configuration`);
+  }
 });
 
 test('generated contract accepts the exact phase-one schema and reuses a verified runtime', async (t) => {
@@ -168,6 +224,72 @@ test('generated contract accepts the exact phase-one schema and reuses a verifie
     (await readFile(calls, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)),
     [{ operation: 'generate-ts' }],
   );
+});
+
+test('profiles share generated-schema evidence but verify their surfaces separately', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-contract-profiles-'));
+  const calls = join(directory, 'calls.jsonl');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const prepared = runtime({
+    env: env({ FAKE_APP_SERVER_CALL_LOG: calls }),
+    version: '0.145.0+profile-cache',
+  });
+
+  await verifyAppServerContract(prepared, 'telemetry');
+  await verifyAppServerContract(prepared, 'turns');
+  await verifyAppServerContract(prepared, 'turns');
+
+  assert.deepEqual(
+    (await readFile(calls, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)),
+    [{ operation: 'generate-ts' }],
+  );
+});
+
+test('turn profile rejects every missing method or notification while retaining the denied server set', async () => {
+  const required = [...TURN_CLIENT_METHODS, ...TURN_NOTIFICATIONS];
+  for (const [index, member] of required.entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-member-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_OMIT: member }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject missing ${member}`,
+    );
+  }
+
+  for (const mode of ['telemetry', 'turns'] as const satisfies readonly CodexAppServerMode[]) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+${mode}-server-request`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST: 'item/future/requestApproval' }),
+      }), mode),
+    );
+  }
+});
+
+test('turn profile requires the pinned request, item, turn, usage, and routing shapes', async () => {
+  for (const [index, shape] of [
+    'thread-params',
+    'turn-params',
+    'user-input',
+    'thread-items',
+    'turn-status',
+    'turn-error',
+    'token-usage',
+    'routing-ids',
+  ].entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-shape-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject missing ${shape}`,
+    );
+  }
 });
 
 test('generated contract rejects an omitted required member', async () => {

@@ -14,6 +14,22 @@ export const TELEMETRY_NOTIFICATIONS = [
   'account/updated',
   'account/rateLimits/updated',
 ] as const;
+export const TURN_CLIENT_METHODS = [
+  'thread/start',
+  'thread/resume',
+  'turn/start',
+  'turn/interrupt',
+] as const;
+export const TURN_NOTIFICATIONS = [
+  'error',
+  'thread/started',
+  'thread/tokenUsage/updated',
+  'turn/started',
+  'turn/plan/updated',
+  'item/started',
+  'item/completed',
+  'turn/completed',
+] as const;
 export const DENIED_SERVER_METHODS = [
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
@@ -33,6 +49,7 @@ export const PRIVATE_NOTIFICATIONS = [
 const GENERATION_TIMEOUT_MS = 10_000;
 const GENERATION_TERMINATION_GRACE_MS = 250;
 const VERIFIED_CONTRACTS = new Map<string, Promise<void>>();
+const GENERATED_SCHEMAS = new Map<string, Promise<Map<string, string>>>();
 const AUTH_MODES = [
   'apikey',
   'chatgpt',
@@ -48,22 +65,33 @@ export type ContractDeps = {
   timeoutMs?: number;
 };
 
-export function telemetryAppServerArgs(): string[] {
+export type CodexAppServerMode = 'telemetry' | 'turns';
+
+export function appServerArgs(mode: CodexAppServerMode): string[] {
+  const config = mode === 'telemetry'
+    ? ['-c', 'hooks={}', '-c', 'mcp_servers={}']
+    : [];
   return [
     '--strict-config',
-    '-c', 'hooks={}',
-    '-c', 'mcp_servers={}',
+    ...config,
     '-c', 'otel.exporter="none"',
     'app-server', '--listen', 'stdio://',
   ];
+}
+
+export function telemetryAppServerArgs(): string[] {
+  return appServerArgs('telemetry');
 }
 
 function publishedVersion(version: string): string {
   return version.split('+', 1)[0];
 }
 
-function contractError(runtime: PreparedCodexRuntime): Error {
-  return new Error(redactValues('Codex telemetry contract verification failed.', Object.values(runtime.env)));
+function contractError(runtime: PreparedCodexRuntime, mode: CodexAppServerMode): Error {
+  const message = mode === 'telemetry'
+    ? 'Codex telemetry contract verification failed.'
+    : 'Codex app-server turn contract verification failed.';
+  return new Error(redactValues(message, Object.values(runtime.env)));
 }
 
 function sameMembers(actual: Iterable<string>, expected: readonly string[]): boolean {
@@ -137,7 +165,7 @@ async function generate(commandPath: string, env: Record<string, string>, direct
   });
 }
 
-function assertContract(files: Map<string, string>): void {
+function assertContract(files: Map<string, string>, mode: CodexAppServerMode): void {
   const all = [...files.values()].join('\n');
   const client = files.get('ClientRequest.ts');
   const server = files.get('ServerRequest.ts');
@@ -169,35 +197,120 @@ function assertContract(files: Map<string, string>): void {
     || !/rateLimits\s*:\s*RateLimitSnapshot/.test(updated)) {
     throw new Error('generated schema differs from the telemetry contract');
   }
+  if (mode === 'turns') assertTurnContract(files, client, notifications);
 }
 
-async function verify(runtime: PreparedCodexRuntime, timeoutMs: number): Promise<void> {
-  if (publishedVersion(runtime.version) !== CODEX_TELEMETRY_VERSION) throw contractError(runtime);
+function assertTurnContract(files: Map<string, string>, client: string, notifications: string): void {
+  const threadStart = files.get(join('v2', 'ThreadStartParams.ts'));
+  const threadResume = files.get(join('v2', 'ThreadResumeParams.ts'));
+  const turnStart = files.get(join('v2', 'TurnStartParams.ts'));
+  const turnInterrupt = files.get(join('v2', 'TurnInterruptParams.ts'));
+  const userInput = files.get(join('v2', 'UserInput.ts'));
+  const threadItem = files.get(join('v2', 'ThreadItem.ts'));
+  const turn = files.get(join('v2', 'Turn.ts'));
+  const turnStatus = files.get(join('v2', 'TurnStatus.ts'));
+  const turnError = files.get(join('v2', 'TurnError.ts'));
+  const tokenUsage = files.get(join('v2', 'ThreadTokenUsage.ts'));
+  const tokenBreakdown = files.get(join('v2', 'TokenUsageBreakdown.ts'));
+  const thread = files.get(join('v2', 'Thread.ts'));
+  const threadStarted = files.get(join('v2', 'ThreadStartedNotification.ts'));
+  const usageUpdated = files.get(join('v2', 'ThreadTokenUsageUpdatedNotification.ts'));
+  const turnStarted = files.get(join('v2', 'TurnStartedNotification.ts'));
+  const planUpdated = files.get(join('v2', 'TurnPlanUpdatedNotification.ts'));
+  const itemStarted = files.get(join('v2', 'ItemStartedNotification.ts'));
+  const itemCompleted = files.get(join('v2', 'ItemCompletedNotification.ts'));
+  const turnCompleted = files.get(join('v2', 'TurnCompletedNotification.ts'));
+  const error = files.get(join('v2', 'ErrorNotification.ts'));
+  const threadConfig = /model\s*\?\s*:\s*string\s*\|\s*null[\s\S]*cwd\s*\?\s*:\s*string\s*\|\s*null[\s\S]*approvalPolicy\s*\?[\s\S]*sandbox\s*\?[\s\S]*config\s*\?/;
+  const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
+  const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
+  if (!threadStart || !threadResume || !turnStart || !turnInterrupt || !userInput || !threadItem
+    || !turn || !turnStatus || !turnError || !tokenUsage || !tokenBreakdown || !thread
+    || !threadStarted || !usageUpdated || !turnStarted || !planUpdated || !itemStarted
+    || !itemCompleted || !turnCompleted || !error
+    || !TURN_CLIENT_METHODS.every((method) => methods(client).includes(method))
+    || !TURN_NOTIFICATIONS.every((method) => methods(notifications).includes(method))
+    || !threadConfig.test(threadStart)
+    || !/threadId\s*:\s*string/.test(threadResume) || !threadConfig.test(threadResume)
+    || !turnInput.test(turnStart)
+    || !/threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/.test(turnInterrupt)
+    || !/"type"\s*:\s*"text"[\s\S]*text\s*:\s*string/.test(userInput)
+    || !/"type"\s*:\s*"localImage"[\s\S]*path\s*:\s*string/.test(userInput)
+    || !['agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange', 'mcpToolCall', 'webSearch', 'contextCompaction']
+      .every((type) => new RegExp(`"type"\\s*:\\s*"${type}"`).test(threadItem))
+    || !sameMembers(quoted(turnStatus), ['completed', 'interrupted', 'failed', 'inProgress'])
+    || !/id\s*:\s*string[\s\S]*status\s*:\s*TurnStatus[\s\S]*error\s*:\s*TurnError\s*\|\s*null/.test(turn)
+    || !/message\s*:\s*string[\s\S]*codexErrorInfo\s*:\s*CodexErrorInfo\s*\|\s*null/.test(turnError)
+    || !/total\s*:\s*TokenUsageBreakdown[\s\S]*last\s*:\s*TokenUsageBreakdown/.test(tokenUsage)
+    || !['totalTokens', 'inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens']
+      .every((field) => new RegExp(`${field}\\s*:\\s*number`).test(tokenBreakdown))
+    || !/id\s*:\s*string/.test(thread)
+    || !/thread\s*:\s*Thread/.test(threadStarted)
+    || !routing.test(usageUpdated)
+    || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnStarted)
+    || !routing.test(planUpdated)
+    || !routing.test(itemStarted) || !/item\s*:\s*ThreadItem/.test(itemStarted)
+    || !routing.test(itemCompleted) || !/item\s*:\s*ThreadItem/.test(itemCompleted)
+    || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnCompleted)
+    || !routing.test(error) || !/error\s*:\s*TurnError/.test(error)) {
+    throw new Error('generated schema differs from the turn contract');
+  }
+}
+
+async function generateSchema(
+  runtime: PreparedCodexRuntime,
+  timeoutMs: number,
+): Promise<Map<string, string>> {
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-contract-'));
   try {
     await generate(runtime.commandPath, runtime.env, directory, timeoutMs);
-    assertContract(await generatedFiles(directory));
-  } catch {
-    throw contractError(runtime);
+    return await generatedFiles(directory);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+function generatedSchema(runtime: PreparedCodexRuntime, timeoutMs: number): Promise<Map<string, string>> {
+  const key = `${runtime.commandPath}\u0000${runtime.version}`;
+  const existing = GENERATED_SCHEMAS.get(key);
+  if (existing) return existing;
+  const generated = generateSchema(runtime, timeoutMs);
+  GENERATED_SCHEMAS.set(key, generated);
+  void generated.catch(() => {
+    if (GENERATED_SCHEMAS.get(key) === generated) GENERATED_SCHEMAS.delete(key);
+  });
+  return generated;
+}
+
+export function verifyAppServerContract(
+  runtime: PreparedCodexRuntime,
+  mode: CodexAppServerMode,
+  deps: ContractDeps = {},
+): Promise<void> {
+  if (publishedVersion(runtime.version) !== CODEX_TELEMETRY_VERSION) {
+    return Promise.reject(contractError(runtime, mode));
+  }
+  const timeoutMs = typeof deps.timeoutMs === 'number' && deps.timeoutMs > 0
+    ? deps.timeoutMs
+    : GENERATION_TIMEOUT_MS;
+  const key = `${runtime.commandPath}\u0000${runtime.version}\u0000${mode}`;
+  const existing = VERIFIED_CONTRACTS.get(key);
+  if (existing) return existing;
+  const verification = generatedSchema(runtime, timeoutMs)
+    .then((files) => assertContract(files, mode))
+    .catch(() => {
+      throw contractError(runtime, mode);
+    });
+  VERIFIED_CONTRACTS.set(key, verification);
+  void verification.catch(() => {
+    if (VERIFIED_CONTRACTS.get(key) === verification) VERIFIED_CONTRACTS.delete(key);
+  });
+  return verification;
 }
 
 export function verifyTelemetryContract(
   runtime: PreparedCodexRuntime,
   deps: ContractDeps = {},
 ): Promise<void> {
-  const timeoutMs = typeof deps.timeoutMs === 'number' && deps.timeoutMs > 0
-    ? deps.timeoutMs
-    : GENERATION_TIMEOUT_MS;
-  const key = `${runtime.commandPath}\u0000${runtime.version}`;
-  const existing = VERIFIED_CONTRACTS.get(key);
-  if (existing) return existing;
-  const verification = verify(runtime, timeoutMs);
-  VERIFIED_CONTRACTS.set(key, verification);
-  void verification.catch(() => {
-    if (VERIFIED_CONTRACTS.get(key) === verification) VERIFIED_CONTRACTS.delete(key);
-  });
-  return verification;
+  return verifyAppServerContract(runtime, 'telemetry', deps);
 }

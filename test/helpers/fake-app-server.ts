@@ -99,11 +99,14 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     `export type ServerRequest = ${serverRequests.map((method) => `{ "method": "${method}" }`).join(' | ')};`,
   ].join('\n'));
   const notifications = [
+    'error',
     'account/updated',
     'account/rateLimits/updated',
     'remoteControl/status/changed',
     'thread/started',
+    'thread/tokenUsage/updated',
     'turn/started',
+    'turn/plan/updated',
     'item/started',
     'item/completed',
     'turn/completed',
@@ -119,6 +122,79 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, limitName: string | null, primary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, secondary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
   writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimits: RateLimitSnapshot, rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
   writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
+  const shapeOmit = process.env.FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT;
+  const shape = (name: string, value: string): string => shapeOmit === name ? '' : value;
+  writeFileSync(join(out, 'v2', 'ThreadStartParams.ts'), [
+    'export type ThreadStartParams = {',
+    shape('thread-params', 'model?: string | null, cwd?: string | null, approvalPolicy?: "never" | unknown, sandbox?: "workspace-write" | unknown, config?: Record<string, unknown> | null,'),
+    '};\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'ThreadResumeParams.ts'), [
+    'export type ThreadResumeParams = { threadId: string,',
+    shape('thread-params', 'model?: string | null, cwd?: string | null, approvalPolicy?: "never" | unknown, sandbox?: "workspace-write" | unknown, config?: Record<string, unknown> | null,'),
+    '};\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnStartParams.ts'), [
+    'export type TurnStartParams = { threadId: string,',
+    shape('turn-params', 'clientUserMessageId?: string | null, input: Array<UserInput>,'),
+    '};\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnInterruptParams.ts'), 'export type TurnInterruptParams = { threadId: string, turnId: string };\n');
+  writeFileSync(join(out, 'v2', 'UserInput.ts'), [
+    'export type UserInput = { "type": "text", text: string, text_elements: Array<TextElement> } | ',
+    shape('user-input', '{ "type": "localImage", path: string };\n'),
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'ThreadItem.ts'), [
+    'export type ThreadItem = { "type": "agentMessage", id: string } | { "type": "reasoning", id: string } | { "type": "plan", id: string } | { "type": "commandExecution", id: string } | { "type": "fileChange", id: string } | { "type": "mcpToolCall", id: string } | ',
+    shape('thread-items', '{ "type": "webSearch", id: string } | '),
+    '{ "type": "contextCompaction", id: string };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnStatus.ts'), [
+    'export type TurnStatus = ',
+    shape('turn-status', '"completed" | "interrupted" | "failed" | "inProgress"'),
+    ';\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnError.ts'), [
+    'export type TurnError = { message: string, ',
+    shape('turn-error', 'codexErrorInfo: CodexErrorInfo | null,'),
+    ' additionalDetails: string | null };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'Turn.ts'), 'export type Turn = { id: string, status: TurnStatus, error: TurnError | null };\n');
+  writeFileSync(join(out, 'v2', 'TokenUsageBreakdown.ts'), 'export type TokenUsageBreakdown = { totalTokens: number, inputTokens: number, cachedInputTokens: number, cacheWriteInputTokens: number, outputTokens: number, reasoningOutputTokens: number };\n');
+  writeFileSync(join(out, 'v2', 'ThreadTokenUsage.ts'), [
+    'export type ThreadTokenUsage = { total: TokenUsageBreakdown, ',
+    shape('token-usage', 'last: TokenUsageBreakdown,'),
+    ' modelContextWindow: number | null };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'Thread.ts'), 'export type Thread = { id: string };\n');
+  writeFileSync(join(out, 'v2', 'ThreadStartedNotification.ts'), 'export type ThreadStartedNotification = { thread: Thread };\n');
+  writeFileSync(join(out, 'v2', 'ThreadTokenUsageUpdatedNotification.ts'), [
+    'export type ThreadTokenUsageUpdatedNotification = { threadId: string, ',
+    shape('routing-ids', 'turnId: string,'),
+    ' tokenUsage: ThreadTokenUsage };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnStartedNotification.ts'), 'export type TurnStartedNotification = { threadId: string, turn: Turn };\n');
+  writeFileSync(join(out, 'v2', 'TurnPlanUpdatedNotification.ts'), [
+    'export type TurnPlanUpdatedNotification = { threadId: string, ',
+    shape('routing-ids', 'turnId: string,'),
+    ' plan: Array<unknown> };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'ItemStartedNotification.ts'), [
+    'export type ItemStartedNotification = { item: ThreadItem, threadId: string, ',
+    shape('routing-ids', 'turnId: string,'),
+    ' startedAtMs: number };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'ItemCompletedNotification.ts'), [
+    'export type ItemCompletedNotification = { item: ThreadItem, threadId: string, ',
+    shape('routing-ids', 'turnId: string,'),
+    ' completedAtMs: number };\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'TurnCompletedNotification.ts'), 'export type TurnCompletedNotification = { threadId: string, turn: Turn };\n');
+  writeFileSync(join(out, 'v2', 'ErrorNotification.ts'), [
+    'export type ErrorNotification = { error: TurnError, willRetry: boolean, threadId: string, ',
+    shape('routing-ids', 'turnId: string'),
+    ' };\n',
+  ].join(''));
   record({ operation: 'generate-ts' });
   process.exit(0);
 }
@@ -140,6 +216,16 @@ if (appServerIndex !== -1) {
   if (!configs.includes('mcp_servers={}') && process.env.FAKE_APP_SERVER_INHERITED_MCP_MARKER) {
     writeFileSync(process.env.FAKE_APP_SERVER_INHERITED_MCP_MARKER, 'inherited mcp');
     fail('inherited MCP server started');
+  }
+  const launchRecord = process.env.FAKE_APP_SERVER_LAUNCH_RECORD;
+  if (launchRecord) {
+    writeFileSync(launchRecord, JSON.stringify({
+      strict,
+      configs,
+      inheritedHooks: !configs.includes('hooks={}'),
+      inheritedMcpServers: !configs.includes('mcp_servers={}'),
+    }));
+    process.exit(0);
   }
 }
 
