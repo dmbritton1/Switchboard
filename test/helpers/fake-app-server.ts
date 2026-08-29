@@ -149,9 +149,21 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'export type ThreadStartParams = {',
     shape('thread-params', [
       'model?: string | null, cwd?: string | null, ',
-      changedShape('thread-start-approval-type', 'approvalPolicy?: AskForApproval | null, ', 'approvalPolicy?: unknown, '),
-      changedShape('thread-start-sandbox-type', 'sandbox?: SandboxMode | null, ', 'sandbox?: unknown, '),
-      changedShape('thread-start-config-type', 'config?: { [key in string]?: JsonValue } | null,', 'config?: unknown,'),
+      changedShape('thread-start-approval-type', changedShape(
+        'thread-start-approval-union',
+        'approvalPolicy?: AskForApproval | null, ',
+        'approvalPolicy?: AskForApproval | null | unknown, ',
+      ), 'approvalPolicy?: unknown, '),
+      changedShape('thread-start-sandbox-type', changedShape(
+        'thread-start-sandbox-union',
+        'sandbox?: SandboxMode | null, ',
+        'sandbox?: SandboxMode | null | unknown, ',
+      ), 'sandbox?: unknown, '),
+      changedShape('thread-start-config-type', changedShape(
+        'thread-start-config-union',
+        'config?: { [key in string]?: JsonValue } | null,',
+        'config?: { [key in string]?: JsonValue } | null | unknown,',
+      ), 'config?: unknown,'),
     ].join('')),
     '};\n',
   ].join(''));
@@ -159,9 +171,21 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'export type ThreadResumeParams = { threadId: string,',
     shape('thread-params', [
       'model?: string | null, cwd?: string | null, ',
-      changedShape('thread-resume-approval-type', 'approvalPolicy?: AskForApproval | null, ', 'approvalPolicy?: unknown, '),
-      changedShape('thread-resume-sandbox-type', 'sandbox?: SandboxMode | null, ', 'sandbox?: unknown, '),
-      changedShape('thread-resume-config-type', 'config?: { [key in string]?: JsonValue } | null,', 'config?: unknown,'),
+      changedShape('thread-resume-approval-type', changedShape(
+        'thread-resume-approval-union',
+        'approvalPolicy?: AskForApproval | null, ',
+        'approvalPolicy?: AskForApproval | null | unknown, ',
+      ), 'approvalPolicy?: unknown, '),
+      changedShape('thread-resume-sandbox-type', changedShape(
+        'thread-resume-sandbox-union',
+        'sandbox?: SandboxMode | null, ',
+        'sandbox?: SandboxMode | null | unknown, ',
+      ), 'sandbox?: unknown, '),
+      changedShape('thread-resume-config-type', changedShape(
+        'thread-resume-config-union',
+        'config?: { [key in string]?: JsonValue } | null,',
+        'config?: { [key in string]?: JsonValue } | null | unknown,',
+      ), 'config?: unknown,'),
     ].join('')),
     '};\n',
   ].join(''));
@@ -172,12 +196,21 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnInterruptParams.ts'), 'export type TurnInterruptParams = { threadId: string, turnId: string };\n');
   writeFileSync(join(out, 'v2', 'UserInput.ts'), [
-    'export type UserInput = { "type": "text", text: string, ',
-    shape('user-input-text-elements', 'text_elements: Array<TextElement>'),
+    'export type UserInput = { "type": "text", ',
+    changedShape('user-input-text-union', 'text: string, ', 'text: string | null, '),
+    shape('user-input-text-elements', changedShape(
+      'user-input-text-elements-union',
+      'text_elements: Array<TextElement>,',
+      'text_elements: Array<TextElement> | null,',
+    )),
     ' } | { "type": "image", url: string } | ',
     shape('user-input', changedShape(
       'user-input-local-image-path',
-      '{ "type": "localImage", path: string } | ',
+      changedShape(
+        'user-input-local-image-path-union',
+        '{ "type": "localImage", path: string, } | ',
+        '{ "type": "localImage", path: string | null, } | ',
+      ),
       '{ "type": "localImage", detail?: ImageDetail } | ',
     )),
     '{ "type": "audio", url: string } | { "type": "localAudio", path: string } | { "type": "skill", name: string, path: string } | { "type": "mention", name: string, path: string };\n',
@@ -209,7 +242,11 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'ThreadTokenUsageUpdatedNotification.ts'), [
     'export type ThreadTokenUsageUpdatedNotification = { threadId: string, ',
     shape('routing-ids', 'turnId: string,'),
-    changedShape('token-usage-payload', ' tokenUsage: ThreadTokenUsage', ' tokenUsage: unknown'),
+    changedShape('token-usage-payload', changedShape(
+      'token-usage-payload-union',
+      ' tokenUsage: ThreadTokenUsage,',
+      ' tokenUsage: ThreadTokenUsage | null,',
+    ), ' tokenUsage: unknown,'),
     ' };\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnStartedNotification.ts'), 'export type TurnStartedNotification = { threadId: string, turn: Turn };\n');

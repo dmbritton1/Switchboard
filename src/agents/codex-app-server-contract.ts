@@ -232,9 +232,9 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const approvalPolicyContract = /export\s+type\s+AskForApproval\s*=\s*"untrusted"\s*\|\s*"on-request"\s*\|\s*\{\s*"granular"\s*:\s*\{\s*sandbox_approval\s*:\s*boolean\s*,\s*rules\s*:\s*boolean\s*,\s*skill_approval\s*:\s*boolean\s*,\s*request_permissions\s*:\s*boolean\s*,\s*mcp_elicitations\s*:\s*boolean\s*,?\s*\}\s*\}\s*\|\s*"never"\s*;/;
   const sandboxModeContract = /export\s+type\s+SandboxMode\s*=\s*"read-only"\s*\|\s*"workspace-write"\s*\|\s*"danger-full-access"\s*;/;
   const threadBasics = /model\s*\?\s*:\s*string\s*\|\s*null[\s\S]*cwd\s*\?\s*:\s*string\s*\|\s*null/;
-  const threadApproval = /approvalPolicy\s*\?\s*:\s*AskForApproval\s*\|\s*null/;
-  const threadSandbox = /sandbox\s*\?\s*:\s*SandboxMode\s*\|\s*null/;
-  const threadConfig = /config\s*\?\s*:\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null/;
+  const threadApproval = /approvalPolicy\s*\?\s*:\s*AskForApproval\s*\|\s*null\s*,/;
+  const threadSandbox = /sandbox\s*\?\s*:\s*SandboxMode\s*\|\s*null\s*,/;
+  const threadConfig = /config\s*\?\s*:\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*,/;
   const jsonValueContract = /export\s+type\s+JsonValue\s*=\s*number\s*\|\s*string\s*\|\s*boolean\s*\|\s*Array\s*<\s*JsonValue\s*>\s*\|\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*;/;
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
@@ -257,9 +257,9 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
     || !threadConfig.test(threadResume)
     || !turnInput.test(turnStart)
     || !/threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/.test(turnInterrupt)
-    || !textInput || !/text\s*:\s*string/.test(textInput)
-    || !/text_elements\s*:\s*Array\s*<\s*TextElement\s*>/.test(textInput)
-    || !localImageInput || !/path\s*:\s*string/.test(localImageInput)
+    || !textInput || !/text\s*:\s*string\s*,/.test(textInput)
+    || !/text_elements\s*:\s*Array\s*<\s*TextElement\s*>\s*,\s*\}/.test(textInput)
+    || !localImageInput || !/path\s*:\s*string\s*,\s*\}/.test(localImageInput)
     || !['agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange', 'mcpToolCall', 'webSearch', 'contextCompaction']
       .every((type) => new RegExp(`"type"\\s*:\\s*"${type}"`).test(threadItem))
     || !sameMembers(quoted(turnStatus), ['completed', 'interrupted', 'failed', 'inProgress'])
@@ -270,7 +270,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
       .every((field) => new RegExp(`${field}\\s*:\\s*number`).test(tokenBreakdown))
     || !/id\s*:\s*string/.test(thread)
     || !/thread\s*:\s*Thread/.test(threadStarted)
-    || !routing.test(usageUpdated) || !/tokenUsage\s*:\s*ThreadTokenUsage/.test(usageUpdated)
+    || !routing.test(usageUpdated) || !/tokenUsage\s*:\s*ThreadTokenUsage\s*,\s*\}/.test(usageUpdated)
     || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnStarted)
     || !routing.test(planUpdated)
     || !routing.test(itemStarted) || !/item\s*:\s*ThreadItem/.test(itemStarted)

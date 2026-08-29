@@ -299,11 +299,17 @@ test('turn profile requires pinned thread safety aliases and config maps on star
     'sandbox-workspace-write',
     'sandbox-alias-extra',
     'thread-start-approval-type',
+    'thread-start-approval-union',
     'thread-resume-approval-type',
+    'thread-resume-approval-union',
     'thread-start-sandbox-type',
+    'thread-start-sandbox-union',
     'thread-resume-sandbox-type',
+    'thread-resume-sandbox-union',
     'thread-start-config-type',
+    'thread-start-config-union',
     'thread-resume-config-type',
+    'thread-resume-config-union',
     'json-value-type',
   ].entries()) {
     await assert.rejects(
@@ -320,8 +326,11 @@ test('turn profile requires pinned thread safety aliases and config maps on star
 
 test('turn profile keeps required input fields within their exact union members', async () => {
   for (const [index, shape] of [
+    'user-input-text-union',
     'user-input-text-elements',
+    'user-input-text-elements-union',
     'user-input-local-image-path',
+    'user-input-local-image-path-union',
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
@@ -336,14 +345,20 @@ test('turn profile keeps required input fields within their exact union members'
 });
 
 test('turn profile requires a typed token-usage notification payload', async () => {
-  await assert.rejects(
-    verifyAppServerContract(runtime({
-      version: '0.145.0+turn-token-usage-payload',
-      env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: 'token-usage-payload' }),
-    }), 'turns'),
-    (error: unknown) => error instanceof Error
-      && error.message === 'Codex app-server turn contract verification failed.',
-  );
+  for (const [index, shape] of [
+    'token-usage-payload',
+    'token-usage-payload-union',
+  ].entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-token-usage-payload-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject incompatible ${shape}`,
+    );
+  }
 });
 
 test('generated contract rejects an omitted required member', async () => {
