@@ -839,13 +839,17 @@ export function readTheme(raw) {
 }
 
 /**
- * Maps each commit to the branch whose line it sits on, for hover-tracing.
+ * Maps each commit to the branch whose line it sits on, for hover-tracing and
+ * for colouring the graph.
  *
  * git only reports a ref at a branch's tip, so every commit below it is
  * anonymous. Walking back from each tip recovers the rest. The first tip to
  * claim a commit keeps it — the same first-claimer-wins rule assignLanes
- * already applies to lanes — and the walk stops at trunk, which has its own
- * tier and needs no tracing.
+ * already applies to lanes — and that includes trunk: its own name (`main`,
+ * or whatever the checked-out branch is called) is a ref like any other, so
+ * the spine gets attributed and coloured too, and a merged-in feature branch
+ * still keeps its own name for the stretch that is only its own, because its
+ * tip was seeded before trunk's walk ever reaches it.
  */
 function branchNames(c) {
   return c.refs
@@ -881,7 +885,6 @@ export function attributeBranches(commits) {
   // walk would run first (it's the child, so it's earlier in topo order) and
   // claim the tip for itself before the tip ever gets to claim its own name.
   for (const c of commits) {
-    if (c.tier === 'trunk') continue;
     const names = branchNames(c);
     if (names.length && !owner.has(c.h)) owner.set(c.h, names[0]);
   }
@@ -893,8 +896,8 @@ export function attributeBranches(commits) {
       while (queue.length) {
         const h = queue.shift();
         const cur = at.get(h);
-        // Missing parent (outside the window) or trunk, which has its own tier.
-        if (!cur || cur.tier === 'trunk') continue;
+        // Missing parent: outside the fetched window.
+        if (!cur) continue;
         // Claimed by a different name: another branch's tip, which the seed
         // pass pre-claimed for itself — stop rather than swallow its history.
         const claimed = owner.get(h);

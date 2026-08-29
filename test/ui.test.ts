@@ -1143,7 +1143,7 @@ test('an empty composer explains itself instead of silently doing nothing', asyn
 
 const gc = (h, p, tier, refs = []) => ({ h, p, tier, refs });
 
-test('attributeBranches walks each tip back to the trunk fork point', () => {
+test('attributeBranches stops each tip at the trunk fork point, but colours trunk too', () => {
   const owner = attributeBranches([
     gc('f1', ['f0'], 'own', ['HEAD -> feat']),
     gc('f0', ['t9'], 'own', []),
@@ -1155,8 +1155,10 @@ test('attributeBranches walks each tip back to the trunk fork point', () => {
   assert.equal(owner.get('f1'), 'feat');
   assert.equal(owner.get('f0'), 'feat', 'attribution continues past the tip');
   assert.equal(owner.get('b1'), 'bugfix', 'a tag is not a branch name');
-  assert.equal(owner.get('t9'), undefined, 'the walk stops at trunk');
-  assert.equal(owner.get('t8'), undefined);
+  // feat's and bugfix's walks both reach t9 but neither may claim it: it was
+  // already seeded with its own name from its own ref, same as any other tip.
+  assert.equal(owner.get('t9'), 'main', "trunk's own ref colours it, same as any branch");
+  assert.equal(owner.get('t8'), 'main', 'attribution continues past trunk\'s own tip too');
 });
 
 test('attributeBranches gives a shared commit to the first tip that claims it', () => {

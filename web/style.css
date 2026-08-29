@@ -615,10 +615,12 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .tier-trunk { color: var(--body); }
 .tier-other { color: var(--muted); }
 /* Hue is per branch and outranks tier by source order — same specificity, so
-   these five must stay below the three above. Trunk is deliberately left out:
-   the spine reads as the thing the coloured branches leave and rejoin. Five
-   tokens the .ref pills are already contrast-checked against (see
-   test/palette.test.ts), so a pill's label stays legible on any of them. */
+   these five must stay below the three above. Trunk gets one too: its own
+   name is a ref like any other branch's, so the spine is coloured the same
+   way, and only a commit with no reachable ref at all falls back to the flat
+   tier colour above. Five tokens the .ref pills are already contrast-checked
+   against (see test/palette.test.ts), so a pill's label stays legible on any
+   of them. */
 .hue-0 { color: var(--lane-a); }
 .hue-1 { color: var(--lane-b); }
 .hue-2 { color: var(--done); }
