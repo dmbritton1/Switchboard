@@ -800,6 +800,14 @@ export function createServer(opts: {
         }
         try {
           await mkdir(join(cwd, dirname(HANDOFF_FILE)), { recursive: true });
+          // Load-bearing, not incidental: this ignores the whole directory for
+          // git status/diff/add, not just commits. Without it the handoff file
+          // (deliberately never committed) reads as untracked "+N added" work on
+          // every /status poll for the life of the session, shows up as a fake
+          // diff, and — since a pathspec exclusion only stops *this* commit, not
+          // whatever the successor runs later — is one `git add -A` away from
+          // landing in a merge target.
+          await writeFile(join(cwd, dirname(HANDOFF_FILE), '.gitignore'), '*\n', 'utf8');
           await writeFile(join(cwd, HANDOFF_FILE), renderHandoff(source), 'utf8');
         } catch (err) {
           // The worktree is left behind, exactly as `create` leaves one when
@@ -829,6 +837,17 @@ export function createServer(opts: {
         const handle = handles.get(source.id);
         handles.delete(source.id);
         handle?.stop();
+        // A rate-limit stop can have already queued "resume A when account
+        // resets" (see the emit callback above). Left in place, that item fires
+        // after handoff and relaunches A onto a branch B has already moved past,
+        // diverging the two — exactly what stopping A here is meant to prevent.
+        // It also blocks unlinking the (now exhausted) source account, since
+        // unlink refuses while reset-triggered items for it remain queued.
+        for (const item of scheduler.all()) {
+          if (item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === source.id) {
+            scheduler.remove(item.id);
+          }
+        }
         return { status: 200, json: { id: session.id } };
       }
 

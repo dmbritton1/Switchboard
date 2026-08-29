@@ -13,7 +13,8 @@ import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
 import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch, type Account } from '../src/server.ts';
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
-import { createWorktree } from '../src/worktree.ts';
+import { createWorktree, worktreeStatus } from '../src/worktree.ts';
+import { HANDOFF_PROMPT } from '../src/handoff.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from '../src/account-limits.ts';
 import { resetScheduleView } from '../web/lib.js';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
@@ -1536,7 +1537,7 @@ test('POST /command push rejects worktrees selected from two different repos', a
 test('handoff branches from the source, writes the transcript, and stops the source', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));
-  const { adapter } = fakeAdapter();
+  const { adapter, starts } = fakeAdapter();
   const { base, registry } = await boot(t, adapter);
 
   const created = await fetch(new URL('/command', base), {
@@ -1565,6 +1566,16 @@ test('handoff branches from the source, writes the transcript, and stops the sou
   assert.match(doc, /do the thing/);
   await run('git', ['merge-base', '--is-ancestor', 'feat/src', 'feat/dest'], { cwd: repo });
   assert.equal(registry.get(created.id)!.status, 'stopped');
+
+  // The handoff document lives under .switchboard/, which is now .gitignore'd
+  // inside the successor's own worktree — so it must not read back as
+  // uncommitted work the successor never did.
+  const status = await worktreeStatus(dest.cwd);
+  assert.equal(status.added, 0, 'the handoff document must not be counted as added lines');
+  assert.equal(status.dirty, false, 'the handoff document must not mark the successor dirty');
+
+  assert.equal(starts.length, 2, 'the source and the successor should each have started once');
+  assert.equal(starts[1].prompt.text, HANDOFF_PROMPT);
 });
 
 test('handoff refuses a working source and creates nothing', async (t) => {
@@ -1611,6 +1622,41 @@ test('handoff rejects an unknown target account before touching the source workt
   const { stdout } = await run('git', ['status', '--porcelain'], { cwd: registry.get(created.id)!.cwd });
   assert.ok(stdout.includes('still-dirty.txt'), 'the source worktree should not have been committed');
   assert.equal(registry.get(created.id)!.status, 'done', 'the source should not have been stopped');
+});
+
+// The flagship scenario: a Claude session stops mid rate-limit, which queues an
+// automatic "resume when the account resets" (see the auto-requeue wiring
+// tests above), and the user hands off rather than waiting out the window. Left
+// in place, that queued item would later relaunch the source onto a branch the
+// successor has already moved past — exactly the divergence stopping the
+// source is meant to prevent (docs/superpowers/specs/2026-08-29-session-handoff-design.md).
+test('handoff prunes a queued auto-requeue resume for the session it hands off', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, emit } = fakeAdapter();
+  const { base, registry, scheduler } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/req', account: 'claude-main', prompt: 'do the thing' }),
+  }).then((r) => r.json());
+
+  // autoRequeue defaults to true (src/types.ts). The adapter dies on its own
+  // during a rate limit, which is the path that queues an automatic resume.
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt: Date.now() + 3600_000 });
+  emit({ type: 'stopped', reason: 'rate limited' });
+  assert.equal(registry.get(created.id)!.status, 'stopped');
+  assert.equal(scheduler.all().length, 1, 'sanity: a resume should be queued before handoff');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/req-dest' }),
+  });
+  assert.equal(res.status, 200);
+
+  const stale = scheduler.all().filter((item) =>
+    item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === created.id);
+  assert.deepEqual(stale, [], 'no queued resume for the handed-off source should survive handoff');
 });
 
 test('POST /command merge then push: end to end against a real repo and remote', async (t) => {
