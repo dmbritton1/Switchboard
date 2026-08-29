@@ -18,8 +18,11 @@ browser-driven: click "Link Claude account" or "Link Codex account", approve
 in the tab that opens, and — for Claude — paste back the code the callback
 page gives you; Codex completes on its own once you approve, because `codex
 login` runs a localhost callback server. That callback binds a fixed port
-(1455), so only one link can run at a time, globally, regardless of provider.
-Once the provider confirms who you signed in as, name the account (a name is
+(1455), so two Codex links can never run concurrently; Switchboard extends the
+same one-at-a-time rule to Claude too, as a deliberate simplicity choice
+rather than a port constraint, so only one link can run at a time, globally,
+regardless of provider. Once the provider confirms who you signed in as, name
+the account (a name is
 suggested from the email) and it's ready to use immediately — no restart.
 
 Linked credentials land in their own directory under

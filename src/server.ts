@@ -67,14 +67,14 @@ export function accountBusy(registry: Registry, name: string): boolean {
 async function revokeLogin(account: Account, claudeBin: string): Promise<void> {
   const env = { ...process.env, ...account.env } as NodeJS.ProcessEnv;
   if (account.provider === 'claude') {
-    await run(claudeBin, ['auth', 'logout'], { env });
+    await run(claudeBin, ['auth', 'logout'], { env, timeout: 10_000 });
     return;
   }
   const runtime = await prepareCodexRuntime(
     { bin: account.bin, env: account.env },
     { requireAuth: false },
   );
-  await run(runtime.commandPath, ['logout'], { env });
+  await run(runtime.commandPath, ['logout'], { env, timeout: 10_000 });
 }
 
 /**
@@ -903,7 +903,7 @@ export function createServer(opts: {
           return { status: 400, json: { error: 'name must be a string' } };
         }
         const { account, error } = await linker.commit(body.name);
-        if (error || !account) return { status: 409, json: { error } };
+        if (error || !account) return { status: 409, json: { error: error ?? 'link failed' } };
         // Directory renamed, now make it durable, then admit it to the running
         // process. Only this entry enters memory: the file on disk may have
         // gained hand edits while the browser tab was open, and adopting those

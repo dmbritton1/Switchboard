@@ -233,7 +233,13 @@ export class Linker {
   }
 
   async start(provider: LinkProvider): Promise<{ error?: string }> {
-    if (this.#pending) return { error: 'a link is already in progress' };
+    // A settled pending (phase: 'error') is done — #fail already killed its
+    // child, cleared its timers and removed its staging dir. Refusing here
+    // too would permanently lock out linking after the first failure, since
+    // nothing else ever clears #pending in that phase.
+    if (this.#pending && !this.#pending.settled) {
+      return { error: 'a link is already in progress' };
+    }
     if (provider !== 'claude' && provider !== 'codex') return { error: 'unknown provider' };
 
     await mkdir(this.#root, { recursive: true });
@@ -261,26 +267,31 @@ export class Linker {
     this.#pending = pending;
 
     pending.urlTimer = setTimeout(() => {
-      void this.#fail('The sign-in command did not print a sign-in URL.');
+      void this.#fail(pending, 'The sign-in command did not print a sign-in URL.');
     }, this.#urlTimeoutMs);
     pending.overallTimer = setTimeout(() => {
-      void this.#fail('The sign-in timed out. Start it again when you are ready.');
+      void this.#fail(pending, 'The sign-in timed out. Start it again when you are ready.');
     }, this.#overallTimeoutMs);
 
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk: string) => this.#onOutput(chunk, true));
-    child.stderr?.on('data', (chunk: string) => this.#onOutput(chunk, false));
-    child.on('error', (error) => { void this.#fail(this.redact(String(error.message))); });
-    child.on('close', (code) => this.#onClose(code));
+    // Each listener closes over `pending`, the object this child belongs to
+    // — not `this.#pending`, which may already point at a different link by
+    // the time a late event from this child arrives (e.g. after cancel()
+    // + a new start()). #onOutput/#onClose bail unless `pending` is still
+    // the live one, matching the guard #verify already has.
+    child.stdout?.on('data', (chunk: string) => this.#onOutput(pending, chunk, true));
+    child.stderr?.on('data', (chunk: string) => this.#onOutput(pending, chunk, false));
+    child.on('error', (error) => { void this.#fail(pending, this.redact(String(error.message))); });
+    child.on('close', (code) => this.#onClose(pending, code));
 
     this.#notify();
     return {};
   }
 
-  #onOutput(chunk: string, isStdout: boolean): void {
-    const p = this.#pending;
-    if (!p) return;
+  #onOutput(pending: Pending, chunk: string, isStdout: boolean): void {
+    if (this.#pending !== pending) return;   // a stale event from a since-replaced link
+    const p = pending;
     p.tail = (p.tail + chunk).slice(-MAX_OUTPUT_TAIL);
 
     let changed = false;
@@ -317,9 +328,11 @@ export class Linker {
     return {};
   }
 
-  #onClose(code: number | null): void {
-    const p = this.#pending;
-    if (!p || p.settled) return;
+  #onClose(pending: Pending, code: number | null): void {
+    // "is there a pending" is not enough — a stale close from a link that
+    // was cancelled and replaced must not touch the new one (see #onOutput).
+    if (this.#pending !== pending || pending.settled) return;
+    const p = pending;
     if (code === 0) {
       // The login succeeded and staging now holds real credentials — the
       // overall timer must not be left running to later `rm` them out from
@@ -332,7 +345,7 @@ export class Linker {
       void this.#verify(p);
       return;
     }
-    void this.#fail(this.redact(
+    void this.#fail(p, this.redact(
       `The sign-in command exited with code ${code}.${tailSuffix(this.redact(p.tail))}`,
     ));
   }
@@ -345,7 +358,7 @@ export class Linker {
         (a) => a.provider === p.provider && a.identity === identity.email,
       );
       if (clash) {
-        await this.#fail(this.redact(`That account is already linked as ${clash.name}.`));
+        await this.#fail(p, this.redact(`That account is already linked as ${clash.name}.`));
         return;
       }
     }
@@ -363,9 +376,12 @@ export class Linker {
     return staging ? text.split(staging).join('[credential dir]') : text;
   }
 
-  async #fail(message: string): Promise<void> {
-    const p = this.#pending;
-    if (!p || p.settled) return;
+  async #fail(pending: Pending, message: string): Promise<void> {
+    // Same "is it still mine" guard as #onClose/#onOutput: a timer or error
+    // event fired against a link this instance has already moved past
+    // (cancelled, replaced, or already settled) must be a no-op.
+    if (this.#pending !== pending || pending.settled) return;
+    const p = pending;
     // Set before the await below so a concurrent re-entry (e.g. the 'close'
     // event this SIGTERM is about to produce) sees settled=true immediately,
     // not just after the rm() completes.
@@ -414,14 +430,18 @@ export class Linker {
     const target = join(this.#root, name);
     try {
       await rename(p.staging, target);
-    } catch (error) {
-      // Redact against the captured local `p.staging`, not `this.redact()`:
-      // a racing second commit() on the same link can null #pending between
-      // this call's entry and this catch (the first call's success clears
-      // it), at which point this.redact() becomes a no-op and the raw
-      // staging path would reach the browser. Mirrors start()'s catch above.
-      const message = String((error as Error).message ?? error);
-      return { error: message.split(p.staging).join('[credential dir]') };
+    } catch {
+      // Node's rename error names BOTH ends — including `target`, which is
+      // about to become this account's CLAUDE_CONFIG_DIR/CODEX_HOME. Redacting
+      // only `p.staging` (as start()'s catch does, correctly, for a path that
+      // never becomes a live credential dir) would still leak `target` here.
+      // The OS message carries no information the browser can act on beyond
+      // "try a different name" anyway, so it is dropped entirely rather than
+      // partially redacted.
+      return {
+        error: 'could not move the credential directory into place — a directory with '
+          + 'that name may already exist. Try another name.',
+      };
     }
 
     const account: Account = {

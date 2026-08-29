@@ -297,11 +297,11 @@
     </p>
     <div class="field" id="link-code-field" hidden>
       <label for="link-code">Code from the sign-in page</label>
-      <input id="link-code" name="code" autocomplete="off" spellcheck="false" required>
+      <input id="link-code" name="code" autocomplete="off" spellcheck="false">
     </div>
     <div class="field" id="link-name-field" hidden>
       <label for="link-name">Account name</label>
-      <input id="link-name" name="name" autocomplete="off" spellcheck="false" required>
+      <input id="link-name" name="name" autocomplete="off" spellcheck="false">
       <p class="hint">Letters, digits and hyphens.</p>
     </div>
     <menu>
@@ -316,7 +316,7 @@
     <h2>Unlink account</h2>
     <p id="unlink-name"></p>
     <p class="hint" id="unlink-hint"></p>
-    <p id="unlink-error"></p>
+    <p id="unlink-error" role="alert"></p>
     <menu>
       <button value="cancel" formnovalidate>Cancel</button>
       <button id="unlink-go" value="unlink">Unlink</button>

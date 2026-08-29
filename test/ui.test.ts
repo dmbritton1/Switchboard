@@ -1314,3 +1314,21 @@ test('linkView surfaces an error and hides every input', () => {
   assert.equal(v.showCodeBox, false);
   assert.equal(v.showNameForm, false);
 });
+
+// C2: a failed link still holds a (settled) pending server-side until
+// something clears it. app.js keeps #link-cancel visible in every phase and
+// relabels it from this field — pinning the label here means the dismiss
+// behaviour is tested even though no test in this suite renders the DOM.
+test('linkView relabels the cancel control to Dismiss once the link has failed', () => {
+  const error = linkView({
+    provider: 'claude', phase: 'error', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: 'The sign-in timed out.',
+  });
+  assert.equal(error.cancelLabel, 'Dismiss');
+
+  const starting = linkView({
+    provider: 'claude', phase: 'starting', url: null, codeRequested: false,
+    identity: null, suggestedName: null, error: null,
+  });
+  assert.equal(starting.cancelLabel, 'Cancel sign-in');
+});

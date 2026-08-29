@@ -771,6 +771,11 @@ export function linkView(link) {
       hint: '', showUrl: false, url: null, showCodeBox: false, showNameForm: false,
       suggestedName: null, identityLine: '', error: link.error ?? 'Something went wrong.',
       busy: false,
+      // A failed link still holds #pending server-side (settled, but present)
+      // until something clears it — the button that used to hide itself here
+      // was the only thing that could. "Dismiss" rather than "Cancel sign-in":
+      // there is no longer a sign-in running to cancel.
+      cancelLabel: 'Dismiss',
     };
   }
 
@@ -783,6 +788,7 @@ export function linkView(link) {
       hint: 'This name appears on the account meter and in the New dialog.',
       showUrl: false, url: null, showCodeBox: false, showNameForm: true,
       suggestedName: link.suggestedName, identityLine, error: null, busy: false,
+      cancelLabel: 'Cancel sign-in',
     };
   }
 
@@ -791,6 +797,7 @@ export function linkView(link) {
       heading: `Linking ${provider}…`, hint: 'Checking who you signed in as.',
       showUrl: false, url: null, showCodeBox: false, showNameForm: false,
       suggestedName: null, identityLine: '', error: null, busy: true,
+      cancelLabel: 'Cancel sign-in',
     };
   }
 
@@ -803,6 +810,7 @@ export function linkView(link) {
       showUrl: true, url: link.url,
       showCodeBox: Boolean(link.codeRequested), showNameForm: false,
       suggestedName: null, identityLine: '', error: null, busy: false,
+      cancelLabel: 'Cancel sign-in',
     };
   }
 
@@ -810,6 +818,7 @@ export function linkView(link) {
     heading: `Starting ${provider} sign-in…`, hint: '',
     showUrl: false, url: null, showCodeBox: false, showNameForm: false,
     suggestedName: null, identityLine: '', error: null, busy: true,
+    cancelLabel: 'Cancel sign-in',
   };
 }
 

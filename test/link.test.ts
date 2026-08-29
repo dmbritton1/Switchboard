@@ -3,10 +3,27 @@ import assert from 'node:assert';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { Linker, type SpawnLogin } from '../src/link.ts';
 import { DEFAULT_BUDGET, type Account } from '../src/accounts.ts';
 import { writeFakeLoginCli } from './helpers/fake-login.ts';
+
+/** A controllable stand-in for a spawned child process: a real ChildProcess's
+ *  'close' timing can't be forced, which is exactly the timing this exercises
+ *  (a stale close arriving after the link that owned it has been replaced).
+ *  Only the surface Linker touches is implemented. */
+function fakeChild() {
+  const child = new EventEmitter() as unknown as ChildProcess;
+  const stdout = new EventEmitter() as unknown as NodeJS.ReadableStream;
+  const stderr = new EventEmitter() as unknown as NodeJS.ReadableStream;
+  (stdout as unknown as { setEncoding: () => void }).setEncoding = () => {};
+  (stderr as unknown as { setEncoding: () => void }).setEncoding = () => {};
+  Object.assign(child, {
+    stdout, stderr, stdin: { write: () => {} }, kill: () => true,
+  });
+  return child;
+}
 
 async function harness(options: {
   provider?: 'claude' | 'codex';
@@ -307,5 +324,83 @@ test('sweep leaves an in-progress link\'s own staging directory alone', async ()
 test('sweep resolves without throwing when the accounts root does not exist', async () => {
   const h = await harness();
   await assert.doesNotReject(() => h.linker.sweep());
+  await h.cleanup();
+});
+
+// C2: #fail deliberately leaves #pending set (in the 'error' phase) so the
+// error can be rendered. start() used to refuse whenever #pending was
+// non-null at all, which permanently locked out linking after the first
+// failure — nothing else ever clears it. A settled pending must not block a
+// fresh start().
+test('a new link can start after a failed one, without cancelling first', async () => {
+  const h = await harness({ provider: 'claude', mode: 'bad-code' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.codeRequested === true);
+  h.linker.submitCode('wrong');
+  await until(h.linker, (l) => l?.phase === 'error');
+
+  const { error } = await h.linker.start('claude');
+  assert.equal(error, undefined);
+  await until(h.linker, (l) => l?.codeRequested === true);
+  assert.equal(h.linker.snapshot()?.phase, 'awaiting-user');
+  await h.linker.cancel();
+  await h.cleanup();
+});
+
+// I1: a stale 'close' from a cancelled child must not touch whatever link
+// replaced it. Uses fake, hand-controlled children rather than real
+// processes so the race (a late event arriving strictly after cancel() +
+// a second start()) is deterministic instead of dependent on OS signal
+// timing.
+test('a stale close event from a cancelled link does not affect the next link', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'switchboard-link-'));
+  const children: ReturnType<typeof fakeChild>[] = [];
+  const spawnLogin: SpawnLogin = () => {
+    const child = fakeChild();
+    children.push(child);
+    return child;
+  };
+  const linker = new Linker({ accountsRoot: join(dir, 'accounts'), accounts: () => [], spawnLogin });
+
+  await linker.start('claude');
+  const first = children[0];
+  await linker.cancel();
+  await linker.start('claude');
+  assert.equal(linker.snapshot()?.phase, 'starting');
+
+  // The first (cancelled) child's close event arrives late, after the second
+  // link has already replaced it in #pending.
+  first.emit('close', null);
+  // The buggy path is async (#fail awaits an rm()); give it a window to run
+  // to completion before asserting nothing changed.
+  await new Promise((resolve) => { setTimeout(resolve, 200); });
+
+  assert.equal(linker.snapshot()?.phase, 'starting', 'the second link must be untouched');
+  assert.equal(linker.snapshot()?.error, null);
+
+  await linker.cancel();
+  await rm(dir, { recursive: true, force: true });
+});
+
+// I2 regression guard: Promise.all([commit(x), commit(x)]) races both calls
+// onto the same `p`, so the second rename() always throws (source already
+// moved by the first). Before I2 the catch redacted only `p.staging`, so the
+// (still raw) destination path — the exact directory about to become the
+// account's CLAUDE_CONFIG_DIR — leaked into the error text.
+test('commit\'s double-submit race does not leak the destination credential path', async () => {
+  const h = await harness({ provider: 'claude', mode: 'no-prompt', email: 'dwight@example.com' });
+  await h.linker.start('claude');
+  await until(h.linker, (l) => l?.phase === 'naming');
+  const target = join(h.dir, 'accounts', 'race-name');
+
+  const [a, b] = await Promise.all([h.linker.commit('race-name'), h.linker.commit('race-name')]);
+  const results = [a, b];
+  assert.equal(results.filter((r) => r.account).length, 1, 'exactly one commit should succeed');
+  const failed = results.find((r) => r.error);
+  assert.ok(failed, 'exactly one commit should fail');
+  assert.ok(
+    !failed!.error!.includes(target) && !failed!.error!.includes(h.dir),
+    `error leaked a credential path: ${failed!.error}`,
+  );
   await h.cleanup();
 });

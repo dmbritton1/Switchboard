@@ -2214,6 +2214,11 @@ const repoCombo = (() => {
 /* ---- Account linking ---------------------------------------------------- */
 
 const linkDialog = $('#link');
+// Fires for every way the dialog closes — Esc included, which is native and
+// bypasses #link-close's onclick entirely. Without this, Esc closed the
+// dialog visually but left linkDismissed false, so the next render (any SSE
+// update) popped it right back open.
+linkDialog.addEventListener('close', () => { linkDismissed = true; });
 
 /** Re-renders the link dialog from state.link on every render() — the only
  *  local state layered on top is linkCommandError (a synchronous command
@@ -2235,10 +2240,19 @@ function renderLink() {
   if (v.showUrl) $('#link-url').href = v.url;
   $('#link-code-field').hidden = !v.showCodeBox;
   $('#link-name-field').hidden = !v.showNameForm;
+  // `required` toggles in lockstep with `hidden` — see bindWhen() below. A
+  // hidden input is not barred from constraint validation on its own, so an
+  // input left `required` while its wrapper is hidden aborts the whole
+  // form's submit before #link-form.onsubmit ever fires.
+  $('#link-code').required = v.showCodeBox;
+  $('#link-name').required = v.showNameForm;
   if (v.showNameForm && !$('#link-name').value) $('#link-name').value = v.suggestedName ?? '';
   $('#link-go').hidden = !(v.showCodeBox || v.showNameForm);
-  // Nothing left to cancel once the flow has already ended in error.
-  $('#link-cancel').hidden = v.error !== null;
+  // Always visible, not hidden in error phase: it is the only thing that can
+  // clear a failed link's still-pending state, and #link-cancel already
+  // posts 'link-cancel', which works in every phase. Relabeled per phase via
+  // linkView so this is pinned by a test rather than living only here.
+  $('#link-cancel').textContent = v.cancelLabel;
   // Reopening on every render (rather than only when a link first starts)
   // would undo #link-close — see linkDismissed above.
   if (!linkDialog.open && !linkDismissed) linkDialog.showModal();
@@ -2267,8 +2281,10 @@ for (const button of document.querySelectorAll('[data-link-provider]')) {
 }
 
 // Closing does NOT cancel: the child keeps running so the user can look
-// elsewhere while the browser tab is open. #link-chip reopens it.
-$('#link-close').onclick = () => { linkDismissed = true; linkDialog.close(); };
+// elsewhere while the browser tab is open. #link-chip reopens it. close()
+// firing the dialog's 'close' listener above sets linkDismissed — no need to
+// set it here too.
+$('#link-close').onclick = () => { linkDialog.close(); };
 $('#link-chip').onclick = () => { linkDismissed = false; renderLink(); };
 $('#link-cancel').onclick = async () => {
   const result = await postCommand({ cmd: 'link-cancel' });

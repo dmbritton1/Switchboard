@@ -2453,6 +2453,21 @@ test('unlink refuses while a create is queued for the account', async (t) => {
   assert.equal(res.status, 409);
 });
 
+// The queued-item guard is `(trigger.kind === 'reset' && trigger.account ===
+// name) || (action.kind === 'create' && action.account === name)` — two
+// independent expressions. The test above only exercises the `create` half;
+// this one isolates the `reset` half by giving the action a different,
+// unrelated account, so it can't accidentally pass via the other clause.
+test('unlink refuses while a reset trigger is queued for the account', async (t) => {
+  const h = await bootLinking(t, { mode: 'no-prompt' });
+  await linkAccount(h, 'claude-x');
+  h.scheduler.add({ kind: 'reset', account: 'claude-x' }, {
+    kind: 'send', sessionId: 'unrelated-session', text: 'hi',
+  });
+  const res = await post(h.base, { cmd: 'unlink', name: 'claude-x' });
+  assert.equal(res.status, 409);
+});
+
 test('unlink succeeds over a stopped session, which then cannot resume', async (t) => {
   const h = await bootLinking(t, { mode: 'no-prompt' });
   await linkAccount(h, 'claude-x');
