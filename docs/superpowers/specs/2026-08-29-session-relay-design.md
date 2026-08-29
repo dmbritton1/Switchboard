@@ -43,6 +43,14 @@ no persistence: `Registry.load` forces every session to `stopped` on start
 (`src/sessions.ts:578`), and a stopped session has no live handle, so no channel
 can outlive the process in a form that could still be used.
 
+A channel is a property of the pair, not of a direction, so opening one binds
+both ends: once A's send is approved, B may reply without a card of its own,
+even if B is the more closely supervised of the two. That is deliberate. The
+alternative — keying channels by direction so each session's owner approves only
+its own outbound messages — buys a distinction that costs a second map entry per
+conversation and a checkpoint that fires per direction rather than per exchange.
+Approving a send is taken as approving the conversation it starts.
+
 Nothing hooks the approval decision. The gate is consulted before the tool runs;
 if the human allows, the tool executes; a successful `relay()` marks the channel
 open. A denial means the tool never ran, the channel stays closed, and the next
@@ -63,11 +71,17 @@ This is a periodic check-in rather than a wall. The conversation never dies
 silently and never runs unbounded, and the human decides at each checkpoint
 whether it is still worth what it is spending.
 
-`auto` interacts with this deliberately. It skips the opening approval, the way
-it skips every other tool call. It does **not** skip a checkpoint: an unattended
-pair is exactly the configuration where nothing else would ever stop a loop, and
-`canUseTool` already has this shape — it exempts `AskUserQuestion` from `auto`
-because auto-allowing a question is useless. A checkpoint is the same move.
+`auto` means one thing here and means it completely: never ask about relays. It
+skips the opening approval and it skips checkpoints too, so an `auto` session
+opens channels and carries them past every checkpoint without a card.
+
+That removes the only loop protection this design has, and the trade is
+deliberate. `auto` already means "I have decided not to supervise this session":
+such a session runs unbounded Bash, makes unlimited edits, and spends its budget
+without asking. Relaying is consistent with that posture. What differs is the
+blast radius — an ordinary `auto` session spends one account, and an `auto`
+relay chain spends two — so this is a setting to turn on knowing that, not a
+default to drift into.
 
 ## Transport: in-process, not a subprocess
 
@@ -214,8 +228,9 @@ harness.
   driving the Registry directly.
 - Channels: the first relay between a pair is gated and the second is not; a
   denial leaves the channel closed so the next attempt is gated again.
-- Checkpoints: crossing the cap closes the channel, so the next relay is gated
-  even on a session with `auto` on, and allowing it resets the count.
+- Checkpoints: crossing the cap closes the channel, so the next relay from a
+  supervised session is gated and allowing it resets the count — while a session
+  with `auto` on carries past the same checkpoint without a card.
 - Deleting a session drops the channels naming it.
 - Delivery: a relay to a live session appends the prompt and calls the target's
   handle; a relay to a stopped session does neither.
