@@ -20,6 +20,20 @@ export const HANDOFF_PROMPT = [
   'Then continue the work.',
 ].join('\n');
 
+function findLongestBacktickRun(text: string): number {
+  let maxRun = 0;
+  let currentRun = 0;
+  for (const char of text) {
+    if (char === '`') {
+      currentRun++;
+      maxRun = Math.max(maxRun, currentRun);
+    } else {
+      currentRun = 0;
+    }
+  }
+  return maxRun;
+}
+
 function renderMsg(m: Msg): string | null {
   switch (m.kind) {
     case 'user':
@@ -28,7 +42,13 @@ function renderMsg(m: Msg): string | null {
       return m.text;
     case 'tool': {
       const head = `- **${m.name}** ${m.summary} — ${m.status}`;
-      if (m.detail) return `${head}\n\n\`\`\`\n${m.detail}\n\`\`\``;
+      if (m.detail) {
+        // Use a fence longer than any backtick run in detail to prevent
+        // premature fence closure if detail contains ``` or longer runs.
+        const fenceSize = Math.max(3, findLongestBacktickRun(m.detail) + 1);
+        const fence = '`'.repeat(fenceSize);
+        return `${head}\n\n${fence}\n${m.detail}\n${fence}`;
+      }
       // An evicted body is called out rather than omitted: a successor reading
       // a confident history with silent holes in it is worse off than one that
       // can see where the holes are.

@@ -62,3 +62,26 @@ test('the opening prompt points the successor at the handoff file', () => {
   assert.match(HANDOFF_PROMPT, /\.switchboard\/handoff\.md/);
   assert.match(HANDOFF_PROMPT, /git log/);
 });
+
+test('renderHandoff escapes backticks in tool detail with a longer fence', () => {
+  const out = renderHandoff(session([
+    { kind: 'tool', id: 'c', name: 'Read', summary: 'doc.md', status: 'ok',
+      detail: 'Here is code:\n```\nconst x = 1;\n```\nEnd.' },
+  ]));
+  // Detail with ``` should still be intact in the output
+  assert.match(out, /Here is code:/);
+  assert.match(out, /const x = 1;/);
+  assert.match(out, /End\./);
+  // Verify the outer fence uses 4 backticks (more than the 3 in the detail)
+  assert.match(out, /````\nHere is code:/);
+});
+
+test('renderHandoff renders a tool with neither detail nor detailEvicted', () => {
+  const out = renderHandoff(session([
+    { kind: 'tool', id: 'd', name: 'Bash', summary: 'npm test', status: 'running' },
+  ]));
+  // Should render just the head (no detail section, no eviction marker)
+  assert.match(out, /- \*\*Bash\*\* npm test — running/);
+  assert.doesNotMatch(out, /evicted/);
+  assert.doesNotMatch(out, /```/);
+});
