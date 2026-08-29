@@ -20,7 +20,7 @@ the provider difference lives in sending, and that is the whole reason this
 phase is worth shipping alone: registering the tool on the Claude adapter gets
 Claude→Claude and Claude→Codex at once, without touching Codex at all.
 
-## The gate is the tool-approval flow that already exists
+## Approval opens a channel, not a message
 
 The earlier sketch of this feature put the hold on the receiver: B gets a
 message and waits for the human to release it. That needed new session state, a
@@ -30,13 +30,44 @@ into the SDK. A held message is not an SDK approval, so none of that fit.
 
 Putting the gate on the sender costs nothing, because a relay *is* a tool call.
 `canUseTool` (`src/agents/claude.ts:319`) fires for every tool call including
-MCP ones, builds an `ApprovalRequest`, and emits it as the approval card. The
-human approves the message on the sending session's card, and only then does it
-go.
+MCP ones, builds an `ApprovalRequest`, and emits it as the approval card.
 
-The per-session toggle this feature seemed to need also already exists: `auto`.
-Off, the human approves each message; on, the agents collaborate unattended.
-That is the same fork, with no new field, no new default, and no new UI.
+But approving every message would be the wrong unit. A useful exchange between
+two agents is many messages, and a card per message turns collaboration into
+clicking. So the approval opens a **channel** between the two sessions: the
+first relay between a pair asks, and once it succeeds the pair talks freely.
+
+A channel is an unordered pair of session ids with a count of exchanges since it
+was last confirmed. It is process-local, like `AccountLimitSnapshot`, and needs
+no persistence: `Registry.load` forces every session to `stopped` on start
+(`src/sessions.ts:578`), and a stopped session has no live handle, so no channel
+can outlive the process in a form that could still be used.
+
+Nothing hooks the approval decision. The gate is consulted before the tool runs;
+if the human allows, the tool executes; a successful `relay()` marks the channel
+open. A denial means the tool never ran, the channel stays closed, and the next
+attempt asks again. The existing Allow/Deny card is the whole interface.
+
+## Checkpoints replace the hop limit
+
+Counting hops per session was the wrong shape — a chain is a property of a pair,
+not of either end. The channel's exchange count replaces it.
+
+When the count crosses the cap (10), the channel closes *after* delivering that
+message. The next relay between that pair therefore asks again, and the card
+carries a note saying how many messages have been exchanged. Allow reopens the
+channel and resets the count; Deny leaves it closed. That is the continue-or-stop
+choice, using the two buttons the card already has.
+
+This is a periodic check-in rather than a wall. The conversation never dies
+silently and never runs unbounded, and the human decides at each checkpoint
+whether it is still worth what it is spending.
+
+`auto` interacts with this deliberately. It skips the opening approval, the way
+it skips every other tool call. It does **not** skip a checkpoint: an unattended
+pair is exactly the configuration where nothing else would ever stop a loop, and
+`canUseTool` already has this shape — it exempts `AskUserQuestion` from `auto`
+because auto-allowing a question is useless. A checkpoint is the same move.
 
 ## Transport: in-process, not a subprocess
 
@@ -66,44 +97,48 @@ Rules, in order, each failing before anything is delivered:
    sessions are exactly the ones whose work can collide.
 4. The target has a live handle. Otherwise `not-live` — a stopped session cannot
    act on a message, and silently accepting one would strand it.
-5. The chain is under the hop cap. Otherwise `hop-limit`.
 
 On success it appends the text to the target's transcript as a prompt and hands
 it to the target's handle, exactly as the `send` command does. Delivery timing
 is therefore whatever that path already does: a target mid-turn queues the
 message and picks it up when the turn ends.
 
+`relay()` does not itself check whether the pair is approved. The gate lives in
+`canUseTool`, which runs first and is what puts the card up; by the time
+`relay()` is called the human has already allowed this send, and re-checking
+here would reject the very first message of a channel — the one the approval was
+for. What `relay()` does on success is *open* the channel and increment it.
+
 The function returns a discriminated result rather than throwing, because its
 caller is a tool handler whose return value the model reads.
 
-### Hop counting
+### Channel state
 
-One new field, `Session.relayHops: number`, defaulting to 0.
+A map keyed by the unordered pair of session ids, holding `{ open, exchanges }`.
+Process-local, held by the server beside the handle map.
 
-On a successful relay, the target's count becomes the sender's plus one. Over
-the cap (3), the relay is rejected with `hop-limit` and nothing is delivered.
-Any human-originated prompt to a session — a `send` from the composer, or the
-prompt a session is created with — resets that session's count to 0, because a
-human speaking is what ends a chain.
+`relayGate()` reads it; `relay()` writes it. A successful send opens the channel
+and increments `exchanges`, and closes it again once the count crosses the cap,
+so the next attempt is gated and the human is asked to continue or stop. Deleting a session drops every channel naming it.
 
-With approval on, the cap is close to unreachable: each hop needs a click. It
-earns its place only for sessions running with `auto` on, which is exactly the
-configuration where nothing else stops a loop.
+No field is added to `Session`. An earlier draft put `relayHops` there, which
+was wrong twice over: it made a pair's property look like a session's, and it
+put it in persisted state that could outlive the handles that give it meaning.
 
-An earlier decision had the cap divert a message to `needs-you` instead of
-rejecting it. Rejection replaces that: with the gate on the sender there is no
-receiver-side held state to divert into, and a rejected tool call surfaces to
-the human through the sending agent anyway.
-
-### `StartOpts.relay` — how the adapter reaches the Registry
+### `StartOpts.relay` and `relayGate` — how the adapter reaches the Registry
 
 Adapters do not know their session id and have no Registry access; they emit
 events and stay ignorant of the store. That separation is worth keeping.
 
-So `StartOpts` gains an optional `relay` callback. The server builds it per
-launch, closing over the session id and the Registry, and the adapter wires it
-into a tool handler. The adapter calls a function it was handed, the same way it
-already calls `emit`.
+So `StartOpts` gains two optional callbacks, both built by the server per launch
+and both closing over the session id and the Registry. The adapter calls
+functions it was handed, the same way it already calls `emit`.
+
+`relay(target, text)` performs the send. `relayGate(target)` answers whether this
+send needs a card, returning `{ ask, note? }`; `canUseTool` consults it for
+`send_to_session` and appends `note` to the summary, which is how a checkpoint
+card explains itself. The gate is a separate callback because `canUseTool` runs
+*before* the tool does and so cannot learn the answer from the send.
 
 The session's identity comes from that closure and never from a tool argument,
 so an agent cannot send as another session by naming one.
@@ -143,19 +178,27 @@ card.
 
 ### `@session` in the composer
 
-Pure autocomplete. `web/lib.js` already has `commandMenu` driving the
-slash-command menu; an `@` menu mirrors it, listing same-repo sessions by branch
-and inserting the branch name as plain text.
+An `@` menu mirroring the slash-command menu `commandMenu` already drives in
+`web/lib.js`, listing same-repo sessions by branch.
 
-There is no plumbing behind the mention. The agent already has `list_sessions`
-and `send_to_session`; naming a session in a prompt is enough for it to act. The
-menu exists so the human can name one correctly without checking the grid, and
-adding delivery semantics to the mention itself would duplicate the tools.
+Picking one inserts not just the branch name but a short instruction naming what
+it is — that `feat-login` is another session on this repo, reachable with
+`send_to_session`. Still plain text with no plumbing behind it, but the agent is
+told what the token means rather than left to infer it from an `@`.
+
+That inference is the only thing the cheaper version would have been relying on,
+and it fails invisibly: an agent that answers from its own knowledge instead of
+messaging looks exactly like an agent that had nothing to say. One sentence of
+inserted text removes the doubt.
+
+The mention still does nothing by itself. It does not fetch the other session's
+context, does not notify it, and does not send anything — the agent decides, and
+the first send opens a channel through the normal approval.
 
 ## Error handling
 
 Every `RelayResult` other than success leaves the target untouched — no
-transcript entry, no hop increment. The sending agent receives the reason as its
+transcript entry, no change to the channel's count. The sending agent receives the reason as its
 tool result and can react.
 
 A relay whose approval the human denies never reaches `relay()` at all; the SDK
@@ -167,10 +210,13 @@ denied tool call.
 Offline throughout, using the simulator adapter and the existing `boot()`
 harness.
 
-- `relay()` unit tests over the five rejection rules and the success path,
+- `relay()` unit tests over the four rejection rules and the success path,
   driving the Registry directly.
-- Hop counting: a chain reaching the cap is rejected; a human `send` to a
-  session in that chain resets it and the next relay succeeds.
+- Channels: the first relay between a pair is gated and the second is not; a
+  denial leaves the channel closed so the next attempt is gated again.
+- Checkpoints: crossing the cap closes the channel, so the next relay is gated
+  even on a session with `auto` on, and allowing it resets the count.
+- Deleting a session drops the channels naming it.
 - Delivery: a relay to a live session appends the prompt and calls the target's
   handle; a relay to a stopped session does neither.
 - `list_sessions` filtering: same-repo only, self excluded.
