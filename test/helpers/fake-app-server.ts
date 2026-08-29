@@ -78,6 +78,7 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     process.exit(0);
   }
   mkdirSync(join(out, 'v2'), { recursive: true });
+  mkdirSync(join(out, 'serde_json'), { recursive: true });
   const omit = process.env.FAKE_APP_SERVER_SCHEMA_OMIT;
   const include = (value: string): boolean => value !== omit;
   writeFileSync(join(out, 'ClientRequest.ts'), [
@@ -124,14 +125,44 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
   const shapeOmit = process.env.FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT;
   const shape = (name: string, value: string): string => shapeOmit === name ? '' : value;
+  const changedShape = (name: string, value: string, changed: string): string =>
+    shapeOmit === name ? changed : value;
+  writeFileSync(join(out, 'v2', 'AskForApproval.ts'), [
+    'export type AskForApproval = "untrusted" | "on-request" | { "granular": { sandbox_approval: boolean, rules: boolean, skill_approval: boolean, request_permissions: boolean, mcp_elicitations: boolean } } | ',
+    shape('approval-never', '"never"'),
+    changedShape('approval-alias-extra', '', ' | "future"'),
+    ';\n',
+  ].join(''));
+  writeFileSync(join(out, 'v2', 'SandboxMode.ts'), [
+    'export type SandboxMode = "read-only" | ',
+    shape('sandbox-workspace-write', '"workspace-write" | '),
+    '"danger-full-access"',
+    changedShape('sandbox-alias-extra', '', ' | "future"'),
+    ';\n',
+  ].join(''));
+  writeFileSync(join(out, 'serde_json', 'JsonValue.ts'), changedShape(
+    'json-value-type',
+    'export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null;\n',
+    'export type JsonValue = unknown;\n',
+  ));
   writeFileSync(join(out, 'v2', 'ThreadStartParams.ts'), [
     'export type ThreadStartParams = {',
-    shape('thread-params', 'model?: string | null, cwd?: string | null, approvalPolicy?: "never" | unknown, sandbox?: "workspace-write" | unknown, config?: Record<string, unknown> | null,'),
+    shape('thread-params', [
+      'model?: string | null, cwd?: string | null, ',
+      changedShape('thread-start-approval-type', 'approvalPolicy?: AskForApproval | null, ', 'approvalPolicy?: unknown, '),
+      changedShape('thread-start-sandbox-type', 'sandbox?: SandboxMode | null, ', 'sandbox?: unknown, '),
+      changedShape('thread-start-config-type', 'config?: { [key in string]?: JsonValue } | null,', 'config?: unknown,'),
+    ].join('')),
     '};\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'ThreadResumeParams.ts'), [
     'export type ThreadResumeParams = { threadId: string,',
-    shape('thread-params', 'model?: string | null, cwd?: string | null, approvalPolicy?: "never" | unknown, sandbox?: "workspace-write" | unknown, config?: Record<string, unknown> | null,'),
+    shape('thread-params', [
+      'model?: string | null, cwd?: string | null, ',
+      changedShape('thread-resume-approval-type', 'approvalPolicy?: AskForApproval | null, ', 'approvalPolicy?: unknown, '),
+      changedShape('thread-resume-sandbox-type', 'sandbox?: SandboxMode | null, ', 'sandbox?: unknown, '),
+      changedShape('thread-resume-config-type', 'config?: { [key in string]?: JsonValue } | null,', 'config?: unknown,'),
+    ].join('')),
     '};\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnStartParams.ts'), [
@@ -141,8 +172,15 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnInterruptParams.ts'), 'export type TurnInterruptParams = { threadId: string, turnId: string };\n');
   writeFileSync(join(out, 'v2', 'UserInput.ts'), [
-    'export type UserInput = { "type": "text", text: string, text_elements: Array<TextElement> } | ',
-    shape('user-input', '{ "type": "localImage", path: string };\n'),
+    'export type UserInput = { "type": "text", text: string, ',
+    shape('user-input-text-elements', 'text_elements: Array<TextElement>'),
+    ' } | { "type": "image", url: string } | ',
+    shape('user-input', changedShape(
+      'user-input-local-image-path',
+      '{ "type": "localImage", path: string } | ',
+      '{ "type": "localImage", detail?: ImageDetail } | ',
+    )),
+    '{ "type": "audio", url: string } | { "type": "localAudio", path: string } | { "type": "skill", name: string, path: string } | { "type": "mention", name: string, path: string };\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'ThreadItem.ts'), [
     'export type ThreadItem = { "type": "agentMessage", id: string } | { "type": "reasoning", id: string } | { "type": "plan", id: string } | { "type": "commandExecution", id: string } | { "type": "fileChange", id: string } | { "type": "mcpToolCall", id: string } | ',
@@ -171,7 +209,8 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'ThreadTokenUsageUpdatedNotification.ts'), [
     'export type ThreadTokenUsageUpdatedNotification = { threadId: string, ',
     shape('routing-ids', 'turnId: string,'),
-    ' tokenUsage: ThreadTokenUsage };\n',
+    changedShape('token-usage-payload', ' tokenUsage: ThreadTokenUsage', ' tokenUsage: unknown'),
+    ' };\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnStartedNotification.ts'), 'export type TurnStartedNotification = { threadId: string, turn: Turn };\n');
   writeFileSync(join(out, 'v2', 'TurnPlanUpdatedNotification.ts'), [

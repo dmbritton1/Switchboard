@@ -107,6 +107,11 @@ function quoted(source: string): string[] {
   return [...source.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 }
 
+function taggedUnionMember(source: string, type: string): string | undefined {
+  const escaped = type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return source.match(new RegExp(`\\{\\s*"type"\\s*:\\s*"${escaped}"\\s*,[\\s\\S]*?\\}`))?.[0];
+}
+
 async function generatedFiles(directory: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   async function walk(current: string, relative = ''): Promise<void> {
@@ -201,6 +206,9 @@ function assertContract(files: Map<string, string>, mode: CodexAppServerMode): v
 }
 
 function assertTurnContract(files: Map<string, string>, client: string, notifications: string): void {
+  const approvalPolicy = files.get(join('v2', 'AskForApproval.ts'));
+  const sandboxMode = files.get(join('v2', 'SandboxMode.ts'));
+  const jsonValue = files.get(join('serde_json', 'JsonValue.ts'));
   const threadStart = files.get(join('v2', 'ThreadStartParams.ts'));
   const threadResume = files.get(join('v2', 'ThreadResumeParams.ts'));
   const turnStart = files.get(join('v2', 'TurnStartParams.ts'));
@@ -221,21 +229,37 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const itemCompleted = files.get(join('v2', 'ItemCompletedNotification.ts'));
   const turnCompleted = files.get(join('v2', 'TurnCompletedNotification.ts'));
   const error = files.get(join('v2', 'ErrorNotification.ts'));
-  const threadConfig = /model\s*\?\s*:\s*string\s*\|\s*null[\s\S]*cwd\s*\?\s*:\s*string\s*\|\s*null[\s\S]*approvalPolicy\s*\?[\s\S]*sandbox\s*\?[\s\S]*config\s*\?/;
+  const approvalPolicyContract = /export\s+type\s+AskForApproval\s*=\s*"untrusted"\s*\|\s*"on-request"\s*\|\s*\{\s*"granular"\s*:\s*\{\s*sandbox_approval\s*:\s*boolean\s*,\s*rules\s*:\s*boolean\s*,\s*skill_approval\s*:\s*boolean\s*,\s*request_permissions\s*:\s*boolean\s*,\s*mcp_elicitations\s*:\s*boolean\s*,?\s*\}\s*\}\s*\|\s*"never"\s*;/;
+  const sandboxModeContract = /export\s+type\s+SandboxMode\s*=\s*"read-only"\s*\|\s*"workspace-write"\s*\|\s*"danger-full-access"\s*;/;
+  const threadBasics = /model\s*\?\s*:\s*string\s*\|\s*null[\s\S]*cwd\s*\?\s*:\s*string\s*\|\s*null/;
+  const threadApproval = /approvalPolicy\s*\?\s*:\s*AskForApproval\s*\|\s*null/;
+  const threadSandbox = /sandbox\s*\?\s*:\s*SandboxMode\s*\|\s*null/;
+  const threadConfig = /config\s*\?\s*:\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null/;
+  const jsonValueContract = /export\s+type\s+JsonValue\s*=\s*number\s*\|\s*string\s*\|\s*boolean\s*\|\s*Array\s*<\s*JsonValue\s*>\s*\|\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*;/;
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
-  if (!threadStart || !threadResume || !turnStart || !turnInterrupt || !userInput || !threadItem
+  const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
+  const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
+  if (!approvalPolicy || !sandboxMode || !jsonValue || !threadStart || !threadResume
+    || !turnStart || !turnInterrupt || !userInput || !threadItem
     || !turn || !turnStatus || !turnError || !tokenUsage || !tokenBreakdown || !thread
     || !threadStarted || !usageUpdated || !turnStarted || !planUpdated || !itemStarted
     || !itemCompleted || !turnCompleted || !error
     || !TURN_CLIENT_METHODS.every((method) => methods(client).includes(method))
     || !TURN_NOTIFICATIONS.every((method) => methods(notifications).includes(method))
-    || !threadConfig.test(threadStart)
-    || !/threadId\s*:\s*string/.test(threadResume) || !threadConfig.test(threadResume)
+    || !approvalPolicyContract.test(approvalPolicy)
+    || !sandboxModeContract.test(sandboxMode)
+    || !jsonValueContract.test(jsonValue)
+    || !threadBasics.test(threadStart) || !threadApproval.test(threadStart)
+    || !threadSandbox.test(threadStart) || !threadConfig.test(threadStart)
+    || !/threadId\s*:\s*string/.test(threadResume) || !threadBasics.test(threadResume)
+    || !threadApproval.test(threadResume) || !threadSandbox.test(threadResume)
+    || !threadConfig.test(threadResume)
     || !turnInput.test(turnStart)
     || !/threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/.test(turnInterrupt)
-    || !/"type"\s*:\s*"text"[\s\S]*text\s*:\s*string/.test(userInput)
-    || !/"type"\s*:\s*"localImage"[\s\S]*path\s*:\s*string/.test(userInput)
+    || !textInput || !/text\s*:\s*string/.test(textInput)
+    || !/text_elements\s*:\s*Array\s*<\s*TextElement\s*>/.test(textInput)
+    || !localImageInput || !/path\s*:\s*string/.test(localImageInput)
     || !['agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange', 'mcpToolCall', 'webSearch', 'contextCompaction']
       .every((type) => new RegExp(`"type"\\s*:\\s*"${type}"`).test(threadItem))
     || !sameMembers(quoted(turnStatus), ['completed', 'interrupted', 'failed', 'inProgress'])
@@ -246,7 +270,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
       .every((field) => new RegExp(`${field}\\s*:\\s*number`).test(tokenBreakdown))
     || !/id\s*:\s*string/.test(thread)
     || !/thread\s*:\s*Thread/.test(threadStarted)
-    || !routing.test(usageUpdated)
+    || !routing.test(usageUpdated) || !/tokenUsage\s*:\s*ThreadTokenUsage/.test(usageUpdated)
     || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnStarted)
     || !routing.test(planUpdated)
     || !routing.test(itemStarted) || !/item\s*:\s*ThreadItem/.test(itemStarted)

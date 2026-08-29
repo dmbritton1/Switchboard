@@ -292,6 +292,60 @@ test('turn profile requires the pinned request, item, turn, usage, and routing s
   }
 });
 
+test('turn profile requires pinned thread safety aliases and config maps on start and resume', async () => {
+  for (const [index, shape] of [
+    'approval-never',
+    'approval-alias-extra',
+    'sandbox-workspace-write',
+    'sandbox-alias-extra',
+    'thread-start-approval-type',
+    'thread-resume-approval-type',
+    'thread-start-sandbox-type',
+    'thread-resume-sandbox-type',
+    'thread-start-config-type',
+    'thread-resume-config-type',
+    'json-value-type',
+  ].entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-safety-shape-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject incompatible ${shape}`,
+    );
+  }
+});
+
+test('turn profile keeps required input fields within their exact union members', async () => {
+  for (const [index, shape] of [
+    'user-input-text-elements',
+    'user-input-local-image-path',
+  ].entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-input-member-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject incompatible ${shape}`,
+    );
+  }
+});
+
+test('turn profile requires a typed token-usage notification payload', async () => {
+  await assert.rejects(
+    verifyAppServerContract(runtime({
+      version: '0.145.0+turn-token-usage-payload',
+      env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: 'token-usage-payload' }),
+    }), 'turns'),
+    (error: unknown) => error instanceof Error
+      && error.message === 'Codex app-server turn contract verification failed.',
+  );
+});
+
 test('generated contract rejects an omitted required member', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({
