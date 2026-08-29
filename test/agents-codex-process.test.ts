@@ -386,7 +386,13 @@ test('follow-up prompts execute in FIFO order', async (t) => {
   );
   handle.send({ text: 'second', attachments: [] });
 
-  await waitFor(async () => (await fixture.readInvocations()).length === 2);
+  // Wait for both things this test asserts on, not just the first. The
+  // invocation log is written when a turn starts; the `done` event arrives when
+  // it finishes, through a separate async path. Waiting only for two log
+  // entries can therefore return with the second `done` still in flight, which
+  // fails the count below under load.
+  const doneCount = () => events.filter((e) => e.type === 'status' && e.status === 'done').length;
+  await waitFor(async () => (await fixture.readInvocations()).length === 2 && doneCount() === 2);
   const invocations = await fixture.readInvocations();
   assert.deepEqual(invocations.map((invocation) => invocation.prompt), ['first', 'second']);
   assert.equal(events.filter((event) => event.type === 'status' && event.status === 'done').length, 2);
