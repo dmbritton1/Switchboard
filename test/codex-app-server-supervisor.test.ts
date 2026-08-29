@@ -91,12 +91,12 @@ function managedAccountResult(): Record<string, unknown> {
   };
 }
 
-function rateLimitsResult(): Record<string, unknown> {
+function rateLimitsResult(usedPercent = 25): Record<string, unknown> {
   return {
     rateLimits: {
       limitId: null,
       limitName: null,
-      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 2_000_000_000 },
+      primary: { usedPercent, windowDurationMins: 300, resetsAt: 2_000_000_000 },
       secondary: null,
       spendControlReached: false,
       rateLimitReachedType: null,
@@ -422,10 +422,115 @@ test('treats rate-limit notification bursts as one full-read invalidation and ig
   await waitFor(() => observed.snapshots.length === 2);
 
   const log = await calls(callLog);
-  assert.equal(log.filter((entry) => entry.method === 'account/rateLimits/read').length, 2);
+  assert.equal(log.filter((entry) => entry.method === 'account/rateLimits/read').length, 3);
+  assert.equal(observed.snapshots.length, 2);
   const publicData = JSON.stringify({ snapshots: observed.snapshots, stale: observed.stale });
   assert.equal(publicData.includes('private-sparse-server'), false);
   assert.equal(publicData.includes('private-sparse-installation'), false);
+});
+
+test('rate-limit invalidation during a pending read runs one trailing read for all callers', async (t) => {
+  const pendingRead = deferred<unknown>();
+  const observed = callbacks();
+  let protocol!: AppServerClientOptions;
+  let rateLimitReads = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return {
+        request: async <T>(method: string): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') {
+            rateLimitReads += 1;
+            if (rateLimitReads === 1) return rateLimitsResult(10) as T;
+            if (rateLimitReads === 2) return pendingRead.promise as Promise<T>;
+            return rateLimitsResult(80) as T;
+          }
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  const reconciliation = supervisor.reconcile();
+  await waitFor(() => rateLimitReads === 2);
+  protocol.onNotification('account/rateLimits/updated', { rateLimits: { limitId: null } });
+  protocol.onNotification('account/rateLimits/updated', { rateLimits: { limitId: null } });
+  protocol.onNotification('account/rateLimits/updated', { rateLimits: { limitId: null } });
+  const boundary = supervisor.readAtResetBoundary(2_000);
+  pendingRead.resolve(rateLimitsResult(40));
+
+  const [reconciled, boundarySnapshot] = await Promise.all([reconciliation, boundary]);
+  assert.equal(rateLimitReads, 3);
+  assert.equal(reconciled.windows[0]?.usedPercent, 80);
+  assert.equal(boundarySnapshot.windows[0]?.usedPercent, 80);
+  assert.equal(reconciled, boundarySnapshot);
+  assert.deepEqual(observed.snapshots.map((snapshot) => snapshot.windows[0]?.usedPercent), [10, 80]);
+});
+
+test('managed plan updates during a pending read coalesce one trailing read with the latest plan', async (t) => {
+  const pendingRead = deferred<unknown>();
+  const observed = callbacks();
+  let protocol!: AppServerClientOptions;
+  let rateLimitReads = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return {
+        request: async <T>(method: string): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') {
+            rateLimitReads += 1;
+            if (rateLimitReads === 1) return rateLimitsResult(10) as T;
+            if (rateLimitReads === 2) return pendingRead.promise as Promise<T>;
+            return rateLimitsResult(90) as T;
+          }
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  const reconciliation = supervisor.reconcile();
+  await waitFor(() => rateLimitReads === 2);
+  protocol.onNotification('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+  protocol.onNotification('account/updated', { authMode: 'chatgpt', planType: 'team' });
+  const boundary = supervisor.readAtResetBoundary(2_000);
+  pendingRead.resolve(rateLimitsResult(50));
+
+  const [reconciled, boundarySnapshot] = await Promise.all([reconciliation, boundary]);
+  assert.equal(rateLimitReads, 3);
+  assert.equal(reconciled.plan, 'team');
+  assert.equal(reconciled.windows[0]?.usedPercent, 90);
+  assert.equal(boundarySnapshot.plan, 'team');
+  assert.equal(boundarySnapshot.windows[0]?.usedPercent, 90);
+  assert.equal(reconciled, boundarySnapshot);
+  assert.deepEqual(observed.snapshots.map((snapshot) => [snapshot.plan, snapshot.windows[0]?.usedPercent]), [
+    ['pro', 10],
+    ['team', 90],
+  ]);
 });
 
 test('unsupported auth updates stop reads until managed ChatGPT auth returns', async (t) => {
@@ -671,6 +776,99 @@ test('uses injected bounded restart delays and calls onStale once until a read s
   assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 2_000, 4_000, 8_000, 30_000, 30_000]);
   assert.deepEqual(observed.stale, [unavailable]);
   assert.equal(observed.snapshots.length, 0);
+});
+
+test('directly observed unsupported auth does not reset crash restart backoff', async (t) => {
+  const observed = callbacks();
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const clients: ScriptedClient[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      const client: ScriptedClient = {
+        request: async <T>(method: string): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') {
+            return { account: null, requiresOpenaiAuth: true } as T;
+          }
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+        crash: () => options.onExit(new Error('private scripted crash')),
+      };
+      clients.push(client);
+      return client;
+    },
+    setTimer: (callback, delay) => {
+      scheduled.push({ callback, delay });
+      return { callback, delay };
+    },
+    clearTimer: () => {},
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  for (let index = 0; index < 3; index += 1) {
+    clients[index]!.crash();
+    await waitFor(() => scheduled.length === index + 1);
+    if (index < 2) {
+      scheduled[index]!.callback();
+      await waitFor(() => clients.length === index + 2);
+      await supervisor.start();
+    }
+  }
+
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 2_000, 4_000]);
+  assert.deepEqual(observed.stale, [signedOut, unavailable, signedOut, unavailable, signedOut, unavailable]);
+  assert.equal(observed.snapshots.length, 0);
+});
+
+test('latched unsupported auth does not reset crash restart backoff', async (t) => {
+  const observed = callbacks();
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const clients: ScriptedClient[] = [];
+  const protocols: AppServerClientOptions[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: observed.onSnapshot,
+    onStale: observed.onStale,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocols.push(options);
+      const client = scriptedClient(options);
+      clients.push(client);
+      return client;
+    },
+    setTimer: (callback, delay) => {
+      scheduled.push({ callback, delay });
+      return { callback, delay };
+    },
+    clearTimer: () => {},
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  protocols[0]!.onServerRequest(9_002, 'account/chatgptAuthTokens/refresh', {
+    refreshToken: 'private-refresh-token',
+  });
+  for (let index = 0; index < 3; index += 1) {
+    clients[index]!.crash();
+    await waitFor(() => scheduled.length === index + 1);
+    if (index < 2) {
+      scheduled[index]!.callback();
+      await waitFor(() => clients.length === index + 2);
+      await supervisor.start();
+    }
+  }
+
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 2_000, 4_000]);
+  assert.equal(observed.snapshots.length, 1);
+  assert.equal(observed.stale.includes(externalTokens), true);
 });
 
 test('a successful restarted read resets backoff to one second', async (t) => {

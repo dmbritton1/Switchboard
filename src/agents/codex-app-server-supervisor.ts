@@ -25,6 +25,13 @@ const MAX_RESTART_DELAY_MS = 30_000;
 type TimerHandle = unknown;
 type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError' | 'close'>;
 type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: false }>;
+type ReadOutcome =
+  | { invalidated: true }
+  | { invalidated: false; snapshot: AccountLimitSnapshot };
+type ActiveRead = {
+  revision: number;
+  promise: Promise<ReadOutcome>;
+};
 
 export type CodexAppServerSupervisorOptions = {
   runtime: PreparedCodexRuntime;
@@ -63,7 +70,8 @@ export class CodexAppServerSupervisor {
   #client: SupervisorClient | null = null;
   #readyClient: SupervisorClient | null = null;
   #launch: Promise<void> | null = null;
-  #read: Promise<AccountLimitSnapshot> | null = null;
+  #read: ActiveRead | null = null;
+  #limitRevision = 0;
   #auth: CodexTelemetryAuth | null = null;
   #unsupportedAuthLatch: UnsupportedCodexTelemetryAuth | null = null;
   #authRevision = 0;
@@ -137,7 +145,6 @@ export class CodexAppServerSupervisor {
       this.#assertActive(client);
       if (this.#unsupportedAuthLatch) {
         this.#auth = this.#unsupportedAuthLatch;
-        this.#restartAttempt = 0;
         this.#markStale(this.#unsupportedAuthLatch.reason);
         return;
       }
@@ -145,7 +152,6 @@ export class CodexAppServerSupervisor {
       const account = normalizeCodexAccountRead(accountInput);
       this.#auth = account;
       if (!account.supported) {
-        this.#restartAttempt = 0;
         this.#markStale(account.reason);
         return;
       }
@@ -181,6 +187,7 @@ export class CodexAppServerSupervisor {
     if (method === 'account/updated') {
       const auth = normalizeCodexAuthUpdate(params);
       this.#authRevision += 1;
+      this.#limitRevision += 1;
       this.#unsupportedAuthLatch = auth.supported ? null : auth;
       this.#auth = auth;
       if (!auth.supported) {
@@ -191,6 +198,7 @@ export class CodexAppServerSupervisor {
       return;
     }
     if (method === 'account/rateLimits/updated' && this.#auth?.supported) {
+      this.#limitRevision += 1;
       void this.#readFrom(client, this.#now()).catch(() => {});
     }
   }
@@ -212,6 +220,7 @@ export class CodexAppServerSupervisor {
         reason: CODEX_TELEMETRY_REASONS.externalTokens,
       };
       this.#authRevision += 1;
+      this.#limitRevision += 1;
       this.#unsupportedAuthLatch = auth;
       this.#auth = auth;
       this.#markStale(auth.reason);
@@ -235,21 +244,42 @@ export class CodexAppServerSupervisor {
     return this.#readFrom(client, now);
   }
 
-  #readFrom(client: SupervisorClient, now: number): Promise<AccountLimitSnapshot> {
-    if (this.#read) return this.#read;
-    const read = this.#performRead(client, now);
+  async #readFrom(client: SupervisorClient, now: number): Promise<AccountLimitSnapshot> {
+    let readNow = now;
+    while (true) {
+      this.#assertActive(client);
+      if (!this.#auth?.supported) {
+        throw new UnsupportedTelemetryError(this.#auth?.reason ?? PUBLIC_UNAVAILABLE);
+      }
+      const read = this.#read ?? this.#beginRead(client, readNow);
+      const outcome = await read.promise;
+      if (outcome.invalidated || read.revision !== this.#limitRevision) {
+        readNow = this.#now();
+        continue;
+      }
+      return outcome.snapshot;
+    }
+  }
+
+  #beginRead(client: SupervisorClient, now: number): ActiveRead {
+    const revision = this.#limitRevision;
+    const read: ActiveRead = {
+      revision,
+      promise: this.#performRead(client, now, revision),
+    };
     this.#read = read;
-    void read.finally(() => {
+    void read.promise.finally(() => {
       if (this.#read === read) this.#read = null;
     }).catch(() => {});
     return read;
   }
 
-  async #performRead(client: SupervisorClient, now: number): Promise<AccountLimitSnapshot> {
+  async #performRead(client: SupervisorClient, now: number, revision: number): Promise<ReadOutcome> {
     try {
       this.#assertActive(client);
       const input = await client.request('account/rateLimits/read');
       this.#assertActive(client);
+      if (revision !== this.#limitRevision) return { invalidated: true };
       if (!this.#auth?.supported) {
         throw new UnsupportedTelemetryError(this.#auth?.reason ?? PUBLIC_UNAVAILABLE);
       }
@@ -261,7 +291,7 @@ export class CodexAppServerSupervisor {
       } catch {
         // Snapshot observers cannot affect process supervision.
       }
-      return snapshot;
+      return { invalidated: false, snapshot };
     } catch (error) {
       if (error instanceof UnsupportedTelemetryError) throw error;
       await this.#retire(client);
