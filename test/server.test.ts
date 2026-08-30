@@ -3498,7 +3498,7 @@ test('/status reports overlapping sessions on the same repo and ignores other re
 
   assert.deepEqual(
     seen.overlapping,
-    [{ id: b.id, branch: 'feat/b', files: ['shared.ts'] }],
+    [{ id: b.id, branch: 'feat/b', count: 1, files: ['shared.ts'] }],
     'same repo and shared path only',
   );
   assert.equal(seen.added !== undefined && seen.dirty !== undefined, true, 'existing fields survive');
@@ -3562,5 +3562,79 @@ test('a deleted session no longer appears as an overlap', async (t) => {
   assert.deepEqual(
     (await status(a.id)).overlapping, [],
     'a deleted session leaves no paths behind to overlap with',
+  );
+});
+
+// Regression guard for the whole-branch review's Fix 1: a handoff's successor
+// branches from the source's own branch at the same commit, so the two share
+// every committed path. Without the `lineage` set the pair lands in the silent
+// (unwarned-collision) bucket and both cards warn about each other forever —
+// a false positive on a first-class workflow, not a real conflict.
+test('a handoff does not warn the source and its successor about each other', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const created = await post({
+    cmd: 'create', repo, branch: 'feat/src', account: 'claude-main', prompt: 'do the thing',
+  });
+  await writeFile(join(registry.get(created.id)!.cwd, 'work.txt'), 'uncommitted work\n');
+  registry.apply(created.id, { type: 'status', status: 'done' });
+
+  const handoff = await post({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/dest' });
+
+  // Prime both caches, in both orders, so this actually exercises the pair
+  // symmetrically rather than relying on whichever side happens to be cached
+  // first (overlap is asymmetric until the cache fills — see src/overlap.ts).
+  await status(handoff.id);
+  const sourceSeen = await status(created.id);
+  const destSeen = await status(handoff.id);
+
+  assert.deepEqual(sourceSeen.overlapping, [], 'the source must not warn about its own successor');
+  assert.deepEqual(destSeen.overlapping, [], 'the successor must not warn about its source');
+});
+
+// Regression guard for the whole-branch review's Fix 2: refreshPaths
+// deliberately keeps a stale entry on a *transient* git failure, but a missing
+// worktree fails every later attempt too, so a sibling would report overlap
+// with a worktree that no longer exists for the life of the process. /status
+// already computes the liveness signal (worktreeStatus) and must act on it by
+// dropping the cached paths rather than discarding it.
+test('removing a worktree clears its phantom overlap once its own /status is polled', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  await status(b.id);
+  assert.equal((await status(a.id)).overlapping.length, 1, 'overlap is visible before the worktree vanishes');
+
+  // Remove b's worktree directly from disk, not through the `delete` command
+  // — this simulates the worktree disappearing out from under a session that
+  // is still registered, which is exactly the case refreshPaths' stale-on-
+  // failure behaviour was never meant to hide forever.
+  await rm(registry.get(b.id)!.cwd, { recursive: true, force: true });
+
+  assert.equal(await status(b.id), null, 'a missing worktree reports null status');
+
+  assert.deepEqual(
+    (await status(a.id)).overlapping, [],
+    'the sibling must stop reporting overlap with a worktree that no longer exists',
   );
 });

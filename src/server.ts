@@ -11,7 +11,7 @@ import { createAccountLimitCoordinator, type AccountLimitCoordinator } from './a
 import { Scheduler } from './schedule.ts';
 import { changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
 import { commitOutstanding, currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
-import { dropPaths, overlaps, refreshPaths, type PathCache } from './overlap.ts';
+import { dropPaths, MAX_LISTED_PATHS, overlaps, refreshPaths, type PathCache } from './overlap.ts';
 import { HANDOFF_FILE, HANDOFF_PROMPT, renderHandoff } from './handoff.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
@@ -476,6 +476,16 @@ export function createServer(opts: {
   // local like the channel maps, and for the same reason — this describes live
   // worktrees, and Registry.load forces every session to `stopped` on start.
   const paths: PathCache = new Map();
+  // Pairs related by handoff — the successor's branch point is the source's own
+  // branch, so they share every committed path and would otherwise land in the
+  // silent (unwarned-collision) bucket and cry wolf on a pair that shares
+  // history rather than colliding. Process-local, same lifecycle as the other
+  // maps: a restart loses it and a handed-off pair can show a false warning
+  // again until one side changes something. A `git merge-base --is-ancestor`
+  // check would survive a restart and be correct instead of remembered, but it
+  // is a git call per pair against an O(n^2) pairing — bookkeeping was chosen
+  // over that cost, not missed.
+  const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
 
   /**
@@ -600,6 +610,7 @@ export function createServer(opts: {
           );
           const shared = new Map(
             overlaps(paths, sessionId, siblings.map((s) => ({ id: s.id, branch: s.branch })))
+              .filter((o) => !lineage.has(channelKey(sessionId, o.id)))
               .map((o) => [o.id, o.files]),
           );
           return siblings.map((s) => ({
@@ -887,6 +898,11 @@ export function createServer(opts: {
           branch,
           title: branch,
         });
+        // The successor branches from the source at the source's own commit, so
+        // the two share every committed path and would otherwise report a
+        // guaranteed, permanent false overlap warning on each other — see the
+        // `lineage` comment above.
+        lineage.add(channelKey(source.id, session.id));
         const promptId = registry.appendPrompt(
           session.id, HANDOFF_PROMPT, account.provider === 'codex' ? 'queued' : 'sent',
         );
@@ -1098,6 +1114,7 @@ export function createServer(opts: {
         registry.remove(String(body.id));
         dropChannels(channels, String(body.id));
         dropSeen(seenChannels, String(body.id));
+        dropSeen(lineage, String(body.id));
         dropPaths(paths, String(body.id));
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
@@ -1423,6 +1440,18 @@ export function createServer(opts: {
         const session = registry.get(id);
         if (!session) { res.writeHead(404).end('{}'); return; }
         const status = await worktreeStatus(session.cwd).catch(() => null);
+        if (!status) {
+          // The worktree is gone, permanently as far as this process is
+          // concerned — every later attempt will fail the same way. Drop the
+          // cached paths rather than leaving them for siblings to keep
+          // intersecting against forever: a transient git hiccup is what
+          // refreshPaths' stale-on-failure is for, but this caller has the
+          // liveness signal that says this is not that.
+          dropPaths(paths, id);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('null');
+          return;
+        }
         // Collected here rather than on a timer of its own: this route is
         // already polled per card, and refreshPaths' TTL is what stops a
         // four-second poll from spawning git on every call.
@@ -1439,10 +1468,16 @@ export function createServer(opts: {
           .filter((s) => s.id !== id && s.repo === session.repo)
           .map((s) => ({ id: s.id, branch: s.branch }));
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(status && {
+        res.end(JSON.stringify({
           ...status,
           talking: siblings.filter((s) => channelOpen(channels, id, s.id)),
-          overlapping: overlaps(paths, id, siblings),
+          // The count is the true total; the file list is capped so a full
+          // intersection (a codemod across thousands of files, polled every
+          // four seconds per visible card) is never serialized whole — nothing
+          // downstream reads past MAX_LISTED_PATHS anyway.
+          overlapping: overlaps(paths, id, siblings)
+            .filter((o) => !lineage.has(channelKey(id, o.id)))
+            .map((o) => ({ id: o.id, branch: o.branch, count: o.files.length, files: o.files.slice(0, MAX_LISTED_PATHS) })),
         }));
         return;
       }
