@@ -1940,6 +1940,7 @@ function wireMentionMenu({ field, menu, ids, sessions }) {
     field.value = field.value.slice(0, at) + inserted + field.value.slice(caret);
     const end = at + inserted.length;
     field.setSelectionRange(end, end);
+    growPrompt();
     close();
     field.focus();
   }
