@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -20,6 +20,23 @@ const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import
 
 function prompt(text: string): AgentPrompt {
   return { text, attachments: [] };
+}
+
+async function imagePrompt(cwd: string, text = 'inspect image'): Promise<AgentPrompt> {
+  const absolutePath = join(cwd, 'image.png');
+  await writeFile(absolutePath, Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0,
+  ]));
+  return {
+    text,
+    attachments: [{
+      name: 'image.png', relativePath: 'image.png', absolutePath, kind: 'image',
+    }],
+  };
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  return access(path).then(() => true, () => false);
 }
 
 function safeThreadResponse(threadId: string, cwd: string): Record<string, unknown> {
@@ -66,9 +83,13 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(e
   return { promise, resolve, reject };
 }
 
-async function waitFor(check: () => boolean, message = 'adapter state', milliseconds = 2_000): Promise<void> {
+async function waitFor(
+  check: () => boolean | Promise<boolean>,
+  message = 'adapter state',
+  milliseconds = 2_000,
+): Promise<void> {
   const deadline = Date.now() + milliseconds;
-  while (!check()) {
+  while (!await check()) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${message}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -98,7 +119,7 @@ class ScriptedSupervisor {
     });
   }
 
-  registerSession(_sessionId: string, route: CodexSessionRoute): () => void {
+  registerSession(sessionId: string, route: CodexSessionRoute): () => void {
     assert.equal(this.route, null, 'the adapter registers exactly one route');
     this.trace.push('route:registered');
     this.route = route;
@@ -108,6 +129,7 @@ class ScriptedSupervisor {
       active = false;
       this.detached += 1;
       this.route = null;
+      if (this.bound?.sessionId === sessionId) this.bound = null;
     };
   }
 
@@ -222,6 +244,53 @@ test('normalization ignores user messages, unknown variants, and provider thread
   }), []);
 });
 
+test('declined command execution normalizes to a terminal error row', () => {
+  assert.deepEqual(normalizeCodexAppServerItem('completed', {
+    type: 'commandExecution', id: 'command-declined', command: 'printf safe',
+    status: 'declined', aggregatedOutput: 'not run',
+  }), [{ type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'command-declined', name: 'shell', summary: 'printf safe', status: 'error',
+    detail: 'not run', detailTruncated: false,
+  } }]);
+});
+
+test('declined file change normalizes to a terminal error row', () => {
+  const [event] = normalizeCodexAppServerItem('completed', {
+    type: 'fileChange', id: 'file-declined', status: 'declined',
+    changes: [{ path: '/private/worktree/safe.ts', kind: 'update' }],
+  });
+  assert.equal(event?.type, 'upsert-msg');
+  assert.ok(event?.type === 'upsert-msg' && event.msg.kind === 'tool');
+  assert.equal(event.msg.status, 'error');
+});
+
+test('normalization scrubs embedded absolute paths while preserving useful safe text', () => {
+  const events = [
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'agentMessage', id: 'agent-path', text: 'Read /private/worktree/result.txt successfully',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'reasoning', id: 'reason-path', summary: ['Inspect /private/worktree/result.txt before testing'],
+    }),
+    ...normalizeCodexAppServerItem('started', {
+      type: 'plan', id: 'plan-path', text: 'Update /private/worktree/result.txt carefully',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'commandExecution', id: 'command-path',
+      command: 'cat /private/worktree/result.txt && printf safe', status: 'completed',
+      aggregatedOutput: 'read /private/worktree/result.txt successfully',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'error', id: 'error-path', message: 'Failed at /private/worktree/result.txt: permission denied',
+    }),
+  ];
+
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /\/private\/worktree/);
+  assert.match(serialized, /Read|Inspect|Update|printf safe|permission denied/);
+  assert.match(serialized, /\[path omitted\]/);
+});
+
 test('thread setup binds before one-at-a-time FIFO turns and preserves delivery, usage, plan, and status order', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-fifo-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -314,6 +383,34 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
     type: 'usage', inputTokens: 10, outputTokens: 9, cachedInputTokens: 3,
     cacheWriteInputTokens: 2, reasoningOutputTokens: 4,
   });
+});
+
+test('adapter plan and terminal error events scrub embedded absolute paths', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-event-paths-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'event-paths', '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'event-paths', env: {} }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+
+  supervisor.notify('turn/plan/updated', {
+    threadId: 'thread-new', turnId: 'turn-1',
+    plan: [{ step: 'Inspect /private/worktree/result.txt carefully', status: 'inProgress' }],
+  });
+  supervisor.notify('turn/completed', {
+    threadId: 'thread-new',
+    turn: turn('turn-1', 'failed', {
+      message: 'Failed at /private/worktree/result.txt: permission denied',
+      codexErrorInfo: null,
+      additionalDetails: '/private/provider/error.json',
+    }),
+  });
+  await waitFor(() => events.some((event) => event.type === 'stopped'), 'path-scrubbed terminal event');
+
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /\/private\/(?:worktree|provider)/);
+  assert.match(serialized, /Inspect|carefully|permission denied/);
 });
 
 test('thread safety mismatches fail closed before turn/start', async (t) => {
@@ -430,6 +527,101 @@ test('stop interrupts a turn accepted just before its response returns', async (
   }]);
 });
 
+test('a stopped pending turn detaches after rejected or invalid responses so resume can register again', async (t) => {
+  for (const outcome of ['reject', 'invalid'] as const) {
+    const cwd = await mkdtemp(join(tmpdir(), `switchboard-app-adapter-detach-${outcome}-`));
+    t.after(() => rm(cwd, { recursive: true, force: true }));
+    const accepted = deferred<unknown>();
+    let turnStarts = 0;
+    const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+      if (method === 'thread/start') return safeThreadResponse(`thread-${outcome}`, (params as { cwd: string }).cwd);
+      if (method === 'thread/resume') {
+        const value = params as { threadId: string; cwd: string };
+        return safeThreadResponse(value.threadId, value.cwd);
+      }
+      if (method === 'turn/start' && turnStarts++ === 0) return accepted.promise;
+      if (method === 'turn/start') return { turn: turn(`resumed-turn-${outcome}`, 'inProgress') };
+      if (method === 'turn/interrupt') return {};
+      throw new Error(`unexpected ${method}`);
+    });
+    const firstEvents: AdapterEvent[] = [];
+    const first = createCodexAppServerAdapter(
+      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.145.0',
+    ).start({ cwd, prompt: prompt('first'), promptId: `first-${outcome}`, env: {} }, (event) => firstEvents.push(event));
+
+    await waitFor(() => firstEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+    first.stop();
+    if (outcome === 'reject') accepted.reject(new Error('turn/start rejected'));
+    else accepted.resolve({ turn: { status: 'inProgress' } });
+    await waitFor(() => supervisor.detached === 1, `${outcome} pending route detach`);
+
+    const resumedEvents: AdapterEvent[] = [];
+    createCodexAppServerAdapter(
+      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.145.0',
+    ).start({
+      cwd, prompt: prompt('resume'), promptId: `resume-${outcome}`, env: {}, resumeId: `thread-${outcome}`,
+    }, (event) => resumedEvents.push(event));
+    await waitFor(() => supervisor.requests.some(({ method }) => method === 'thread/resume'), `${outcome} resume registration`);
+    await waitFor(() => resumedEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+  }
+});
+
+test('image snapshots remain readable for the active turn and clean after completion', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-image-complete-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'image-complete', '0.145.0')
+    .start({ cwd, prompt: await imagePrompt(cwd), promptId: 'image-complete', env: {} }, (event) => events.push(event));
+
+  await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'image turn/start');
+  const input = (supervisor.requests.find(({ method }) => method === 'turn/start')?.params as { input: unknown[] }).input;
+  const snapshotPath = (input.find((item) => (item as { type?: string }).type === 'localImage') as { path: string }).path;
+  assert.equal(await pathExists(snapshotPath), true, 'snapshot remains through the active turn');
+
+  supervisor.notify('turn/completed', { threadId: 'thread-new', turn: turn('turn-1', 'completed') });
+  await waitFor(() => events.some((event) => event.type === 'status' && event.status === 'done'), 'image completion');
+  await waitFor(async () => !await pathExists(snapshotPath), 'completed snapshot cleanup');
+});
+
+test('image snapshots clean on stop, crash, and turn/start rejection while queued images remain unsent', async (t) => {
+  for (const terminal of ['stop', 'crash', 'reject'] as const) {
+    const cwd = await mkdtemp(join(tmpdir(), `switchboard-app-adapter-image-${terminal}-`));
+    t.after(() => rm(cwd, { recursive: true, force: true }));
+    const accepted = deferred<unknown>();
+    const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+      if (method === 'thread/start') return safeThreadResponse(`thread-image-${terminal}`, (params as { cwd: string }).cwd);
+      if (method === 'turn/start') return terminal === 'reject' ? accepted.promise : { turn: turn(`turn-image-${terminal}`, 'inProgress') };
+      if (method === 'turn/interrupt') return {};
+      throw new Error(`unexpected ${method}`);
+    });
+    const events: AdapterEvent[] = [];
+    const handle = createCodexAppServerAdapter(
+      supervisor as unknown as CodexAppServerSupervisor, `image-${terminal}`, '0.145.0',
+    ).start({ cwd, prompt: await imagePrompt(cwd), promptId: `active-${terminal}`, env: {} }, (event) => events.push(event));
+    await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), `${terminal} image turn/start`);
+    const input = (supervisor.requests.find(({ method }) => method === 'turn/start')?.params as { input: unknown[] }).input;
+    const snapshotPath = (input.find((item) => (item as { type?: string }).type === 'localImage') as { path: string }).path;
+    assert.equal(await pathExists(snapshotPath), true, `${terminal} retains active snapshot before terminal state`);
+
+    if (terminal === 'stop') {
+      handle.send(await imagePrompt(cwd, 'queued image'), 'queued-image');
+      handle.stop();
+    } else if (terminal === 'crash') {
+      supervisor.fatal('transport crashed', 'codex_transport_crashed');
+    } else {
+      accepted.reject(new Error('Codex app-server request turn/start timed out after 5ms.'));
+    }
+    await waitFor(() => events.some((event) => event.type === 'stopped'), `${terminal} image terminal event`);
+    await waitFor(async () => !await pathExists(snapshotPath), `${terminal} snapshot cleanup`);
+    if (terminal === 'stop') {
+      assert.ok(events.some((event) => event.type === 'prompt-delivery'
+        && event.id === 'queued-image' && event.delivery === 'unsent'));
+      assert.equal(supervisor.requests.filter(({ method }) => method === 'turn/start').length, 1);
+    }
+  }
+});
+
 test('crash and timeout are terminal without replaying active or queued work', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-failure-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -496,6 +688,29 @@ function runtime(overrides: Record<string, string> = {}): PreparedCodexRuntime {
     diagnostics: [],
   };
 }
+
+test('real app-server request timeout reaches the active route as codex_request_timed_out', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-real-timeout-'));
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime({ FAKE_APP_SERVER_MODE: 'turn-request-timeout' }),
+    verifyContract: async () => {},
+    requestTimeoutMs: 1_000,
+  });
+  t.after(async () => {
+    await supervisor.close();
+    await rm(cwd, { recursive: true, force: true });
+  });
+  await supervisor.ensureTurnTransport();
+  const events: AdapterEvent[] = [];
+  createCodexAppServerAdapter(supervisor, 'real-timeout', '0.145.0')
+    .start({ cwd, prompt: prompt('time out'), promptId: 'real-timeout', env: {} }, (event) => events.push(event));
+
+  await waitFor(() => events.some((event) => event.type === 'stopped'), 'real request timeout', 3_000);
+  assert.deepEqual(events.filter((event) => event.type === 'stopped').map((event) => event.code), [
+    'codex_request_timed_out',
+  ]);
+  assert.equal(events.some((event) => event.type === 'stopped' && event.code === 'codex_transport_crashed'), false);
+});
 
 test('two adapters share the real fake child without cross-routing turns or stopping telemetry', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-multi-'));

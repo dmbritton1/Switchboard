@@ -782,6 +782,12 @@ async function handle(message: Message): Promise<void> {
       return;
     case 'thread/start': {
       if (!initialized) fail('thread/start before initialized');
+      if (mode === 'turn-request-timeout') {
+        const cwd = message.params?.cwd;
+        if (typeof cwd !== 'string') fail('turn timeout thread/start requires cwd');
+        send({ id: message.id, result: multiThreadResponse(threadId, cwd) });
+        return;
+      }
       if (mode === 'turn-multi-session') {
         const cwd = message.params?.cwd;
         if (typeof cwd !== 'string') fail('multi-session thread/start requires cwd');
@@ -836,6 +842,7 @@ async function handle(message: Message): Promise<void> {
         || ((textInput as Record<string, unknown>).text_elements as unknown[]).length !== 0) {
         fail('turn/start text input must include empty text_elements');
       }
+      if (mode === 'turn-request-timeout') return;
       turnNumber += 1;
       const turnId = `fixture-turn-${turnNumber}`;
       send({ id: message.id, result: { turn: turn(turnId, 'inProgress') } });

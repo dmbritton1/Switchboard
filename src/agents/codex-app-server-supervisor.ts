@@ -7,7 +7,7 @@ import {
   CODEX_TELEMETRY_REASONS, normalizeCodexAccountRead, normalizeCodexAuthUpdate,
   normalizeCodexRateLimits, type CodexTelemetryAuth,
 } from './codex-limits.ts';
-import { redactValues, type PreparedCodexRuntime } from './codex-runtime.ts';
+import { CodexRuntimeError, redactValues, type PreparedCodexRuntime } from './codex-runtime.ts';
 import type { AccountLimitSnapshot, CodexFailureCode } from '../types.ts';
 
 const PUBLIC_UNAVAILABLE = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
@@ -21,6 +21,7 @@ type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: fa
 type ReadOutcome = { invalidated: true } | { invalidated: false; snapshot: AccountLimitSnapshot };
 type ActiveRead = { revision: number; promise: Promise<ReadOutcome> };
 type SessionState = { route: CodexSessionRoute; threadId: string | null; activeTurn: boolean };
+type RouteFailure = { reason: string; code: CodexFailureCode };
 
 export type CodexLimitListener = {
   onSnapshot(snapshot: AccountLimitSnapshot): void;
@@ -248,7 +249,15 @@ export class CodexAppServerSupervisor {
     const mode = this.#mode;
     try {
       await this.#verifyContract(this.#options.runtime, mode);
-      if (this.#closed) return;
+    } catch {
+      this.#handleFailure(false);
+      if (mode === 'turns') {
+        throw new CodexRuntimeError('codex_protocol_mismatch', 'Codex app-server protocol mismatch.');
+      }
+      throw unavailableError();
+    }
+    if (this.#closed) return;
+    try {
       client = this.#createClient(mode);
       this.#client = client;
       await client.request('initialize', {
@@ -277,6 +286,12 @@ export class CodexAppServerSupervisor {
     } catch {
       if (client !== null) await this.#retire(client, true);
       else this.#handleFailure(false);
+      if (mode === 'turns') {
+        throw new CodexRuntimeError(
+          'codex_app_server_initialization_failed',
+          'Codex app-server initialization failed.',
+        );
+      }
       throw unavailableError();
     }
   }
@@ -291,7 +306,7 @@ export class CodexAppServerSupervisor {
       redact: (text) => redactValues(text, Object.values(this.#options.runtime.env)),
       onNotification: (method, params) => this.#notification(client, method, params),
       onServerRequest: (id, method, _params) => this.#serverRequest(client, id, method),
-      onExit: () => this.#clientExit(client),
+      onExit: (error) => this.#clientExit(client, error),
     });
     return client;
   }
@@ -355,11 +370,15 @@ export class CodexAppServerSupervisor {
     }
   }
 
-  #clientExit(client: SupervisorClient): void {
+  #clientExit(client: SupervisorClient, error: Error): void {
     if (client !== this.#client || this.#closed) return;
     this.#client = null;
     this.#readyClient = null;
-    this.#handleFailure(true);
+    const reason = redactValues(error.message, Object.values(this.#options.runtime.env));
+    const routeFailure = /^Codex app-server request .+ timed out after \d+ms\.$/.test(reason)
+      ? { reason, code: 'codex_request_timed_out' as const }
+      : undefined;
+    this.#handleFailure(true, routeFailure);
   }
 
   async #readCurrent(now: number): Promise<AccountLimitSnapshot> {
@@ -425,19 +444,21 @@ export class CodexAppServerSupervisor {
     this.#handleFailure(fatalRoutes);
   }
 
-  #handleFailure(fatalRoutes: boolean): void {
+  #handleFailure(fatalRoutes: boolean, routeFailure?: RouteFailure): void {
     if (this.#closed) return;
     this.#markStale(PUBLIC_UNAVAILABLE);
-    if (fatalRoutes && this.#mode === 'turns') this.#fatalRoutes();
+    if (fatalRoutes && this.#mode === 'turns') this.#fatalRoutes(routeFailure);
     this.#scheduleRestart();
   }
 
-  #fatalRoutes(): void {
+  #fatalRoutes(failure: RouteFailure = {
+    reason: PUBLIC_TRANSPORT_CRASH, code: 'codex_transport_crashed',
+  }): void {
     for (const state of [...this.#sessions.values()]) {
       if (!state.activeTurn) continue;
       state.activeTurn = false;
       try {
-        state.route.onFatal(PUBLIC_TRANSPORT_CRASH, 'codex_transport_crashed');
+        state.route.onFatal(failure.reason, failure.code);
       } catch {
         // One route observer cannot hide the crash from sibling sessions.
       }

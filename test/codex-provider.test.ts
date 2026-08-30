@@ -29,7 +29,12 @@ type Harness = {
 
 async function harness(
   t: { after(fn: () => Promise<void>): void },
-  options: { failPreflight?: boolean; failPreflightAttempts?: number; failContract?: boolean } = {},
+  options: {
+    failPreflight?: boolean;
+    failPreflightAttempts?: number;
+    failContract?: boolean;
+    failInitialization?: boolean;
+  } = {},
 ): Promise<Harness> {
   const prepared: string[] = [];
   const sdkAdapters: Array<Adapter & { label: string }> = [];
@@ -68,7 +73,10 @@ async function harness(
           let closed = false;
           return {
             request: async <T>(method: string): Promise<T> => {
-              if (method === 'initialize') return { initialized: true } as T;
+              if (method === 'initialize') {
+                if (options.failInitialization) throw new Error('private initialization detail');
+                return { initialized: true } as T;
+              }
               if (method === 'account/read') {
                 return {
                   account: { type: 'chatgpt', email: null, planType: 'pro' },
@@ -237,6 +245,28 @@ test('app-server preflight and contract failures fail closed without constructin
     assert.equal(fixture.sdkAdapters.length, 0);
     assert.equal(fixture.appAdapters.length, 0);
   });
+});
+
+test('app-server preparation preserves sanitized typed setup failure codes without SDK fallback', async (t) => {
+  const cases = [
+    { name: 'contract', options: { failContract: true }, code: 'codex_protocol_mismatch' },
+    { name: 'initialization', options: { failInitialization: true }, code: 'codex_app_server_initialization_failed' },
+  ] as const;
+  for (const entry of cases) {
+    await t.test(entry.name, async (t) => {
+      const fixture = await harness(t, entry.options);
+      await assert.rejects(
+        fixture.pool.prepare(account(`typed-${entry.name}`), 'app-server', 'session'),
+        (error: unknown) => {
+          assert.equal((error as { code?: unknown }).code, entry.code);
+          assert.doesNotMatch(String((error as Error).message), /private/);
+          return true;
+        },
+      );
+      assert.equal(fixture.sdkAdapters.length, 0);
+      assert.equal(fixture.appAdapters.length, 0);
+    });
+  }
 });
 
 test('concurrent app-server prepares share a transient preflight failure and a later prepare retries', async (t) => {

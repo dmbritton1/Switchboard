@@ -26,12 +26,22 @@ function text(value: unknown): string | null {
 }
 
 function toolStatus(value: unknown, phase: ItemPhase): ToolMsg['status'] {
-  if (value === 'failed') return 'error';
+  if (value === 'failed' || value === 'declined') return 'error';
   return phase === 'completed' || value === 'completed' ? 'ok' : 'running';
 }
 
+function scrubAbsolutePaths(value: string): string {
+  return value
+    .replace(/(^|[\s"'`([{=:])\/(?!\/)[^\s"'`<>{}\[\](),;:]+/g, '$1[path omitted]')
+    .replace(/(^|[\s"'`([{=:])(?:[A-Za-z]:\\|\\\\)[^\s"'`<>{}\[\](),;:]+/g, '$1[path omitted]');
+}
+
+function safePublicText(value: string, env: Record<string, string>): string {
+  return scrubAbsolutePaths(redactCodexText(value, env));
+}
+
 function withoutAbsolutePaths(value: unknown): unknown {
-  if (typeof value === 'string') return value.startsWith('/') ? '[path omitted]' : value;
+  if (typeof value === 'string') return scrubAbsolutePaths(value);
   if (Array.isArray(value)) return value.map(withoutAbsolutePaths);
   const record = object(value);
   if (!record) return value;
@@ -72,21 +82,21 @@ export function normalizeCodexAppServerItem(
   switch (value.type) {
     case 'agentMessage':
       return phase === 'completed' && text(value.text) !== null
-        ? [{ type: 'msg', msg: { kind: 'text', text: redactCodexText(text(value.text)!, env) } }]
+        ? [{ type: 'msg', msg: { kind: 'text', text: safePublicText(text(value.text)!, env) } }]
         : [];
     case 'reasoning': {
       const summary = Array.isArray(value.summary) ? value.summary.filter((part): part is string => typeof part === 'string') : [];
       return summary.length ? [{ type: 'upsert-msg', msg: {
-        kind: 'reasoning', id, text: redactCodexText(summary.join('\n'), env),
+        kind: 'reasoning', id, text: safePublicText(summary.join('\n'), env),
       } }] : [];
     }
     case 'plan':
       return text(value.text) === null ? [] : [{ type: 'upsert-msg', msg: {
-        kind: 'todo', id, items: [{ text: redactCodexText(text(value.text)!, env), completed: false }],
+        kind: 'todo', id, items: [{ text: safePublicText(text(value.text)!, env), completed: false }],
       } }];
     case 'commandExecution':
       return detail({
-        kind: 'tool', id, name: 'shell', summary: redactCodexText(text(value.command) ?? 'Command', env),
+        kind: 'tool', id, name: 'shell', summary: safePublicText(text(value.command) ?? 'Command', env),
         status: toolStatus(value.status, phase),
       }, value.aggregatedOutput, env);
     case 'fileChange': {
@@ -97,20 +107,20 @@ export function normalizeCodexAppServerItem(
       }, { changes }, env);
     }
     case 'mcpToolCall': {
-      const server = redactCodexText(text(value.server) ?? 'mcp', env);
-      const tool = redactCodexText(text(value.tool) ?? 'tool', env);
+      const server = safePublicText(text(value.server) ?? 'mcp', env);
+      const tool = safePublicText(text(value.tool) ?? 'tool', env);
       return detail({ kind: 'tool', id, name: tool, summary: `${server}.${tool}`, status: toolStatus(value.status, phase) }, {
         arguments: value.arguments, result: value.result, error: value.error,
       }, env);
     }
     case 'webSearch':
       return [{ type: 'upsert-msg', msg: {
-        kind: 'tool', id, name: 'search', summary: redactCodexText(text(value.query) ?? 'Search', env),
+        kind: 'tool', id, name: 'search', summary: safePublicText(text(value.query) ?? 'Search', env),
         status: toolStatus(value.status, phase),
       } }];
     case 'error':
       return phase === 'completed' && text(value.message) !== null
-        ? [{ type: 'msg', msg: { kind: 'error', text: redactCodexText(text(value.message)!, env) } }]
+        ? [{ type: 'msg', msg: { kind: 'error', text: safePublicText(text(value.message)!, env) } }]
         : [];
     case 'contextCompaction':
       return [{ type: 'upsert-msg', msg: {
@@ -166,24 +176,38 @@ export function createCodexAppServerAdapter(
       let threadId: string | null = null;
       let activeTurnId: string | null = null;
       let activeUsage: unknown = null;
+      let activeSnapshotCleanup: (() => Promise<void>) | null = null;
       let draining = false;
+      let completing = false;
       let stopped = false;
       let interrupted = false;
       let interruptSent = false;
       let turnRequestInFlight = false;
       const bufferedNotifications: Array<{ method: string; params: unknown }> = [];
 
-      const finish = (reason: string, code: CodexFailureCode, detachRoute = true): void => {
+      const detachRoute = (): void => {
+        detach?.();
+        detach = null;
+      };
+
+      const cleanupActiveSnapshot = async (): Promise<void> => {
+        const cleanup = activeSnapshotCleanup;
+        if (!cleanup) return;
+        activeSnapshotCleanup = null;
+        await cleanup();
+      };
+
+      const finish = (
+        reason: string, code: CodexFailureCode, detachNow = true, cleanupSnapshot = true,
+      ): void => {
         if (stopped) return;
         stopped = true;
         for (const queued of queue.splice(0)) {
           if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'unsent' });
         }
-        if (detachRoute) {
-          detach?.();
-          detach = null;
-        }
-        emit({ type: 'stopped', reason: redactCodexText(reason, opts.env), code });
+        if (detachNow) detachRoute();
+        if (cleanupSnapshot) void cleanupActiveSnapshot().catch(() => {});
+        emit({ type: 'stopped', reason: safePublicText(reason, opts.env), code });
       };
 
       const finishRequest = (error: unknown, fallback: CodexFailureCode): void => {
@@ -197,6 +221,25 @@ export function createCodexAppServerAdapter(
         void supervisor.requestForSession(sessionId, 'turn/interrupt', {
           threadId, turnId: activeTurnId,
         }).catch(() => {});
+      };
+
+      const completeTurn = async (turnId: string): Promise<void> => {
+        if (stopped || completing || turnId !== activeTurnId) return;
+        completing = true;
+        const usage = lastUsage(activeUsage);
+        activeTurnId = null;
+        activeUsage = null;
+        try {
+          await cleanupActiveSnapshot();
+        } catch {
+          // Snapshot cleanup is best-effort and must not suppress terminal events.
+        }
+        if (!stopped) {
+          if (usage) emit(usage);
+          emit({ type: 'status', status: 'done' });
+        }
+        completing = false;
+        if (!stopped) void drain();
       };
 
       function onNotification(method: string, params: unknown): void {
@@ -223,7 +266,7 @@ export function createCodexAppServerAdapter(
             items: value.plan.flatMap((step) => {
               const item = object(step);
               const stepText = item && text(item.step);
-              return stepText === null ? [] : [{ text: redactCodexText(stepText, opts.env), completed: item.status === 'completed' }];
+              return stepText === null ? [] : [{ text: safePublicText(stepText, opts.env), completed: item.status === 'completed' }];
             }),
           } });
           return;
@@ -241,12 +284,7 @@ export function createCodexAppServerAdapter(
           const completed = object(value.turn);
           const status = completed?.status;
           if (status === 'completed') {
-            const usage = lastUsage(activeUsage);
-            if (usage) emit(usage);
-            emit({ type: 'status', status: 'done' });
-            activeTurnId = null;
-            activeUsage = null;
-            void drain();
+            void completeTurn(receivedTurn);
           } else if (status === 'interrupted' && interrupted) {
             // stop() already produced the one terminal event.
           } else {
@@ -263,11 +301,13 @@ export function createCodexAppServerAdapter(
       };
 
       const drain = async (): Promise<void> => {
-        if (draining || stopped || !threadId || activeTurnId || queue.length === 0) return;
+        if (draining || completing || stopped || !threadId || activeTurnId || queue.length === 0) return;
         draining = true;
         try {
           const queued = queue[0];
           const prepared = await snapshotCodexPrompt(opts.cwd, queued.prompt);
+          activeSnapshotCleanup = prepared.cleanup;
+          let retainSnapshot = false;
           try {
             if (stopped || queue[0] !== queued || !threadId || activeTurnId) return;
             emit({ type: 'status', status: 'working' });
@@ -285,23 +325,27 @@ export function createCodexAppServerAdapter(
             const turn = object(response)?.turn;
             const id = turn && text(turn.id);
             if (!id) {
-              finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
+              if (stopped) detachRoute();
+              else finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
               return;
             }
             activeTurnId = id;
             if (stopped) {
               if (interrupted) interruptActiveTurn();
-              detach?.();
-              detach = null;
+              detachRoute();
               return;
             }
+            retainSnapshot = true;
             const early = bufferedNotifications.splice(0);
             for (const notification of early) onNotification(notification.method, notification.params);
           } finally {
-            await prepared.cleanup();
+            if (!retainSnapshot && activeSnapshotCleanup === prepared.cleanup) {
+              await cleanupActiveSnapshot();
+            }
           }
         } catch (error) {
-          if (!stopped) finishRequest(error, 'codex_app_server_unavailable');
+          if (stopped) detachRoute();
+          else finishRequest(error, 'codex_app_server_unavailable');
         } finally {
           draining = false;
         }
@@ -356,7 +400,7 @@ export function createCodexAppServerAdapter(
           if (stopped) return;
           interrupted = true;
           interruptActiveTurn();
-          finish('Stopped by user.', 'codex_user_stopped', !turnRequestInFlight);
+          finish('Stopped by user.', 'codex_user_stopped', !turnRequestInFlight, !turnRequestInFlight);
         },
       };
     },
