@@ -1761,16 +1761,23 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   let index = 0;
 
   function close() {
-    // A menu that is already closed has nothing to say about the shared field:
-    // #prompt is also wireMentionMenu's field, and touching aria-expanded /
-    // aria-activedescendant here when this menu was never open would stomp
-    // whatever the other menu just set.
+    // Cheap early-out for the common case, and makes the guard below obvious:
+    // an already-closed menu still needs no work.
     if (menu.hidden) return;
     matches = [];
     menu.hidden = true;
     menu.replaceChildren();
-    field.setAttribute('aria-expanded', 'false');
-    field.removeAttribute('aria-activedescendant');
+    // Only surrender the field's ARIA state if it currently describes THIS
+    // menu. #prompt is shared with wireMentionMenu, so a menu that closes in
+    // the same event another opens must not clear attributes the other just
+    // set — and which of the two runs last is an accident of registration
+    // order, not something to depend on. Delimiter-aware (`${ids}-`, not
+    // bare `ids`) so a future id namespace that happens to start with this
+    // one's text can't match by the same kind of accident.
+    if ((field.getAttribute('aria-activedescendant') ?? '').startsWith(`${ids}-`)) {
+      field.setAttribute('aria-expanded', 'false');
+      field.removeAttribute('aria-activedescendant');
+    }
   }
 
   /**
@@ -1910,15 +1917,14 @@ function wireMentionMenu({ field, menu, ids, sessions }) {
   let index = 0;
 
   function close() {
-    // Same guard as wireCommandMenu's close(): #prompt is shared between both
-    // menus, and this factory runs its listeners second (registered after
-    // wireCommandMenu's), so an unconditional write here would win the race on
-    // every keystroke that isn't a mention — which is most of them.
+    // Same ownership guard as wireCommandMenu's close() — see its comment.
     if (menu.hidden) return;
     menu.hidden = true;
     matches = [];
-    field.removeAttribute('aria-activedescendant');
-    field.setAttribute('aria-expanded', 'false');
+    if ((field.getAttribute('aria-activedescendant') ?? '').startsWith(`${ids}-`)) {
+      field.removeAttribute('aria-activedescendant');
+      field.setAttribute('aria-expanded', 'false');
+    }
   }
 
   function highlight() {
