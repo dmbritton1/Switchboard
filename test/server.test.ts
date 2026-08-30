@@ -3440,3 +3440,94 @@ test('the gate distinguishes a first send from a checkpoint', async (t) => {
   assert.equal(gate.ask, true);
   assert.match(gate.note!, /continue\?/);
 });
+
+// ---- /status: overlap and channel signals --------------------------------
+
+test('/status reports overlapping sessions on the same repo and ignores other repos', async (t) => {
+  const repo = await makeRepo();
+  const other = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  t.after(() => rm(other, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo: other, branch: 'feat/elsewhere', account: 'claude-main', prompt: 'go' });
+
+  // Both touch one shared file; each also touches one of its own.
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(a.id)!.cwd, 'only-a.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  // Prime the cache for both, then read A: overlap is computed against what is
+  // cached, so B must have been collected before A can see it.
+  await status(b.id);
+  const seen = await status(a.id);
+
+  assert.deepEqual(
+    seen.overlapping,
+    [{ id: b.id, branch: 'feat/b', files: ['shared.ts'] }],
+    'same repo and shared path only',
+  );
+  assert.equal(seen.added !== undefined && seen.dirty !== undefined, true, 'existing fields survive');
+});
+
+test('/status reports an open relay channel as talking', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  assert.deepEqual((await status(a.id)).talking, [], 'no channel yet');
+
+  starts[0].relay!(b.id, 'ping');
+
+  assert.deepEqual(
+    (await status(a.id)).talking, [{ id: b.id, branch: 'feat/b' }],
+    'a successful relay opens the channel, which both ends can see',
+  );
+  assert.deepEqual(
+    (await status(b.id)).talking, [{ id: a.id, branch: 'feat/a' }],
+    'the channel is a pair, so it reads the same from either side',
+  );
+});
+
+test('deleting a session drops its cached paths', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+  await status(b.id);
+  assert.equal((await status(a.id)).overlapping.length, 1, 'overlap is visible before the delete');
+
+  await post({ cmd: 'delete', id: b.id });
+
+  assert.deepEqual(
+    (await status(a.id)).overlapping, [],
+    'a deleted session leaves no paths behind to overlap with',
+  );
+});

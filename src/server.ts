@@ -9,8 +9,9 @@ import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from './account-limits.ts';
 import { Scheduler } from './schedule.ts';
-import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
-import { commitOutstanding, mergeWorktrees, pushRepo } from './merge.ts';
+import { changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
+import { commitOutstanding, currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
+import { dropPaths, overlaps, refreshPaths, type PathCache } from './overlap.ts';
 import { HANDOFF_FILE, HANDOFF_PROMPT, renderHandoff } from './handoff.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
@@ -471,6 +472,10 @@ export function createServer(opts: {
   // Pairs that have talked before, so the card can say which question it is
   // asking. Never cleared on checkpoint, only when a session goes away.
   const seenChannels = new Set<string>();
+  // Paths each session has changed, with the time they were collected. Process-
+  // local like the channel maps, and for the same reason — this describes live
+  // worktrees, and Registry.load forces every session to `stopped` on start.
+  const paths: PathCache = new Map();
   const resumeReservations = new Map<string, symbol>();
 
   /**
@@ -1070,6 +1075,7 @@ export function createServer(opts: {
         registry.remove(String(body.id));
         dropChannels(channels, String(body.id));
         dropSeen(seenChannels, String(body.id));
+        dropPaths(paths, String(body.id));
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
@@ -1394,8 +1400,27 @@ export function createServer(opts: {
         const session = registry.get(id);
         if (!session) { res.writeHead(404).end('{}'); return; }
         const status = await worktreeStatus(session.cwd).catch(() => null);
+        // Collected here rather than on a timer of its own: this route is
+        // already polled per card, and refreshPaths' TTL is what stops a
+        // four-second poll from spawning git on every call.
+        //
+        // currentBranch resolves INSIDE the closure, not before it. Outside, it
+        // would run on every poll even when the paths are fresh — and it is the
+        // same answer for every session in the repo, so a ten-session grid would
+        // ask it 150 times a minute to learn one thing. Inside, it rides the TTL
+        // that is already there and costs nothing when nothing is stale.
+        await refreshPaths(paths, id, async () => changedPaths(
+          session.cwd, await currentBranch(session.repo).catch(() => ''),
+        ), Date.now());
+        const siblings = registry.all()
+          .filter((s) => s.id !== id && s.repo === session.repo)
+          .map((s) => ({ id: s.id, branch: s.branch }));
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(status));
+        res.end(JSON.stringify(status && {
+          ...status,
+          talking: siblings.filter((s) => channelOpen(channels, id, s.id)),
+          overlapping: overlaps(paths, id, siblings),
+        }));
         return;
       }
 
