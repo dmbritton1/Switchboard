@@ -5,6 +5,7 @@ import {
   sortSessions, visibleSessions, cardAction, handoffTargets, decideSpecs, selectionState, triggerLabel, targetLabel,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
+  mentionMenu, mentionInsert,
   attributeBranches, branchHues, HUES, readTheme, ACCENTS, CANVASES,
   pastedName, composeMessage, diffSummary, patchLineClass,
   transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
@@ -1503,6 +1504,30 @@ test('a newline ends the command token, for the multi-line new-session prompt', 
   assert.ok(commandMenu('/comp\nthen carry on', 5, CMDS));
   // ...and the menu is gone once the caret is down on the next line.
   assert.equal(commandMenu('/compact\nthen carry on', 12, CMDS), null);
+});
+
+const SESSIONS = [
+  { id: 's1', branch: 'feat/login', account: 'claude-main', status: 'working', repo: '/r' },
+  { id: 's2', branch: 'feat/auth', account: 'claude-alt', status: 'done', repo: '/r' },
+];
+
+test('the mention menu opens on @ and filters by branch', () => {
+  assert.deepEqual(mentionMenu('@', 1, SESSIONS).matches.length, 2);
+  assert.deepEqual(mentionMenu('ask @log', 8, SESSIONS).matches.map((s) => s.branch), ['feat/login']);
+  assert.equal(mentionMenu('ask @zzz', 8, SESSIONS).matches.length, 0);
+});
+
+test('the mention menu stays shut without an @ under the caret', () => {
+  assert.equal(mentionMenu('plain text', 10, SESSIONS), null);
+  // Past the mention: the caret has moved on to ordinary prose.
+  assert.equal(mentionMenu('@feat/login and then some', 25, SESSIONS), null);
+});
+
+test('a mention inserts text naming what the token is', () => {
+  const inserted = mentionInsert(SESSIONS[0]);
+  assert.match(inserted, /feat\/login/);
+  assert.match(inserted, /send_to_session/,
+    'the agent is told how to reach it rather than left to infer it from an @');
 });
 
 test('readTheme falls back to the default for anything that is not a known pair', () => {

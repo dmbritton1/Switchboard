@@ -115,6 +115,27 @@ document can never reach a merge target. The source session is stopped — Resum
 works, but leaving it running would let it edit a branch the new session is
 already based on.
 
+A Claude session can message another session on the same repository. It has two
+tools: one lists the sessions it can reach, one sends to a chosen session. A
+relayed message arrives the way a message you type does, so a session mid-turn
+picks it up when that turn ends — and a Codex session can receive one even
+though it cannot yet send.
+
+Approval is per conversation rather than per message. The first send between a
+pair raises the usual approval card showing the target and the message; once you
+allow it, that pair exchanges freely. After ten messages the channel closes
+itself and the next send asks again, which is where you decide whether the
+exchange is still worth what it is spending. Denying leaves it closed.
+
+`auto` means never ask about relays: a session with auto-approve on opens
+channels and carries past checkpoints without a card. That is the one setting
+that removes the loop protection, and an unattended pair spends two accounts
+rather than one.
+
+Typing `@` in the composer lists the other sessions on that repository and
+inserts a short note naming what the session is, so the agent knows the name
+refers to something it can reach. The mention itself sends nothing.
+
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one
 write every two seconds, on any other state change — so a session that runs to

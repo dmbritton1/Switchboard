@@ -28,6 +28,7 @@ Registry and git worktrees, then into a provider adapter.
 - `web/` renders browser state and command failures.
 - `test/` covers those boundaries offline.
 - `src/handoff.ts` owns the transcript render and the successor's opening prompt.
+- `src/relay.ts` owns cross-session messaging rules and open-channel state.
 
 ## Safety boundaries
 
@@ -69,6 +70,11 @@ Registry and git worktrees, then into a provider adapter.
 - Handoff renders a transcript to disk. Reasoning is never included, and
   `.switchboard/` is excluded from the outstanding-work commit so a handoff
   document can never reach a merge target.
+- Relay channels are process-local and keyed by session pair. Never persist them
+  or move them onto `Session`: a channel names two live handles, and a restart
+  forces every session to `stopped`.
+- A relay tool never takes a sender. The sending session's identity comes from
+  the closure the server built in launch(), never from a tool argument.
 
 ## Test isolation
 
