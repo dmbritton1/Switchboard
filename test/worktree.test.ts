@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignLanes, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
+import { assignLanes, changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
 
 const run = promisify(execFile);
 
@@ -377,4 +377,52 @@ test('worktreeDiff on a clean worktree is an empty list, not a throw', async (t)
   t.after(() => rm(repo, { recursive: true, force: true }));
 
   assert.deepEqual(await worktreeDiff(repo), []);
+});
+
+test('changedPaths unions committed and uncommitted work', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/paths');
+
+  await writeFile(join(wt, 'committed.txt'), 'done\n');
+  await run('git', ['add', '.'], { cwd: wt });
+  await run('git', ['commit', '-m', 'a commit'], { cwd: wt });
+  await writeFile(join(wt, 'dirty.txt'), 'in progress\n');
+  await writeFile(join(wt, 'a.txt'), 'modified\n');
+
+  assert.deepEqual(
+    await changedPaths(wt, 'main'),
+    ['a.txt', 'committed.txt', 'dirty.txt'],
+  );
+});
+
+test('changedPaths excludes conversation inputs', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/inputs');
+
+  await writeFile(join(wt, 'real.txt'), 'work\n');
+  // The name writeContainedUpload actually produces (src/upload.ts) — without
+  // the exclusion every session that ever had a screenshot pasted into it would
+  // register as overlapping with every other one.
+  await writeFile(join(wt, '.switchboard-upload-0123456789abcdef0123456789abcdef-shot.png'), 'png\n');
+  await mkdir(join(wt, '.switchboard'), { recursive: true });
+  await writeFile(join(wt, '.switchboard', 'handoff.md'), '# Handoff\n');
+
+  assert.deepEqual(await changedPaths(wt, 'main'), ['real.txt']);
+});
+
+test('changedPaths skips the committed half when there is no base branch', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/detached');
+
+  await writeFile(join(wt, 'committed.txt'), 'done\n');
+  await run('git', ['add', '.'], { cwd: wt });
+  await run('git', ['commit', '-m', 'a commit'], { cwd: wt });
+  await writeFile(join(wt, 'dirty.txt'), 'in progress\n');
+
+  // A detached base repo yields '' from currentBranch. Degrade to the
+  // uncommitted half rather than failing the whole status response.
+  assert.deepEqual(await changedPaths(wt, ''), ['dirty.txt']);
 });
