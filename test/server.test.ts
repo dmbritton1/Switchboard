@@ -3336,6 +3336,26 @@ test('deleting a session drops its channels', async (t) => {
   );
 });
 
+test('relaySessions lists same-repo siblings and excludes the caller', async (t) => {
+  const repo = await makeRepo();
+  const other = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  t.after(() => rm(other, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo: other, branch: 'feat/elsewhere', account: 'claude-main', prompt: 'go' });
+
+  const listed = starts[0].relaySessions!().map((s) => s.branch);
+  assert.deepEqual(listed, ['feat/b'], 'same repo only, self excluded');
+});
+
 test('deleting a session drops its seenChannels entry, not just its channel', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));

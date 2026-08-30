@@ -259,6 +259,8 @@ export type StartOpts = {
    */
   relay?: (target: string, text: string) => RelayResult;
   relayGate?: (target: string) => { ask: boolean; note?: string };
+  /** The sessions this one may message: same repo, excluding itself. */
+  relaySessions?: () => RelaySession[];
 };
 
 export type RelayResult =

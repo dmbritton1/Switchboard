@@ -566,6 +566,9 @@ export function createServer(opts: {
             ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
             : { ask: true };
         },
+        relaySessions: () => registry.all()
+          .filter((s) => s.id !== sessionId && s.repo === session?.repo)
+          .map((s) => ({ id: s.id, branch: s.branch, account: s.account, status: s.status })),
       }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {

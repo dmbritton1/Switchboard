@@ -12,6 +12,7 @@ import type {
 import { redactCodexText as redactSecrets } from './codex-runtime.ts';
 import { simulatorServer } from './simulator.ts';
 import { browserServer, CHROME } from './browser.ts';
+import { relayServer } from './relay-tools.ts';
 
 export function renderClaudePrompt(prompt: AgentPrompt): string {
   return [
@@ -39,7 +40,7 @@ const mcpServers = {
  * which renders the choices as buttons right underneath and would otherwise
  * print each label twice; the transcript has no buttons and keeps them.
  */
-function summarize(name: string, input: Record<string, unknown>, listOptions = true): string {
+export function summarize(name: string, input: Record<string, unknown>, listOptions = true): string {
   // AskUserQuestion carries none of the fields below, so it used to render as
   // the bare tool name — the question itself never reached the UI. The SDK has
   // no interactive terminal, so allowing it returns "The user did not answer";
@@ -51,6 +52,12 @@ function summarize(name: string, input: Record<string, unknown>, listOptions = t
         ? `${q.question ?? ''} [${(q.options ?? []).map((o) => o.label).join(' / ')}]`
         : q.question ?? ''))
       .join(' | ');
+  }
+  // The message is the thing being approved, so it has to be on the card — the
+  // generic fallthrough would show only the tool name.
+  if (name.endsWith('__send_to_session')
+    && typeof input.session === 'string' && typeof input.text === 'string') {
+    return `→ ${input.session}: ${input.text}`;
   }
   if (typeof input.command === 'string') return input.command;
   if (typeof input.file_path === 'string') return input.file_path;
@@ -321,6 +328,14 @@ export const claudeAdapter: Adapter = {
       toolInput: Record<string, unknown>,
     ): Promise<PermissionResult> => {
       const options = questionOptions(toolName, toolInput);
+      // Relays are gated by the channel rather than by `auto`: the first send to
+      // a pair asks, the pair then talks freely, and the checkpoint asks again.
+      // A session with `auto` on skips both, which is what `auto` means here.
+      const relayTarget = toolName.endsWith('__send_to_session') && typeof toolInput.session === 'string'
+        ? toolInput.session
+        : null;
+      const gate = relayTarget && opts.relayGate ? opts.relayGate(relayTarget) : null;
+      if (gate && !gate.ask) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
       // Read at call time, not captured: setAuto() can flip this mid-session and
       // every later tool call must see the new value. A question is exempt: auto
       // means "don't make me approve tool calls", and allowing AskUserQuestion
@@ -330,13 +345,22 @@ export const claudeAdapter: Adapter = {
       const request = {
         id: `a${++approvalSeq}`,
         tool: toolName,
-        summary: summarize(toolName, toolInput, !options),
+        summary: gate?.note
+          ? `${summarize(toolName, toolInput, !options)} (${gate.note})`
+          : summarize(toolName, toolInput, !options),
         ...(options ? { options } : {}),
       };
       const { promise, isHead } = approvals.wait(request);
       if (isHead) emit({ type: 'approval', request });
       return promise;
     };
+
+    // Per launch, not module level: the relay tools close over this session's
+    // own callbacks, so they cannot be shared the way the browser and simulator
+    // servers are.
+    const servers = opts.relay && opts.relaySessions
+      ? { ...mcpServers, relay: relayServer({ sessions: opts.relaySessions, send: opts.relay }) }
+      : mcpServers;
 
     const options: Options = {
       cwd: opts.cwd,
@@ -345,7 +369,7 @@ export const claudeAdapter: Adapter = {
       // callback was never removed.
       env: { ...process.env, ...opts.env } as Options['env'],
       canUseTool,
-      ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
+      ...(Object.keys(servers).length ? { mcpServers: servers } : {}),
       ...(opts.resumeId ? { resume: opts.resumeId } : {}),
     };
 

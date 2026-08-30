@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  normalizeClaude, approvalQueue, probeLimits, questionOptions, renderClaudePrompt, resultText,
+  normalizeClaude, approvalQueue, probeLimits, questionOptions, renderClaudePrompt, resultText, summarize,
 } from '../src/agents/claude.ts';
+import { relayServer } from '../src/agents/relay-tools.ts';
 import type { AdapterEvent } from '../src/types.ts';
 
 const fixture = JSON.parse(
@@ -404,4 +405,20 @@ test('init reports the CLI slash commands, and only when there are some', () => 
   for (const absent of [init, { ...init, slash_commands: [] }, { ...init, slash_commands: 'nope' }]) {
     assert.deepEqual(normalizeClaude(absent as never), [{ type: 'vendor-session-id', id: 's1' }]);
   }
+});
+
+test('the approval card names the target and the message', () => {
+  assert.equal(
+    summarize('mcp__relay__send_to_session', { session: 'feat/login', text: 'auth moved' }),
+    '→ feat/login: auth moved',
+  );
+});
+
+test('a relay summary survives a missing field', () => {
+  assert.equal(summarize('mcp__relay__send_to_session', {}), 'mcp__relay__send_to_session');
+});
+
+test('relayServer exposes exactly the two relay tools', () => {
+  const server = relayServer({ sessions: () => [], send: () => ({ ok: true, queued: false }) });
+  assert.equal(server.name, 'relay');
 });
