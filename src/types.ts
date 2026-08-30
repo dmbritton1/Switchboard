@@ -251,6 +251,13 @@ export type StartOpts = {
   codexSettings?: CodexThreadSettings;
 };
 
+export type RelayResult =
+  | { ok: true; queued: boolean }
+  | { ok: false; reason: 'unknown-session' | 'self' | 'different-repo' | 'not-live' };
+
+/** One row of what a session may message: same repo, never itself. */
+export type RelaySession = { id: string; branch: string; account: string; status: Status };
+
 export type AgentHandle = {
   send(prompt: AgentPrompt, promptId?: string): void;
   /** `answer` is the AskUserQuestion option label the user picked; it overrides
