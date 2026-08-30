@@ -75,6 +75,15 @@ The result is cached in a process-local map beside `channels` and `handles`
 (`src/server.ts:470`), dropped when a session is deleted, the same lifecycle
 relay's maps already have.
 
+**The cache is also the rate limiter, and that is not optional.**
+`STATUS_THROTTLE_MS` is 4000 (`web/app.js:442`), so each visible card polls
+`/status` every four seconds — on a ten-session grid, recomputing paths on every
+poll would mean roughly three hundred git invocations a minute. Each entry
+therefore carries the time it was computed, and collection is skipped when the
+entry is younger than a TTL of its own (30s), independent of how often `/status`
+is called. Everything below that says "throttle window" means this TTL, not the
+browser's poll interval.
+
 **Overlap is asymmetric until the cache fills.** Overlap for session X is X's
 paths intersected against the *cached* paths of the other same-repo sessions. A
 session whose `/status` has not run yet is not in the cache, so X may show
@@ -153,8 +162,8 @@ fail.
 An agent may call `list_sessions` before the browser has polled the sessions it
 asks about, leaving the cache cold and the tool silently reporting no overlap
 where there is some. Since agents call it rarely, that path refreshes any entry
-older than the browser's own throttle window — a handful of git invocations on an
-agent-initiated action, in exchange for a tool that does not quietly lie.
+older than the same TTL — a handful of git invocations on an agent-initiated
+action, in exchange for a tool that does not quietly lie.
 
 This makes `relaySessions` (`src/server.ts:579`) return a promise. Its only
 caller is an already-async tool handler.
@@ -178,10 +187,13 @@ failing the whole response: a partial advisory signal beats none, and
 overlapping. Noted and not solved; rename-aware overlap is a deeper hole than it
 looks, and this signal is advisory.
 
-**Cost.** Pairwise intersection is O(n²) in same-repo sessions per `/status`
-call, and two git invocations per session refresh. Trivial at ten sessions on a
-thirty-second throttle. Worth a `ponytail:` comment naming where that stops being
-true rather than pretending it never does.
+**Cost.** Two git invocations per session per TTL window, not per `/status`
+call — see the rate-limiting note above, which is what keeps a four-second poll
+from turning into hundreds of subprocess spawns a minute. Pairwise intersection
+is O(n²) in same-repo sessions and runs on every call, but it is set arithmetic
+over cached data with no git in it. Trivial at ten sessions; worth a `ponytail:`
+comment naming where that stops being true rather than pretending it never
+does.
 
 ## Testing
 
