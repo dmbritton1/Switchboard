@@ -3309,6 +3309,44 @@ test('launch hands a session relay callbacks scoped to itself', async (t) => {
   assert.equal(registry.get(a.id)!.transcript.length, 1, 'the sender is untouched');
 });
 
+test('a relay addressed by branch delivers, and the channel it opens is found by branch or id', async (t) => {
+  // The tool schema tells the model 'the target session id or branch', and the
+  // @ mention inserts a branch — so a branch-addressed send has to work, and
+  // the channel it opens has to be the same one the next relayGate call (which
+  // may itself be addressed by branch or by id, since either can recur) finds.
+  // Otherwise the human is asked again on every message, defeating the whole
+  // point of a channel.
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  const fromA = starts[0];
+  assert.equal(fromA.relayGate!('feat/b').ask, true, 'closed channel: addressed by branch, still gated');
+
+  const result = fromA.relay!('feat/b', 'ping');
+  assert.deepEqual(result, { ok: true, queued: false }, 'a branch-addressed send must actually deliver');
+
+  const transcript = registry.get(b.id)!.transcript;
+  assert.equal((transcript.at(-1) as { text: string }).text, 'ping');
+
+  assert.equal(
+    fromA.relayGate!('feat/b').ask, false,
+    'the channel opened by a branch-addressed send must be found by the same branch',
+  );
+  assert.equal(
+    fromA.relayGate!(b.id).ask, false,
+    'and by the id, since the gate and the send must key on one canonical resolved id',
+  );
+});
+
 test('deleting a session drops its channels', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));

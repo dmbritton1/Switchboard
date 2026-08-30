@@ -22,7 +22,7 @@ import {
 } from './relay.ts';
 import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
-  CodexRuntimeError, prepareCodexRuntime, redactValues,
+  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactValues,
 } from './agents/codex-runtime.ts';
 import {
   createAccountStore, loadAccounts, ACCOUNT_NAME_RE, type Account, type AccountStore,
@@ -552,17 +552,27 @@ export function createServer(opts: {
     const session = registry.get(sessionId);
     const auto = session?.auto ?? false;
     const codexSettings = session?.codexSettings;
+    // The tool schema and the @ mention both hand the model a branch, not an id
+    // — but relay() and the channel map key on id. Resolve here, once, so the
+    // gate and the send agree on the same canonical key: an exact id match
+    // first (deterministic even if a branch name is ever ambiguous), then a
+    // same-repo branch lookup, then the raw target unchanged so relay() can
+    // still report unknown-session on genuine nonsense.
+    const resolve = (target: string) => registry.all()
+      .find((s) => s.id === target || (s.repo === session?.repo && s.branch === target))?.id ?? target;
     try {
       const handle = adapter.start({
         cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings,
         relay: (target, text) => {
-          const result = relay({ registry, handles, channels }, sessionId, target, text);
-          if (result.ok) seenChannels.add(channelKey(sessionId, target));
+          const to = resolve(target);
+          const result = relay({ registry, handles, channels }, sessionId, to, redactCodexText(text, account.env));
+          if (result.ok) seenChannels.add(channelKey(sessionId, to));
           return result;
         },
         relayGate: (target) => {
-          if (channelOpen(channels, sessionId, target)) return { ask: false };
-          return seenChannels.has(channelKey(sessionId, target))
+          const to = resolve(target);
+          if (channelOpen(channels, sessionId, to)) return { ask: false };
+          return seenChannels.has(channelKey(sessionId, to))
             ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
             : { ask: true };
         },
