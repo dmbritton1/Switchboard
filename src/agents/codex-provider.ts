@@ -1,4 +1,5 @@
 import { createCodexAdapter } from './codex.ts';
+import { createCodexAppServerAdapter } from './codex-app-server.ts';
 import {
   CodexAppServerSupervisor,
   type CodexAppServerSupervisorOptions,
@@ -48,7 +49,7 @@ export class CodexProviderPool {
       new CodexAppServerSupervisor(supervisorOptions)
     ));
     this.#createSdkAdapter = options.createSdkAdapter ?? createCodexAdapter;
-    this.#createAppServerAdapter = options.createAppServerAdapter;
+    this.#createAppServerAdapter = options.createAppServerAdapter ?? createCodexAppServerAdapter;
   }
 
   async limits(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {

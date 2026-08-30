@@ -17,6 +17,10 @@ const mode = process.env.FAKE_APP_SERVER_MODE ?? 'normal';
 const interleave = process.env.FAKE_APP_SERVER_INTERLEAVE === '1';
 const threadId = 'fixture-thread';
 let turnNumber = 0;
+let multiThreadNumber = 0;
+let multiTurnNumber = 0;
+const multiThreads = new Map<string, string>();
+const multiTurns = new Map<string, string>();
 let initialized = false;
 let heldAccountRead: Message | undefined;
 let heldClientRequest: Message | undefined;
@@ -384,6 +388,46 @@ function threadResponse(): Record<string, unknown> {
   };
 }
 
+function multiThreadResponse(id: string, cwd: string): Record<string, unknown> {
+  return {
+    thread: { id, cwd, path: '/private/fake/thread.json' },
+    model: 'fixture-model',
+    modelProvider: 'openai',
+    serviceTier: null,
+    cwd,
+    instructionSources: [],
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    sandbox: {
+      type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false,
+      excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+    },
+    reasoningEffort: null,
+  };
+}
+
+function multiInputText(message: Message): string {
+  const input = message.params?.input;
+  if (!Array.isArray(input) || input.length === 0) return '';
+  const first = input[0];
+  return first && typeof first === 'object' && !Array.isArray(first)
+    && typeof (first as Record<string, unknown>).text === 'string'
+    ? (first as Record<string, unknown>).text as string
+    : '';
+}
+
+function multiUsage(thread: string): Record<string, unknown> {
+  const inputTokens = thread.endsWith('-1') ? 11 : 12;
+  return {
+    total: {},
+    last: {
+      totalTokens: inputTokens + 3, inputTokens, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+      outputTokens: 3, reasoningOutputTokens: 1,
+    },
+    modelContextWindow: 100,
+  };
+}
+
 function agentMessage(id: string, text: string): Record<string, unknown> {
   return { type: 'agentMessage', id, text, phase: null, memoryCitation: null };
 }
@@ -738,6 +782,14 @@ async function handle(message: Message): Promise<void> {
       return;
     case 'thread/start': {
       if (!initialized) fail('thread/start before initialized');
+      if (mode === 'turn-multi-session') {
+        const cwd = message.params?.cwd;
+        if (typeof cwd !== 'string') fail('multi-session thread/start requires cwd');
+        const id = multiThreads.get(cwd) ?? `multi-thread-${++multiThreadNumber}`;
+        multiThreads.set(cwd, id);
+        send({ id: message.id, result: multiThreadResponse(id, cwd) });
+        return;
+      }
       send({ method: 'thread/started', params: { thread: thread() } });
       send({ id: message.id, result: threadResponse() });
       if (heldAccountRead) {
@@ -748,6 +800,31 @@ async function handle(message: Message): Promise<void> {
       return;
     }
     case 'turn/start': {
+      if (mode === 'turn-multi-session') {
+        const requestedThread = message.params?.threadId;
+        if (typeof requestedThread !== 'string' || ![...multiThreads.values()].includes(requestedThread)) {
+          fail('turn/start used an unknown multi-session thread');
+        }
+        const turnId = `multi-turn-${++multiTurnNumber}`;
+        multiTurns.set(turnId, requestedThread);
+        send({ id: message.id, result: { turn: turn(turnId, 'inProgress') } });
+        send({ method: 'turn/started', params: { threadId: requestedThread, turn: turn(turnId, 'inProgress') } });
+        const promptText = multiInputText(message);
+        if (!promptText.startsWith('hold-')) {
+          const reply = promptText.includes('session-a') ? 'reply:session-a' : 'reply:session-b';
+          send({ method: 'turn/plan/updated', params: {
+            threadId: requestedThread, turnId, plan: [{ step: `plan:${reply}`, status: 'completed' }],
+          } });
+          send({ method: 'thread/tokenUsage/updated', params: {
+            threadId: requestedThread, turnId, tokenUsage: multiUsage(requestedThread),
+          } });
+          send({ method: 'item/completed', params: {
+            threadId: requestedThread, turnId, item: agentMessage(`multi-item-${turnId}`, reply), completedAtMs: 2,
+          } });
+          send({ method: 'turn/completed', params: { threadId: requestedThread, turn: turn(turnId, 'completed') } });
+        }
+        return;
+      }
       if (message.params?.threadId !== threadId) fail('turn/start used the wrong thread');
       const input = message.params.input;
       if (!Array.isArray(input) || input.length !== 1) fail('turn/start requires one input');
@@ -797,6 +874,15 @@ async function handle(message: Message): Promise<void> {
       send({ id: message.id, result: threadResponse() });
       return;
     case 'turn/interrupt': {
+      if (mode === 'turn-multi-session') {
+        const requestedThread = message.params?.threadId;
+        const requestedTurn = message.params?.turnId;
+        if (typeof requestedThread !== 'string' || typeof requestedTurn !== 'string'
+          || multiTurns.get(requestedTurn) !== requestedThread) fail('turn/interrupt used the wrong multi-session identifiers');
+        send({ id: message.id, result: {} });
+        send({ method: 'turn/completed', params: { threadId: requestedThread, turn: turn(requestedTurn, 'interrupted') } });
+        return;
+      }
       if (message.params?.threadId !== threadId || message.params?.turnId !== 'fixture-turn-3') {
         fail('turn/interrupt used the wrong identifiers');
       }

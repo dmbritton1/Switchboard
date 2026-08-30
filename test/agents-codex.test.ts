@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { normalizeCodex } from '../src/agents/codex.ts';
+import { classifyCodexFailure, normalizeCodex } from '../src/agents/codex.ts';
 
 test('thread.started reports the vendor session id', () => {
   assert.deepEqual(
@@ -349,5 +349,27 @@ test('a fatal error event stops the session', () => {
   assert.deepEqual(
     normalizeCodex({ type: 'error', message: 'fatal' } as never),
     [{ type: 'stopped', reason: 'fatal' }],
+  );
+});
+
+test('shared Codex failure classification keeps app-server transport failures stable', () => {
+  assert.equal(
+    classifyCodexFailure(
+      'Codex app-server request turn/start timed out after 5000ms.',
+      'codex_app_server_unavailable',
+    ),
+    'codex_request_timed_out',
+  );
+  assert.equal(
+    classifyCodexFailure('generated protocol contract differs', 'codex_app_server_initialization_failed'),
+    'codex_protocol_mismatch',
+  );
+  assert.equal(
+    classifyCodexFailure('app-server initialization failed', 'codex_app_server_unavailable'),
+    'codex_app_server_initialization_failed',
+  );
+  assert.equal(
+    classifyCodexFailure('401 unauthorized', 'codex_app_server_initialization_failed'),
+    'codex_auth_unavailable',
   );
 });

@@ -21,12 +21,27 @@ test('reset schedule view changes with the selected Codex account without disabl
 
 test('every stable Codex failure has a user-facing label', () => {
   assert.deepEqual(Object.keys(CODEX_FAILURE_LABEL).sort(), [
+    'codex_app_server_initialization_failed', 'codex_app_server_unavailable',
     'codex_auth_unavailable', 'codex_binary_missing',
     'codex_binary_not_executable', 'codex_platform_unsupported',
+    'codex_protocol_mismatch', 'codex_request_timed_out',
     'codex_resume_failed', 'codex_sandbox_denied', 'codex_start_failed',
-    'codex_stream_failed', 'codex_user_stopped',
+    'codex_stream_failed', 'codex_transport_crashed', 'codex_user_stopped',
     'codex_version_mismatch', 'codex_version_unreadable',
   ]);
+  assert.deepEqual({
+    unavailable: CODEX_FAILURE_LABEL.codex_app_server_unavailable,
+    protocol: CODEX_FAILURE_LABEL.codex_protocol_mismatch,
+    initialization: CODEX_FAILURE_LABEL.codex_app_server_initialization_failed,
+    crash: CODEX_FAILURE_LABEL.codex_transport_crashed,
+    timeout: CODEX_FAILURE_LABEL.codex_request_timed_out,
+  }, {
+    unavailable: 'Codex app-server unavailable',
+    protocol: 'Codex app-server protocol mismatch',
+    initialization: 'Codex app-server initialization failed',
+    crash: 'Codex app-server transport crashed',
+    timeout: 'Codex app-server request timed out',
+  });
 });
 
 test('a session failure is retained with the session that caused it', async () => {

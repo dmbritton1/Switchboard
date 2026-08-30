@@ -150,7 +150,7 @@ export function normalizeCodex(
 
 export function classifyCodexFailure(
   reason: string,
-  fallback: 'codex_start_failed' | 'codex_resume_failed' | 'codex_stream_failed',
+  fallback: CodexFailureCode,
 ): CodexFailureCode {
   if (/not logged in|authentication|unauthorized|\b401\b/i.test(reason)) {
     return 'codex_auth_unavailable';
@@ -158,6 +158,9 @@ export function classifyCodexFailure(
   if (/sandbox|permission denied|operation not permitted|read-only file system/i.test(reason)) {
     return 'codex_sandbox_denied';
   }
+  if (/\btime(?:d)? out\b/i.test(reason)) return 'codex_request_timed_out';
+  if (/protocol|contract/i.test(reason)) return 'codex_protocol_mismatch';
+  if (/initializ/i.test(reason)) return 'codex_app_server_initialization_failed';
   return fallback;
 }
 
