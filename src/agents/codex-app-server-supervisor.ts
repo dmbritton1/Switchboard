@@ -130,7 +130,7 @@ export class CodexAppServerSupervisor {
     if ([...this.#sessions.values()].some((session) => session.activeTurn)) {
       return Promise.reject(new Error('Cannot promote Codex transport while a session turn is active.'));
     }
-    const promotion = this.#promoteNow();
+    const promotion = Promise.resolve().then(() => this.#promoteNow());
     this.#promotion = promotion;
     void promotion.finally(() => {
       if (this.#promotion === promotion) this.#promotion = null;
@@ -434,9 +434,10 @@ export class CodexAppServerSupervisor {
 
   #fatalRoutes(): void {
     for (const state of [...this.#sessions.values()]) {
+      if (!state.activeTurn) continue;
       state.activeTurn = false;
       try {
-        state.route.onFatal(PUBLIC_TRANSPORT_CRASH, 'codex_transport_crashed' as CodexFailureCode);
+        state.route.onFatal(PUBLIC_TRANSPORT_CRASH, 'codex_transport_crashed');
       } catch {
         // One route observer cannot hide the crash from sibling sessions.
       }

@@ -122,6 +122,10 @@ class FactoryCodexPool implements CodexLimitPool {
     if (!entry) {
       entry = this.#create(account);
       this.#entries.set(account.name, entry);
+      const created = entry;
+      void created.catch(() => {
+        if (this.#entries.get(account.name) === created) this.#entries.delete(account.name);
+      });
     }
     const { surface } = await entry;
     if (this.#closed) throw new Error(CODEX_FAILURE);

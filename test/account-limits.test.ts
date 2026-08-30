@@ -190,6 +190,45 @@ test('coalesces overlapping concurrent reconciliation passes and signals one cha
   await coordinator.close();
 });
 
+test('concurrent limit callers share one failed preparation and a later reconciliation retries', async () => {
+  const usage = new Usage();
+  const firstPreparation = deferred<PreparedCodexRuntime>();
+  let preparations = 0;
+  let supervisors = 0;
+  const coordinator = createAccountLimitCoordinator({
+    accounts: [accounts[1], accounts[1]],
+    usage,
+    onChange: () => {},
+    prepareCodex: async () => {
+      preparations += 1;
+      if (preparations === 1) return firstPreparation.promise;
+      return runtime();
+    },
+    supervisorFactory: () => {
+      supervisors += 1;
+      return {
+        reconcile: async () => availableSnapshot(),
+        readAtResetBoundary: async () => availableSnapshot(),
+        close: async () => {},
+      };
+    },
+  });
+
+  const firstPass = coordinator.reconcile();
+  await waitFor(() => preparations === 1);
+  firstPreparation.reject(new Error('private transient preparation failure'));
+  await firstPass;
+  assert.equal(preparations, 1, 'concurrent account callers share one in-flight preparation');
+  assert.equal(supervisors, 0);
+
+  await coordinator.reconcile();
+
+  assert.equal(preparations, 2);
+  assert.equal(supervisors, 1);
+  assert.equal(usage.getLimitSnapshot('codex-one').snapshot?.fresh, true);
+  await coordinator.close();
+});
+
 test('publishes supervisor snapshot and stale callbacks immediately outside reconciliation', async () => {
   const usage = new Usage();
   let changes = 0;

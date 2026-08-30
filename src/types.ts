@@ -9,6 +9,7 @@ export type CodexFailureCode =
   | 'codex_auth_unavailable'
   | 'codex_start_failed'
   | 'codex_resume_failed'
+  | 'codex_transport_crashed'
   | 'codex_stream_failed'
   | 'codex_sandbox_denied'
   | 'codex_user_stopped';

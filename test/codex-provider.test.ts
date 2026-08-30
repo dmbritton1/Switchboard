@@ -29,7 +29,7 @@ type Harness = {
 
 async function harness(
   t: { after(fn: () => Promise<void>): void },
-  options: { failPreflight?: boolean; failContract?: boolean } = {},
+  options: { failPreflight?: boolean; failPreflightAttempts?: number; failContract?: boolean } = {},
 ): Promise<Harness> {
   const prepared: string[] = [];
   const sdkAdapters: Array<Adapter & { label: string }> = [];
@@ -37,10 +37,14 @@ async function harness(
   const appSupervisors: CodexAppServerSupervisor[] = [];
   const launches = new Map<string, string[][]>();
   const closes = new Map<string, number>();
+  let prepareAttempts = 0;
   const pool = new CodexProviderPool({
     prepareRuntime: async (configured) => {
       prepared.push(configured.name);
-      if (options.failPreflight) throw new Error('private preflight detail');
+      prepareAttempts += 1;
+      if (options.failPreflight || prepareAttempts <= (options.failPreflightAttempts ?? 0)) {
+        throw new Error('private preflight detail');
+      }
       return {
         source: 'explicit' as const,
         commandPath: `/fixture/${configured.name}/codex`,
@@ -233,4 +237,25 @@ test('app-server preflight and contract failures fail closed without constructin
     assert.equal(fixture.sdkAdapters.length, 0);
     assert.equal(fixture.appAdapters.length, 0);
   });
+});
+
+test('concurrent app-server prepares share a transient preflight failure and a later prepare retries', async (t) => {
+  const fixture = await harness(t, { failPreflightAttempts: 1 });
+  const configured = account('retry');
+
+  const failed = await Promise.allSettled([
+    fixture.pool.prepare(configured, 'app-server', 'session-one'),
+    fixture.pool.prepare(configured, 'app-server', 'session-two'),
+  ]);
+
+  assert.deepEqual(failed.map(({ status }) => status), ['rejected', 'rejected']);
+  assert.deepEqual(fixture.prepared, ['retry'], 'concurrent callers share one in-flight preflight');
+  assert.equal(fixture.sdkAdapters.length, 0, 'app-server failure never falls back to SDK');
+
+  const retried = await fixture.pool.prepare(configured, 'app-server', 'session-three');
+
+  assert.equal(retried.adapter, fixture.appAdapters[0]);
+  assert.deepEqual(fixture.prepared, ['retry', 'retry']);
+  assert.equal(fixture.sdkAdapters.length, 0);
+  assert.deepEqual(fixture.launches.get('retry'), [appServerArgs('turns')]);
 });

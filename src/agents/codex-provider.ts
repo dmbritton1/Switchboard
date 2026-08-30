@@ -119,6 +119,9 @@ export class CodexProviderPool {
       supervisor: null,
     };
     this.#entries.set(account.name, entry);
+    void entry.runtime.catch(() => {
+      if (this.#entries.get(account.name) === entry) this.#entries.delete(account.name);
+    });
     return entry;
   }
 

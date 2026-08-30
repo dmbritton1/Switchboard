@@ -14,7 +14,7 @@ import {
 } from '../src/agents/codex-app-server-supervisor.ts';
 import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
-import type { AccountLimitSnapshot } from '../src/types.ts';
+import type { AccountLimitSnapshot, CodexFailureCode } from '../src/types.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 const unavailable = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
@@ -1084,6 +1084,55 @@ test('serializes promotion against reads without writing to a retired child or l
   else assert.equal((result.error as Error).message, unavailable);
 });
 
+test('publishes the promotion lock before stale listeners can send through the retiring child', async (t) => {
+  const clients: Array<{ closed: boolean; requests: string[] }> = [];
+  let reentrantPromotion: Promise<void> | null = null;
+  let reentrantRequest: Promise<unknown> | null = null;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {
+      reentrantPromotion = supervisor.ensureTurnTransport();
+      supervisor.registerSession('reentrant', {
+        onNotification: () => {},
+        onFatal: () => {},
+      });
+      reentrantRequest = supervisor.requestForSession('reentrant', 'thread/start', { cwd: '/fixture' });
+    },
+    verifyContract: async () => {},
+    clientFactory: () => {
+      const state = { closed: false, requests: [] as string[] };
+      clients.push(state);
+      return {
+        request: async <T>(method: string): Promise<T> => {
+          state.requests.push(method);
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          if (method === 'thread/start') return { thread: { id: 'thread-reentrant' } } as T;
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => { state.closed = true; },
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  const promotion = supervisor.ensureTurnTransport();
+  await promotion;
+  assert.equal(reentrantPromotion, promotion);
+  await reentrantPromotion;
+  await reentrantRequest;
+
+  assert.equal(clients.length, 2, 'one promotion launches exactly one replacement');
+  assert.equal(clients[0]?.closed, true);
+  assert.equal(clients[0]?.requests.includes('thread/start'), false, 'the telemetry child receives no session write');
+  assert.equal(clients[1]?.requests.filter((method) => method === 'thread/start').length, 1);
+});
+
 test('allowlists session requests and routes only bound thread notifications', async (t) => {
   const protocols: AppServerClientOptions[] = [];
   const requests: Array<{ method: string; params: unknown }> = [];
@@ -1168,13 +1217,13 @@ test('allowlists session requests and routes only bound thread notifications', a
   assert.ok(denied.every((entry) => entry.message.includes('current Switchboard phase')));
 });
 
-test('a turn-mode crash fatals every active route once, stales telemetry, and restarts without replay', async (t) => {
+test('a turn-mode crash fatals only active routes, stales telemetry, and restarts without replay', async (t) => {
   const observed = callbacks();
   const scheduled: Array<{ callback: () => void; delay: number }> = [];
   const clients: ScriptedClient[] = [];
   const optionsSeen: AppServerClientOptions[] = [];
   const requestMethods: string[] = [];
-  const fatals: Array<{ session: string; reason: string; code: string }> = [];
+  const fatals: Array<{ session: string; reason: string; code: CodexFailureCode }> = [];
   const supervisor = new CodexAppServerSupervisor({
     runtime: runtime(),
     onSnapshot: () => {},
@@ -1209,22 +1258,21 @@ test('a turn-mode crash fatals every active route once, stales telemetry, and re
 
   await supervisor.start();
   await supervisor.ensureTurnTransport();
-  for (const session of ['a', 'b']) {
+  for (const session of ['active', 'idle']) {
     supervisor.registerSession(session, {
       onNotification: () => {},
       onFatal: (reason, code) => fatals.push({ session, reason, code }),
     });
     supervisor.bindThread(session, `thread-${session}`);
-    await supervisor.requestForSession(session, 'turn/start', { threadId: `thread-${session}` });
   }
+  await supervisor.requestForSession('active', 'turn/start', { threadId: 'thread-active' });
   const sessionRequestCount = requestMethods.filter((method) => /^(thread|turn)\//.test(method)).length;
   clients.at(-1)!.crash();
   clients.at(-1)!.crash();
   await waitFor(() => scheduled.length === 1);
 
   assert.deepEqual(fatals.map(({ session, code }) => ({ session, code })), [
-    { session: 'a', code: 'codex_transport_crashed' },
-    { session: 'b', code: 'codex_transport_crashed' },
+    { session: 'active', code: 'codex_transport_crashed' },
   ]);
   assert.ok(fatals.every(({ reason }) => !reason.includes('private child crash details')));
   assert.equal(observed.stale.at(-1), unavailable);
@@ -1234,4 +1282,59 @@ test('a turn-mode crash fatals every active route once, stales telemetry, and re
   await supervisor.start();
   assert.equal(optionsSeen.at(-1)!.args.includes('hooks={}'), false);
   assert.equal(requestMethods.filter((method) => /^(thread|turn)\//.test(method)).length, sessionRequestCount);
+});
+
+test('a failed replacement launch does not fatal the prior active route twice', async (t) => {
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const clients: ScriptedClient[] = [];
+  const fatals: CodexFailureCode[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      const index = clients.length;
+      const client: ScriptedClient = {
+        request: async <T>(method: string): Promise<T> => {
+          if (index === 2 && method === 'initialize') throw new Error('private replacement failure');
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          return { accepted: true } as T;
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+        crash: () => options.onExit(new Error('private child crash details')),
+      };
+      clients.push(client);
+      return client;
+    },
+    setTimer: (callback, delay) => {
+      scheduled.push({ callback, delay });
+      return { callback, delay };
+    },
+    clearTimer: () => {},
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  await supervisor.ensureTurnTransport();
+  supervisor.registerSession('active', {
+    onNotification: () => {},
+    onFatal: (_reason, code) => {
+      fatals.push(code);
+      throw new Error('route callback failure must not preserve activeTurn');
+    },
+  });
+  supervisor.bindThread('active', 'thread-active');
+  await supervisor.requestForSession('active', 'turn/start', { threadId: 'thread-active' });
+
+  clients[1]!.crash();
+  await waitFor(() => scheduled.length === 1);
+  scheduled[0]!.callback();
+  await waitFor(() => clients.length === 3 && scheduled.length === 2);
+
+  assert.deepEqual(fatals, ['codex_transport_crashed']);
 });
