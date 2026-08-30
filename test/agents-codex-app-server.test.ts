@@ -291,6 +291,21 @@ test('normalization scrubs embedded absolute paths while preserving useful safe 
   assert.match(serialized, /\[path omitted\]/);
 });
 
+test('normalization scrubs every punctuation-delimited path without changing URL syntax', () => {
+  const [event] = normalizeCodexAppServerItem('completed', {
+    type: 'commandExecution', id: 'punctuated-paths', status: 'completed',
+    command: 'inspect /private/a,/private/b;/private/c and </private/d> via https://example.test/a//b safely',
+    aggregatedOutput: 'details /private/e,/private/f;/private/g and </private/h> remain useful',
+  });
+
+  assert.deepEqual(event, { type: 'upsert-msg', msg: {
+    kind: 'tool', id: 'punctuated-paths', name: 'shell', status: 'ok',
+    summary: 'inspect [path omitted],[path omitted];[path omitted] and <[path omitted]> via https://example.test/a//b safely',
+    detail: 'details [path omitted],[path omitted];[path omitted] and <[path omitted]> remain useful',
+    detailTruncated: false,
+  } });
+});
+
 test('thread setup binds before one-at-a-time FIFO turns and preserves delivery, usage, plan, and status order', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-fifo-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));

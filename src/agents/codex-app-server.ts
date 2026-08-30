@@ -32,8 +32,8 @@ function toolStatus(value: unknown, phase: ItemPhase): ToolMsg['status'] {
 
 function scrubAbsolutePaths(value: string): string {
   return value
-    .replace(/(^|[\s"'`([{=:])\/(?!\/)[^\s"'`<>{}\[\](),;:]+/g, '$1[path omitted]')
-    .replace(/(^|[\s"'`([{=:])(?:[A-Za-z]:\\|\\\\)[^\s"'`<>{}\[\](),;:]+/g, '$1[path omitted]');
+    .replace(/(^|[^\p{L}\p{N}_./\\-])\/(?!\/)[^\s"'`<>{}\[\](),;:]+/gu, '$1[path omitted]')
+    .replace(/(^|[^\p{L}\p{N}_./\\-])(?:[A-Za-z]:\\|\\\\)[^\s"'`<>{}\[\](),;:]+/gu, '$1[path omitted]');
 }
 
 function safePublicText(value: string, env: Record<string, string>): string {
