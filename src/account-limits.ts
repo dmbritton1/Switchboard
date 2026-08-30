@@ -1,8 +1,10 @@
 import { probeLimits } from './agents/claude.ts';
 import { CodexAppServerSupervisor } from './agents/codex-app-server-supervisor.ts';
+import type { CodexLimitListener } from './agents/codex-app-server-supervisor.ts';
+import { CodexProviderPool } from './agents/codex-provider.ts';
 import { CODEX_TELEMETRY_REASONS } from './agents/codex-limits.ts';
 import { prepareCodexRuntime, redactValues, type PreparedCodexRuntime } from './agents/codex-runtime.ts';
-import type { Account } from './server.ts';
+import type { Account } from './accounts.ts';
 import type { AccountLimitSnapshot } from './types.ts';
 import { Usage } from './usage.ts';
 
@@ -15,15 +17,25 @@ export type ResetRelease = { ready: boolean; reason: string };
 
 export type CodexLimitSupervisor = Pick<
   CodexAppServerSupervisor,
-  'reconcile' | 'readAtResetBoundary' | 'close'
+  'subscribe' | 'reconcile' | 'readAtResetBoundary'
 >;
+
+type FactoryCodexSupervisor = Pick<
+  CodexAppServerSupervisor,
+  'reconcile' | 'readAtResetBoundary' | 'close'
+> & Partial<Pick<CodexAppServerSupervisor, 'subscribe'>>;
+
+export type CodexLimitPool = {
+  limits(account: Account, listener: CodexLimitListener): Promise<CodexLimitSupervisor>;
+  close(): Promise<void>;
+};
 
 export type CodexSupervisorFactory = (options: {
   account: Account;
   runtime: PreparedCodexRuntime;
   onSnapshot: (snapshot: AccountLimitSnapshot) => void;
   onStale: (reason: string) => void;
-}) => CodexLimitSupervisor;
+}) => FactoryCodexSupervisor;
 
 export interface AccountLimitCoordinator {
   start(): Promise<void>;
@@ -43,6 +55,7 @@ export type AccountLimitCoordinatorOptions = {
   prepareCodex?: typeof prepareCodexRuntime;
   probeClaude?: typeof probeLimits;
   supervisorFactory?: CodexSupervisorFactory;
+  codexPool?: CodexLimitPool;
   now?: () => number;
   boundaryTimeoutMs?: number;
 };
@@ -88,17 +101,107 @@ function isCleanSnapshot(value: unknown): value is AccountLimitSnapshot {
       && typeof block.resettable === 'boolean');
 }
 
+class FactoryCodexPool implements CodexLimitPool {
+  readonly #prepare: typeof prepareCodexRuntime;
+  readonly #factory: CodexSupervisorFactory;
+  readonly #entries = new Map<string, Promise<{
+    supervisor: FactoryCodexSupervisor;
+    surface: CodexLimitSupervisor;
+  }>>();
+  #closed = false;
+  #close: Promise<void> | null = null;
+
+  constructor(prepare: typeof prepareCodexRuntime, factory: CodexSupervisorFactory) {
+    this.#prepare = prepare;
+    this.#factory = factory;
+  }
+
+  async limits(account: Account, listener: CodexLimitListener): Promise<CodexLimitSupervisor> {
+    if (this.#closed) throw new Error(CODEX_FAILURE);
+    let entry = this.#entries.get(account.name);
+    if (!entry) {
+      entry = this.#create(account);
+      this.#entries.set(account.name, entry);
+    }
+    const { surface } = await entry;
+    if (this.#closed) throw new Error(CODEX_FAILURE);
+    surface.subscribe(listener);
+    return surface;
+  }
+
+  close(): Promise<void> {
+    if (this.#close) return this.#close;
+    this.#close = this.#closeNow();
+    return this.#close;
+  }
+
+  async #create(account: Account): Promise<{
+    supervisor: FactoryCodexSupervisor;
+    surface: CodexLimitSupervisor;
+  }> {
+    const listeners = new Set<CodexLimitListener>();
+    const removers = new WeakMap<CodexLimitListener, () => void>();
+    const publishSnapshot = (snapshot: AccountLimitSnapshot) => {
+      for (const listener of [...listeners]) {
+        try { listener.onSnapshot(snapshot); } catch { /* observer isolation */ }
+      }
+    };
+    const publishStale = (reason: string) => {
+      for (const listener of [...listeners]) {
+        try { listener.onStale(reason); } catch { /* observer isolation */ }
+      }
+    };
+    const runtime = await this.#prepare({ bin: account.bin, env: account.env });
+    if (this.#closed) throw new Error(CODEX_FAILURE);
+    const supervisor = this.#factory({
+      account,
+      runtime,
+      onSnapshot: publishSnapshot,
+      onStale: publishStale,
+    });
+    const surface: CodexLimitSupervisor = {
+      subscribe(listener) {
+        const existing = removers.get(listener);
+        if (existing) return existing;
+        listeners.add(listener);
+        let active = true;
+        const remove = () => {
+          if (!active) return;
+          active = false;
+          listeners.delete(listener);
+          removers.delete(listener);
+        };
+        removers.set(listener, remove);
+        return remove;
+      },
+      reconcile: () => supervisor.reconcile(),
+      readAtResetBoundary: (now) => supervisor.readAtResetBoundary(now),
+    };
+    return { supervisor, surface };
+  }
+
+  async #closeNow(): Promise<void> {
+    this.#closed = true;
+    const entries = await Promise.allSettled(this.#entries.values());
+    const supervisors = entries.flatMap((entry) => entry.status === 'fulfilled' ? [entry.value.supervisor] : []);
+    await Promise.allSettled(supervisors.map((supervisor) => supervisor.close()));
+  }
+}
+
 class Coordinator implements AccountLimitCoordinator {
   readonly #accounts: Account[];
   readonly #usage: Usage;
   readonly #onChange: () => void;
-  readonly #prepareCodex: typeof prepareCodexRuntime;
   readonly #probeClaude: typeof probeLimits;
-  readonly #supervisorFactory: CodexSupervisorFactory;
+  readonly #codexPool: CodexLimitPool;
+  readonly #ownsCodexPool: boolean;
   readonly #now: () => number;
   readonly #boundaryTimeoutMs: number;
-  readonly #supervisors = new Map<string, CodexLimitSupervisor>();
-  readonly #starting = new Map<string, Promise<CodexLimitSupervisor>>();
+  readonly #subscriptions = new Map<string, {
+    listener: CodexLimitListener;
+    unsubscribe: (() => void) | null;
+  }>();
+  readonly #poolAccesses = new Set<Promise<CodexLimitSupervisor>>();
   readonly #boundaryReads = new Map<string, Promise<ResetRelease>>();
   #reconciliation: Promise<void> | null = null;
   #reconciliationActive = false;
@@ -110,13 +213,25 @@ class Coordinator implements AccountLimitCoordinator {
     this.#accounts = options.accounts;
     this.#usage = options.usage;
     this.#onChange = options.onChange;
-    this.#prepareCodex = options.prepareCodex ?? prepareCodexRuntime;
     this.#probeClaude = options.probeClaude ?? probeLimits;
-    this.#supervisorFactory = options.supervisorFactory ?? ((supervisorOptions) => new CodexAppServerSupervisor({
-      runtime: supervisorOptions.runtime,
-      onSnapshot: supervisorOptions.onSnapshot,
-      onStale: supervisorOptions.onStale,
-    }));
+    if (options.codexPool) {
+      this.#codexPool = options.codexPool;
+      this.#ownsCodexPool = false;
+    } else if (options.prepareCodex || options.supervisorFactory) {
+      const factory = options.supervisorFactory ?? ((supervisorOptions) => {
+        const supervisor = new CodexAppServerSupervisor({ runtime: supervisorOptions.runtime });
+        supervisor.subscribe({
+          onSnapshot: supervisorOptions.onSnapshot,
+          onStale: supervisorOptions.onStale,
+        });
+        return supervisor;
+      });
+      this.#codexPool = new FactoryCodexPool(options.prepareCodex ?? prepareCodexRuntime, factory);
+      this.#ownsCodexPool = true;
+    } else {
+      this.#codexPool = new CodexProviderPool();
+      this.#ownsCodexPool = true;
+    }
     this.#now = options.now ?? Date.now;
     this.#boundaryTimeoutMs = options.boundaryTimeoutMs ?? 5_000;
   }
@@ -248,29 +363,30 @@ class Coordinator implements AccountLimitCoordinator {
   }
 
   #supervisor(account: Account): Promise<CodexLimitSupervisor> {
-    const existing = this.#supervisors.get(account.name);
-    if (existing) return Promise.resolve(existing);
-    const starting = this.#starting.get(account.name);
-    if (starting) return starting;
-    const create = this.#createSupervisor(account);
-    this.#starting.set(account.name, create);
-    void create.finally(() => {
-      if (this.#starting.get(account.name) === create) this.#starting.delete(account.name);
-    }).catch(() => {});
-    return create;
-  }
-
-  async #createSupervisor(account: Account): Promise<CodexLimitSupervisor> {
-    const runtime = await this.#prepareCodex({ bin: account.bin, env: account.env });
-    if (this.#closed) throw new Error(CODEX_FAILURE);
-    const supervisor = this.#supervisorFactory({
-      account,
-      runtime,
-      onSnapshot: (snapshot) => this.#storeSnapshot(account.name, snapshot),
-      onStale: (reason) => this.#fail(account, reason, CODEX_FAILURE),
+    let subscription = this.#subscriptions.get(account.name);
+    if (!subscription) {
+      subscription = {
+        listener: {
+          onSnapshot: (snapshot) => this.#storeSnapshot(account.name, snapshot),
+          onStale: (reason) => this.#fail(account, reason, CODEX_FAILURE),
+        },
+        unsubscribe: null,
+      };
+      this.#subscriptions.set(account.name, subscription);
+    }
+    const current = subscription;
+    const access = this.#codexPool.limits(account, current.listener).then((supervisor) => {
+      const unsubscribe = supervisor.subscribe(current.listener);
+      if (current.unsubscribe === null) current.unsubscribe = unsubscribe;
+      if (this.#closed) {
+        current.unsubscribe?.();
+        throw new Error(CODEX_FAILURE);
+      }
+      return supervisor;
     });
-    this.#supervisors.set(account.name, supervisor);
-    return supervisor;
+    this.#poolAccesses.add(access);
+    void access.finally(() => this.#poolAccesses.delete(access)).catch(() => {});
+    return access;
   }
 
   #fail(account: Account, error: unknown, fallback: string): void {
@@ -305,7 +421,9 @@ class Coordinator implements AccountLimitCoordinator {
 
   async #closeNow(): Promise<void> {
     this.#closed = true;
-    await Promise.allSettled([...this.#supervisors.values()].map((supervisor) => supervisor.close()));
+    await Promise.allSettled([...this.#poolAccesses]);
+    for (const subscription of this.#subscriptions.values()) subscription.unsubscribe?.();
+    if (this.#ownsCodexPool) await this.#codexPool.close();
   }
 }
 

@@ -13,6 +13,7 @@ import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './wor
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
+import { CodexProviderPool } from './agents/codex-provider.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
 import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
@@ -51,7 +52,7 @@ function defaultClearLimitInterval(handle: LimitIntervalHandle): void {
 
 /**
  * Attaches account telemetry only after the HTTP server is listening. The
- * coordinator owns provider processes; this seam owns cadence and shutdown.
+ * coordinator owns subscriptions and cadence; the application owns the shared provider pool.
  */
 export function attachAccountLimitLifecycle(
   server: Server,
@@ -451,6 +452,8 @@ export function createServer(opts: {
   beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
   /** Entry-point owned telemetry lifecycle. Tests inject a fake, never a child process. */
   limitCoordinator?: AccountLimitCoordinator;
+  /** One application-level close owner for the shared per-account Codex pool. */
+  codexPool?: Pick<CodexProviderPool, 'close'>;
   /** Injectable interval seam for process-free lifecycle tests. */
   limitLifecycle?: AccountLimitLifecycleDeps;
 }): Server & { tick: () => Promise<void> } {
@@ -458,6 +461,7 @@ export function createServer(opts: {
     registry, usage, accounts, scheduler = new Scheduler(), prepare = prepareProvider,
     resolvePrompt = resolveAgentPrompt, accountStore, linker,
     beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval, limitCoordinator, limitLifecycle,
+    codexPool,
   } = opts;
   const handles = new Map<string, AgentHandle>();
   const resumeReservations = new Map<string, symbol>();
@@ -1466,6 +1470,7 @@ export function createServer(opts: {
   const tickTimer = setInterval(() => { void tick().catch(() => {}); }, TICK_MS).unref();
   server.on('close', () => clearInterval(tickTimer));
   if (limitCoordinator) attachAccountLimitLifecycle(server, limitCoordinator, limitLifecycle);
+  if (codexPool) server.once('close', () => { void codexPool.close().catch(() => {}); });
 
   // Exposed so tests can drive exactly one pass instead of racing a 30s timer.
   (server as Server & { tick: () => Promise<void> }).tick = tick;
@@ -1487,16 +1492,18 @@ if (process.argv[1] === new URL(import.meta.url).pathname) {
   const usage = new Usage();
   const scheduler = new Scheduler();
   const registry = await Registry.load(statePath, usage, scheduler);
+  const codexPool = new CodexProviderPool();
   const limitCoordinator = createAccountLimitCoordinator({
     accounts,
     usage,
     onChange: () => registry.touch(),
+    codexPool,
   });
   // ponytail: env override so a second copy (a worktree, a test drive) can run
   // beside the real one instead of failing on EADDRINUSE.
   const port = Number(process.env.PORT) || 4711;
   const server = createServer({
-    registry, usage, scheduler, accounts, accountStore, linker, limitCoordinator,
+    registry, usage, scheduler, accounts, accountStore, linker, limitCoordinator, codexPool,
   });
   server.listen(port, '127.0.0.1', () => console.log(`switchboard on http://127.0.0.1:${port}`));
 }

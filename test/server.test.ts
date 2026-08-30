@@ -85,6 +85,7 @@ test('account telemetry starts asynchronously after HTTP listen and cleans up wi
   const usage = new Usage();
   const order: string[] = [];
   let closes = 0;
+  let poolCloses = 0;
   let cleared: unknown = null;
   let intervalDelay = 0;
   const limitCoordinator: AccountLimitCoordinator = {
@@ -97,6 +98,7 @@ test('account telemetry starts asynchronously after HTTP listen and cleans up wi
   const timer = { id: 'limit-reconcile' };
   const server = createServer({
     registry, usage, accounts, limitCoordinator,
+    codexPool: { close: async () => { poolCloses += 1; } },
     limitLifecycle: {
       setInterval: (_callback: () => void, delay: number) => { intervalDelay = delay; return timer; },
       clearInterval: (handle: unknown) => { cleared = handle; },
@@ -114,6 +116,7 @@ test('account telemetry starts asynchronously after HTTP listen and cleans up wi
   await Promise.resolve();
   assert.equal(cleared, timer);
   assert.equal(closes, 1);
+  assert.equal(poolCloses, 1);
 });
 
 test('account telemetry reconciliation never overlaps the initial or prior pass', async () => {

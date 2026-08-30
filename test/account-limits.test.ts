@@ -451,3 +451,72 @@ test('fails closed on empty or malformed normalized windows', async () => {
     await coordinator.close();
   }
 });
+
+test('coordinators share an external Codex pool, unsubscribe independently, and never close it', async () => {
+  type Listener = {
+    onSnapshot(value: AccountLimitSnapshot): void;
+    onStale(reason: string): void;
+  };
+  const listeners = new Set<Listener>();
+  const removers = new WeakMap<Listener, () => void>();
+  const limitCalls: string[] = [];
+  let poolCloses = 0;
+  const sharedSupervisor = {
+    subscribe(listener: Listener): () => void {
+      const existing = removers.get(listener);
+      if (existing) return existing;
+      listeners.add(listener);
+      let active = true;
+      const remove = () => {
+        if (!active) return;
+        active = false;
+        listeners.delete(listener);
+        removers.delete(listener);
+      };
+      removers.set(listener, remove);
+      return remove;
+    },
+    reconcile: async () => availableSnapshot(),
+    readAtResetBoundary: async () => availableSnapshot(),
+    close: async () => assert.fail('only the application-level pool owner closes supervisors'),
+  };
+  const pool = {
+    limits: async (configured: typeof accounts[number], listener: Listener) => {
+      limitCalls.push(configured.name);
+      sharedSupervisor.subscribe(listener);
+      return sharedSupervisor;
+    },
+    close: async () => { poolCloses += 1; },
+  };
+  const usageA = new Usage();
+  const usageB = new Usage();
+  let changesA = 0;
+  let changesB = 0;
+  const coordinatorA = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage: usageA, onChange: () => { changesA += 1; }, codexPool: pool,
+  });
+  const coordinatorB = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage: usageB, onChange: () => { changesB += 1; }, codexPool: pool,
+  });
+
+  await Promise.all([coordinatorA.start(), coordinatorB.start()]);
+  assert.deepEqual(limitCalls, ['codex-one', 'codex-one']);
+  assert.equal(listeners.size, 2);
+
+  for (const listener of listeners) listener.onSnapshot(availableSnapshot({ plan: 'team' }));
+  assert.equal(usageA.getLimitSnapshot('codex-one').snapshot?.plan, 'team');
+  assert.equal(usageB.getLimitSnapshot('codex-one').snapshot?.plan, 'team');
+
+  await coordinatorA.close();
+  assert.equal(listeners.size, 1);
+  assert.equal(poolCloses, 0);
+  const previousA = changesA;
+  const previousB = changesB;
+  for (const listener of listeners) listener.onStale(CODEX_TELEMETRY_REASONS.apiKey);
+  assert.equal(changesA, previousA);
+  assert.equal(changesB, previousB + 1);
+
+  await coordinatorB.close();
+  assert.equal(listeners.size, 0);
+  assert.equal(poolCloses, 0);
+});

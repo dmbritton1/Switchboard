@@ -8,7 +8,11 @@ import {
   AppServerClient,
   type AppServerClientOptions,
 } from '../src/agents/codex-app-server-client.ts';
-import { CodexAppServerSupervisor } from '../src/agents/codex-app-server-supervisor.ts';
+import {
+  CodexAppServerSupervisor as ProductionCodexAppServerSupervisor,
+  type CodexAppServerSupervisorOptions,
+} from '../src/agents/codex-app-server-supervisor.ts';
+import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AccountLimitSnapshot } from '../src/types.ts';
 
@@ -17,6 +21,19 @@ const unavailable = 'Codex account telemetry is temporarily unavailable. Using t
 const signedOut = 'Codex account telemetry is unavailable while signed out.';
 const externalHeaders = 'Codex account telemetry is unavailable for external header authentication.';
 const externalTokens = 'Codex account telemetry is unavailable for external ChatGPT token authentication.';
+
+type LegacyObservedOptions = CodexAppServerSupervisorOptions & {
+  onSnapshot: (snapshot: AccountLimitSnapshot) => void;
+  onStale: (reason: string) => void;
+};
+
+class CodexAppServerSupervisor extends ProductionCodexAppServerSupervisor {
+  constructor(options: LegacyObservedOptions) {
+    const { onSnapshot, onStale, ...supervisorOptions } = options;
+    super(supervisorOptions);
+    this.subscribe({ onSnapshot, onStale });
+  }
+}
 
 function environment(overrides: Record<string, string> = {}): Record<string, string> {
   return {
@@ -974,4 +991,247 @@ test('close is bounded and idempotent even when the child ignores EOF and SIGTER
     Promise.all([supervisor.close(), supervisor.close(), supervisor.close()]),
     deadline,
   ]);
+});
+
+test('promotes one telemetry child in place, keeps listeners, reconciles, and makes repeat promotion a no-op', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-supervisor-promotion-'));
+  const callLog = join(directory, 'calls.jsonl');
+  const launchLog = join(directory, 'launches.jsonl');
+  const observed = callbacks();
+  const modes: string[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime({ FAKE_APP_SERVER_CALL_LOG: callLog, FAKE_APP_SERVER_LAUNCH_LOG: launchLog }),
+    onSnapshot: () => {},
+    onStale: () => {},
+    now: () => 1_000,
+    verifyContract: async (_runtime, mode) => { modes.push(mode); },
+  });
+  const unsubscribe = supervisor.subscribe(observed);
+  t.after(async () => {
+    unsubscribe();
+    await supervisor.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  await supervisor.ensureTurnTransport();
+  await supervisor.ensureTurnTransport();
+
+  const launches = await calls(launchLog);
+  assert.deepEqual(modes, ['telemetry', 'turns']);
+  assert.deepEqual(launches.map((entry) => entry.configs), [
+    ['hooks={}', 'mcp_servers={}', 'otel.exporter="none"'],
+    ['otel.exporter="none"'],
+  ]);
+  assert.equal((await calls(callLog)).filter((entry) => entry.operation === 'eof').length, 1);
+  assert.equal(observed.stale.length, 1);
+  assert.equal(observed.snapshots.length, 2);
+  assert.equal((await supervisor.reconcile()).fresh, true);
+});
+
+test('serializes promotion against reads without writing to a retired child or launching two replacements', async (t) => {
+  const observed = callbacks();
+  const pendingRead = deferred<unknown>();
+  const clients: Array<{ options: AppServerClientOptions; closed: boolean; requests: string[] }> = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    now: () => 1_000,
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      const state = { options, closed: false, requests: [] as string[] };
+      clients.push(state);
+      return {
+        request: async <T>(method: string): Promise<T> => {
+          assert.equal(state.closed, false, `request ${method} reached a retired child`);
+          state.requests.push(method);
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') {
+            if (clients.length === 1 && state.requests.filter((value) => value === method).length === 2) {
+              return pendingRead.promise as Promise<T>;
+            }
+            return rateLimitsResult(clients.length === 1 ? 10 : 70) as T;
+          }
+          throw new Error('unsupported scripted request');
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => { state.closed = true; },
+      };
+    },
+  });
+  supervisor.subscribe(observed);
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  const read = supervisor.reconcile().then(
+    (snapshot) => ({ status: 'fulfilled' as const, snapshot }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  );
+  await waitFor(() => clients[0]?.requests.filter((method) => method === 'account/rateLimits/read').length === 2);
+  const promotions = Promise.all([supervisor.ensureTurnTransport(), supervisor.ensureTurnTransport()]);
+  await waitFor(() => clients[0]?.closed === true);
+  pendingRead.resolve(rateLimitsResult(40));
+  await promotions;
+  const result = await read;
+
+  assert.equal(clients.length, 2);
+  assert.equal(clients[0]?.closed, true);
+  assert.equal(clients[1]?.options.args.includes('hooks={}'), false);
+  if (result.status === 'fulfilled') assert.equal(result.snapshot.windows[0]?.usedPercent, 70);
+  else assert.equal((result.error as Error).message, unavailable);
+});
+
+test('allowlists session requests and routes only bound thread notifications', async (t) => {
+  const protocols: AppServerClientOptions[] = [];
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const denied: Array<{ id: string | number; code: number; message: string }> = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocols.push(options);
+      return {
+        request: async <T>(method: string, params?: unknown): Promise<T> => {
+          requests.push({ method, params });
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          return { accepted: method } as T;
+        },
+        notify: () => {},
+        respondError: (id, code, message) => denied.push({ id, code, message }),
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  await assert.rejects(
+    supervisor.requestForSession('session-a', 'thread/start', {}),
+    /turn transport/i,
+  );
+  await supervisor.ensureTurnTransport();
+  const routedA: string[] = [];
+  const routedB: string[] = [];
+  supervisor.registerSession('session-a', {
+    onNotification: (method) => routedA.push(method),
+    onFatal: () => assert.fail('route A must remain healthy'),
+  });
+  supervisor.registerSession('session-b', {
+    onNotification: (method) => routedB.push(method),
+    onFatal: () => assert.fail('route B must remain healthy'),
+  });
+  supervisor.bindThread('session-a', 'thread-a');
+  supervisor.bindThread('session-b', 'thread-b');
+  assert.throws(() => supervisor.bindThread('session-b', 'thread-a'), /already bound/i);
+
+  await supervisor.requestForSession('session-a', 'thread/start', { cwd: '/fixture-a' });
+  await supervisor.requestForSession('session-a', 'thread/resume', { threadId: 'thread-a' });
+  await supervisor.requestForSession('session-b', 'turn/start', { threadId: 'thread-b' });
+  await supervisor.requestForSession('session-b', 'turn/interrupt', { threadId: 'thread-b', turnId: 'turn-b' });
+  await assert.rejects(
+    supervisor.requestForSession('missing', 'turn/start', {}),
+    /registered/i,
+  );
+  await assert.rejects(
+    supervisor.requestForSession('session-a', 'thread/shellCommand' as never, {}),
+    /unsupported/i,
+  );
+
+  const protocol = protocols.at(-1)!;
+  protocol.onNotification('item/started', { threadId: 'thread-a', turnId: 'turn-a', item: {} });
+  protocol.onNotification('turn/plan/updated', { threadId: 'thread-b', turnId: 'turn-b', plan: [] });
+  protocol.onNotification('account/rateLimits/updated', { rateLimits: { limitId: null } });
+  protocol.onNotification('remoteControl/status/changed', { threadId: 'thread-a', private: true });
+  protocol.onNotification('future/private', { threadId: 'thread-b', private: true });
+  protocol.onNotification('thread/started', { thread: { id: 'thread-a' } });
+
+  assert.deepEqual(routedA, ['item/started']);
+  assert.deepEqual(routedB, ['turn/plan/updated']);
+  assert.deepEqual(requests.filter(({ method }) => /^(thread|turn)\//.test(method)).map(({ method }) => method), [
+    'thread/start',
+    'thread/resume',
+    'turn/start',
+    'turn/interrupt',
+  ]);
+
+  DENIED_SERVER_METHODS.forEach((method, index) => protocol.onServerRequest(index, method, { private: true }));
+  protocol.onServerRequest('unknown', 'future/serverRequest', { private: true });
+  assert.equal(denied.length, DENIED_SERVER_METHODS.length + 1);
+  assert.ok(denied.every((entry) => entry.code === -32601));
+  assert.ok(denied.every((entry) => entry.message.includes('current Switchboard phase')));
+});
+
+test('a turn-mode crash fatals every active route once, stales telemetry, and restarts without replay', async (t) => {
+  const observed = callbacks();
+  const scheduled: Array<{ callback: () => void; delay: number }> = [];
+  const clients: ScriptedClient[] = [];
+  const optionsSeen: AppServerClientOptions[] = [];
+  const requestMethods: string[] = [];
+  const fatals: Array<{ session: string; reason: string; code: string }> = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      optionsSeen.push(options);
+      const client: ScriptedClient = {
+        request: async <T>(method: string): Promise<T> => {
+          requestMethods.push(method);
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          return { accepted: true } as T;
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+        crash: () => options.onExit(new Error('private child crash details')),
+      };
+      clients.push(client);
+      return client;
+    },
+    setTimer: (callback, delay) => {
+      scheduled.push({ callback, delay });
+      return { callback, delay };
+    },
+    clearTimer: () => {},
+  });
+  supervisor.subscribe(observed);
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  await supervisor.ensureTurnTransport();
+  for (const session of ['a', 'b']) {
+    supervisor.registerSession(session, {
+      onNotification: () => {},
+      onFatal: (reason, code) => fatals.push({ session, reason, code }),
+    });
+    supervisor.bindThread(session, `thread-${session}`);
+    await supervisor.requestForSession(session, 'turn/start', { threadId: `thread-${session}` });
+  }
+  const sessionRequestCount = requestMethods.filter((method) => /^(thread|turn)\//.test(method)).length;
+  clients.at(-1)!.crash();
+  clients.at(-1)!.crash();
+  await waitFor(() => scheduled.length === 1);
+
+  assert.deepEqual(fatals.map(({ session, code }) => ({ session, code })), [
+    { session: 'a', code: 'codex_transport_crashed' },
+    { session: 'b', code: 'codex_transport_crashed' },
+  ]);
+  assert.ok(fatals.every(({ reason }) => !reason.includes('private child crash details')));
+  assert.equal(observed.stale.at(-1), unavailable);
+
+  scheduled[0]!.callback();
+  await waitFor(() => clients.length === 3);
+  await supervisor.start();
+  assert.equal(optionsSeen.at(-1)!.args.includes('hooks={}'), false);
+  assert.equal(requestMethods.filter((method) => /^(thread|turn)\//.test(method)).length, sessionRequestCount);
 });

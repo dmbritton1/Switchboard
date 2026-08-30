@@ -294,6 +294,16 @@ if (appServerIndex !== -1) {
     fail('inherited MCP server started');
   }
   const launchRecord = process.env.FAKE_APP_SERVER_LAUNCH_RECORD;
+  const launchLog = process.env.FAKE_APP_SERVER_LAUNCH_LOG;
+  if (launchLog) {
+    appendFileSync(launchLog, `${JSON.stringify({
+      operation: 'launch',
+      strict,
+      configs,
+      inheritedHooks: !configs.includes('hooks={}'),
+      inheritedMcpServers: !configs.includes('mcp_servers={}'),
+    })}\n`);
+  }
   if (launchRecord) {
     writeFileSync(launchRecord, JSON.stringify({
       strict,
