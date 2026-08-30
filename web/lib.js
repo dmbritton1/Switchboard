@@ -66,6 +66,20 @@ export function handoffTargets(session, accounts) {
   return accounts.filter((a) => a.name !== session.account);
 }
 
+// Mirrors src/overlap.ts's MAX_LISTED_PATHS: web/lib.js is a browser module
+// with no build step, so it can't import a constant from that TypeScript file.
+// The duplication is a considered cost of that boundary, not an oversight —
+// change both if the number ever moves.
+const MAX_LISTED_PATHS = 10;
+
+/** A path list for a card tooltip, bounded so neither grows unread. Mirrors
+ *  src/overlap.ts's summarizePaths so the two surfaces read the same way. */
+function summarizePaths(files) {
+  if (files.length <= MAX_LISTED_PATHS) return files.join(', ');
+  const shown = files.slice(0, MAX_LISTED_PATHS).join(', ');
+  return `${shown}, and ${files.length - MAX_LISTED_PATHS} more`;
+}
+
 /**
  * The coupling badges for one session's /status response: `text` follows the
  * existing `+N −M · dirty`, `title` is the tooltip.
@@ -77,6 +91,10 @@ export function handoffTargets(session, accounts) {
  *
  * Advisory throughout: "also in", never "locked by". Nothing here prevents
  * anything, and wording that implies otherwise would be a lie.
+ *
+ * The badge text always reports the true overlap count; only the tooltip's
+ * file list is capped, so the number never lies about how much actually
+ * overlaps even when the list behind it is trimmed.
  */
 export function couplingBadges(status) {
   const talking = status?.talking ?? [];
@@ -89,7 +107,7 @@ export function couplingBadges(status) {
     ...silent.map((o) => `⚠ ${o.files.length} file${o.files.length === 1 ? '' : 's'} also in ${o.branch}`),
   ];
   const title = silent
-    .map((o) => `${o.branch}: ${o.files.join(', ')}`)
+    .map((o) => `${o.branch}: ${summarizePaths(o.files)}`)
     .join('\n');
   return { text: parts.join(' · '), title };
 }

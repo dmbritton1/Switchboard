@@ -1825,3 +1825,16 @@ test('couplingBadges is empty when there is nothing to say', () => {
   assert.deepEqual(couplingBadges({ talking: [], overlapping: [] }), { text: '', title: '' });
   assert.deepEqual(couplingBadges(null), { text: '', title: '' });
 });
+
+test('couplingBadges caps the tooltip list at ten paths but keeps the true count in the badge text', () => {
+  const files = Array.from({ length: 12 }, (_, i) => `src/file${i}.ts`);
+  const badges = couplingBadges({
+    talking: [],
+    overlapping: [{ id: 'b', branch: 'feat/b', files }],
+  });
+
+  assert.match(badges.text, /⚠ 12 files also in feat\/b/);
+  assert.match(badges.title, /and 2 more/);
+  assert.doesNotMatch(badges.title, /file10\.ts/);
+  assert.doesNotMatch(badges.title, /file11\.ts/);
+});
