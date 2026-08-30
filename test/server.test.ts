@@ -3506,7 +3506,7 @@ test('/status reports an open relay channel as talking', async (t) => {
   );
 });
 
-test('deleting a session drops its cached paths', async (t) => {
+test('a deleted session no longer appears as an overlap', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));
   const { adapter } = fakeAdapter();
@@ -3526,6 +3526,13 @@ test('deleting a session drops its cached paths', async (t) => {
 
   await post({ cmd: 'delete', id: b.id });
 
+  // This does NOT prove dropPaths runs. registry.remove already takes b out of
+  // registry.all(), and /status builds `siblings` from that list — so b is
+  // excluded from `overlapping` here whether or not its entry in the paths
+  // cache was ever dropped. A leaked entry would be invisible through this
+  // endpoint forever. dropPaths exists to bound the map's size in a
+  // long-running process, not to change any response, and nothing here
+  // exercises that.
   assert.deepEqual(
     (await status(a.id)).overlapping, [],
     'a deleted session leaves no paths behind to overlap with',
