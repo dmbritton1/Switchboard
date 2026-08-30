@@ -365,6 +365,10 @@ git commit -m "feat: cache session paths with a TTL and intersect them"
 
 Wire the cache into the server and extend the response the card already fetches. This is also where the second coupling — an open relay channel — is answered, which needs no git at all.
 
+`/status` already costs four git invocations (`worktreeStatus` runs `branch --show-current`, `diff HEAD --numstat`, `status --porcelain` and `ls-files --others`), and the card poll is throttled as a batch to once per four seconds with every visible card then fetching (`web/app.js:475`). A ten-session grid is therefore already around 600 git invocations a minute before this feature adds anything.
+
+Against that baseline this task adds three invocations per session per TTL window — about 60 a minute at ten sessions — provided `currentBranch` is resolved inside the refresh closure rather than before it. Resolved outside, it runs on every poll regardless of freshness and asks the same question once per session, which would be 150 a minute to learn one repo's branch name. The code below has it inside; that placement is the point.
+
 **Files:**
 - Modify: `src/server.ts` (imports; a cache beside `channels` at line 470; the `/status` route at line 1392; the `delete` case's cleanup)
 - Test: `test/server.test.ts`
@@ -479,7 +483,7 @@ Extend the imports in `src/server.ts`:
 
 ```ts
 import { changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
-import { currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
+import { commitOutstanding, currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
 import { dropPaths, overlaps, refreshPaths, type PathCache } from './overlap.ts';
 ```
 
@@ -505,8 +509,15 @@ Replace the `/status` route body (`src/server.ts:1392-1398`):
         // Collected here rather than on a timer of its own: this route is
         // already polled per card, and refreshPaths' TTL is what stops a
         // four-second poll from spawning git on every call.
-        const base = await currentBranch(session.repo).catch(() => '');
-        await refreshPaths(paths, id, () => changedPaths(session.cwd, base), Date.now());
+        //
+        // currentBranch resolves INSIDE the closure, not before it. Outside, it
+        // would run on every poll even when the paths are fresh — and it is the
+        // same answer for every session in the repo, so a ten-session grid would
+        // ask it 150 times a minute to learn one thing. Inside, it rides the TTL
+        // that is already there and costs nothing when nothing is stale.
+        await refreshPaths(paths, id, async () => changedPaths(
+          session.cwd, await currentBranch(session.repo).catch(() => ''),
+        ), Date.now());
         const siblings = registry.all()
           .filter((s) => s.id !== id && s.repo === session.repo)
           .map((s) => ({ id: s.id, branch: s.branch }));
