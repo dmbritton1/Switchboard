@@ -17,6 +17,9 @@ import { createCodexAdapter } from './agents/codex.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
 import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
+import {
+  channelKey, channelOpen, dropChannels, dropSeen, relay, RELAY_CHECKPOINT, type Channels,
+} from './relay.ts';
 import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
   CodexRuntimeError, prepareCodexRuntime, redactValues,
@@ -461,6 +464,13 @@ export function createServer(opts: {
     beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval, limitCoordinator, limitLifecycle,
   } = opts;
   const handles = new Map<string, AgentHandle>();
+  // Process-local like the handle map, and for the same reason: a channel names
+  // two live sessions, and Registry.load forces every session to `stopped` on
+  // start, so none could survive a restart in a usable form.
+  const channels: Channels = new Map();
+  // Pairs that have talked before, so the card can say which question it is
+  // asking. Never cleared on checkpoint, only when a session goes away.
+  const seenChannels = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
 
   /**
@@ -543,7 +553,20 @@ export function createServer(opts: {
     const auto = session?.auto ?? false;
     const codexSettings = session?.codexSettings;
     try {
-      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings }, (e) => {
+      const handle = adapter.start({
+        cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings,
+        relay: (target, text) => {
+          const result = relay({ registry, handles, channels }, sessionId, target, text);
+          if (result.ok) seenChannels.add(channelKey(sessionId, target));
+          return result;
+        },
+        relayGate: (target) => {
+          if (channelOpen(channels, sessionId, target)) return { ask: false };
+          return seenChannels.has(channelKey(sessionId, target))
+            ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
+            : { ask: true };
+        },
+      }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {
           // Optional Codex breakdowns are informational subsets, not account pace.
@@ -1032,6 +1055,8 @@ export function createServer(opts: {
         // the remove() below would then drop the session while that agent is
         // still running, leaving it with no card and no stop().
         registry.remove(String(body.id));
+        dropChannels(channels, String(body.id));
+        dropSeen(seenChannels, String(body.id));
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })

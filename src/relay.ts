@@ -36,6 +36,14 @@ export function dropChannels(channels: Channels, sessionId: string): void {
   }
 }
 
+/** The seen-pairs companion to dropChannels; same reason, same key format. */
+export function dropSeen(seen: Set<string>, sessionId: string): void {
+  for (const key of seen) {
+    const [x, y] = key.split(':');
+    if (x === sessionId || y === sessionId) seen.delete(key);
+  }
+}
+
 export type RelayDeps = {
   registry: Registry;
   handles: Map<string, AgentHandle>;

@@ -249,6 +249,16 @@ export type StartOpts = {
    *  it had before the restart rather than silently reverting to prompting. */
   auto?: boolean;
   codexSettings?: CodexThreadSettings;
+  /**
+   * Cross-session messaging, provided by the server so the adapter can expose it
+   * as a tool without knowing its own session id or reaching the Registry — the
+   * same separation `emit` keeps. Absent means the provider has no relay tool.
+   *
+   * `relayGate` is separate because canUseTool runs before the tool does, and so
+   * cannot learn from the send whether a card was needed.
+   */
+  relay?: (target: string, text: string) => RelayResult;
+  relayGate?: (target: string) => { ask: boolean; note?: string };
 };
 
 export type RelayResult =

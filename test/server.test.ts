@@ -3277,3 +3277,103 @@ test('unlink of an unknown account is a 404', async (t) => {
   const h = await bootLinking(t);
   assert.equal((await post(h.base, { cmd: 'unlink', name: 'nope' })).status, 404);
 });
+
+test('launch hands a session relay callbacks scoped to itself', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  const fromA = starts[0];
+  assert.equal(typeof fromA.relay, 'function');
+  assert.equal(typeof fromA.relayGate, 'function');
+
+  // Closed channel: the first send is gated.
+  assert.equal(fromA.relayGate!(b.id).ask, true);
+
+  assert.deepEqual(fromA.relay!(b.id, 'ping'), { ok: true, queued: false });
+  assert.equal(
+    fromA.relayGate!(b.id).ask, false,
+    'a successful send opens the channel, so the next one is not gated',
+  );
+
+  const transcript = registry.get(b.id)!.transcript;
+  assert.equal((transcript.at(-1) as { text: string }).text, 'ping');
+  assert.equal(registry.get(a.id)!.transcript.length, 1, 'the sender is untouched');
+});
+
+test('deleting a session drops its channels', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  starts[0].relay!(b.id, 'ping');
+  assert.equal(starts[0].relayGate!(b.id).ask, false);
+
+  await post({ cmd: 'delete', id: b.id });
+  const c = await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
+
+  assert.equal(
+    starts[0].relayGate!(c.id).ask, true,
+    'a fresh pair is gated; the deleted session left no channel behind',
+  );
+});
+
+test('deleting a session drops its seenChannels entry, not just its channel', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  starts[0].relay!(b.id, 'ping');
+
+  await post({ cmd: 'delete', id: b.id });
+  const c = await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
+
+  // If seenChannels still carried an entry for the deleted session under a
+  // recreated id, this would come back with a checkpoint note instead of a
+  // plain first-send gate.
+  assert.equal(starts[0].relayGate!(c.id).note, undefined, 'a fresh pair has never talked');
+});
+
+test('the gate distinguishes a first send from a checkpoint', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  assert.equal(starts[0].relayGate!(b.id).note, undefined, 'a first send needs no explanation');
+
+  for (let i = 0; i < 10; i++) starts[0].relay!(b.id, `m${i}`);
+
+  const gate = starts[0].relayGate!(b.id);
+  assert.equal(gate.ask, true);
+  assert.match(gate.note!, /continue\?/);
+});
