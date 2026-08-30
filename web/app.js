@@ -1761,6 +1761,11 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   let index = 0;
 
   function close() {
+    // A menu that is already closed has nothing to say about the shared field:
+    // #prompt is also wireMentionMenu's field, and touching aria-expanded /
+    // aria-activedescendant here when this menu was never open would stomp
+    // whatever the other menu just set.
+    if (menu.hidden) return;
     matches = [];
     menu.hidden = true;
     menu.replaceChildren();
@@ -1905,6 +1910,11 @@ function wireMentionMenu({ field, menu, ids, sessions }) {
   let index = 0;
 
   function close() {
+    // Same guard as wireCommandMenu's close(): #prompt is shared between both
+    // menus, and this factory runs its listeners second (registered after
+    // wireCommandMenu's), so an unconditional write here would win the race on
+    // every keystroke that isn't a mention — which is most of them.
+    if (menu.hidden) return;
     menu.hidden = true;
     matches = [];
     field.removeAttribute('aria-activedescendant');
