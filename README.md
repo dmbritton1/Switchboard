@@ -140,9 +140,12 @@ Sessions on one repository are also checked against each other for overlapping
 work. A session's card shows `↔ feat/other` when the two have an open relay
 channel, and `⚠ 3 files also in feat/other` when they have changed the same
 files without one — the second is the one worth looking at, because it is a
-merge conflict that has not happened yet. Hovering names the files. `list_sessions`
-carries the same information to the agents, so one can see who is in the file it
-is about to change and message just that session rather than all of them.
+merge conflict that has not happened yet. Hovering names the files, capped at ten
+with "and N more" if there are more; the badge count is the true total. An agent
+learns about overlap through `list_sessions`, which it must call to find out — there
+is no push, injection, or interrupt, so an agent that never calls the tool never learns.
+With that information, a session can see who is in the file it is about to change and
+message just that session rather than all of them.
 
 Overlap counts committed work as well as uncommitted: two sessions that each
 committed a change to the same file have clean worktrees and still collide.
