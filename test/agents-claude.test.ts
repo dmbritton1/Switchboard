@@ -6,6 +6,13 @@ import {
 } from '../src/agents/claude.ts';
 import { relayServer } from '../src/agents/relay-tools.ts';
 import type { AdapterEvent } from '../src/types.ts';
+// Only route to genuinely list what an SdkMcpServer registers: `_registeredTools`
+// on the MCP SDK's McpServer is private, so the supported way to enumerate tools
+// is the protocol itself — connect a real client over an in-memory transport and
+// ask. Both classes are public API of @modelcontextprotocol/sdk, the same
+// transitive dependency relay-tools.ts already reaches past for zod.
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 const fixture = JSON.parse(
   await readFile(new URL('./fixtures/claude-basic.json', import.meta.url), 'utf8'),
@@ -418,7 +425,19 @@ test('a relay summary survives a missing field', () => {
   assert.equal(summarize('mcp__relay__send_to_session', {}), 'mcp__relay__send_to_session');
 });
 
-test('relayServer exposes exactly the two relay tools', () => {
+test('relayServer exposes exactly the two relay tools', async () => {
   const server = relayServer({ sessions: () => [], send: () => ({ ok: true, queued: false }) });
   assert.equal(server.name, 'relay');
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+  const { tools } = await client.listTools();
+  assert.deepEqual(
+    tools.map((t) => t.name).sort(),
+    ['list_sessions', 'send_to_session'],
+  );
 });
