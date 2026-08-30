@@ -56,6 +56,19 @@ async function rejectsWithin(
   }
 }
 
+async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`timed out waiting for file: ${path}`);
+}
+
 async function waitForMarker(path: string, expectedContent: string, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -148,14 +161,19 @@ test('settles a request when its input write fails', async (t) => {
 test('times out a request and terminates the child', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-client-timeout-'));
   const marker = join(directory, 'terminated');
+  const pidFile = join(directory, 'pid');
   t.after(async () => rm(directory, { recursive: true, force: true }));
   const client = clientFor({
     mode: 'hang',
     requestTimeoutMs: 300,
-    overrides: { FAKE_APP_SERVER_EXIT_MARKER: marker },
+    overrides: {
+      FAKE_APP_SERVER_EXIT_MARKER: marker,
+      FAKE_APP_SERVER_PID_FILE: pidFile,
+    },
   });
   t.after(() => client.close());
 
+  await waitForFile(pidFile);
   await rejectsWithin(
     client.request('initialize'),
     2_000,
@@ -197,6 +215,7 @@ test('escalates SIGTERM to SIGKILL before a timed-out request settles', async (t
   });
   t.after(() => client.close());
 
+  await waitForFile(pidFile);
   await rejectsWithin(
     client.request('initialize'),
     2_000,
