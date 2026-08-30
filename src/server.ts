@@ -581,9 +581,32 @@ export function createServer(opts: {
             ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
             : { ask: true };
         },
-        relaySessions: () => registry.all()
-          .filter((s) => s.id !== sessionId && s.repo === session?.repo)
-          .map((s) => ({ id: s.id, branch: s.branch, account: s.account, status: s.status })),
+        relaySessions: async () => {
+          // `session` is read once at launch; without it there is no repo to scope
+          // by and currentBranch would run against the server's own cwd.
+          if (!session) return [];
+          const siblings = registry.all().filter((s) => s.id !== sessionId && s.repo === session.repo);
+          // Agents call this rarely, and a tool that reports no overlap because
+          // nobody happened to open the card is a tool that quietly lies. Refresh
+          // anything stale — refreshPaths skips whatever is already fresh.
+          const base = await currentBranch(session.repo).catch(() => '');
+          const now = Date.now();
+          // In parallel, not a sequential loop: each refreshPaths is three git
+          // invocations, so N sessions serialized is N round trips the agent
+          // waits through for no benefit. refreshPaths is per-key and never
+          // throws, so concurrent calls cannot interfere.
+          await Promise.all(
+            [...siblings, session].map((s) => refreshPaths(paths, s.id, () => changedPaths(s.cwd, base), now)),
+          );
+          const shared = new Map(
+            overlaps(paths, sessionId, siblings.map((s) => ({ id: s.id, branch: s.branch })))
+              .map((o) => [o.id, o.files]),
+          );
+          return siblings.map((s) => ({
+            id: s.id, branch: s.branch, account: s.account, status: s.status,
+            files: shared.get(s.id) ?? [],
+          }));
+        },
       }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {

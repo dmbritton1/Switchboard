@@ -1,6 +1,7 @@
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { RelayResult, RelaySession } from '../types.ts';
+import { summarizePaths } from '../overlap.ts';
 
 function describe(result: RelayResult, queuedNote: string): string {
   if (result.ok) return result.queued ? queuedNote : 'Delivered.';
@@ -18,7 +19,7 @@ function describe(result: RelayResult, queuedNote: string): string {
  * different sender — the tool takes a target, never a from.
  */
 export function relayServer(deps: {
-  sessions: () => RelaySession[];
+  sessions: () => Promise<RelaySession[]>;
   send: (target: string, text: string) => RelayResult;
 }) {
   return createSdkMcpServer({
@@ -27,14 +28,16 @@ export function relayServer(deps: {
     instructions:
       'Other agent sessions working on this same repository, on their own git '
       + 'branches. Use this to coordinate — to say what you are changing, to ask '
-      + 'what another session has already done, or to answer when one asks you.',
+      + 'what another session has already done, or to answer when one asks you. '
+      + 'Sessions here may be editing the same files you are; list_sessions says '
+      + 'which, so check before making a large change to a shared file.',
     tools: [
       tool(
         'list_sessions',
         'List the other sessions on this repository that you can message.',
         {},
         async () => {
-          const rows = deps.sessions();
+          const rows = await deps.sessions();
           if (!rows.length) {
             return { content: [{ type: 'text' as const, text: 'No other sessions on this repository.' }] };
           }
@@ -42,7 +45,12 @@ export function relayServer(deps: {
             content: [{
               type: 'text' as const,
               text: rows
-                .map((s) => `${s.branch} — ${s.status}, on account ${s.account} (id ${s.id})`)
+                .map((s) => {
+                  const head = `${s.branch} — ${s.status}, on account ${s.account} (id ${s.id})`;
+                  return s.files.length
+                    ? `${head} — also changed ${summarizePaths(s.files)}`
+                    : head;
+                })
                 .join('\n'),
             }],
           };

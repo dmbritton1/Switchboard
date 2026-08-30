@@ -260,7 +260,7 @@ export type StartOpts = {
   relay?: (target: string, text: string) => RelayResult;
   relayGate?: (target: string) => { ask: boolean; note?: string };
   /** The sessions this one may message: same repo, excluding itself. */
-  relaySessions?: () => RelaySession[];
+  relaySessions?: () => Promise<RelaySession[]>;
 };
 
 export type RelayResult =
@@ -268,7 +268,11 @@ export type RelayResult =
   | { ok: false; reason: 'unknown-session' | 'self' | 'different-repo' | 'not-live' };
 
 /** One row of what a session may message: same repo, never itself. */
-export type RelaySession = { id: string; branch: string; account: string; status: Status };
+export type RelaySession = {
+  id: string; branch: string; account: string; status: Status;
+  /** Paths this session has also changed, from the caller's point of view. */
+  files: string[];
+};
 
 export type AgentHandle = {
   send(prompt: AgentPrompt, promptId?: string): void;

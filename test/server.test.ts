@@ -3390,8 +3390,34 @@ test('relaySessions lists same-repo siblings and excludes the caller', async (t)
   await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
   await post({ cmd: 'create', repo: other, branch: 'feat/elsewhere', account: 'claude-main', prompt: 'go' });
 
-  const listed = starts[0].relaySessions!().map((s) => s.branch);
+  const listed = (await starts[0].relaySessions!()).map((s) => s.branch);
   assert.deepEqual(listed, ['feat/b'], 'same repo only, self excluded');
+});
+
+test('relaySessions annotates each sibling with the paths it shares with the caller', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
+
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  // No /status has run, so nothing is cached — the tool must collect for itself
+  // rather than quietly reporting no overlap.
+  const listed = await starts[0].relaySessions!();
+
+  const byBranch = Object.fromEntries(listed.map((s) => [s.branch, s.files]));
+  assert.deepEqual(byBranch['feat/b'], ['shared.ts']);
+  assert.deepEqual(byBranch['feat/c'], [], 'a sibling with no shared path reports none');
 });
 
 test('deleting a session drops its seenChannels entry, not just its channel', async (t) => {
