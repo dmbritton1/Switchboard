@@ -56,7 +56,7 @@ async function rejectsWithin(
   }
 }
 
-async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {

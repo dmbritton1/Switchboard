@@ -473,3 +473,50 @@ test('relayServer exposes exactly the two relay tools', async () => {
     ['list_sessions', 'send_to_session'],
   );
 });
+
+test('list_sessions renders branch, status, account, id, and any shared files per row', async () => {
+  const rows = [
+    {
+      id: 'sess-b', branch: 'feat/b', account: 'claude-alt', status: 'working',
+      files: ['src/auth.ts', 'src/session.ts'],
+    },
+    { id: 'sess-c', branch: 'feat/c', account: 'claude-main', status: 'done', files: [] },
+  ];
+  const server = relayServer({ sessions: async () => rows, send: () => ({ ok: true, queued: false }) });
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+
+  const result = await client.callTool({ name: 'list_sessions', arguments: {} });
+  const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+  const lines = text.split('\n');
+
+  assert.equal(
+    lines[0],
+    'feat/b — working, on account claude-alt (id sess-b) — also changed src/auth.ts, src/session.ts',
+  );
+  assert.equal(
+    lines[1],
+    'feat/c — done, on account claude-main (id sess-c)',
+    'a sibling with no shared paths gets no "also changed" tail',
+  );
+});
+
+test('list_sessions reports there are no other sessions rather than an empty body', async () => {
+  const server = relayServer({ sessions: async () => [], send: () => ({ ok: true, queued: false }) });
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+
+  const result = await client.callTool({ name: 'list_sessions', arguments: {} });
+  const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+  assert.equal(text, 'No other sessions on this repository.');
+});
