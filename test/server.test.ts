@@ -3322,14 +3322,17 @@ test('deleting a session drops its channels', async (t) => {
   const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
   const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
   starts[0].relay!(b.id, 'ping');
-  assert.equal(starts[0].relayGate!(b.id).ask, false);
+  assert.equal(starts[0].relayGate!(b.id).ask, false, 'the channel is open before the delete');
 
   await post({ cmd: 'delete', id: b.id });
-  const c = await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
 
+  // relayGate only reads the channel/seen maps, never the registry, so probing
+  // with b's own id post-delete is valid and is the thing dropChannels is
+  // supposed to have cleaned — a fresh, unrelated id would pass whether or not
+  // dropChannels ran at all.
   assert.equal(
-    starts[0].relayGate!(c.id).ask, true,
-    'a fresh pair is gated; the deleted session left no channel behind',
+    starts[0].relayGate!(b.id).ask, true,
+    'the channel is gone once its session is deleted',
   );
 });
 
@@ -3348,12 +3351,14 @@ test('deleting a session drops its seenChannels entry, not just its channel', as
   starts[0].relay!(b.id, 'ping');
 
   await post({ cmd: 'delete', id: b.id });
-  const c = await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
 
-  // If seenChannels still carried an entry for the deleted session under a
-  // recreated id, this would come back with a checkpoint note instead of a
+  // Probing with b's own id (not a fresh, unrelated one) so this can actually
+  // fail: dropChannels alone would already make `ask` true, but a leaked
+  // seenChannels entry would still attach a checkpoint note here instead of a
   // plain first-send gate.
-  assert.equal(starts[0].relayGate!(c.id).note, undefined, 'a fresh pair has never talked');
+  const gate = starts[0].relayGate!(b.id);
+  assert.equal(gate.ask, true);
+  assert.equal(gate.note, undefined, 'a leaked seenChannels entry would set this');
 });
 
 test('the gate distinguishes a first send from a checkpoint', async (t) => {
