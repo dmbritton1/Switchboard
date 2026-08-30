@@ -549,6 +549,8 @@ The agent-facing half. `list_sessions` gains the overlap, and the tool's instruc
 
 `relaySessions` becomes async so it can refresh a stale entry rather than reporting no overlap when the browser has not polled recently. Its only caller is an already-async tool handler.
 
+Be aware what that costs: `changedPaths` is three git invocations, so a repo with five sessions is sixteen subprocess spawns on a single `list_sessions` call. The refresh runs in parallel for that reason. The cost is also bursty rather than constant — with the grid open most entries are fresh and the refresh is a no-op, while an agent working unattended finds everything stale and pays full price. That is the right shape (the cost lands exactly when the cached answer would otherwise be wrong), but it is not uniform.
+
 **Files:**
 - Modify: `src/types.ts` (`RelaySession` gains a field; `StartOpts.relaySessions` returns a promise)
 - Modify: `src/server.ts` (the `relaySessions` closure at line 579)
@@ -627,9 +629,13 @@ Replace the `relaySessions` closure in `src/server.ts:579`:
           // anything stale — refreshPaths skips whatever is already fresh.
           const base = await currentBranch(session.repo).catch(() => '');
           const now = Date.now();
-          for (const s of [...siblings, session]) {
-            await refreshPaths(paths, s.id, () => changedPaths(s.cwd, base), now);
-          }
+          // In parallel, not a sequential loop: each refreshPaths is three git
+          // invocations, so N sessions serialized is N round trips the agent
+          // waits through for no benefit. refreshPaths is per-key and never
+          // throws, so concurrent calls cannot interfere.
+          await Promise.all(
+            [...siblings, session].map((s) => refreshPaths(paths, s.id, () => changedPaths(s.cwd, base), now)),
+          );
           const shared = new Map(
             overlaps(paths, sessionId, siblings.map((s) => ({ id: s.id, branch: s.branch })))
               .map((o) => [o.id, o.files]),
@@ -688,9 +694,11 @@ The human-facing half. Two `/status` consumers read the response, and both must 
 
 The decision — which badge a pair earns — is a pure function in `web/lib.js`, tested there, because `test/ui.test.ts` never loads `web/app.js` as code (see the comment at its line 20). The DOM half is the rendering only.
 
+The sidebar has **three** touch points, not one. `sidebarDiffText` is a cached string re-applied on every render, so a tooltip set only inside the poll would outlive the session it describes.
+
 **Files:**
 - Modify: `web/lib.js` (a new export beside `handoffTargets`)
-- Modify: `web/app.js` (its `lib.js` import block; the card's `/status` handler at line 924; `pollSidebarDiff` at line 456)
+- Modify: `web/app.js` — its `lib.js` import block; the card's `/status` handler at line 924; and all three sidebar sites: the `sidebarDiffText` declaration at line 454, `pollSidebarDiff` at line 456, the switch-reset at line 1066, and the re-render at line 1145
 - Test: `test/ui.test.ts`
 
 **Interfaces:**
@@ -802,21 +810,59 @@ In the card's `/status` handler (`web/app.js:924`), append the badges and set th
     }).catch(() => {});
 ```
 
-In `pollSidebarDiff` (`web/app.js:456`), do the same for the sidebar line:
+The sidebar needs all three of its sites changed together, because the poll is not the only thing that writes that element.
+
+Declare a cached title beside the cached text (`web/app.js:454`):
+
+```js
+let sidebarDiffText = '';
+// Cached beside the text and restored with it: #sidebar-diffstat is rewritten on
+// every render (see below), so a title set only by the poll would outlive the
+// session it describes and hang the previous session's file list on the next one.
+let sidebarDiffTitle = '';
+```
+
+In `pollSidebarDiff` (`web/app.js:456`), set both:
 
 ```js
     const badges = d ? couplingBadges(d) : { text: '', title: '' };
     sidebarDiffText = d
       ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}${badges.text ? ` · ${badges.text}` : ''}`
       : '';
-    $('#sidebar-diffstat').textContent = sidebarDiffText;
-    if (badges.title) $('#sidebar-diffstat').title = badges.title;
-    else $('#sidebar-diffstat').removeAttribute('title');
+    sidebarDiffTitle = badges.title;
+    applySidebarDiff(sidebarDiffText, sidebarDiffTitle);
+```
+
+In the switch-reset (`web/app.js:1066`), clear it alongside the text:
+
+```js
+    sidebarDiffFor = null; sidebarDiffText = ''; sidebarDiffTitle = '';
+    diffOpen.clear(); lastDiffText = '';
+```
+
+And at the re-render (`web/app.js:1145`), restore or clear both — this is the site that would otherwise leave a stale tooltip on a session it does not belong to:
+
+```js
+  const mine = sidebarDiffFor === s.id;
+  applySidebarDiff(mine ? sidebarDiffText : '', mine ? sidebarDiffTitle : '');
+```
+
+with one small helper so the three sites cannot drift:
+
+```js
+/** The element is written from three places; keeping them in one function is
+ *  what stops a title outliving the text it belongs to. */
+function applySidebarDiff(text, title) {
+  const el = $('#sidebar-diffstat');
+  el.textContent = text;
+  if (title) el.title = title;
+  else el.removeAttribute('title');
+}
 ```
 
 Neither renderer may throw when `talking`/`overlapping` are absent — `couplingBadges` already returns empties for that, which is what the fourth test pins.
 
-There is no test for this step. `test/ui.test.ts` never loads `app.js`, so verify by reading: both call sites use the same helper, both guard the null response the route can still return, and neither leaves a stale `title` behind when the badges go away.
+There is no test for this step. `test/ui.test.ts` never loads `app.js`, so reading is the verification. Check specifically: the card's selector still matches the element it did before; both renderers clear `title` rather than leaving a stale one; `applySidebarDiff` is used at all three sidebar sites and none writes the element directly; and switching sessions leaves neither the text nor the tooltip of the session you left.
 
 - [ ] **Step 6: Run the full suite and commit**
 
