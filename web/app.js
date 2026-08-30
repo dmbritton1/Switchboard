@@ -11,7 +11,8 @@ import {
   beginAttachmentSend, completeAttachmentSend,
   codexSettingsFromForm, codexSettingsSummary, usageLines,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
-  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
+  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, mentionMenu, mentionInsert,
+  attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
 
@@ -1888,6 +1889,92 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   return paint;
 }
 
+/**
+ * Session autocomplete for the chat composer.
+ *
+ * A sibling of wireCommandMenu rather than a second mode inside it. The two
+ * menus share a shape but nothing else, and folding them together would mean
+ * editing a working, untested closure to add a case — where a mistake breaks
+ * slash commands silently, since no test loads this file.
+ *
+ * `sessions()` is supplied by the caller because this factory must not know how
+ * the grid stores state; it returns the sessions the open one may mention.
+ */
+function wireMentionMenu({ field, menu, ids, sessions }) {
+  let matches = [];
+  let index = 0;
+
+  function close() {
+    menu.hidden = true;
+    matches = [];
+    field.removeAttribute('aria-activedescendant');
+    field.setAttribute('aria-expanded', 'false');
+  }
+
+  function highlight() {
+    [...menu.children].forEach((li, i) => li.setAttribute('aria-selected', String(i === index)));
+    field.setAttribute('aria-activedescendant', `${ids}-${index}`);
+    menu.children[index]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function apply(session) {
+    const caret = field.selectionStart ?? 0;
+    const at = field.value.slice(0, caret).lastIndexOf('@');
+    const inserted = mentionInsert(session);
+    field.value = field.value.slice(0, at) + inserted + field.value.slice(caret);
+    const end = at + inserted.length;
+    field.setSelectionRange(end, end);
+    close();
+    field.focus();
+  }
+
+  function render() {
+    const found = mentionMenu(field.value, field.selectionStart ?? 0, sessions());
+    if (!found || !found.matches.length) { close(); return; }
+    // Only reset the highlight when the list itself changed, so a caret move
+    // does not throw away an arrow-key selection.
+    const keys = found.matches.map((m) => m.id).join('\n');
+    if (keys !== matches.map((m) => m.id).join('\n')) index = 0;
+    matches = found.matches;
+
+    menu.replaceChildren(...matches.map((session, i) => {
+      const li = document.createElement('li');
+      li.id = `${ids}-${i}`;
+      li.setAttribute('role', 'option');
+      const account = document.createElement('span');
+      account.className = 'ns';
+      account.textContent = ` ${session.account}`;
+      li.append(`@${session.branch}`, account);
+      // mousedown, not click: preventDefault keeps focus in the field so the
+      // menu never races its own blur handler.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); apply(session); });
+      return li;
+    }));
+    menu.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    highlight();
+  }
+
+  for (const evt of ['input', 'click', 'keyup']) field.addEventListener(evt, render);
+  field.addEventListener('blur', close);
+
+  field.addEventListener('keydown', (e) => {
+    if (!matches.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      index = (index + (e.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length;
+      highlight();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      apply(matches[index]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+}
+
 const paintMirror = wireCommandMenu({
   field: $('#prompt'), box: $('#prompt-box'), mirror: $('#prompt-mirror'),
   menu: $('#cmd-menu'), ids: 'cmd-opt',
@@ -1896,6 +1983,18 @@ const paintMirror = wireCommandMenu({
 const paintNewMirror = wireCommandMenu({
   field: $('#prompt-input'), box: $('#new-prompt-box'), mirror: $('#new-prompt-mirror'),
   menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
+});
+
+// Only the chat composer gets this: the new-session prompt has no open
+// session yet, so there is nothing for `@` to be relative to there.
+wireMentionMenu({
+  field: $('#prompt'), menu: $('#mention-menu'), ids: 'mention-opt',
+  sessions: () => {
+    const open = state.sessions.find((x) => x.id === openId);
+    return open
+      ? state.sessions.filter((x) => x.id !== open.id && x.repo === open.repo)
+      : [];
+  },
 });
 
 /**

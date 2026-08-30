@@ -67,6 +67,32 @@ export function handoffTargets(session, accounts) {
 }
 
 /**
+ * The `@` mention menu, the same shape commandMenu returns for slash commands:
+ * `{ query, matches }`, or null when the caret is not inside a mention.
+ *
+ * A mention runs from an `@` to the caret with no whitespace between, so the
+ * menu closes as soon as the sentence moves on.
+ */
+export function mentionMenu(text, caret, sessions) {
+  const before = text.slice(0, caret);
+  const at = before.lastIndexOf('@');
+  if (at === -1) return null;
+  const query = before.slice(at + 1);
+  if (/\s/.test(query)) return null;
+  return { query, matches: sessions.filter((s) => s.branch.includes(query)) };
+}
+
+/**
+ * What picking a session inserts. Not just the branch name: the agent would be
+ * left inferring that a name with an `@` in front means "go talk to that", and
+ * that inference fails invisibly — an agent answering from its own knowledge
+ * looks exactly like one that had nothing to say. One sentence removes the doubt.
+ */
+export function mentionInsert(session) {
+  return `${session.branch} (another session on this repo — reach it with send_to_session)`;
+}
+
+/**
  * The buttons a pending request gets: `{ label, description, command }`, where
  * `command` is merged into the decide call. An AskUserQuestion carries
  * `options`, and each one answers the question outright, captioned with the
