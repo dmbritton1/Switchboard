@@ -72,12 +72,19 @@ export function handoffTargets(session, accounts) {
 // change both if the number ever moves.
 const MAX_LISTED_PATHS = 10;
 
-/** A path list for a card tooltip, bounded so neither grows unread. Mirrors
- *  src/overlap.ts's summarizePaths so the two surfaces read the same way. */
-function summarizePaths(files) {
-  if (files.length <= MAX_LISTED_PATHS) return files.join(', ');
+/**
+ * A path list for a card tooltip, bounded so neither grows unread. Mirrors
+ * src/overlap.ts's summarizePaths so the two surfaces read the same way,
+ * except `total` is a separate argument here: `/status` now sends `files`
+ * pre-capped at MAX_LISTED_PATHS plus the true `count` alongside it, so the
+ * tail has to be computed from that true count rather than from the (already
+ * capped) list's own length — otherwise a capped list would claim there is
+ * nothing more to see.
+ */
+function summarizePaths(files, total = files.length) {
+  if (total <= MAX_LISTED_PATHS) return files.join(', ');
   const shown = files.slice(0, MAX_LISTED_PATHS).join(', ');
-  return `${shown}, and ${files.length - MAX_LISTED_PATHS} more`;
+  return `${shown}, and ${total - MAX_LISTED_PATHS} more`;
 }
 
 /**
@@ -104,10 +111,13 @@ export function couplingBadges(status) {
 
   const parts = [
     ...talking.map((t) => `↔ ${t.branch}`),
-    ...silent.map((o) => `⚠ ${o.files.length} file${o.files.length === 1 ? '' : 's'} also in ${o.branch}`),
+    ...silent.map((o) => {
+      const count = o.count ?? o.files.length;
+      return `⚠ ${count} file${count === 1 ? '' : 's'} also in ${o.branch}`;
+    }),
   ];
   const title = silent
-    .map((o) => `${o.branch}: ${summarizePaths(o.files)}`)
+    .map((o) => `${o.branch}: ${summarizePaths(o.files, o.count ?? o.files.length)}`)
     .join('\n');
   return { text: parts.join(' · '), title };
 }

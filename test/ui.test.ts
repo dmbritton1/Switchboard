@@ -1793,7 +1793,7 @@ test('linkView relabels the cancel control to Dismiss once the link has failed',
 test('couplingBadges shows a talking pair as talking, not as a collision', () => {
   const badges = couplingBadges({
     talking: [{ id: 'b', branch: 'feat/b' }],
-    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts'] }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 1, files: ['src/auth.ts'] }],
   });
 
   assert.match(badges.text, /↔ feat\/b/);
@@ -1803,7 +1803,7 @@ test('couplingBadges shows a talking pair as talking, not as a collision', () =>
 test('couplingBadges flags overlap only when the pair is not talking', () => {
   const badges = couplingBadges({
     talking: [],
-    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts', 'src/session.ts'] }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 2, files: ['src/auth.ts', 'src/session.ts'] }],
   });
 
   assert.match(badges.text, /⚠ 2 files also in feat\/b/);
@@ -1814,7 +1814,7 @@ test('couplingBadges flags overlap only when the pair is not talking', () => {
 test('couplingBadges reports each pair on its own terms', () => {
   const badges = couplingBadges({
     talking: [{ id: 'a', branch: 'feat/a' }],
-    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts'] }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 1, files: ['src/auth.ts'] }],
   });
 
   assert.match(badges.text, /↔ feat\/a/);
@@ -1826,14 +1826,17 @@ test('couplingBadges is empty when there is nothing to say', () => {
   assert.deepEqual(couplingBadges(null), { text: '', title: '' });
 });
 
-test('couplingBadges caps the tooltip list at ten paths but keeps the true count in the badge text', () => {
-  const files = Array.from({ length: 12 }, (_, i) => `src/file${i}.ts`);
+test('couplingBadges reports the true count in the badge text even when the wire list is pre-capped', () => {
+  // /status now caps `files` at MAX_LISTED_PATHS itself and sends the true
+  // total separately as `count` — this is what a 12-file overlap looks like
+  // over the wire, not the un-capped array a client-side cap used to see.
+  const files = Array.from({ length: 10 }, (_, i) => `src/file${i}.ts`);
   const badges = couplingBadges({
     talking: [],
-    overlapping: [{ id: 'b', branch: 'feat/b', files }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 12, files }],
   });
 
-  assert.match(badges.text, /⚠ 12 files also in feat\/b/);
+  assert.match(badges.text, /⚠ 12 files also in feat\/b/, 'the badge must report the true count, not the capped list length');
   assert.match(badges.title, /and 2 more/);
   assert.doesNotMatch(badges.title, /file10\.ts/);
   assert.doesNotMatch(badges.title, /file11\.ts/);
