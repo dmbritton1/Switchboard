@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  normalizeClaude, approvalQueue, probeLimits, questionOptions, renderClaudePrompt, resultText, summarize,
+  normalizeClaude, approvalQueue, probeLimits, questionOptions, relayDecision, renderClaudePrompt, resultText,
+  summarize,
 } from '../src/agents/claude.ts';
 import { relayServer } from '../src/agents/relay-tools.ts';
 import type { AdapterEvent } from '../src/types.ts';
@@ -423,6 +424,37 @@ test('the approval card names the target and the message', () => {
 
 test('a relay summary survives a missing field', () => {
   assert.equal(summarize('mcp__relay__send_to_session', {}), 'mcp__relay__send_to_session');
+});
+
+test('a relay summary is clamped so an agent-authored body cannot blow up the card', () => {
+  const long = 'x'.repeat(500);
+  const summary = summarize('mcp__relay__send_to_session', { session: 'feat/login', text: long });
+  assert.ok(summary.length < 450, `expected a clamped summary, got ${summary.length} chars`);
+  assert.ok(summary.endsWith('…'), 'a truncated summary must say so');
+
+  // Short bodies are untouched — the clamp must not touch the other branches
+  // or a normal-length relay.
+  const short = summarize('mcp__relay__send_to_session', { session: 'feat/login', text: 'auth moved' });
+  assert.equal(short, '→ feat/login: auth moved');
+});
+
+test('relayDecision: an open gate allows regardless of auto', () => {
+  assert.equal(relayDecision({ ask: false }, false, false), 'allow');
+  assert.equal(relayDecision({ ask: false }, true, false), 'allow');
+});
+
+test('relayDecision: a gate that asks still allows silently under auto — that is what auto means for relays', () => {
+  assert.equal(relayDecision({ ask: true }, true, false), 'allow');
+});
+
+test('relayDecision: a gate that asks with auto off asks', () => {
+  assert.equal(relayDecision({ ask: true }, false, false), 'ask');
+});
+
+test('relayDecision: no gate falls through to the ordinary auto && !isQuestion rule, unchanged', () => {
+  assert.equal(relayDecision(null, true, false), 'allow');
+  assert.equal(relayDecision(null, true, true), 'ask', 'a question is exempt from auto even with no gate');
+  assert.equal(relayDecision(null, false, false), 'ask');
 });
 
 test('relayServer exposes exactly the two relay tools', async () => {

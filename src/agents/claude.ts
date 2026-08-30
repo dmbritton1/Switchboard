@@ -54,15 +54,46 @@ export function summarize(name: string, input: Record<string, unknown>, listOpti
       .join(' | ');
   }
   // The message is the thing being approved, so it has to be on the card — the
-  // generic fallthrough would show only the tool name.
+  // generic fallthrough would show only the tool name. Clamped here only: a
+  // relay body is agent-authored prose, structurally much longer than the
+  // input.command the other branches were built for, and this summary is
+  // persisted, re-serialized into every SSE snapshot, and rendered unclamped.
   if (name.endsWith('__send_to_session')
     && typeof input.session === 'string' && typeof input.text === 'string') {
-    return `→ ${input.session}: ${input.text}`;
+    const RELAY_SUMMARY_LIMIT = 400;
+    const text = input.text.length > RELAY_SUMMARY_LIMIT
+      ? `${input.text.slice(0, RELAY_SUMMARY_LIMIT)}…`
+      : input.text;
+    return `→ ${input.session}: ${text}`;
   }
   if (typeof input.command === 'string') return input.command;
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   return name;
+}
+
+/**
+ * The whole of `canUseTool`'s security decision, pulled out so it is testable
+ * without driving the SDK: `gate` is `relayGate`'s answer for a relay call (or
+ * null for any other tool, or a relay call before `relayGate` was wired up),
+ * `auto` is the session's current auto-approve flag, `isQuestion` is whether
+ * this is an AskUserQuestion call.
+ *
+ * An open gate always allows, regardless of `auto` — a channel already
+ * approved does not need `auto` to skip its card. Otherwise this falls
+ * through to today's `auto && !isQuestion` rule, unchanged: a gate that asks
+ * still allows silently under `auto`, because `auto` here means "never ask
+ * about relays", and a non-relay call with no gate at all takes the same path
+ * it always did.
+ */
+export function relayDecision(
+  gate: { ask: boolean; note?: string } | null,
+  auto: boolean,
+  isQuestion: boolean,
+): 'allow' | 'ask' {
+  if (gate && !gate.ask) return 'allow';
+  if (auto && !isQuestion) return 'allow';
+  return 'ask';
 }
 
 /**
@@ -335,18 +366,23 @@ export const claudeAdapter: Adapter = {
         ? toolInput.session
         : null;
       const gate = relayTarget && opts.relayGate ? opts.relayGate(relayTarget) : null;
-      if (gate && !gate.ask) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
-      // Read at call time, not captured: setAuto() can flip this mid-session and
-      // every later tool call must see the new value. A question is exempt: auto
-      // means "don't make me approve tool calls", and allowing AskUserQuestion
-      // just makes the CLI answer "The user did not answer the questions" — the
-      // question would flash past with nothing to click.
-      if (auto && !options) return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
+      // Read `auto` at call time, not captured: setAuto() can flip this
+      // mid-session and every later tool call must see the new value. A
+      // question is exempt: auto means "don't make me approve tool calls", and
+      // allowing AskUserQuestion just makes the CLI answer "The user did not
+      // answer the questions" — the question would flash past with nothing to
+      // click.
+      if (relayDecision(gate, auto, Boolean(options)) === 'allow') {
+        return Promise.resolve({ behavior: 'allow', updatedInput: toolInput });
+      }
       const request = {
         id: `a${++approvalSeq}`,
         tool: toolName,
+        // Prefixed, not appended: the tail of the summary is the agent's own
+        // message body for a relay, and a message that happens to end in text
+        // resembling a checkpoint note must not be able to impersonate one.
         summary: gate?.note
-          ? `${summarize(toolName, toolInput, !options)} (${gate.note})`
+          ? `(${gate.note}) ${summarize(toolName, toolInput, !options)}`
           : summarize(toolName, toolInput, !options),
         ...(options ? { options } : {}),
       };
