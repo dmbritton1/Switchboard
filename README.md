@@ -136,6 +136,27 @@ Typing `@` in the composer lists the other sessions on that repository and
 inserts a short note naming what the session is, so the agent knows the name
 refers to something it can reach. The mention itself sends nothing.
 
+Sessions on one repository are also checked against each other for overlapping
+work. A session's card shows `↔ feat/other` when the two have an open relay
+channel, and `⚠ 3 files also in feat/other` when they have changed the same
+files without one — the second is the one worth looking at, because it is a
+merge conflict that has not happened yet. Hovering names the files, capped at ten
+with "and N more" if there are more; the badge count is the true total. An agent
+learns about overlap through `list_sessions`, which it must call to find out — there
+is no push, injection, or interrupt, so an agent that never calls the tool never learns.
+With that information, a session can see who is in the file it is about to change and
+message just that session rather than all of them.
+
+Overlap counts committed work as well as uncommitted: two sessions that each
+committed a change to the same file have clean worktrees and still collide.
+Pasted uploads and handoff documents are excluded, the same way they are
+excluded from the outstanding-work commit.
+
+It is advisory and nothing more. It never blocks a merge, never refuses an edit,
+and never claims a file — it is "also changed in", not "locked by". The paths are
+recollected at most every thirty seconds per session, so a badge can lag a change
+by that much, and can briefly show on one side of a pair before the other.
+
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one
 write every two seconds, on any other state change — so a session that runs to

@@ -66,6 +66,62 @@ export function handoffTargets(session, accounts) {
   return accounts.filter((a) => a.name !== session.account);
 }
 
+// Mirrors src/overlap.ts's MAX_LISTED_PATHS: web/lib.js is a browser module
+// with no build step, so it can't import a constant from that TypeScript file.
+// The duplication is a considered cost of that boundary, not an oversight —
+// change both if the number ever moves.
+const MAX_LISTED_PATHS = 10;
+
+/**
+ * A path list for a card tooltip, bounded so neither grows unread. Mirrors
+ * src/overlap.ts's summarizePaths so the two surfaces read the same way,
+ * except `total` is a separate argument here: `/status` now sends `files`
+ * pre-capped at MAX_LISTED_PATHS plus the true `count` alongside it, so the
+ * tail has to be computed from that true count rather than from the (already
+ * capped) list's own length — otherwise a capped list would claim there is
+ * nothing more to see.
+ */
+function summarizePaths(files, total = files.length) {
+  if (total <= MAX_LISTED_PATHS) return files.join(', ');
+  const shown = files.slice(0, MAX_LISTED_PATHS).join(', ');
+  return `${shown}, and ${total - MAX_LISTED_PATHS} more`;
+}
+
+/**
+ * The coupling badges for one session's /status response: `text` follows the
+ * existing `+N −M · dirty`, `title` is the tooltip.
+ *
+ * Talking wins over overlapping for a given pair. Two sessions editing one file
+ * and talking about it is coordination working; the same two in silence is a
+ * merge conflict that has not happened yet, and only the second is worth a
+ * warning. Flagging both would cry wolf on the healthy case.
+ *
+ * Advisory throughout: "also in", never "locked by". Nothing here prevents
+ * anything, and wording that implies otherwise would be a lie.
+ *
+ * The badge text always reports the true overlap count; only the tooltip's
+ * file list is capped, so the number never lies about how much actually
+ * overlaps even when the list behind it is trimmed.
+ */
+export function couplingBadges(status) {
+  const talking = status?.talking ?? [];
+  const overlapping = status?.overlapping ?? [];
+  const talkingIds = new Set(talking.map((t) => t.id));
+  const silent = overlapping.filter((o) => !talkingIds.has(o.id));
+
+  const parts = [
+    ...talking.map((t) => `↔ ${t.branch}`),
+    ...silent.map((o) => {
+      const count = o.count ?? o.files.length;
+      return `⚠ ${count} file${count === 1 ? '' : 's'} also in ${o.branch}`;
+    }),
+  ];
+  const title = silent
+    .map((o) => `${o.branch}: ${summarizePaths(o.files, o.count ?? o.files.length)}`)
+    .join('\n');
+  return { text: parts.join(' · '), title };
+}
+
 /**
  * The `@` mention menu, the same shape commandMenu returns for slash commands:
  * `{ query, matches }`, or null when the caret is not inside a mention.

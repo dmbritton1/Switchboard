@@ -56,6 +56,39 @@ async function rejectsWithin(
   }
 }
 
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`timed out waiting for file: ${path}`);
+}
+
+async function waitForMarker(path: string, expectedContent: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const content = await readFile(path, 'utf8');
+      assert.equal(content, expectedContent);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  // On timeout, try to read one more time to get a better error message
+  try {
+    const content = await readFile(path, 'utf8');
+    assert.equal(content, expectedContent);
+  } catch (error) {
+    throw new Error(`marker file assertion failed after ${timeoutMs}ms: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 test('correlates out-of-order responses while delivering notifications and colliding server requests', async (t) => {
   const notifications: Array<{ method: string; params: unknown }> = [];
   const requests: Array<{ id: string | number; method: string; params: unknown }> = [];
@@ -128,21 +161,25 @@ test('settles a request when its input write fails', async (t) => {
 test('times out a request and terminates the child', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-client-timeout-'));
   const marker = join(directory, 'terminated');
+  const pidFile = join(directory, 'pid');
   t.after(async () => rm(directory, { recursive: true, force: true }));
   const client = clientFor({
     mode: 'hang',
     requestTimeoutMs: 300,
-    overrides: { FAKE_APP_SERVER_EXIT_MARKER: marker },
+    overrides: {
+      FAKE_APP_SERVER_EXIT_MARKER: marker,
+      FAKE_APP_SERVER_PID_FILE: pidFile,
+    },
   });
   t.after(() => client.close());
 
+  await waitForFile(pidFile);
   await rejectsWithin(
     client.request('initialize'),
     2_000,
     (error) => error instanceof Error && /initialize timed out after 300ms/i.test(error.message),
   );
-  await access(marker);
-  assert.equal(await readFile(marker, 'utf8'), 'SIGTERM');
+  await waitForMarker(marker, 'SIGTERM');
 });
 
 test('rejects a pending request when the child exits without exposing stderr', async (t) => {
@@ -178,12 +215,13 @@ test('escalates SIGTERM to SIGKILL before a timed-out request settles', async (t
   });
   t.after(() => client.close());
 
+  await waitForFile(pidFile);
   await rejectsWithin(
     client.request('initialize'),
     2_000,
     (error) => error instanceof Error && /initialize timed out after 300ms/i.test(error.message),
   );
-  assert.equal(await readFile(marker, 'utf8'), 'SIGTERM');
+  await waitForMarker(marker, 'SIGTERM');
   const pid = Number(await readFile(pidFile, 'utf8'));
   assert.ok(Number.isSafeInteger(pid) && pid > 0);
   assert.throws(

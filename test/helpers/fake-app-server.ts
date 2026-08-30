@@ -642,12 +642,12 @@ async function handle(message: Message): Promise<void> {
 
 if (mode === 'hang' || mode === 'ignore-term') {
   const pidFile = process.env.FAKE_APP_SERVER_PID_FILE;
-  if (pidFile) writeFileSync(pidFile, String(process.pid));
   process.on('SIGTERM', () => {
     const marker = process.env.FAKE_APP_SERVER_EXIT_MARKER;
     if (marker) appendFileSync(marker, 'SIGTERM');
     if (mode === 'hang') process.exit(0);
   });
+  if (pidFile) writeFileSync(pidFile, String(process.pid));
 }
 
 const lines = readline.createInterface({ input: process.stdin });

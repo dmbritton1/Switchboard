@@ -9,8 +9,9 @@ import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from './account-limits.ts';
 import { Scheduler } from './schedule.ts';
-import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
-import { commitOutstanding, mergeWorktrees, pushRepo } from './merge.ts';
+import { changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
+import { commitOutstanding, currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
+import { dropPaths, MAX_LISTED_PATHS, overlaps, refreshPaths, type PathCache } from './overlap.ts';
 import { HANDOFF_FILE, HANDOFF_PROMPT, renderHandoff } from './handoff.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
@@ -471,6 +472,20 @@ export function createServer(opts: {
   // Pairs that have talked before, so the card can say which question it is
   // asking. Never cleared on checkpoint, only when a session goes away.
   const seenChannels = new Set<string>();
+  // Paths each session has changed, with the time they were collected. Process-
+  // local like the channel maps, and for the same reason — this describes live
+  // worktrees, and Registry.load forces every session to `stopped` on start.
+  const paths: PathCache = new Map();
+  // Pairs related by handoff — the successor's branch point is the source's own
+  // branch, so they share every committed path and would otherwise land in the
+  // silent (unwarned-collision) bucket and cry wolf on a pair that shares
+  // history rather than colliding. Process-local, same lifecycle as the other
+  // maps: a restart loses it and a handed-off pair can show a false warning
+  // again until one side changes something. A `git merge-base --is-ancestor`
+  // check would survive a restart and be correct instead of remembered, but it
+  // is a git call per pair against an O(n^2) pairing — bookkeeping was chosen
+  // over that cost, not missed.
+  const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
 
   /**
@@ -576,9 +591,33 @@ export function createServer(opts: {
             ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
             : { ask: true };
         },
-        relaySessions: () => registry.all()
-          .filter((s) => s.id !== sessionId && s.repo === session?.repo)
-          .map((s) => ({ id: s.id, branch: s.branch, account: s.account, status: s.status })),
+        relaySessions: async () => {
+          // `session` is read once at launch; without it there is no repo to scope
+          // by and currentBranch would run against the server's own cwd.
+          if (!session) return [];
+          const siblings = registry.all().filter((s) => s.id !== sessionId && s.repo === session.repo);
+          // Agents call this rarely, and a tool that reports no overlap because
+          // nobody happened to open the card is a tool that quietly lies. Refresh
+          // anything stale — refreshPaths skips whatever is already fresh.
+          const base = await currentBranch(session.repo).catch(() => '');
+          const now = Date.now();
+          // In parallel, not a sequential loop: each refreshPaths is three git
+          // invocations, so N sessions serialized is N round trips the agent
+          // waits through for no benefit. refreshPaths is per-key and never
+          // throws, so concurrent calls cannot interfere.
+          await Promise.all(
+            [...siblings, session].map((s) => refreshPaths(paths, s.id, () => changedPaths(s.cwd, base), now)),
+          );
+          const shared = new Map(
+            overlaps(paths, sessionId, siblings.map((s) => ({ id: s.id, branch: s.branch })))
+              .filter((o) => !lineage.has(channelKey(sessionId, o.id)))
+              .map((o) => [o.id, o.files]),
+          );
+          return siblings.map((s) => ({
+            id: s.id, branch: s.branch, account: s.account, status: s.status,
+            files: shared.get(s.id) ?? [],
+          }));
+        },
       }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {
@@ -859,6 +898,11 @@ export function createServer(opts: {
           branch,
           title: branch,
         });
+        // The successor branches from the source at the source's own commit, so
+        // the two share every committed path and would otherwise report a
+        // guaranteed, permanent false overlap warning on each other — see the
+        // `lineage` comment above.
+        lineage.add(channelKey(source.id, session.id));
         const promptId = registry.appendPrompt(
           session.id, HANDOFF_PROMPT, account.provider === 'codex' ? 'queued' : 'sent',
         );
@@ -1070,6 +1114,8 @@ export function createServer(opts: {
         registry.remove(String(body.id));
         dropChannels(channels, String(body.id));
         dropSeen(seenChannels, String(body.id));
+        dropSeen(lineage, String(body.id));
+        dropPaths(paths, String(body.id));
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
@@ -1394,8 +1440,45 @@ export function createServer(opts: {
         const session = registry.get(id);
         if (!session) { res.writeHead(404).end('{}'); return; }
         const status = await worktreeStatus(session.cwd).catch(() => null);
+        if (!status) {
+          // The worktree is gone, permanently as far as this process is
+          // concerned — every later attempt will fail the same way. Drop the
+          // cached paths rather than leaving them for siblings to keep
+          // intersecting against forever: a transient git hiccup is what
+          // refreshPaths' stale-on-failure is for, but this caller has the
+          // liveness signal that says this is not that.
+          dropPaths(paths, id);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('null');
+          return;
+        }
+        // Collected here rather than on a timer of its own: this route is
+        // already polled per card, and refreshPaths' TTL is what stops a
+        // four-second poll from spawning git on every call.
+        //
+        // currentBranch resolves INSIDE the closure, not before it. Outside, it
+        // would run on every poll even when the paths are fresh — and it is the
+        // same answer for every session in the repo, so a ten-session grid would
+        // ask it 150 times a minute to learn one thing. Inside, it rides the TTL
+        // that is already there and costs nothing when nothing is stale.
+        await refreshPaths(paths, id, async () => changedPaths(
+          session.cwd, await currentBranch(session.repo).catch(() => ''),
+        ), Date.now());
+        const siblings = registry.all()
+          .filter((s) => s.id !== id && s.repo === session.repo)
+          .map((s) => ({ id: s.id, branch: s.branch }));
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(status));
+        res.end(JSON.stringify({
+          ...status,
+          talking: siblings.filter((s) => channelOpen(channels, id, s.id)),
+          // The count is the true total; the file list is capped so a full
+          // intersection (a codemod across thousands of files, polled every
+          // four seconds per visible card) is never serialized whole — nothing
+          // downstream reads past MAX_LISTED_PATHS anyway.
+          overlapping: overlaps(paths, id, siblings)
+            .filter((o) => !lineage.has(channelKey(id, o.id)))
+            .map((o) => ({ id: o.id, branch: o.branch, count: o.files.length, files: o.files.slice(0, MAX_LISTED_PATHS) })),
+        }));
         return;
       }
 

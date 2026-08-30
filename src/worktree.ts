@@ -234,6 +234,35 @@ export async function worktreeStatus(cwd: string): Promise<{
   };
 }
 
+/**
+ * Every path this session has changed relative to `base`, committed work and
+ * uncommitted work together.
+ *
+ * The committed half is not optional: two sessions that each committed a change
+ * to one file have clean worktrees and still collide at merge, which is the
+ * collision most worth warning about and the one a dirty-file check misses.
+ *
+ * `base` is a branch name — the base repo's currently checked-out branch, which
+ * is what mergeWorktrees merges into. An empty string means the base repo is on
+ * a detached HEAD; the committed half is skipped rather than failing, because a
+ * partial advisory signal beats none.
+ */
+export async function changedPaths(cwd: string, base: string): Promise<string[]> {
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
+  const [tracked, untracked, committed] = await Promise.all([
+    run('git', ['diff', 'HEAD', '--name-only', '-z', ...SPEC], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
+    base
+      ? run('git', ['diff', '--name-only', '-z', `${base}...HEAD`, ...SPEC], { cwd })
+      : Promise.resolve({ stdout: '' }),
+  ]);
+  const paths = new Set<string>();
+  for (const out of [tracked.stdout, untracked.stdout, committed.stdout]) {
+    for (const rel of out.split('\0')) if (rel) paths.add(rel);
+  }
+  return [...paths].sort();
+}
+
 export type FileDiff = {
   path: string;
   old?: string;
