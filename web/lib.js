@@ -67,6 +67,34 @@ export function handoffTargets(session, accounts) {
 }
 
 /**
+ * The coupling badges for one session's /status response: `text` follows the
+ * existing `+N −M · dirty`, `title` is the tooltip.
+ *
+ * Talking wins over overlapping for a given pair. Two sessions editing one file
+ * and talking about it is coordination working; the same two in silence is a
+ * merge conflict that has not happened yet, and only the second is worth a
+ * warning. Flagging both would cry wolf on the healthy case.
+ *
+ * Advisory throughout: "also in", never "locked by". Nothing here prevents
+ * anything, and wording that implies otherwise would be a lie.
+ */
+export function couplingBadges(status) {
+  const talking = status?.talking ?? [];
+  const overlapping = status?.overlapping ?? [];
+  const talkingIds = new Set(talking.map((t) => t.id));
+  const silent = overlapping.filter((o) => !talkingIds.has(o.id));
+
+  const parts = [
+    ...talking.map((t) => `↔ ${t.branch}`),
+    ...silent.map((o) => `⚠ ${o.files.length} file${o.files.length === 1 ? '' : 's'} also in ${o.branch}`),
+  ];
+  const title = silent
+    .map((o) => `${o.branch}: ${o.files.join(', ')}`)
+    .join('\n');
+  return { text: parts.join(' · '), title };
+}
+
+/**
  * The `@` mention menu, the same shape commandMenu returns for slash commands:
  * `{ query, matches }`, or null when the caret is not inside a mention.
  *

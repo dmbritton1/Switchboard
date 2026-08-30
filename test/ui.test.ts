@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  sortSessions, visibleSessions, cardAction, handoffTargets, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, couplingBadges, decideSpecs, selectionState, triggerLabel, targetLabel,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
   mentionMenu, mentionInsert,
@@ -1788,4 +1788,40 @@ test('linkView relabels the cancel control to Dismiss once the link has failed',
     identity: null, suggestedName: null, error: null,
   });
   assert.equal(starting.cancelLabel, 'Cancel sign-in');
+});
+
+test('couplingBadges shows a talking pair as talking, not as a collision', () => {
+  const badges = couplingBadges({
+    talking: [{ id: 'b', branch: 'feat/b' }],
+    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts'] }],
+  });
+
+  assert.match(badges.text, /↔ feat\/b/);
+  assert.doesNotMatch(badges.text, /⚠/, 'a pair that is talking has already coordinated');
+});
+
+test('couplingBadges flags overlap only when the pair is not talking', () => {
+  const badges = couplingBadges({
+    talking: [],
+    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts', 'src/session.ts'] }],
+  });
+
+  assert.match(badges.text, /⚠ 2 files also in feat\/b/);
+  assert.match(badges.title, /src\/auth\.ts/);
+  assert.match(badges.title, /src\/session\.ts/);
+});
+
+test('couplingBadges reports each pair on its own terms', () => {
+  const badges = couplingBadges({
+    talking: [{ id: 'a', branch: 'feat/a' }],
+    overlapping: [{ id: 'b', branch: 'feat/b', files: ['src/auth.ts'] }],
+  });
+
+  assert.match(badges.text, /↔ feat\/a/);
+  assert.match(badges.text, /⚠ 1 file also in feat\/b/);
+});
+
+test('couplingBadges is empty when there is nothing to say', () => {
+  assert.deepEqual(couplingBadges({ talking: [], overlapping: [] }), { text: '', title: '' });
+  assert.deepEqual(couplingBadges(null), { text: '', title: '' });
 });

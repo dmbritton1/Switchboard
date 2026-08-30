@@ -1,5 +1,5 @@
 import {
-  sortSessions, visibleSessions, cardAction, handoffTargets, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, couplingBadges, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   transcriptView, requestOnce, fetchToolDetail,
   createDetailController, changeDetailSession, setDetailExpanded,
@@ -452,6 +452,19 @@ let forceDiffFetch = false;
 // than teaching renderDiffPane() to also feed a consumer it doesn't know about.
 let sidebarDiffFor = null;
 let sidebarDiffText = '';
+// Cached beside the text and restored with it: #sidebar-diffstat is rewritten on
+// every render (see below), so a title set only by the poll would outlive the
+// session it describes and hang the previous session's file list on the next one.
+let sidebarDiffTitle = '';
+
+/** The element is written from three places; keeping them in one function is
+ *  what stops a title outliving the text it belongs to. */
+function applySidebarDiff(text, title) {
+  const el = $('#sidebar-diffstat');
+  el.textContent = text;
+  if (title) el.title = title;
+  else el.removeAttribute('title');
+}
 
 function pollSidebarDiff() {
   if (!openId) return;
@@ -459,8 +472,12 @@ function pollSidebarDiff() {
   fetch(`/status?id=${id}`).then((r) => r.json()).then((d) => {
     if (openId !== id) return; // switched or closed while the request was in flight
     sidebarDiffFor = id;
-    sidebarDiffText = d ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}` : '';
-    $('#sidebar-diffstat').textContent = sidebarDiffText;
+    const badges = d ? couplingBadges(d) : { text: '', title: '' };
+    sidebarDiffText = d
+      ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}${badges.text ? ` · ${badges.text}` : ''}`
+      : '';
+    sidebarDiffTitle = badges.title;
+    applySidebarDiff(sidebarDiffText, sidebarDiffTitle);
   }).catch(() => {});
 }
 setInterval(pollSidebarDiff, STATUS_THROTTLE_MS);
@@ -924,7 +941,12 @@ function card(s, fetchStatus) {
     fetch(`/status?id=${s.id}`).then((r) => r.json()).then((data) => {
       if (!data) return;
       const live = document.querySelector(`.card[data-id="${s.id}"] > .wt`);
-      if (live) live.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`;
+      if (!live) return;
+      const badges = couplingBadges(data);
+      live.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`
+        + (badges.text ? ` · ${badges.text}` : '');
+      if (badges.title) live.title = badges.title;
+      else live.removeAttribute('title');
     }).catch(() => {});
   }
 
@@ -1063,7 +1085,8 @@ function openTab(id, which) {
   // left. Carried over, the cache would suppress the first render of the new
   // session's diff whenever the two happened to be byte-identical.
   if (switching) {
-    sidebarDiffFor = null; sidebarDiffText = ''; diffOpen.clear(); lastDiffText = '';
+    sidebarDiffFor = null; sidebarDiffText = ''; sidebarDiffTitle = '';
+    diffOpen.clear(); lastDiffText = '';
     pollSidebarDiff();
   }
 }
@@ -1142,7 +1165,8 @@ function renderSession() {
   // snapshot, the 30s timer) doesn't need to trigger a fetch of its own — it
   // only needs to make sure a session switch doesn't show the previous
   // session's leftover number for the instant before the next poll lands.
-  $('#sidebar-diffstat').textContent = sidebarDiffFor === s.id ? sidebarDiffText : '';
+  const mine = sidebarDiffFor === s.id;
+  applySidebarDiff(mine ? sidebarDiffText : '', mine ? sidebarDiffTitle : '');
   renderSidebarAccount(s);
   renderSidebarSwitch(s);
 
