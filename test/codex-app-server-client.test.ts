@@ -56,6 +56,19 @@ async function rejectsWithin(
   }
 }
 
+async function waitForFakeChildReady(marker: string): Promise<void> {
+  const deadline = Date.now() + 1_500;
+  while (true) {
+    try {
+      await access(marker);
+      return;
+    } catch {
+      if (Date.now() >= deadline) throw new Error('fake child did not become ready');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
 test('correlates out-of-order responses while delivering notifications and colliding server requests', async (t) => {
   const notifications: Array<{ method: string; params: unknown }> = [];
   const requests: Array<{ id: string | number; method: string; params: unknown }> = [];
@@ -132,9 +145,10 @@ test('times out a request and terminates the child', async (t) => {
   const client = clientFor({
     mode: 'hang',
     requestTimeoutMs: 300,
-    overrides: { FAKE_APP_SERVER_EXIT_MARKER: marker },
+    overrides: { FAKE_APP_SERVER_EXIT_MARKER: marker, FAKE_APP_SERVER_READY_MARKER: `${marker}.ready` },
   });
   t.after(() => client.close());
+  await waitForFakeChildReady(`${marker}.ready`);
 
   await rejectsWithin(
     client.request('initialize'),
@@ -174,9 +188,11 @@ test('escalates SIGTERM to SIGKILL before a timed-out request settles', async (t
     overrides: {
       FAKE_APP_SERVER_EXIT_MARKER: marker,
       FAKE_APP_SERVER_PID_FILE: pidFile,
+      FAKE_APP_SERVER_READY_MARKER: `${marker}.ready`,
     },
   });
   t.after(() => client.close());
+  await waitForFakeChildReady(`${marker}.ready`);
 
   await rejectsWithin(
     client.request('initialize'),

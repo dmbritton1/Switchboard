@@ -40,3 +40,36 @@ The decision is final for this phase, not unresolved. Version-matched schema gen
 The approval-bridge hybrid is rejected. The prototype does not prove that the SDK and app-server safely share the same vendor thread with one process owner; fixture identifiers cannot supply that proof.
 
 An app-server replacement is not a production candidate. Although the version-matched stable schema, real no-turn handshake, and offline fixture gates pass, there is no explicitly authorized non-CI live smoke proving new turn, follow-up, resume, cancellation, approvals, and existing vendor-thread continuity. Even if those gates later pass, replacement would require a separate design and implementation plan before any production adapter or transport change.
+
+## Opt-in turn-transport gate
+
+New Codex sessions remain SDK-owned by default. An account can explicitly set
+`codexTransport: "app-server"` for future sessions only; each created session
+persists that choice and never crosses ownership on resume. The shared
+account-scoped app-server process continues to own telemetry and, for opted-in
+sessions, supports start, follow-up, resume, and interrupt. Every app-server
+thread keeps the mandatory `workspace-write` sandbox and `never` approval
+policy.
+
+The deterministic fake transport gate passed for pinned `0.145.0`. It drove
+the production provider pool and adapter through initialization, telemetry
+continuity across promotion, independent fixture sessions, first and follow-up
+turns, a clean process restart, resume, interrupt, crash handling without
+prompt replay, multi-session routing, and clean shutdown. Its serialized
+evidence contains only booleans, the pinned version, and opaque fixture IDs;
+it excludes prompts, account identity, environment values, stderr, absolute
+paths, item detail, and raw protocol messages.
+
+The real transport gate is **Not run**. It is deliberately separate from the
+no-turn evaluators and requires both `SWITCHBOARD_ALLOW_PAID_CODEX_SMOKE=1`
+and `--account <configured-codex-account>` before any provider startup,
+worktree creation, thread creation, or turn request. A real run uses bounded
+prompts that request no file or tool use and removes its temporary worktree in
+`finally`; it consumes real Codex turns and is never part of `npm test`.
+Failure leaves this report unchanged. Fake evidence is not live parity.
+
+Rollback means changing the account-level choice for future sessions; active
+and restored sessions retain their immutable transport. Interactive approvals,
+questions, MCP elicitation, capability discovery, browser/simulator MCP
+sidecars, automatic usage recovery and its public failure code,
+and a default cutover remain deferred.

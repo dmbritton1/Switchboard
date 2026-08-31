@@ -80,6 +80,16 @@ transport at creation and always resumes through that same transport, so
 changing the account affects future sessions rather than migrating existing
 vendor threads. It is not a browser setting.
 
+Opted-in app-server sessions use the same account-scoped process as telemetry,
+but every session retains immutable SDK or app-server ownership. App-server
+sessions support start, follow-up, resume, and interrupt with the fixed
+`workspace-write` sandbox and `never` approval policy. Rollback changes future
+sessions by changing the account entry; it never transfers an existing vendor
+thread between transports. Approvals and other interactions, capability
+discovery, browser/simulator MCP sidecars, automatic Codex usage recovery, and
+an app-server default cutover remain deferred. Codex sessions never
+auto-requeue in this phase.
+
 An optional explicit binary is documentation for a local account, not a
 portable default:
 
@@ -288,6 +298,21 @@ paths, or account environment values. Running it against a real configured
 account is optional and requires separate operator intent; it is not part of
 `npm test`.
 
+The separate transport smoke drives the production provider pool and adapter
+against a deterministic fake child in the offline suite. A real run consumes
+Codex turns and is refused before starting a provider, worktree, thread, or
+turn unless both an explicitly configured Codex account and the paid guard are
+provided:
+
+```bash
+SWITCHBOARD_ALLOW_PAID_CODEX_SMOKE=1 \
+  npm run smoke:codex-app-server-transport -- --account <configured-codex-account>
+```
+
+It uses bounded no-tool prompts, cleans its temporary worktree in `finally`,
+and prints only sanitized evidence. It is not part of `npm test`; do not run it
+without intentionally authorizing those paid turns.
+
 ## Limits
 
 - Only sessions started here are shown. Sessions from the Claude desktop app or
@@ -378,20 +403,15 @@ The session shows the SDK's last-turn usage fields when available. Account pace
 remains an estimate from observed input/output spend against the local account
 budget, not a provider rate-limit or plan-limit reading.
 
-The Phase 2 app-server evaluation passed its real, installed-`0.145.0` no-turn
-schema-generation, initialization, authentication-state, and clean-shutdown
-checks. It intentionally did not start a live/paid turn, so turn lifecycle and
-vendor-thread continuity are not proven. Production therefore remains SDK-only;
-the hybrid and replacement paths are rejected pending a future approved
-transport plan. See
+The no-turn app-server evaluators remain limited to real, installed-`0.145.0`
+schema-generation, initialization, authentication-state, and clean shutdown;
+they never create a thread or spend a turn. The deterministic transport fake
+proves the opt-in app-server path separately, while the paid transport gate is
+currently not run. SDK remains the default and the hybrid path remains rejected.
+See
 [`docs/superpowers/reports/2026-08-01-codex-app-server-decision.md`](docs/superpowers/reports/2026-08-01-codex-app-server-decision.md).
-Its lifecycle, approval, MCP-elicitation, and crash-evidence fields are `false`
-because this no-turn evaluation did not start a thread or turn: they are
-unmeasured, not failed live round trips.
-This completes 100% of the approved two-phase specification and the design's
-estimated 90–95% of the desired local Codex worker experience; it is not parity
-with every Codex app, cloud, connector, collaboration, or external-session
-capability.
+Fake evidence does not establish live parity and does not cover deferred
+interactions, capabilities, sidecars, recovery, or a production-default flip.
 
 ## Verification
 

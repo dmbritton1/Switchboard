@@ -7,6 +7,7 @@
   "scripts": {
     "evaluate:codex-app-server": "node scripts/codex-app-server-probe.ts",
     "evaluate:codex-telemetry": "node scripts/codex-telemetry-smoke.ts",
+    "smoke:codex-app-server-transport": "node scripts/codex-app-server-transport-smoke.ts",
     "start": "node src/server.ts",
     "test": "node --test test/*.test.ts"
   },

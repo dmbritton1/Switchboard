@@ -814,6 +814,10 @@ async function handle(message: Message): Promise<void> {
         const turnId = `multi-turn-${++multiTurnNumber}`;
         multiTurns.set(turnId, requestedThread);
         send({ id: message.id, result: { turn: turn(turnId, 'inProgress') } });
+        if (multiInputText(message).startsWith('crash-')) {
+          setImmediate(() => process.exit(25));
+          return;
+        }
         send({ method: 'turn/started', params: { threadId: requestedThread, turn: turn(turnId, 'inProgress') } });
         const promptText = multiInputText(message);
         if (!promptText.startsWith('hold-')) {
@@ -877,6 +881,16 @@ async function handle(message: Message): Promise<void> {
       return;
     }
     case 'thread/resume':
+      if (mode === 'turn-multi-session') {
+        const requestedThread = message.params?.threadId;
+        const cwd = message.params?.cwd;
+        if (typeof requestedThread !== 'string' || !requestedThread.startsWith('multi-thread-') || typeof cwd !== 'string') {
+          fail('thread/resume used invalid multi-session identifiers');
+        }
+        multiThreads.set(cwd, requestedThread);
+        send({ id: message.id, result: multiThreadResponse(requestedThread, cwd) });
+        return;
+      }
       if (message.params?.threadId !== threadId) fail('thread/resume used the wrong thread');
       send({ id: message.id, result: threadResponse() });
       return;
@@ -914,6 +928,9 @@ if (mode === 'hang' || mode === 'ignore-term') {
     if (mode === 'hang') process.exit(0);
   });
 }
+
+const readyMarker = process.env.FAKE_APP_SERVER_READY_MARKER;
+if (readyMarker) writeFileSync(readyMarker, 'ready');
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on('line', (line) => {
