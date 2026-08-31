@@ -21,6 +21,7 @@ import { writeFakeLoginCli } from './helpers/fake-login.ts';
 import { createAccountStore, type Account } from '../src/accounts.ts';
 import { Linker, type PublicLink } from '../src/link.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
+import type { CodexProviderPool, CodexTransport } from '../src/agents/codex-provider.ts';
 
 const run = promisify(execFile);
 
@@ -341,6 +342,8 @@ async function bootCodex(
   options: {
     bin?: string;
     env?: Record<string, string>;
+    codexTransport?: CodexTransport;
+    codexPool?: Pick<CodexProviderPool, 'prepare' | 'close'>;
     resolvePrompt?: typeof resolveAgentPrompt;
     gatedPreflight?: boolean;
     beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
@@ -392,6 +395,7 @@ process.exit(result.status ?? 1);
   const usage = new Usage();
   const account = {
     name: 'codex', provider: 'codex' as const, budget: 1000,
+    ...(options.codexTransport ? { codexTransport: options.codexTransport } : {}),
     bin,
     env: {
       FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome,
@@ -405,6 +409,7 @@ process.exit(result.status ?? 1);
   };
   const server = createServer({
     registry, usage, scheduler: new Scheduler(), accounts: [account],
+    ...(options.codexPool ? { codexPool: options.codexPool } : {}),
     ...(options.resolvePrompt ? { resolvePrompt: options.resolvePrompt } : {}),
     ...(options.beforeWorktreeRemoval ? { beforeWorktreeRemoval: options.beforeWorktreeRemoval } : {}),
   });
@@ -413,7 +418,7 @@ process.exit(result.status ?? 1);
   t.after(() => { server.close(); return rm(dir, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${port}`;
   return {
-    base, registry, usage, repo, bin, statePath, ...(preflightGate ? { preflightGate } : {}),
+    base, registry, usage, repo, bin, statePath, server, account, ...(preflightGate ? { preflightGate } : {}),
     async command(body) {
       const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
       return { status: response.status, data: await response.json() };
@@ -445,6 +450,76 @@ process.exit(result.status ?? 1);
   };
 }
 
+test('Codex create, scheduled create, and resume route exclusively through the persisted account transport', async (t) => {
+  const routes: Array<{ transport: CodexTransport; sessionId: string }> = [];
+  const { adapter: sdkAdapter, starts: sdkStarts } = fakeAdapter();
+  const { adapter: appAdapter, starts: appStarts } = fakeAdapter();
+  let closes = 0;
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare(_account, transport, sessionId) {
+      routes.push({ transport, sessionId });
+      return { adapter: transport === 'sdk' ? sdkAdapter : appAdapter, runtimeVersion: '0.145.0' };
+    },
+    async close() { closes += 1; },
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+
+  const created = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'app-route', prompt: 'first',
+  });
+  assert.equal(created.status, 200);
+  const appSession = fixture.registry.get(created.data.id)!;
+  assert.equal(appSession.codexTransport, 'app-server');
+  assert.equal(appSession.codexRuntimeVersion, '0.145.0');
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server']);
+
+  await fixture.command({ cmd: 'stop', id: appSession.id });
+  fixture.account.codexTransport = 'sdk';
+  const resumed = await fixture.command({ cmd: 'resume', id: appSession.id, prompt: 'resume' });
+  assert.equal(resumed.status, 200);
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server']);
+  assert.equal(appStarts.at(-1)!.resumeId, appSession.vendorSessionId ?? undefined);
+  assert.equal(sdkStarts.length, 0);
+
+  fixture.account.codexTransport = 'sdk';
+  const schedule = await fixture.command({
+    cmd: 'schedule', trigger: { kind: 'at', time: Date.now() - 1 },
+    action: { kind: 'create', account: 'codex', repo: fixture.repo, branch: 'scheduled-sdk', prompt: 'later' },
+  });
+  assert.equal(schedule.status, 200);
+  await fixture.server.tick();
+  const scheduled = fixture.registry.all().find((session) => session.branch === 'scheduled-sdk')!;
+  assert.equal(scheduled.codexTransport, 'sdk');
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server', 'sdk']);
+
+  await fixture.command({ cmd: 'delete', id: appSession.id });
+  assert.equal(closes, 0, 'detaching a session must not close the account-owned process');
+  await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+  await Promise.resolve();
+  assert.equal(closes, 1, 'the HTTP server owns exactly one shared-pool close');
+});
+
+test('an app-server preparation failure stays stopped and never falls back to the SDK adapter', async (t) => {
+  const routes: CodexTransport[] = [];
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare(_account, transport) {
+      routes.push(transport);
+      throw new Error('app-server unavailable');
+    },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+  const response = await fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'failed-app', prompt: 'first',
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(routes, ['app-server']);
+  assert.equal(fixture.registry.all()[0].status, 'stopped');
+  assert.equal(fixture.registry.all()[0].codexTransport, 'app-server');
+  assert.equal(fixture.registry.all()[0].stoppedCode, 'codex_app_server_initialization_failed');
+});
+
 test('Codex account pace records only input and output totals', async (t) => {
   const fixture = await bootCodex(t);
   const calls: Array<[string, number, number]> = [];
@@ -458,7 +533,7 @@ test('Codex account pace records only input and output totals', async (t) => {
   assert.deepEqual(calls, [['codex', 11, 5]]);
 });
 
-test('Codex preflight failure creates neither a session nor a worktree', async (t) => {
+test('Codex preflight failure preserves the newly owned stopped session before launch', async (t) => {
   const fixture = await bootCodex(t, { bin: join(tmpdir(), 'definitely-missing-codex') });
   const before = await fixture.worktrees();
 
@@ -469,8 +544,10 @@ test('Codex preflight failure creates neither a session nor a worktree', async (
 
   assert.equal(response.status, 400);
   assert.equal(response.data.code, 'codex_binary_missing');
-  assert.deepEqual(fixture.registry.all(), []);
-  assert.equal(await fixture.worktrees(), before);
+  assert.equal(fixture.registry.all().length, 1);
+  assert.equal(fixture.registry.all()[0].codexTransport, 'sdk');
+  assert.equal(fixture.registry.all()[0].status, 'stopped');
+  assert.notEqual(await fixture.worktrees(), before);
 });
 
 test('Codex create preflight errors redact long ordinary launch-environment values', async (t) => {
@@ -496,7 +573,8 @@ process.exit(2);
   assert.equal(response.status, 400);
   assert.ok(!JSON.stringify(response.data).includes('customer-internal-42'));
   assert.match(response.data.error, /workspace \[REDACTED\]/);
-  assert.deepEqual(fixture.registry.all(), []);
+  assert.equal(fixture.registry.all().length, 1);
+  assert.equal(fixture.registry.all()[0].status, 'stopped');
 });
 
 test('a successful Codex create finishes with the fake executable', async (t) => {
@@ -545,7 +623,7 @@ test('Codex settings reject non-Codex, live, and malformed changes', async (t) =
   }
   for (const status of ['working', 'done', 'needs-you'] as const) {
     const codex = registry.create({
-      provider: 'codex', account: 'codex', repo: '/r', cwd: `/r/${status}`, branch: status, title: status,
+      provider: 'codex', account: 'codex', repo: '/r', cwd: `/r/${status}`, branch: status, title: status, codexTransport: 'sdk',
     });
     if (status === 'needs-you') {
       registry.apply(codex.id, { type: 'approval', request: { id: 'p', tool: 'tool', summary: 'wait' } });
@@ -558,7 +636,7 @@ test('Codex settings reject non-Codex, live, and malformed changes', async (t) =
     assert.equal(response.status, 409, status);
   }
   const stopped = registry.create({
-    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/stopped', branch: 'stopped', title: 'stopped',
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/stopped', branch: 'stopped', title: 'stopped', codexTransport: 'sdk',
   });
   registry.apply(stopped.id, { type: 'stopped', reason: 'stopped' });
   const malformed = await fetch(`${base}/command`, {
@@ -1230,7 +1308,7 @@ test('SSE projects tool metadata while GET /detail lazily returns the body', asy
   const { base, registry } = await boot(t);
   const session = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 'detail',
+    cwd: '/r/wt', branch: 'b', title: 'detail', codexTransport: 'sdk',
   });
   registry.apply(session.id, { type: 'upsert-msg', msg: {
     kind: 'tool', id: 'cmd-1', name: 'shell', summary: 'command', status: 'ok',
@@ -1265,7 +1343,7 @@ test('GET /detail returns 404 for unknown session, item, and non-tool ids', asyn
   const { base, registry } = await boot(t);
   const session = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 'detail',
+    cwd: '/r/wt', branch: 'b', title: 'detail', codexTransport: 'sdk',
   });
   registry.apply(session.id, {
     type: 'upsert-msg', msg: { kind: 'reasoning', id: 'reasoning-1', text: 'summary' },
@@ -1285,7 +1363,7 @@ test('GET /detail returns metadata for evicted and never-populated tool bodies',
   const { base, registry } = await boot(t, { maxTotalDetailBytes: 5 });
   const session = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 'detail',
+    cwd: '/r/wt', branch: 'b', title: 'detail', codexTransport: 'sdk',
   });
   registry.apply(session.id, { type: 'upsert-msg', msg: {
     kind: 'tool', id: 'evicted', name: 'shell', summary: 'large', status: 'ok', detail: '123456',
@@ -1319,7 +1397,7 @@ test('GET /detail ignores a client path and resolves only Registry keys', async 
   await writeFile(clientPath, 'PATH_SENTINEL');
   const session = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 'detail',
+    cwd: '/r/wt', branch: 'b', title: 'detail', codexTransport: 'sdk',
   });
   registry.apply(session.id, { type: 'upsert-msg', msg: {
     kind: 'tool', id: 'empty', name: 'shell', summary: 'running', status: 'running',
@@ -2053,7 +2131,7 @@ test('a reset trigger on a send takes its account from the target session, not t
   });
   const s = registry.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 't',
+    cwd: '/r/wt', branch: 'b', title: 't', codexTransport: 'sdk',
   });
 
   await post(base, {
@@ -2240,7 +2318,7 @@ test('a restored Codex reset item waits for a current-process boundary read befo
   const limitCoordinator = fakeLimitCoordinator({ release: async () => releases.shift()! });
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
   const target = registry.create({
-    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'restore', title: 'restore',
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'restore', title: 'restore', codexTransport: 'sdk',
   });
   registry.apply(target.id, { type: 'stopped', reason: 'restored' });
   scheduler.restore([{
@@ -2261,7 +2339,7 @@ test('restored reset items fail closed when create or send/resume accounts misma
   const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
   const codex = registry.create({
-    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex',
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex', codexTransport: 'sdk',
   });
   registry.apply(codex.id, { type: 'stopped', reason: 'restored' });
   scheduler.restore([
@@ -2375,7 +2453,7 @@ test('restored Codex session fails closed when the same account name is now conf
   const configured: Account[] = [{ name: 'shared', provider: 'claude', budget: 1000, env: {} }];
   const { registry, scheduler, server } = await boot(t, undefined, { accounts: configured });
   const session = registry.create({
-    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex',
+    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex', codexTransport: 'sdk',
   });
   registry.apply(session.id, { type: 'stopped', reason: 'restored' });
   scheduler.restore([{
@@ -2416,7 +2494,7 @@ test('restored send remains waiting after the correct same-provider Codex bounda
   const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: false, reason: 'still limited' }) });
   const { registry, scheduler, server } = await boot(t, undefined, { accounts: configured, limitCoordinator });
   const session = registry.create({
-    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex',
+    provider: 'codex', account: 'shared', repo: '/r', cwd: '/r/codex', branch: 'codex', title: 'codex', codexTransport: 'sdk',
   });
   registry.apply(session.id, { type: 'stopped', reason: 'restored' });
   scheduler.restore([{
@@ -2433,8 +2511,8 @@ test('restored send remains waiting after the correct same-provider Codex bounda
 test('Codex reset boundary reads batch by account and release only the oldest waiting item', async (t) => {
   const limitCoordinator = fakeLimitCoordinator({ release: async () => ({ ready: true, reason: 'available' }) });
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
-  const first = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/one', branch: 'one', title: 'one' });
-  const second = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/two', branch: 'two', title: 'two' });
+  const first = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/one', branch: 'one', title: 'one', codexTransport: 'sdk' });
+  const second = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/two', branch: 'two', title: 'two', codexTransport: 'sdk' });
   registry.apply(first.id, { type: 'stopped', reason: 'parked' });
   registry.apply(second.id, { type: 'stopped', reason: 'parked' });
   const oldest = scheduler.add({ kind: 'reset', account: 'codex' }, { kind: 'send', sessionId: first.id, text: 'one' }, 0);
@@ -2461,8 +2539,8 @@ test('Codex reset reads run concurrently across accounts and skip busy accounts'
     { name: 'codex-b', provider: 'codex', budget: 1000, env: {} },
   ];
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator, accounts: twoCodex });
-  const first = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/a', branch: 'a', title: 'a' });
-  const second = registry.create({ provider: 'codex', account: 'codex-b', repo: '/r', cwd: '/r/b', branch: 'b', title: 'b' });
+  const first = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/a', branch: 'a', title: 'a', codexTransport: 'sdk' });
+  const second = registry.create({ provider: 'codex', account: 'codex-b', repo: '/r', cwd: '/r/b', branch: 'b', title: 'b', codexTransport: 'sdk' });
   registry.apply(first.id, { type: 'stopped', reason: 'parked' });
   registry.apply(second.id, { type: 'stopped', reason: 'parked' });
   scheduler.add({ kind: 'reset', account: 'codex-a' }, { kind: 'send', sessionId: first.id, text: 'a' });
@@ -2471,7 +2549,7 @@ test('Codex reset reads run concurrently across accounts and skip busy accounts'
   await server.tick();
   assert.deepEqual(readOrder, ['codex-a', 'codex-b']);
 
-  const busy = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/busy', branch: 'busy', title: 'busy' });
+  const busy = registry.create({ provider: 'codex', account: 'codex-a', repo: '/r', cwd: '/r/busy', branch: 'busy', title: 'busy', codexTransport: 'sdk' });
   scheduler.add({ kind: 'reset', account: 'codex-a' }, { kind: 'send', sessionId: busy.id, text: 'later' });
   // The waiting item above shares an account that has just become busy.
   await server.tick();
@@ -2486,7 +2564,7 @@ test('timed work dispatches before a hung Codex boundary read and the reset item
   const limitCoordinator = fakeLimitCoordinator({ release: async () => { startRead(); return hungRead; } });
   const { registry, scheduler, server } = await boot(t, undefined, { limitCoordinator });
   const timed = registry.create({ provider: 'claude', account: 'claude-main', repo: '/r', cwd: '/r/timed', branch: 'timed', title: 'timed' });
-  const reset = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/reset', branch: 'reset', title: 'reset' });
+  const reset = registry.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/reset', branch: 'reset', title: 'reset', codexTransport: 'sdk' });
   registry.apply(timed.id, { type: 'stopped', reason: 'parked' });
   registry.apply(reset.id, { type: 'stopped', reason: 'parked' });
   const timedItem = scheduler.add({ kind: 'at', time: Date.now() - 1 }, { kind: 'send', sessionId: timed.id, text: 'now' });

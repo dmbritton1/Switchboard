@@ -16,6 +16,38 @@ const claude = (name: string): Account => ({
   name, provider: 'claude', budget: DEFAULT_BUDGET, env: {},
 });
 
+test('loadAccounts accepts Codex transport choices only on Codex accounts', async (t) => {
+  const d = await dir();
+  t.after(() => rm(d, { recursive: true, force: true }));
+  const path = join(d, 'accounts.json');
+  await writeFile(path, JSON.stringify([
+    { name: 'sdk', provider: 'codex', budget: 1, env: {}, codexTransport: 'sdk' },
+    { name: 'app-server', provider: 'codex', budget: 1, env: {}, codexTransport: 'app-server' },
+    { name: 'linked-default', provider: 'codex', budget: 1, env: {} },
+  ]));
+
+  assert.deepEqual((await loadAccounts(path)).map((account) => account.codexTransport), [
+    'sdk', 'app-server', undefined,
+  ]);
+});
+
+test('loadAccounts rejects invalid or Claude Codex transport without exposing environment values', async (t) => {
+  const d = await dir();
+  t.after(() => rm(d, { recursive: true, force: true }));
+  const path = join(d, 'accounts.json');
+  for (const entry of [
+    { name: 'bad-value', provider: 'codex', budget: 1, env: { SECRET: 'do-not-expose' }, codexTransport: 'other' },
+    { name: 'claude-transport', provider: 'claude', budget: 1, env: { SECRET: 'do-not-expose' }, codexTransport: 'sdk' },
+  ]) {
+    await writeFile(path, JSON.stringify([entry]));
+    await assert.rejects(loadAccounts(path), (error: Error) => {
+      assert.match(error.message, /codexTransport/);
+      assert.doesNotMatch(error.message, /do-not-expose/);
+      return true;
+    });
+  }
+});
+
 test('a missing accounts.json loads as an empty list', async () => {
   const d = await dir();
   assert.deepEqual(await loadAccounts(join(d, 'accounts.json')), []);

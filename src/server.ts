@@ -13,7 +13,7 @@ import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './wor
 import { mergeWorktrees, pushRepo } from './merge.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
-import { CodexProviderPool } from './agents/codex-provider.ts';
+import { CodexProviderPool, type CodexTransport } from './agents/codex-provider.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
 import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
@@ -104,12 +104,16 @@ export function attachAccountLimitLifecycle(
 
 type PreparedProvider = {
   adapter: Adapter;
+  runtimeVersion?: string;
 };
 
-async function prepareProvider(account: Account): Promise<PreparedProvider> {
+type SessionPreparation = { sessionId: string; transport?: CodexTransport };
+type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare'>>;
+
+async function prepareProvider(account: Account, _session?: SessionPreparation): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
   const runtime = await prepareCodexRuntime({ bin: account.bin, env: account.env });
-  return { adapter: createCodexAdapter(runtime) };
+  return { adapter: createCodexAdapter(runtime), runtimeVersion: runtime.version };
 }
 
 /** Does this account have a live agent? `needs-you` counts: it is not
@@ -439,7 +443,7 @@ export function createServer(opts: {
   scheduler?: Scheduler;
   accounts: Account[];
   /** Provider preflight seam used by the offline server tests. */
-  prepare?: (account: Account) => Promise<PreparedProvider>;
+  prepare?: (account: Account, session?: SessionPreparation) => Promise<PreparedProvider>;
   resolvePrompt?: typeof resolveAgentPrompt;
   /** Persistence for linked accounts. Absent disables linking entirely, which
    *  is what keeps every pre-existing server test unchanged. */
@@ -453,18 +457,55 @@ export function createServer(opts: {
   /** Entry-point owned telemetry lifecycle. Tests inject a fake, never a child process. */
   limitCoordinator?: AccountLimitCoordinator;
   /** One application-level close owner for the shared per-account Codex pool. */
-  codexPool?: Pick<CodexProviderPool, 'close'>;
+  codexPool?: ServerCodexPool;
   /** Injectable interval seam for process-free lifecycle tests. */
   limitLifecycle?: AccountLimitLifecycleDeps;
 }): Server & { tick: () => Promise<void> } {
   const {
-    registry, usage, accounts, scheduler = new Scheduler(), prepare = prepareProvider,
+    registry, usage, accounts, scheduler = new Scheduler(), prepare: injectedPrepare,
     resolvePrompt = resolveAgentPrompt, accountStore, linker,
     beforeUploadRootPin, beforeUploadWrite, beforeWorktreeRemoval, limitCoordinator, limitLifecycle,
     codexPool,
   } = opts;
+  const prepare = injectedPrepare ?? prepareProvider;
   const handles = new Map<string, AgentHandle>();
   const resumeReservations = new Map<string, symbol>();
+
+  async function prepareForSession(account: Account, session: Session): Promise<PreparedProvider> {
+    if (account.provider === 'codex' && codexPool?.prepare) {
+      if (session.codexTransport !== 'sdk' && session.codexTransport !== 'app-server') {
+        throw new Error('This Codex session has an invalid stored transport. Delete it and create a new session.');
+      }
+      return codexPool.prepare(account, session.codexTransport, session.id);
+    }
+    if (account.provider === 'codex' && session.codexTransport === 'app-server' && !injectedPrepare) {
+      throw new Error('Codex app-server session transport is unavailable. Check this account configuration and try again.');
+    }
+    return prepare(account, {
+      sessionId: session.id,
+      ...(session.provider === 'codex' ? { transport: session.codexTransport } : {}),
+    });
+  }
+
+  function preparationFailure(
+    session: Session,
+    account: Account,
+    error: unknown,
+    phase: 'create' | 'resume',
+  ): { status: number; json: { error: string; code: CodexFailureCode } } {
+    const code = error instanceof CodexRuntimeError
+      ? error.code
+      : session.codexTransport === 'app-server'
+        ? 'codex_app_server_initialization_failed'
+        : phase === 'resume' ? 'codex_resume_failed' : 'codex_start_failed';
+    const reason = error instanceof CodexRuntimeError
+      ? redactAccountValue(error.message, account)
+      : session.codexTransport === 'app-server'
+        ? 'Codex app-server session transport is unavailable. Check this account configuration and try again.'
+        : 'Codex SDK session transport is unavailable. Check this account configuration and try again.';
+    registry.recordStoppedFailure(session.id, reason, code);
+    return { status: 400, json: { error: reason, code } };
+  }
 
   /**
    * Slash commands the CLI reported, for the composer's autocomplete.
@@ -724,18 +765,6 @@ export function createServer(opts: {
         } catch (error) {
           return { status: 400, json: { error: String((error as Error).message ?? error) } };
         }
-        let prepared: PreparedProvider;
-        try {
-          prepared = await prepare(account);
-        } catch (error) {
-          if (error instanceof CodexRuntimeError) {
-            return {
-              status: 400,
-              json: { error: redactAccountValue(error.message, account), code: error.code },
-            };
-          }
-          throw error;
-        }
         let cwd: string;
         try {
           cwd = await createWorktree(String(body.repo), String(body.branch));
@@ -749,8 +778,18 @@ export function createServer(opts: {
           cwd,
           branch: String(body.branch),
           title: String(body.branch),
+          ...(account.provider === 'codex' ? { codexTransport: account.codexTransport ?? 'sdk' } : {}),
           ...(codexSettings ? { codexSettings } : {}),
         });
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareForSession(account, session);
+        } catch (error) {
+          return preparationFailure(session, account, error, 'create');
+        }
+        if (account.provider === 'codex' && prepared.runtimeVersion) {
+          registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
+        }
         const prompt = String(body.prompt);
         const promptId = registry.appendPrompt(
           session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
@@ -852,6 +891,19 @@ export function createServer(opts: {
         }
         const account = accounts.find((a) => a.name === session.account);
         if (!account) return { status: 400, json: { error: 'account no longer configured' } };
+        if (account.provider !== session.provider) {
+          const reason = 'session provider no longer matches its configured account';
+          if (session.provider === 'codex') {
+            registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+            return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+          }
+          return { status: 409, json: { error: reason } };
+        }
+        if (session.provider === 'codex' && session.codexTransport !== 'sdk' && session.codexTransport !== 'app-server') {
+          const reason = session.stoppedReason ?? 'This Codex session has an invalid stored transport. Delete it and create a new session.';
+          registry.recordStoppedFailure(session.id, reason, 'codex_resume_failed');
+          return { status: 409, json: { error: reason, code: 'codex_resume_failed' } };
+        }
         const reservation = Symbol(sessionId);
         resumeReservations.set(sessionId, reservation);
         try {
@@ -871,14 +923,12 @@ export function createServer(opts: {
           }
           let prepared: PreparedProvider;
           try {
-            prepared = await prepare(account);
+            prepared = await prepareForSession(account, session);
           } catch (error) {
-            if (error instanceof CodexRuntimeError) {
-              const reason = redactAccountValue(error.message, account);
-              registry.recordStoppedFailure(session.id, reason, error.code);
-              return { status: 400, json: { error: reason, code: error.code } };
-            }
-            throw error;
+            return preparationFailure(session, account, error, 'resume');
+          }
+          if (account.provider === 'codex' && prepared.runtimeVersion) {
+            registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
           }
           // No request can interleave between this final identity/status check and
           // synchronous revival + launch. The reservation blocks another resume;

@@ -2,5 +2,7 @@
   { "name": "claude-main", "provider": "claude", "budget": 2000000, "env": {} },
   { "name": "claude-alt", "provider": "claude", "budget": 2000000,
     "env": { "CLAUDE_CONFIG_DIR": "/absolute/path/to/.claude-alt" } },
-  { "name": "codex", "provider": "codex", "budget": 2000000, "env": {} }
+  { "name": "codex-sdk-default", "provider": "codex", "budget": 2000000, "env": {} },
+  { "name": "codex-app-server", "provider": "codex", "budget": 2000000,
+    "codexTransport": "app-server", "env": {} }
 ]

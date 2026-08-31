@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { MAX_CODEX_DETAIL_TOTAL_BYTES } from './agents/codex-detail.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
+import type { CodexTransport } from './agents/codex-provider.ts';
 import type {
   AdapterEvent, CodexFailureCode, CodexThreadSettings, NotifyOn, PromptDelivery, PublicMsg, PublicSession, Session, Settings, ToolMsg, TurnUsage, UpsertMsg,
 } from './types.ts';
@@ -9,7 +10,13 @@ import { DEFAULT_SETTINGS } from './types.ts';
 import type { Usage } from './usage.ts';
 import type { Scheduler } from './schedule.ts';
 
-type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title' | 'codexSettings'>;
+type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title' | 'codexSettings' | 'codexTransport'>;
+
+const INVALID_STORED_TRANSPORT = 'This Codex session has an invalid stored transport. Delete it and create a new session.';
+
+function isCodexTransport(value: unknown): value is CodexTransport {
+  return value === 'sdk' || value === 'app-server';
+}
 
 export type ToolDetailRead = {
   text: string | null;
@@ -142,6 +149,12 @@ export class Registry {
   }
 
   create(init: Init): Session {
+    if (init.provider === 'codex' && !isCodexTransport(init.codexTransport)) {
+      throw new Error('Codex transport must be explicitly selected when creating a Codex session.');
+    }
+    if (init.provider === 'claude' && Object.hasOwn(init, 'codexTransport')) {
+      throw new Error('Claude sessions cannot have a Codex transport.');
+    }
     const now = Date.now();
     const s: Session = {
       ...init,
@@ -154,6 +167,7 @@ export class Registry {
       pending: null,
       stoppedReason: null,
       stoppedCode: null,
+      ...(init.provider === 'codex' ? { codexTransport: init.codexTransport } : {}),
       ...(init.codexSettings ? { codexSettings: { ...init.codexSettings } } : {}),
       startedAt: now,
       statusSince: now,
@@ -427,6 +441,19 @@ export class Registry {
     this.#notify();
   }
 
+  /** Records the initial Codex runtime for diagnostics only. It never changes routing. */
+  recordCodexRuntimeVersion(id: string, runtimeVersion: string): void {
+    const session = this.#sessions.get(id);
+    if (!session
+      || session.provider !== 'codex'
+      || session.vendorSessionId !== null
+      || session.codexRuntimeVersion !== undefined
+      || typeof runtimeVersion !== 'string'
+      || runtimeVersion.length === 0) return;
+    session.codexRuntimeVersion = runtimeVersion;
+    this.#notify();
+  }
+
   /** Sets the auto-approve flag. Separate from apply() because this is a user
    *  decision, not an adapter event — and it must work on a `stopped` session,
    *  which apply()'s terminal guard would drop. */
@@ -571,14 +598,31 @@ export class Registry {
           transcript.push({ kind: 'error', text: unsentMessage(interruptedCount) });
         }
         // Agents are children of this process; nothing survived the restart.
-        const { codexSettings: _storedCodexSettings, ...stored } = s;
+        const hasStoredTransport = Object.hasOwn(s, 'codexTransport');
+        const storedTransport = s.codexTransport;
+        const codexTransport = s.provider === 'codex'
+          ? (hasStoredTransport ? (isCodexTransport(storedTransport) ? storedTransport : undefined) : 'sdk')
+          : undefined;
+        const invalidTransport = s.provider === 'codex' && hasStoredTransport && codexTransport === undefined;
+        const codexRuntimeVersion = s.provider === 'codex' && typeof s.codexRuntimeVersion === 'string'
+          && s.codexRuntimeVersion.length > 0
+          ? s.codexRuntimeVersion
+          : undefined;
+        const {
+          codexSettings: _storedCodexSettings,
+          codexTransport: _storedCodexTransport,
+          codexRuntimeVersion: _storedCodexRuntimeVersion,
+          ...stored
+        } = s;
         reg.#sessions.set(s.id, {
           ...stored,
           ...(codexSettings ? { codexSettings } : {}),
+          ...(codexTransport ? { codexTransport } : {}),
+          ...(codexRuntimeVersion ? { codexRuntimeVersion } : {}),
           transcript,
           status: 'stopped',
           statusSince: Date.now(),
-          stoppedReason: s.stoppedReason ?? 'switchboard restarted',
+          stoppedReason: invalidTransport ? INVALID_STORED_TRANSPORT : (s.stoppedReason ?? 'switchboard restarted'),
           stoppedCode: s.stoppedCode ?? null,
           pending: null,
           // Predates the auto toggle in any state.json written before it existed,

@@ -67,11 +67,18 @@ preflight fails before a worktree or session is created with an actionable
 error. A mismatched ChatGPT.app binary is skipped in favor of the SDK fallback.
 Switchboard is intentionally macOS-only.
 
-The usual account uses automatic selection:
+The usual account uses automatic selection and the SDK transport:
 
 ```json
 { "name": "codex", "provider": "codex", "budget": 2000000, "env": {} }
 ```
+
+`codexTransport` is an account-level rollout control for future Codex
+sessions only. Omit it (or set it to `"sdk"`) to keep the SDK default; set it
+to `"app-server"` only for an opted-in account. Each session saves its chosen
+transport at creation and always resumes through that same transport, so
+changing the account affects future sessions rather than migrating existing
+vendor threads. It is not a browser setting.
 
 An optional explicit binary is documentation for a local account, not a
 portable default:
@@ -168,8 +175,8 @@ Codex accounts with managed ChatGPT authentication also show provider plan
 windows through a separate app-server telemetry process. The shortest window is
 the meter headline, so a reported five-hour window is the five-hour reading;
 expanded account panels retain every provider window and the plan name. This
-process is telemetry-only: Switchboard continues to start, resume, and run every
-Codex turn through the SDK. If telemetry is unavailable, unsupported, or fails
+process is shared with opted-in app-server sessions; SDK-default and legacy SDK
+sessions continue to use the SDK. If telemetry is unavailable, unsupported, or fails
 after a successful read, its process-local snapshot becomes stale and the UI
 falls back to the clearly labelled local token-pace estimate. Provider snapshots
 are never written to `state.json`.

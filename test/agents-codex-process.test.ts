@@ -311,7 +311,7 @@ test('rich SDK lifecycles update one Registry row per item with safe bounded det
   const registry = new Registry('/dev/null');
   const session = registry.create({
     provider: 'codex', account: 'fake', repo: fixture.cwd, cwd: fixture.cwd,
-    branch: 'codex/rich-lifecycle', title: 'Rich lifecycle',
+    branch: 'codex/rich-lifecycle', title: 'Rich lifecycle', codexTransport: 'sdk',
   });
   const events: AdapterEvent[] = [];
   createCodexAdapter(fixture.runtime).start(

@@ -133,6 +133,10 @@ export type Session = {
   /** Auto-approve every tool call instead of asking. Codex sessions ignore it —
    *  their SDK has no interactive approval to skip (see codex.ts approvalPolicy). */
   auto: boolean;
+  /** Immutable owner of this Codex vendor thread. Claude sessions omit both fields. */
+  codexTransport?: 'sdk' | 'app-server';
+  /** Runtime diagnostics captured once before the initial vendor-thread assignment. */
+  codexRuntimeVersion?: string;
   codexSettings?: CodexThreadSettings;
   lastUsage: TurnUsage | null;
   transcript: Msg[];

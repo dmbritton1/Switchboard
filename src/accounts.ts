@@ -1,4 +1,5 @@
 import { readFile, writeFile, rename } from 'node:fs/promises';
+import type { CodexTransport } from './agents/codex-provider.ts';
 
 export type Account = {
   name: string;
@@ -10,6 +11,8 @@ export type Account = {
    *  the same account being linked twice under two names. Absent for
    *  hand-written entries and for auth modes that expose no identity. */
   identity?: string;
+  /** Account-level rollout choice for future Codex sessions. Omission stays SDK-default. */
+  codexTransport?: CodexTransport;
 };
 
 export const DEFAULT_BUDGET = 2_000_000;
@@ -42,7 +45,48 @@ export async function loadAccounts(path: string): Promise<Account[]> {
   }
   const parsed = JSON.parse(raw) as unknown;
   if (!Array.isArray(parsed)) throw new Error(`${path} must contain a JSON array`);
-  return parsed as Account[];
+  return parsed.map((entry, index) => validateAccount(entry, index));
+}
+
+function validateAccount(value: unknown, index: number): Account {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`accounts.json entry ${index + 1} must be an object`);
+  }
+  const entry = value as Record<string, unknown>;
+  if (typeof entry.name !== 'string') throw new Error(`accounts.json entry ${index + 1} name must be a string`);
+  if (entry.provider !== 'claude' && entry.provider !== 'codex') {
+    throw new Error(`accounts.json entry ${index + 1} provider must be claude or codex`);
+  }
+  if (typeof entry.budget !== 'number' || !Number.isFinite(entry.budget)) {
+    throw new Error(`accounts.json entry ${index + 1} budget must be a finite number`);
+  }
+  if (!entry.env || typeof entry.env !== 'object' || Array.isArray(entry.env)
+    || Object.values(entry.env).some((item) => typeof item !== 'string')) {
+    throw new Error(`accounts.json entry ${index + 1} env must be a string map`);
+  }
+  if (entry.bin !== undefined && typeof entry.bin !== 'string') {
+    throw new Error(`accounts.json entry ${index + 1} bin must be a string`);
+  }
+  if (entry.identity !== undefined && typeof entry.identity !== 'string') {
+    throw new Error(`accounts.json entry ${index + 1} identity must be a string`);
+  }
+  if (entry.codexTransport !== undefined) {
+    if (entry.provider !== 'codex') {
+      throw new Error(`accounts.json entry ${index + 1} codexTransport is only valid for Codex accounts`);
+    }
+    if (entry.codexTransport !== 'sdk' && entry.codexTransport !== 'app-server') {
+      throw new Error(`accounts.json entry ${index + 1} codexTransport must be sdk or app-server`);
+    }
+  }
+  return {
+    name: entry.name,
+    provider: entry.provider,
+    budget: entry.budget,
+    env: { ...entry.env as Record<string, string> },
+    ...(entry.bin !== undefined ? { bin: entry.bin } : {}),
+    ...(entry.identity !== undefined ? { identity: entry.identity } : {}),
+    ...(entry.codexTransport !== undefined ? { codexTransport: entry.codexTransport } : {}),
+  };
 }
 
 export type AccountStore = {

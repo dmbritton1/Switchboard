@@ -22,11 +22,11 @@ function makeTwo(options?: RegistryOptions): { reg: Registry; first: string; sec
   const reg = new Registry('/dev/null', undefined, options);
   const first = reg.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/first', branch: 'first', title: 'first',
+    cwd: '/r/first', branch: 'first', title: 'first', codexTransport: 'sdk',
   }).id;
   const second = reg.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/second', branch: 'second', title: 'second',
+    cwd: '/r/second', branch: 'second', title: 'second', codexTransport: 'sdk',
   }).id;
   return { reg, first, second };
 }
@@ -55,6 +55,70 @@ test('a new session starts working with an empty transcript', () => {
   assert.equal(s.lastUsage, null);
 });
 
+test('Codex transport is explicit at creation and immutable while runtime metadata is diagnostic', () => {
+  const registry = new Registry('/dev/null');
+  assert.throws(() => registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'missing', title: 'missing',
+  }), /Codex transport/);
+  assert.throws(() => registry.create({
+    provider: 'claude', account: 'claude', repo: '/r', cwd: '/r/wt', branch: 'claude', title: 'claude',
+    codexTransport: 'sdk',
+  }), /Claude session/);
+
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'app', title: 'app',
+    codexTransport: 'app-server',
+  });
+  registry.recordCodexRuntimeVersion(session.id, '0.145.0');
+  registry.recordCodexRuntimeVersion(session.id, 'changed');
+  registry.apply(session.id, { type: 'vendor-session-id', id: 'app-thread' });
+  registry.recordCodexRuntimeVersion(session.id, 'after-thread');
+
+  assert.equal(session.codexTransport, 'app-server');
+  assert.equal(session.codexRuntimeVersion, '0.145.0');
+});
+
+test('load migrates genuinely absent Codex transport but stops invalid stored transport without coercion', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-codex-transport-load-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  await writeFile(path, JSON.stringify({ sessions: [
+    {
+      id: 'legacy-sdk', provider: 'codex', account: 'codex', vendorSessionId: 'sdk-thread',
+      repo: '/r', cwd: '/r/sdk', branch: 'sdk', title: 'sdk', status: 'done', auto: false,
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+    {
+      id: 'app-server', provider: 'codex', account: 'codex', vendorSessionId: 'app-thread',
+      codexTransport: 'app-server', codexRuntimeVersion: '0.145.0',
+      repo: '/r', cwd: '/r/app', branch: 'app', title: 'app', status: 'done', auto: false,
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+    {
+      id: 'invalid', provider: 'codex', account: 'codex', vendorSessionId: 'unknown-thread',
+      codexTransport: 'unknown',
+      repo: '/r', cwd: '/r/invalid', branch: 'invalid', title: 'invalid', status: 'working', auto: false,
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+    {
+      id: 'claude', provider: 'claude', account: 'claude', vendorSessionId: null,
+      codexTransport: 'sdk', codexRuntimeVersion: '0.145.0',
+      repo: '/r', cwd: '/r/claude', branch: 'claude', title: 'claude', status: 'done', auto: false,
+      transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
+    },
+  ] }));
+
+  const loaded = await Registry.load(path);
+  assert.equal(loaded.get('legacy-sdk')!.codexTransport, 'sdk');
+  assert.equal(loaded.get('app-server')!.codexTransport, 'app-server');
+  assert.equal(loaded.get('app-server')!.codexRuntimeVersion, '0.145.0');
+  assert.equal(loaded.get('invalid')!.codexTransport, undefined);
+  assert.equal(loaded.get('invalid')!.status, 'stopped');
+  assert.match(loaded.get('invalid')!.stoppedReason ?? '', /invalid stored transport.*delete.*create a new session/i);
+  assert.equal(loaded.get('claude')!.codexTransport, undefined);
+  assert.equal(loaded.get('claude')!.codexRuntimeVersion, undefined);
+});
+
 test('usage events replace a session’s SDK-backed last-turn usage', () => {
   const { reg, id } = make();
   reg.apply(id, {
@@ -80,11 +144,11 @@ test('Codex settings persist only explicit values and legacy sessions inherit th
   const configured = registry.create({
     provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/configured',
     branch: 'configured', title: 'configured',
-    codexSettings: { model: 'gpt-5.3-codex', networkAccessEnabled: false },
+    codexSettings: { model: 'gpt-5.3-codex', networkAccessEnabled: false }, codexTransport: 'sdk',
   });
   const inherited = registry.create({
     provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/inherited',
-    branch: 'inherited', title: 'inherited',
+    branch: 'inherited', title: 'inherited', codexTransport: 'sdk',
   });
 
   registry.setCodexSettings(configured.id, { webSearchMode: 'cached' });
@@ -186,7 +250,7 @@ test('attachment names survive Registry save, reload, and public projection', as
   const registry = new Registry(path);
   const session = registry.create({
     provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt',
-    branch: 'attachments', title: 'attachments',
+    branch: 'attachments', title: 'attachments', codexTransport: 'sdk',
   });
   registry.appendPrompt(session.id, 'Inspect these', 'sent', ['screen.png', 'notes.txt']);
   await registry.save();
@@ -346,7 +410,7 @@ test('a saved registry reloads with sessions marked stopped', async (t) => {
   const reg = new Registry(path);
   const s = reg.create({
     provider: 'codex', account: 'codex', repo: '/r',
-    cwd: '/r/wt', branch: 'b', title: 'title',
+    cwd: '/r/wt', branch: 'b', title: 'title', codexTransport: 'sdk',
   });
   reg.apply(s.id, { type: 'msg', msg: { kind: 'text', text: 'hello' } });
   await reg.save();
