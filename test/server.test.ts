@@ -347,6 +347,7 @@ async function bootCodex(
     resolvePrompt?: typeof resolveAgentPrompt;
     gatedPreflight?: boolean;
     beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
+    initialRegistry?: (statePath: string, repo: string) => Promise<Registry>;
   } = {},
 ): Promise<CodexFixture> {
   const dir = await mkdtemp(join(tmpdir(), 'sb-codex-server-'));
@@ -391,7 +392,9 @@ process.exit(result.status ?? 1);
     await chmod(bin, 0o755);
   }
   const statePath = join(dir, 'state.json');
-  const registry = new Registry(statePath);
+  const registry = options.initialRegistry
+    ? await options.initialRegistry(statePath, repo)
+    : new Registry(statePath);
   const usage = new Usage();
   const account = {
     name: 'codex', provider: 'codex' as const, budget: 1000,
@@ -518,6 +521,90 @@ test('an app-server preparation failure stays stopped and never falls back to th
   assert.equal(fixture.registry.all()[0].status, 'stopped');
   assert.equal(fixture.registry.all()[0].codexTransport, 'app-server');
   assert.equal(fixture.registry.all()[0].stoppedCode, 'codex_app_server_initialization_failed');
+});
+
+test('invalid-present Codex transport remains non-resumable after save and reload', async (t) => {
+  let preparations = 0;
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() {
+      preparations += 1;
+      throw new Error('invalid ownership must not reach provider preparation');
+    },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, {
+    codexPool: pool,
+    initialRegistry: async (statePath, repo) => {
+      await writeFile(statePath, JSON.stringify({ sessions: [{
+        id: 'invalid-after-restart', provider: 'codex', account: 'codex',
+        vendorSessionId: 'existing-vendor-thread', codexTransport: 'unexpected',
+        repo, cwd: repo, branch: 'main', title: 'invalid', status: 'done', auto: false,
+        lastUsage: null, transcript: [], pending: null, stoppedReason: null, stoppedCode: null,
+        startedAt: 1, statusSince: 1,
+      }] }));
+      const firstLoad = await Registry.load(statePath);
+      await firstLoad.save();
+      return Registry.load(statePath);
+    },
+  });
+
+  const response = await fixture.command({
+    cmd: 'resume', id: 'invalid-after-restart', prompt: 'must not route',
+  });
+
+  assert.equal(response.status, 409);
+  assert.equal(response.data.code, 'codex_resume_failed');
+  assert.match(response.data.error, /invalid stored transport.*delete.*create a new session/i);
+  assert.equal(preparations, 0, 'invalid ownership must be rejected before either transport is prepared');
+  assert.equal(fixture.registry.get('invalid-after-restart')!.vendorSessionId, 'existing-vendor-thread');
+  assert.equal(fixture.registry.get('invalid-after-restart')!.status, 'stopped');
+});
+
+test('stopping a Codex session during gated create preflight cancels its launch', async (t) => {
+  const fixture = await bootCodex(t, { gatedPreflight: true });
+  const gate = fixture.preflightGate!;
+  await writeFile(gate.enable, 'enabled');
+
+  const creation = fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'stopped-create', prompt: 'must not launch',
+  });
+  await waitFor(() => gate.count().then((count) => count === 1));
+  const session = fixture.registry.all().find((candidate) => candidate.branch === 'stopped-create')!;
+  assert.equal((await fixture.command({ cmd: 'stop', id: session.id })).status, 200);
+  await writeFile(gate.release, 'release');
+
+  const response = await creation;
+  assert.equal(response.status, 409);
+  assert.equal(fixture.registry.get(session.id), session);
+  assert.equal(session.status, 'stopped');
+  assert.equal(session.transcript.some((message) => message.kind === 'user'), false,
+    'cancelled create must not append its prompt');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(await fixture.invocations(), [], 'cancelled create must not start an adapter');
+});
+
+test('deleting a Codex session during gated create preflight prevents an orphaned launch and worktree', async (t) => {
+  const fixture = await bootCodex(t, { gatedPreflight: true });
+  const gate = fixture.preflightGate!;
+  await writeFile(gate.enable, 'enabled');
+
+  const creation = fixture.command({
+    cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'deleted-create', prompt: 'must not launch',
+  });
+  await waitFor(() => gate.count().then((count) => count === 1));
+  const session = fixture.registry.all().find((candidate) => candidate.branch === 'deleted-create')!;
+  const deletion = await fixture.command({ cmd: 'delete', id: session.id, removeWorktree: true });
+  assert.equal(deletion.status, 200);
+  assert.equal(fixture.registry.get(session.id), undefined);
+  assert.equal(session.transcript.some((message) => message.kind === 'user'), false,
+    'deleted create must not append its prompt');
+  assert.equal(await stat(session.cwd).then(() => true, () => false), false);
+  await writeFile(gate.release, 'release');
+
+  const response = await creation;
+  assert.equal(response.status, 409);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(await fixture.invocations(), [], 'deleted create must not start an orphan adapter');
 });
 
 test('Codex account pace records only input and output totals', async (t) => {

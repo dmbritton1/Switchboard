@@ -469,6 +469,7 @@ export function createServer(opts: {
   } = opts;
   const prepare = injectedPrepare ?? prepareProvider;
   const handles = new Map<string, AgentHandle>();
+  const createReservations = new Map<string, symbol>();
   const resumeReservations = new Map<string, symbol>();
 
   async function prepareForSession(account: Account, session: Session): Promise<PreparedProvider> {
@@ -781,26 +782,48 @@ export function createServer(opts: {
           ...(account.provider === 'codex' ? { codexTransport: account.codexTransport ?? 'sdk' } : {}),
           ...(codexSettings ? { codexSettings } : {}),
         });
-        let prepared: PreparedProvider;
+        const reservation = Symbol(session.id);
+        createReservations.set(session.id, reservation);
+        const changedDuringPreparation = (): boolean => (
+          createReservations.get(session.id) !== reservation
+          || registry.get(session.id) !== session
+          || session.status === 'stopped'
+          || handles.has(session.id)
+        );
         try {
-          prepared = await prepareForSession(account, session);
-        } catch (error) {
-          return preparationFailure(session, account, error, 'create');
+          let prepared: PreparedProvider;
+          try {
+            prepared = await prepareForSession(account, session);
+          } catch (error) {
+            if (changedDuringPreparation()) {
+              return { status: 409, json: { error: 'session changed while create was preparing' } };
+            }
+            return preparationFailure(session, account, error, 'create');
+          }
+          // No request can interleave between this final ownership check and the
+          // synchronous prompt append + launch below. Stop/delete revoke the
+          // reservation before mutating the Registry, so a completed preflight
+          // can never resurrect their session or orphan a handle.
+          if (changedDuringPreparation()) {
+            return { status: 409, json: { error: 'session changed while create was preparing' } };
+          }
+          if (account.provider === 'codex' && prepared.runtimeVersion) {
+            registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
+          }
+          const prompt = String(body.prompt);
+          const promptId = registry.appendPrompt(
+            session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
+          );
+          // Set before launch because launch() reads the flag from the Registry.
+          if (registry.settings().autoApprove) registry.setAuto(session.id, true);
+          const launchError = launch(
+            session.id, account, prepared.adapter, cwd, { text: prompt, attachments: [] }, undefined, promptId,
+          );
+          if (launchError) return { status: 500, json: launchError };
+          return { status: 200, json: { id: session.id } };
+        } finally {
+          if (createReservations.get(session.id) === reservation) createReservations.delete(session.id);
         }
-        if (account.provider === 'codex' && prepared.runtimeVersion) {
-          registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
-        }
-        const prompt = String(body.prompt);
-        const promptId = registry.appendPrompt(
-          session.id, prompt, account.provider === 'codex' ? 'queued' : 'sent',
-        );
-        // Set before launch because launch() reads the flag from the Registry.
-        if (registry.settings().autoApprove) registry.setAuto(session.id, true);
-        const launchError = launch(
-          session.id, account, prepared.adapter, cwd, { text: prompt, attachments: [] }, undefined, promptId,
-        );
-        if (launchError) return { status: 500, json: launchError };
-        return { status: 200, json: { id: session.id } };
       }
 
       case 'send': {
@@ -868,9 +891,18 @@ export function createServer(opts: {
       }
 
       case 'stop': {
+        const sessionId = String(body.id);
+        if (createReservations.delete(sessionId)) {
+          const session = registry.get(sessionId);
+          registry.apply(sessionId, {
+            type: 'stopped',
+            reason: 'Stopped by user.',
+            ...(session?.provider === 'codex' ? { code: 'codex_user_stopped' as const } : {}),
+          });
+        }
         // Delete first, then stop — see the emit callback in launch().
-        const handle = handles.get(String(body.id));
-        handles.delete(String(body.id));
+        const handle = handles.get(sessionId);
+        handles.delete(sessionId);
         handle?.stop();
         return { status: 200, json: { ok: true } };
       }
@@ -984,9 +1016,11 @@ export function createServer(opts: {
       }
 
       case 'delete': {
-        const session = registry.get(String(body.id));
-        const handle = handles.get(String(body.id));
-        handles.delete(String(body.id));
+        const sessionId = String(body.id);
+        createReservations.delete(sessionId);
+        const session = registry.get(sessionId);
+        const handle = handles.get(sessionId);
+        handles.delete(sessionId);
         handle?.stop();
         // Deregister before the worktree await, not after. Concurrent resume
         // clears its final guard on Registry identity (see the resume case); if
@@ -994,7 +1028,7 @@ export function createServer(opts: {
         // that guard and launch an agent into a directory being deleted — and
         // the remove() below would then drop the session while that agent is
         // still running, leaving it with no card and no stop().
-        registry.remove(String(body.id));
+        registry.remove(sessionId);
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })

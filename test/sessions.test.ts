@@ -117,6 +117,24 @@ test('load migrates genuinely absent Codex transport but stops invalid stored tr
   assert.match(loaded.get('invalid')!.stoppedReason ?? '', /invalid stored transport.*delete.*create a new session/i);
   assert.equal(loaded.get('claude')!.codexTransport, undefined);
   assert.equal(loaded.get('claude')!.codexRuntimeVersion, undefined);
+
+  await loaded.save();
+  const saved = JSON.parse(await readFile(path, 'utf8')) as { sessions: Array<Record<string, unknown>> };
+  const savedInvalid = saved.sessions.find((session) => session.id === 'invalid')!;
+  assert.equal(savedInvalid.codexTransportInvalid, true,
+    'saving must retain that transport ownership was present but invalid');
+
+  const reloaded = await Registry.load(path);
+  assert.equal(reloaded.get('invalid')!.codexTransport, undefined);
+  assert.equal(reloaded.get('invalid')!.status, 'stopped');
+  assert.match(reloaded.get('invalid')!.stoppedReason ?? '', /invalid stored transport.*delete.*create a new session/i);
+  assert.equal(Object.hasOwn(reloaded.publicSessions().find((session) => session.id === 'invalid')!, 'codexTransportInvalid'), false,
+    'the persistence sentinel is not part of the public snapshot');
+  await reloaded.save();
+  const reloadedAgain = await Registry.load(path);
+  assert.equal(reloadedAgain.get('invalid')!.codexTransport, undefined);
+  assert.equal(reloadedAgain.get('invalid')!.status, 'stopped');
+  assert.match(reloadedAgain.get('invalid')!.stoppedReason ?? '', /invalid stored transport.*delete.*create a new session/i);
 });
 
 test('usage events replace a session’s SDK-backed last-turn usage', () => {

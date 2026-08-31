@@ -11,6 +11,10 @@ import type { Usage } from './usage.ts';
 import type { Scheduler } from './schedule.ts';
 
 type Init = Pick<Session, 'provider' | 'account' | 'repo' | 'cwd' | 'branch' | 'title' | 'codexSettings' | 'codexTransport'>;
+type StoredSession = Session & {
+  /** Fail-closed persistence marker; never projected through PublicSession. */
+  codexTransportInvalid?: true;
+};
 
 const INVALID_STORED_TRANSPORT = 'This Codex session has an invalid stored transport. Delete it and create a new session.';
 
@@ -111,7 +115,7 @@ export function truncateResult(text: string): string {
 }
 
 export class Registry {
-  #sessions = new Map<string, Session>();
+  #sessions = new Map<string, StoredSession>();
   #subs = new Set<() => void>();
   #path: string;
   // Optional so tests (and anything that only cares about sessions) can skip it.
@@ -156,7 +160,7 @@ export class Registry {
       throw new Error('Claude sessions cannot have a Codex transport.');
     }
     const now = Date.now();
-    const s: Session = {
+    const s: StoredSession = {
       ...init,
       id: randomUUID(),
       vendorSessionId: null,
@@ -186,33 +190,36 @@ export class Registry {
   }
 
   publicSessions(): PublicSession[] {
-    return this.all().map((session) => ({
-      ...session,
-      lastUsage: session.lastUsage ? { ...session.lastUsage } : null,
-      pending: session.pending ? { ...session.pending } : null,
-      transcript: session.transcript.map((message): PublicMsg => {
-        if (message.kind !== 'tool') {
-          if (message.kind === 'todo') {
-            return { ...message, items: message.items.map((item) => ({ ...item })) };
+    return [...this.#sessions.values()].map((storedSession) => {
+      const { codexTransportInvalid: _codexTransportInvalid, ...session } = storedSession;
+      return {
+        ...session,
+        lastUsage: session.lastUsage ? { ...session.lastUsage } : null,
+        pending: session.pending ? { ...session.pending } : null,
+        transcript: session.transcript.map((message): PublicMsg => {
+          if (message.kind !== 'tool') {
+            if (message.kind === 'todo') {
+              return { ...message, items: message.items.map((item) => ({ ...item })) };
+            }
+            return { ...message };
           }
-          return { ...message };
-        }
-        const {
-          detail: _detail,
-          detailTruncated,
-          detailEvicted,
-          detailRevision,
-          ...summary
-        } = message;
-        return {
-          ...summary,
-          detailAvailable: message.detail !== undefined,
-          detailTruncated: detailTruncated ?? false,
-          detailEvicted: detailEvicted ?? false,
-          detailRevision: detailRevision ?? 0,
-        };
-      }),
-    }));
+          const {
+            detail: _detail,
+            detailTruncated,
+            detailEvicted,
+            detailRevision,
+            ...summary
+          } = message;
+          return {
+            ...summary,
+            detailAvailable: message.detail !== undefined,
+            detailTruncated: detailTruncated ?? false,
+            detailEvicted: detailEvicted ?? false,
+            detailRevision: detailRevision ?? 0,
+          };
+        }),
+      };
+    });
   }
 
   getToolDetail(sessionId: string, itemId: string): ToolDetailRead | null {
@@ -568,7 +575,7 @@ export class Registry {
       // state.json is hand-editable, so treat it as untrusted: a `sessions` value
       // that is a string would otherwise be iterated character by character into
       // garbage sessions keyed on `undefined`.
-      for (const s of (Array.isArray(raw) ? raw : []) as Session[]) {
+      for (const s of (Array.isArray(raw) ? raw : []) as StoredSession[]) {
         if (!s || typeof s.id !== 'string') continue;
         let codexSettings: CodexThreadSettings | undefined;
         if (s.provider === 'codex') {
@@ -599,11 +606,17 @@ export class Registry {
         }
         // Agents are children of this process; nothing survived the restart.
         const hasStoredTransport = Object.hasOwn(s, 'codexTransport');
+        const hasInvalidTransportMarker = s.codexTransportInvalid === true;
         const storedTransport = s.codexTransport;
         const codexTransport = s.provider === 'codex'
-          ? (hasStoredTransport ? (isCodexTransport(storedTransport) ? storedTransport : undefined) : 'sdk')
+          ? (hasInvalidTransportMarker
+              ? undefined
+              : hasStoredTransport
+                ? (isCodexTransport(storedTransport) ? storedTransport : undefined)
+                : 'sdk')
           : undefined;
-        const invalidTransport = s.provider === 'codex' && hasStoredTransport && codexTransport === undefined;
+        const invalidTransport = s.provider === 'codex'
+          && (hasInvalidTransportMarker || (hasStoredTransport && codexTransport === undefined));
         const codexRuntimeVersion = s.provider === 'codex' && typeof s.codexRuntimeVersion === 'string'
           && s.codexRuntimeVersion.length > 0
           ? s.codexRuntimeVersion
@@ -611,6 +624,7 @@ export class Registry {
         const {
           codexSettings: _storedCodexSettings,
           codexTransport: _storedCodexTransport,
+          codexTransportInvalid: _storedCodexTransportInvalid,
           codexRuntimeVersion: _storedCodexRuntimeVersion,
           ...stored
         } = s;
@@ -618,6 +632,7 @@ export class Registry {
           ...stored,
           ...(codexSettings ? { codexSettings } : {}),
           ...(codexTransport ? { codexTransport } : {}),
+          ...(invalidTransport ? { codexTransportInvalid: true as const } : {}),
           ...(codexRuntimeVersion ? { codexRuntimeVersion } : {}),
           transcript,
           status: 'stopped',
