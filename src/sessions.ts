@@ -152,17 +152,18 @@ export class Registry {
     this.#maxTotalDetailBytes = resolvedOptions.maxTotalDetailBytes ?? MAX_CODEX_DETAIL_TOTAL_BYTES;
   }
 
-  create(init: Init): Session {
+  create(init: Init, id = randomUUID()): Session {
     if (init.provider === 'codex' && !isCodexTransport(init.codexTransport)) {
       throw new Error('Codex transport must be explicitly selected when creating a Codex session.');
     }
     if (init.provider === 'claude' && Object.hasOwn(init, 'codexTransport')) {
       throw new Error('Claude sessions cannot have a Codex transport.');
     }
+    if (this.#sessions.has(id)) throw new Error('Session id is already registered.');
     const now = Date.now();
     const s: StoredSession = {
       ...init,
-      id: randomUUID(),
+      id,
       vendorSessionId: null,
       status: 'working',
       auto: false,

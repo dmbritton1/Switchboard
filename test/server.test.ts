@@ -302,6 +302,33 @@ function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; sta
   return { adapter, emit: (e) => cb?.(e), starts };
 }
 
+function gatedHandoffPool(adapter: Adapter, outcome: 'ok' | 'error' = 'ok'): {
+  pool: Pick<CodexProviderPool, 'prepare' | 'close'>;
+  entered: Promise<void>;
+  release: () => void;
+} {
+  let preparations = 0;
+  let markEntered!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    entered,
+    release,
+    pool: {
+      async prepare() {
+        preparations += 1;
+        if (preparations === 1) return { adapter, runtimeVersion: '0.145.0' };
+        markEntered();
+        await gate;
+        if (outcome === 'error') throw new Error('handoff transport unavailable');
+        return { adapter, runtimeVersion: '0.145.0' };
+      },
+      async close() {},
+    },
+  };
+}
+
 /** The snapshot the browser actually receives: /events pushes it on connect. */
 async function firstSnapshot(base: string): Promise<any> {
   const res = await fetch(new URL('/events', base));
@@ -486,15 +513,22 @@ test('Codex create, scheduled create, and resume route exclusively through the p
   });
   assert.equal(handoff.status, 200);
   const handoffSession = fixture.registry.get(handoff.data.id)!;
+  assert.equal(
+    fixture.registry.all().filter((session) => session.branch === 'app-route-handoff').length,
+    1,
+    'handoff admits exactly one successor',
+  );
   assert.equal(handoffSession.codexTransport, 'app-server');
   assert.equal(handoffSession.codexRuntimeVersion, '0.145.0');
+  assert.equal(routes[1].sessionId, handoffSession.id, 'preparation is bound to the admitted successor identity');
   assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server']);
 
+  await fixture.command({ cmd: 'stop', id: handoffSession.id });
   fixture.account.codexTransport = 'sdk';
-  const resumed = await fixture.command({ cmd: 'resume', id: appSession.id, prompt: 'resume' });
+  const resumed = await fixture.command({ cmd: 'resume', id: handoffSession.id, prompt: 'resume' });
   assert.equal(resumed.status, 200);
   assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server', 'app-server']);
-  assert.equal(appStarts.at(-1)!.resumeId, appSession.vendorSessionId ?? undefined);
+  assert.equal(appStarts.at(-1)!.resumeId, handoffSession.vendorSessionId ?? undefined);
   assert.equal(sdkStarts.length, 0);
 
   fixture.account.codexTransport = 'sdk';
@@ -1799,6 +1833,78 @@ test('handoff rejects an unknown target account before touching the source workt
   const { stdout } = await run('git', ['status', '--porcelain'], { cwd: registry.get(created.id)!.cwd });
   assert.ok(stdout.includes('still-dirty.txt'), 'the source worktree should not have been committed');
   assert.equal(registry.get(created.id)!.status, 'done', 'the source should not have been stopped');
+});
+
+test('Codex handoff preflight failure leaves the source and repository unchanged', async (t) => {
+  const { adapter, starts } = fakeAdapter();
+  const gate = gatedHandoffPool(adapter, 'error');
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: gate.pool });
+  const created = await fixture.create('handoff-failure-source');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  const source = fixture.registry.get(created.id)!;
+  await writeFile(join(source.cwd, 'still-dirty.txt'), 'not committed\n');
+  const worktreesBefore = await fixture.worktrees();
+
+  const pending = fixture.command({
+    cmd: 'handoff', id: source.id, account: 'codex', branch: 'handoff-preflight-failure',
+  });
+  await gate.entered;
+  gate.release();
+  const response = await pending;
+
+  assert.equal(response.status, 400);
+  assert.equal(response.data.code, 'codex_app_server_initialization_failed');
+  assert.deepEqual(fixture.registry.all().map((session) => session.id), [source.id], 'no successor is admitted');
+  assert.equal(await fixture.worktrees(), worktreesBefore, 'no successor worktree is created');
+  assert.equal(
+    (await run('git', ['branch', '--list', 'handoff-preflight-failure'], { cwd: fixture.repo })).stdout,
+    '',
+    'no successor branch or lineage target is left behind',
+  );
+  assert.match(
+    (await run('git', ['status', '--porcelain'], { cwd: source.cwd })).stdout,
+    /still-dirty\.txt/,
+    'preflight failure must happen before committing the source',
+  );
+  assert.equal(starts.length, 1, 'only the original source adapter starts');
+});
+
+test('stop and delete during Codex handoff preparation cannot launch a successor', async (t) => {
+  for (const action of ['stop', 'delete'] as const) {
+    await t.test(action, async (t) => {
+      const { adapter, starts } = fakeAdapter();
+      const gate = gatedHandoffPool(adapter);
+      const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: gate.pool });
+      const created = await fixture.create(`handoff-${action}-source`);
+      await fixture.command({ cmd: 'stop', id: created.id });
+      const worktreesBefore = await fixture.worktrees();
+
+      const pending = fixture.command({
+        cmd: 'handoff', id: created.id, account: 'codex', branch: `handoff-${action}-successor`,
+      });
+      await gate.entered;
+      const sessionsWhilePreparing = fixture.registry.all().map((session) => session.id);
+      let cancellation: Awaited<ReturnType<typeof fixture.command>>;
+      try {
+        cancellation = await fixture.command({ cmd: action, id: created.id });
+      } finally {
+        gate.release();
+      }
+      const response = await pending;
+
+      assert.equal(cancellation.status, 200);
+      assert.deepEqual(sessionsWhilePreparing, [created.id], 'preparation must not admit the successor early');
+      assert.equal(response.status, 409);
+      assert.match(response.data.error, /session changed while handoff was preparing/i);
+      assert.equal(await fixture.worktrees(), worktreesBefore, 'cancellation leaves no successor worktree');
+      assert.equal(starts.length, 1, 'the prepared successor adapter never starts');
+      assert.deepEqual(
+        fixture.registry.all().map((session) => session.id),
+        action === 'stop' ? [created.id] : [],
+        'cancellation leaves no successor session',
+      );
+    });
+  }
 });
 
 // The flagship scenario: a Claude session stops mid rate-limit, which queues an

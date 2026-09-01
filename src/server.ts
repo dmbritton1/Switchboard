@@ -1,4 +1,5 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
 import { mkdir, readFile, readdir, rm, stat, lstat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
@@ -113,6 +114,7 @@ type PreparedProvider = {
 };
 
 type SessionPreparation = { sessionId: string; transport?: CodexTransport };
+type SessionOwnership = Pick<Session, 'id' | 'provider' | 'codexTransport'>;
 type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare'>>;
 
 async function prepareProvider(account: Account, _session?: SessionPreparation): Promise<PreparedProvider> {
@@ -497,8 +499,9 @@ export function createServer(opts: {
   // over that cost, not missed.
   const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
+  const handoffReservations = new Map<string, { token: symbol; phase: 'preparing' | 'committing' }>();
 
-  async function prepareForSession(account: Account, session: Session): Promise<PreparedProvider> {
+  async function prepareForSession(account: Account, session: SessionOwnership): Promise<PreparedProvider> {
     if (account.provider === 'codex' && codexPool?.prepare) {
       if (session.codexTransport !== 'sdk' && session.codexTransport !== 'app-server') {
         throw new Error('This Codex session has an invalid stored transport. Delete it and create a new session.');
@@ -514,8 +517,8 @@ export function createServer(opts: {
     });
   }
 
-  function preparationFailure(
-    session: Session,
+  function preparationError(
+    session: SessionOwnership,
     account: Account,
     error: unknown,
     phase: 'create' | 'resume',
@@ -530,8 +533,18 @@ export function createServer(opts: {
       : session.codexTransport === 'app-server'
         ? 'Codex app-server session transport is unavailable. Check this account configuration and try again.'
         : 'Codex SDK session transport is unavailable. Check this account configuration and try again.';
-    registry.recordStoppedFailure(session.id, reason, code);
     return { status: 400, json: { error: reason, code } };
+  }
+
+  function preparationFailure(
+    session: Session,
+    account: Account,
+    error: unknown,
+    phase: 'create' | 'resume',
+  ): { status: number; json: { error: string; code: CodexFailureCode } } {
+    const failure = preparationError(session, account, error, phase);
+    registry.recordStoppedFailure(session.id, failure.json.error, failure.json.code);
+    return failure;
   }
 
   /**
@@ -912,87 +925,127 @@ export function createServer(opts: {
         }
         const account = accounts.find((a) => a.name === body.account);
         if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
-        try {
-          await commitOutstanding(source.cwd, source.branch);
-        } catch (err) {
-          return {
-            status: 400,
-            json: { error: `committing "${source.branch}" failed: ${(err as Error).message}` },
-          };
+        if (handoffReservations.has(source.id)) {
+          return { status: 409, json: { error: 'session handoff is already in progress' } };
         }
         const branch = String(body.branch);
-        let cwd: string;
-        try {
-          cwd = await createWorktree(source.repo, branch, source.branch);
-        } catch (err) {
-          return { status: 400, json: { error: (err as Error).message } };
-        }
-        try {
-          await mkdir(join(cwd, dirname(HANDOFF_FILE)), { recursive: true });
-          // Load-bearing, not incidental: this ignores the whole directory for
-          // git status/diff/add, not just commits. Without it the handoff file
-          // (deliberately never committed) reads as untracked "+N added" work on
-          // every /status poll for the life of the session, shows up as a fake
-          // diff, and — since a pathspec exclusion only stops *this* commit, not
-          // whatever the successor runs later — is one `git add -A` away from
-          // landing in a merge target.
-          await writeFile(join(cwd, dirname(HANDOFF_FILE), '.gitignore'), '*\n', 'utf8');
-          await writeFile(join(cwd, HANDOFF_FILE), renderHandoff(source), 'utf8');
-        } catch (err) {
-          // The worktree is left behind, exactly as `create` leaves one when
-          // launch fails. Inventing a cleanup path here that create does not
-          // have would leave the two inconsistent for no gain.
-          return { status: 500, json: { error: `writing the handoff file failed: ${(err as Error).message}` } };
-        }
-        const session = registry.create({
+        const successorId = randomUUID();
+        const ownership: SessionOwnership = {
+          id: successorId,
           provider: account.provider,
-          account: account.name,
-          repo: source.repo,
-          cwd,
-          branch,
-          title: branch,
           ...(account.provider === 'codex' ? { codexTransport: account.codexTransport ?? 'sdk' } : {}),
-        });
-        let prepared: PreparedProvider;
+        };
+        const reservation: { token: symbol; phase: 'preparing' | 'committing' } = {
+          token: Symbol(successorId), phase: 'preparing',
+        };
+        handoffReservations.set(source.id, reservation);
+        const sourceStatus = source.status;
+        const changedDuringPreparation = (): boolean => (
+          handoffReservations.get(source.id) !== reservation
+          || registry.get(source.id) !== source
+          || source.status !== sourceStatus
+        );
         try {
-          prepared = await prepareForSession(account, session);
-        } catch (error) {
-          return preparationFailure(session, account, error, 'create');
-        }
-        if (account.provider === 'codex' && prepared.runtimeVersion) {
-          registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
-        }
-        // The successor branches from the source at the source's own commit, so
-        // the two share every committed path and would otherwise report a
-        // guaranteed, permanent false overlap warning on each other — see the
-        // `lineage` comment above.
-        lineage.add(channelKey(source.id, session.id));
-        const promptId = registry.appendPrompt(
-          session.id, HANDOFF_PROMPT, account.provider === 'codex' ? 'queued' : 'sent',
-        );
-        if (registry.settings().autoApprove) registry.setAuto(session.id, true);
-        const launchError = launch(
-          session.id, account, prepared.adapter, cwd,
-          { text: HANDOFF_PROMPT, attachments: [] }, undefined, promptId,
-        );
-        if (launchError) return { status: 500, json: launchError };
-        // Stopped last: every failure above leaves the source exactly as it was.
-        // Delete before stop — see the emit callback in launch().
-        const handle = handles.get(source.id);
-        handles.delete(source.id);
-        handle?.stop();
-        // A rate-limit stop can have already queued "resume A when account
-        // resets" (see the emit callback above). Left in place, that item fires
-        // after handoff and relaunches A onto a branch B has already moved past,
-        // diverging the two — exactly what stopping A here is meant to prevent.
-        // It also blocks unlinking the (now exhausted) source account, since
-        // unlink refuses while reset-triggered items for it remain queued.
-        for (const item of scheduler.all()) {
-          if (item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === source.id) {
-            scheduler.remove(item.id);
+          let prepared: PreparedProvider;
+          try {
+            prepared = await prepareForSession(account, ownership);
+          } catch (error) {
+            if (changedDuringPreparation()) {
+              return { status: 409, json: { error: 'session changed while handoff was preparing' } };
+            }
+            if (account.provider === 'codex' || error instanceof CodexRuntimeError) {
+              return preparationError(ownership, account, error, 'create');
+            }
+            throw error;
+          }
+          if (changedDuringPreparation()) {
+            return { status: 409, json: { error: 'session changed while handoff was preparing' } };
+          }
+
+          // Preparation is the only long-running phase that stop/delete cancel.
+          // Once repository mutation begins, those commands reject until this
+          // synchronous admission/launch sequence completes or the operation
+          // fails, so they cannot remove either endpoint underneath the handoff.
+          reservation.phase = 'committing';
+          try {
+            await commitOutstanding(source.cwd, source.branch);
+          } catch (err) {
+            return {
+              status: 400,
+              json: { error: `committing "${source.branch}" failed: ${(err as Error).message}` },
+            };
+          }
+          let cwd: string;
+          try {
+            cwd = await createWorktree(source.repo, branch, source.branch);
+          } catch (err) {
+            return { status: 400, json: { error: (err as Error).message } };
+          }
+          try {
+            await mkdir(join(cwd, dirname(HANDOFF_FILE)), { recursive: true });
+            // Load-bearing, not incidental: this ignores the whole directory for
+            // git status/diff/add, not just commits. Without it the handoff file
+            // (deliberately never committed) reads as untracked "+N added" work on
+            // every /status poll for the life of the session, shows up as a fake
+            // diff, and — since a pathspec exclusion only stops *this* commit, not
+            // whatever the successor runs later — is one `git add -A` away from
+            // landing in a merge target.
+            await writeFile(join(cwd, dirname(HANDOFF_FILE), '.gitignore'), '*\n', 'utf8');
+            await writeFile(join(cwd, HANDOFF_FILE), renderHandoff(source), 'utf8');
+          } catch (err) {
+            // The worktree is left behind, exactly as `create` leaves one when
+            // launch fails. Inventing a cleanup path here that create does not
+            // have would leave the two inconsistent for no gain.
+            return { status: 500, json: { error: `writing the handoff file failed: ${(err as Error).message}` } };
+          }
+          const session = registry.create({
+            provider: ownership.provider,
+            account: account.name,
+            repo: source.repo,
+            cwd,
+            branch,
+            title: branch,
+            ...(ownership.provider === 'codex' ? { codexTransport: ownership.codexTransport } : {}),
+          }, successorId);
+          if (account.provider === 'codex' && prepared.runtimeVersion) {
+            registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
+          }
+          // The successor branches from the source at the source's own commit, so
+          // the two share every committed path and would otherwise report a
+          // guaranteed, permanent false overlap warning on each other — see the
+          // `lineage` comment above.
+          lineage.add(channelKey(source.id, session.id));
+          const promptId = registry.appendPrompt(
+            session.id, HANDOFF_PROMPT, account.provider === 'codex' ? 'queued' : 'sent',
+          );
+          if (registry.settings().autoApprove) registry.setAuto(session.id, true);
+          const launchError = launch(
+            session.id, account, prepared.adapter, cwd,
+            { text: HANDOFF_PROMPT, attachments: [] }, undefined, promptId,
+          );
+          if (launchError) return { status: 500, json: launchError };
+          // Stopped last: every failure above leaves the source exactly as it was.
+          // Delete before stop — see the emit callback in launch().
+          const handle = handles.get(source.id);
+          handles.delete(source.id);
+          handle?.stop();
+          // A rate-limit stop can have already queued "resume A when account
+          // resets" (see the emit callback above). Left in place, that item fires
+          // after handoff and relaunches A onto a branch B has already moved past,
+          // diverging the two — exactly what stopping A here is meant to prevent.
+          // It also blocks unlinking the (now exhausted) source account, since
+          // unlink refuses while reset-triggered items for it remain queued.
+          for (const item of scheduler.all()) {
+            if (item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === source.id) {
+              scheduler.remove(item.id);
+            }
+          }
+          return { status: 200, json: { id: session.id } };
+        } finally {
+          if (handoffReservations.get(source.id)?.token === reservation.token) {
+            handoffReservations.delete(source.id);
           }
         }
-        return { status: 200, json: { id: session.id } };
       }
 
       case 'send': {
@@ -1061,6 +1114,11 @@ export function createServer(opts: {
 
       case 'stop': {
         const sessionId = String(body.id);
+        const handoff = handoffReservations.get(sessionId);
+        if (handoff?.phase === 'committing') {
+          return { status: 409, json: { error: 'session handoff is committing' } };
+        }
+        handoffReservations.delete(sessionId);
         if (createReservations.delete(sessionId)) {
           const session = registry.get(sessionId);
           registry.apply(sessionId, {
@@ -1080,6 +1138,9 @@ export function createServer(opts: {
         const sessionId = String(body.id);
         const session = registry.get(sessionId);
         if (!session) return { status: 404, json: { error: 'no such session' } };
+        if (handoffReservations.has(sessionId)) {
+          return { status: 409, json: { error: 'session handoff is in progress' } };
+        }
         // Without this, resume on a live session (or a double-click on Resume)
         // calls launch(), whose handles.set() overwrites the live handle —
         // orphaning an agent that no stop() can reach while it still holds write
@@ -1186,6 +1247,11 @@ export function createServer(opts: {
 
       case 'delete': {
         const sessionId = String(body.id);
+        const handoff = handoffReservations.get(sessionId);
+        if (handoff?.phase === 'committing') {
+          return { status: 409, json: { error: 'session handoff is committing' } };
+        }
+        handoffReservations.delete(sessionId);
         createReservations.delete(sessionId);
         const session = registry.get(sessionId);
         const handle = handles.get(sessionId);
