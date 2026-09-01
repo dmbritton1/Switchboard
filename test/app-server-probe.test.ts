@@ -36,6 +36,30 @@ async function rejectsWithin(
   }
 }
 
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`timed out waiting for file: ${path}`);
+}
+
+function observePending<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => {});
+  return promise;
+}
+
+async function createReadyMarker(t: { after: (fn: () => Promise<void> | void) => void }, prefix: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  return join(directory, 'ready');
+}
+
 test('fake app-server proves the bounded stable lifecycle and approval surface', async () => {
   const evidence = await probeAppServer({ command: fakeCommand, env: env(), fixtureMode: true });
 
@@ -483,26 +507,32 @@ test('schema evidence fails when any stable lifecycle notification is absent', a
   }
 });
 
-test('malformed JSON rejects safely without hanging', async () => {
+test('malformed JSON rejects safely without hanging', async (t) => {
+  const ready = await createReadyMarker(t, 'switchboard-probe-malformed-');
+  const probe = observePending(probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_MODE: 'malformed', FAKE_APP_SERVER_READY_MARKER: ready }),
+    fixtureMode: true,
+  }));
+  await waitForFile(ready);
   await rejectsWithin(
-    probeAppServer({
-      command: fakeCommand,
-      env: env({ FAKE_APP_SERVER_MODE: 'malformed' }),
-      fixtureMode: true,
-    }),
+    probe,
     1_500,
     (error) => error instanceof Error && /invalid JSON/i.test(error.message),
   );
 });
 
-test('an unexpected app-server exit rejects promptly without exposing stderr secrets', async () => {
+test('an unexpected app-server exit rejects promptly without exposing stderr secrets', async (t) => {
   const secret = 'probe-secret-value';
+  const ready = await createReadyMarker(t, 'switchboard-probe-crash-');
+  const probe = observePending(probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_MODE: 'crash', PROBE_TOKEN: secret, FAKE_APP_SERVER_READY_MARKER: ready }),
+    fixtureMode: true,
+  }));
+  await waitForFile(ready);
   await rejectsWithin(
-    probeAppServer({
-      command: fakeCommand,
-      env: env({ FAKE_APP_SERVER_MODE: 'crash', PROBE_TOKEN: secret }),
-      fixtureMode: true,
-    }),
+    probe,
     1_500,
     (error) => error instanceof Error
       && /exited unexpectedly/i.test(error.message)
@@ -510,14 +540,17 @@ test('an unexpected app-server exit rejects promptly without exposing stderr sec
   );
 });
 
-test('an idle exit remains terminal between a response and the next request', async () => {
+test('an idle exit remains terminal between a response and the next request', async (t) => {
   const secret = 'idle-crash-secret';
+  const ready = await createReadyMarker(t, 'switchboard-probe-idle-exit-');
+  const probe = observePending(probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_MODE: 'crash-after-initialize', PROBE_TOKEN: secret, FAKE_APP_SERVER_READY_MARKER: ready }),
+    fixtureMode: true,
+  }));
+  await waitForFile(ready);
   await rejectsWithin(
-    probeAppServer({
-      command: fakeCommand,
-      env: env({ FAKE_APP_SERVER_MODE: 'crash-after-initialize', PROBE_TOKEN: secret }),
-      fixtureMode: true,
-    }),
+    probe,
     1_500,
     (error) => error instanceof Error
       && /exited unexpectedly/i.test(error.message)
@@ -525,13 +558,16 @@ test('an idle exit remains terminal between a response and the next request', as
   );
 });
 
-test('a terminal exit before notification registration is not masked as a timeout', async () => {
+test('a terminal exit before notification registration is not masked as a timeout', async (t) => {
+  const ready = await createReadyMarker(t, 'switchboard-probe-turn-crash-');
+  const probe = observePending(probeAppServer({
+    command: fakeCommand,
+    env: env({ FAKE_APP_SERVER_MODE: 'crash-after-turn-response', FAKE_APP_SERVER_READY_MARKER: ready }),
+    fixtureMode: true,
+  }));
+  await waitForFile(ready);
   await rejectsWithin(
-    probeAppServer({
-      command: fakeCommand,
-      env: env({ FAKE_APP_SERVER_MODE: 'crash-after-turn-response' }),
-      fixtureMode: true,
-    }),
+    probe,
     1_500,
     (error) => error instanceof Error && /exited unexpectedly/i.test(error.message),
   );

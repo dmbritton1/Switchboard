@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import readline from 'node:readline';
 import { DENIED_SERVER_METHODS } from '../../src/agents/codex-app-server-contract.ts';
@@ -326,6 +326,16 @@ function send(message: Message): void {
 function fail(message: string): never {
   process.stderr.write(`${message}\n`);
   process.exit(2);
+}
+
+function maybePauseBootstrap(): void {
+  const enteredMarker = process.env.FAKE_APP_SERVER_BOOTSTRAP_ENTERED_MARKER;
+  if (enteredMarker) writeFileSync(enteredMarker, 'entered');
+  const releaseMarker = process.env.FAKE_APP_SERVER_BOOTSTRAP_RELEASE_MARKER;
+  if (!releaseMarker) return;
+  while (!existsSync(releaseMarker)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
 }
 
 function turn(id: string, status: 'inProgress' | 'completed' | 'interrupted'): Record<string, unknown> {
@@ -928,6 +938,8 @@ if (mode === 'hang' || mode === 'ignore-term') {
   });
   if (pidFile) writeFileSync(pidFile, String(process.pid));
 }
+
+maybePauseBootstrap();
 
 const readyMarker = process.env.FAKE_APP_SERVER_READY_MARKER;
 if (readyMarker) writeFileSync(readyMarker, 'ready');

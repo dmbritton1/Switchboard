@@ -16,6 +16,8 @@ import { resolveAgentPrompt } from '../src/prompt-input.ts';
 import { createWorktree, worktreeStatus } from '../src/worktree.ts';
 import { HANDOFF_PROMPT } from '../src/handoff.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from '../src/account-limits.ts';
+import { createCodexAdapter } from '../src/agents/codex.ts';
+import { prepareCodexRuntime } from '../src/agents/codex-runtime.ts';
 import { resetScheduleView } from '../web/lib.js';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
 import { writeFakeLoginCli } from './helpers/fake-login.ts';
@@ -361,12 +363,41 @@ type CodexFixture = Awaited<ReturnType<typeof boot>> & {
   }>>;
   calls(): Promise<string[][]>;
   preflightGate?: {
-    enable: string;
-    started: string;
-    release: string;
+    enable(): void;
+    waitForCount(target: number, timeoutMs?: number): Promise<void>;
+    release(): void;
     count(): Promise<number>;
   };
 };
+
+function createPreflightGate() {
+  let enabled = false;
+  let started = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    enable() {
+      enabled = true;
+    },
+    enter() {
+      if (!enabled) return false;
+      started += 1;
+      return true;
+    },
+    async wait() {
+      await held;
+    },
+    async waitForCount(target: number, timeoutMs = 2_000) {
+      await waitFor(() => started >= target, timeoutMs);
+    },
+    async count() {
+      return started;
+    },
+    release() {
+      release();
+    },
+  };
+}
 
 async function bootCodex(
   t: { after: (fn: () => void) => void },
@@ -386,14 +417,7 @@ async function bootCodex(
   const log = join(dir, 'fake-codex.jsonl');
   const callLog = join(dir, 'fake-codex-calls.jsonl');
   const codexHome = join(dir, 'codex-home');
-  const preflightGate = options.gatedPreflight ? {
-    enable: join(dir, 'preflight-enabled'),
-    started: join(dir, 'preflight-started.log'),
-    release: join(dir, 'preflight-release'),
-    async count() {
-      return readFile(this.started, 'utf8').then((text) => text.split('\n').filter(Boolean).length, () => 0);
-    },
-  } : undefined;
+  const preflightGate = options.gatedPreflight ? createPreflightGate() : undefined;
   await run('git', ['init', '-b', 'main', repo]);
   await run('git', ['config', 'user.email', 't@t.t'], { cwd: repo });
   await run('git', ['config', 'user.name', 'T'], { cwd: repo });
@@ -405,16 +429,8 @@ async function bootCodex(
   const bin = options.bin ?? join(dir, 'recording-codex');
   if (fakeBin) {
     await writeFile(bin, `#!/usr/bin/env node
-const { appendFileSync, existsSync } = require('node:fs');
+const { appendFileSync } = require('node:fs');
 const { spawnSync } = require('node:child_process');
-if (process.argv.includes('--version')
-  && process.env.FAKE_CODEX_PREFLIGHT_ENABLE
-  && existsSync(process.env.FAKE_CODEX_PREFLIGHT_ENABLE)) {
-  appendFileSync(process.env.FAKE_CODEX_PREFLIGHT_STARTED, 'started\\n');
-  while (!existsSync(process.env.FAKE_CODEX_PREFLIGHT_RELEASE)) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-  }
-}
 appendFileSync(process.env.FAKE_CODEX_CALL_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
 const result = spawnSync(${JSON.stringify(fakeBin)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });
 if (result.error) throw result.error;
@@ -433,17 +449,22 @@ process.exit(result.status ?? 1);
     bin,
     env: {
       FAKE_CODEX_LOG: log, FAKE_CODEX_CALL_LOG: callLog, CODEX_HOME: codexHome,
-      ...(preflightGate ? {
-        FAKE_CODEX_PREFLIGHT_ENABLE: preflightGate.enable,
-        FAKE_CODEX_PREFLIGHT_STARTED: preflightGate.started,
-        FAKE_CODEX_PREFLIGHT_RELEASE: preflightGate.release,
-      } : {}),
       ...options.env,
     },
   };
+  const gatedCodexPool = preflightGate ? {
+    async prepare(preparedAccount: Account, transport: CodexTransport) {
+      const armed = preflightGate.enter();
+      if (armed) await preflightGate.wait();
+      if (transport !== 'sdk') throw new Error('gated preflight tests support only the SDK transport');
+      const runtime = await prepareCodexRuntime({ bin: preparedAccount.bin, env: preparedAccount.env });
+      return { adapter: createCodexAdapter(runtime), runtimeVersion: runtime.version };
+    },
+    async close() {},
+  } satisfies Pick<CodexProviderPool, 'prepare' | 'close'> : undefined;
   const server = createServer({
     registry, usage, scheduler: new Scheduler(), accounts: [account],
-    ...(options.codexPool ? { codexPool: options.codexPool } : {}),
+    ...(options.codexPool ? { codexPool: options.codexPool } : gatedCodexPool ? { codexPool: gatedCodexPool } : {}),
     ...(options.resolvePrompt ? { resolvePrompt: options.resolvePrompt } : {}),
     ...(options.beforeWorktreeRemoval ? { beforeWorktreeRemoval: options.beforeWorktreeRemoval } : {}),
   });
@@ -610,15 +631,15 @@ test('invalid-present Codex transport remains non-resumable after save and reloa
 test('stopping a Codex session during gated create preflight cancels its launch', async (t) => {
   const fixture = await bootCodex(t, { gatedPreflight: true });
   const gate = fixture.preflightGate!;
-  await writeFile(gate.enable, 'enabled');
+  gate.enable();
 
   const creation = fixture.command({
     cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'stopped-create', prompt: 'must not launch',
   });
-  await waitFor(() => gate.count().then((count) => count === 1));
+  await gate.waitForCount(1);
   const session = fixture.registry.all().find((candidate) => candidate.branch === 'stopped-create')!;
   assert.equal((await fixture.command({ cmd: 'stop', id: session.id })).status, 200);
-  await writeFile(gate.release, 'release');
+  gate.release();
 
   const response = await creation;
   assert.equal(response.status, 409);
@@ -633,12 +654,12 @@ test('stopping a Codex session during gated create preflight cancels its launch'
 test('deleting a Codex session during gated create preflight prevents an orphaned launch and worktree', async (t) => {
   const fixture = await bootCodex(t, { gatedPreflight: true });
   const gate = fixture.preflightGate!;
-  await writeFile(gate.enable, 'enabled');
+  gate.enable();
 
   const creation = fixture.command({
     cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'deleted-create', prompt: 'must not launch',
   });
-  await waitFor(() => gate.count().then((count) => count === 1));
+  await gate.waitForCount(1);
   const session = fixture.registry.all().find((candidate) => candidate.branch === 'deleted-create')!;
   const deletion = await fixture.command({ cmd: 'delete', id: session.id, removeWorktree: true });
   assert.equal(deletion.status, 200);
@@ -646,7 +667,7 @@ test('deleting a Codex session during gated create preflight prevents an orphane
   assert.equal(session.transcript.some((message) => message.kind === 'user'), false,
     'deleted create must not append its prompt');
   assert.equal(await stat(session.cwd).then(() => true, () => false), false);
-  await writeFile(gate.release, 'release');
+  gate.release();
 
   const response = await creation;
   assert.equal(response.status, 409);
@@ -1152,16 +1173,16 @@ test('concurrent Codex resumes reserve one session before preflight', async (t) 
   await fixture.command({ cmd: 'stop', id: created.id });
   await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
   const gate = fixture.preflightGate!;
-  await writeFile(gate.enable, 'enabled');
+  gate.enable();
 
   const first = fixture.command({ cmd: 'resume', id: created.id, prompt: 'first resume' });
-  await waitFor(() => gate.count().then((count) => count === 1));
+  await gate.waitForCount(1);
   const second = fixture.command({ cmd: 'resume', id: created.id, prompt: 'second resume' });
   const firstObservable = await Promise.race([
     second.then((response) => ({ kind: 'response' as const, response })),
-    waitFor(() => gate.count().then((count) => count === 2), 1_000).then(() => ({ kind: 'two-preflights' as const })),
+    gate.waitForCount(2, 1_000).then(() => ({ kind: 'two-preflights' as const })),
   ]);
-  await writeFile(gate.release, 'release');
+  gate.release();
   const responses = await Promise.all([first, second]);
 
   assert.equal(firstObservable.kind, 'response', 'the duplicate must be rejected before starting another preflight');
@@ -1178,12 +1199,12 @@ test('deleting a Codex session during gated resume prevents its later launch', a
   await fixture.command({ cmd: 'stop', id: created.id });
   await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
   const gate = fixture.preflightGate!;
-  await writeFile(gate.enable, 'enabled');
+  gate.enable();
 
   const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
-  await waitFor(() => gate.count().then((count) => count === 1));
+  await gate.waitForCount(1);
   assert.equal((await fixture.command({ cmd: 'delete', id: created.id })).status, 200);
-  await writeFile(gate.release, 'release');
+  gate.release();
   const response = await resume;
 
   assert.equal(response.status, 409);
@@ -1211,15 +1232,15 @@ test('deleting a Codex worktree during gated resume prevents an orphaned launch'
   await fixture.command({ cmd: 'stop', id: created.id });
   await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
   const gate = fixture.preflightGate!;
-  await writeFile(gate.enable, 'enabled');
+  gate.enable();
 
   const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
-  await waitFor(() => gate.count().then((count) => count === 1));
+  await gate.waitForCount(1);
   const deletion = fixture.command({ cmd: 'delete', id: created.id, removeWorktree: true });
   // Delete is now parked mid-removal. Releasing resume here runs its final guard
   // inside that window — the exact interleaving the old ordering lost.
   await reachedRemoval;
-  await writeFile(gate.release, 'release');
+  gate.release();
   const response = await resume;
   releaseRemoval();
 

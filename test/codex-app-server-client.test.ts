@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -90,7 +90,18 @@ async function waitForMarker(path: string, expectedContent: string, timeoutMs = 
 }
 
 async function waitForFakeChildReady(marker: string): Promise<void> {
-  await waitForFile(marker, 1_500);
+  await waitForFile(marker);
+}
+
+function observePending<T>(promise: Promise<T>): Promise<T> {
+  void promise.catch(() => {});
+  return promise;
+}
+
+async function createReadyMarker(t: { after: (fn: () => Promise<void> | void) => void }, prefix: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), prefix));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  return join(directory, 'ready');
 }
 
 test('correlates out-of-order responses while delivering notifications and colliding server requests', async (t) => {
@@ -124,15 +135,18 @@ test('correlates out-of-order responses while delivering notifications and colli
 
 test('rejects malformed JSON without exposing the output secret', async (t) => {
   const exits: Error[] = [];
+  const ready = await createReadyMarker(t, 'switchboard-client-malformed-');
   const client = clientFor({
     mode: 'malformed',
-    overrides: { PROBE_TOKEN: 'client-secret-value' },
+    overrides: { PROBE_TOKEN: 'client-secret-value', FAKE_APP_SERVER_READY_MARKER: ready },
     onExit: (error) => exits.push(error),
   });
   t.after(() => client.close());
 
+  const request = observePending(client.request('initialize'));
+  await waitForFakeChildReady(ready);
   await rejectsWithin(
-    client.request('initialize'),
+    request,
     1_500,
     (error) => error instanceof Error && /invalid JSON/i.test(error.message) && !error.message.includes('client-secret-value'),
   );
@@ -140,23 +154,65 @@ test('rejects malformed JSON without exposing the output secret', async (t) => {
   assert.equal(exits[0]?.message.includes('client-secret-value'), false);
 });
 
+test('deterministic bootstrap gate waits for child readiness before measuring malformed JSON rejection', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-client-bootstrap-red-'));
+  const entered = join(directory, 'entered');
+  const release = join(directory, 'release');
+  const ready = join(directory, 'ready');
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const client = clientFor({
+    mode: 'malformed',
+    overrides: {
+      FAKE_APP_SERVER_BOOTSTRAP_ENTERED_MARKER: entered,
+      FAKE_APP_SERVER_BOOTSTRAP_RELEASE_MARKER: release,
+      FAKE_APP_SERVER_READY_MARKER: ready,
+    },
+  });
+  t.after(async () => {
+    await writeFile(release, 'release').catch(() => {});
+    await client.close().catch(() => {});
+  });
+
+  const request = observePending(client.request('initialize'));
+  await waitForFile(entered);
+  await writeFile(release, 'release');
+  await waitForFakeChildReady(ready);
+  await rejectsWithin(
+    request,
+    250,
+    (error) => error instanceof Error && /invalid JSON/i.test(error.message),
+  );
+});
+
 test('rejects an unknown response ID', async (t) => {
-  const client = clientFor({ mode: 'unknown-response' });
+  const ready = await createReadyMarker(t, 'switchboard-client-unknown-response-');
+  const client = clientFor({
+    mode: 'unknown-response',
+    overrides: { FAKE_APP_SERVER_READY_MARKER: ready },
+  });
   t.after(() => client.close());
 
+  const request = observePending(client.request('initialize'));
+  await waitForFakeChildReady(ready);
   await rejectsWithin(
-    client.request('initialize'),
+    request,
     1_500,
     (error) => error instanceof Error && /unknown response id/i.test(error.message),
   );
 });
 
 test('settles a request when its input write fails', async (t) => {
-  const client = clientFor({ mode: 'write-failure' });
+  const ready = await createReadyMarker(t, 'switchboard-client-write-failure-');
+  const client = clientFor({
+    mode: 'write-failure',
+    overrides: { FAKE_APP_SERVER_READY_MARKER: ready },
+  });
   t.after(() => client.close());
 
+  const request = observePending(client.request('initialize'));
+  await waitForFakeChildReady(ready);
   await rejectsWithin(
-    client.request('initialize'),
+    request,
     1_500,
     (error) => error instanceof Error && /input closed unexpectedly|exited unexpectedly/i.test(error.message),
   );
@@ -190,15 +246,18 @@ test('times out a request and terminates the child', async (t) => {
 
 test('rejects a pending request when the child exits without exposing stderr', async (t) => {
   const exits: Error[] = [];
+  const ready = await createReadyMarker(t, 'switchboard-client-crash-');
   const client = clientFor({
     mode: 'crash',
-    overrides: { PROBE_TOKEN: 'client-secret-value' },
+    overrides: { PROBE_TOKEN: 'client-secret-value', FAKE_APP_SERVER_READY_MARKER: ready },
     onExit: (error) => exits.push(error),
   });
   t.after(() => client.close());
 
+  const request = observePending(client.request('initialize'));
+  await waitForFakeChildReady(ready);
   await rejectsWithin(
-    client.request('initialize'),
+    request,
     1_500,
     (error) => error instanceof Error && /exited unexpectedly/i.test(error.message) && !error.message.includes('client-secret-value'),
   );
@@ -245,15 +304,17 @@ test('close is idempotent', async () => {
 
 test('close settles a pending request when the child exits cleanly', async (t) => {
   const exits: Error[] = [];
+  const ready = await createReadyMarker(t, 'switchboard-client-pending-close-');
   const client = clientFor({
     mode: 'pending-until-eof',
     requestTimeoutMs: 1_000,
-    overrides: { PROBE_TOKEN: 'client-secret-value' },
+    overrides: { PROBE_TOKEN: 'client-secret-value', FAKE_APP_SERVER_READY_MARKER: ready },
     onExit: (error) => exits.push(error),
   });
   t.after(() => client.close());
 
-  const pending = client.request('initialize');
+  const pending = observePending(client.request('initialize'));
+  await waitForFakeChildReady(ready);
   const rejected = rejectsWithin(
     pending,
     250,

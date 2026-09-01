@@ -709,7 +709,6 @@ test('real app-server request timeout reaches the active route as codex_request_
   const supervisor = new CodexAppServerSupervisor({
     runtime: runtime({ FAKE_APP_SERVER_MODE: 'turn-request-timeout' }),
     verifyContract: async () => {},
-    requestTimeoutMs: 1_000,
   });
   t.after(async () => {
     await supervisor.close();
@@ -720,7 +719,7 @@ test('real app-server request timeout reaches the active route as codex_request_
   createCodexAppServerAdapter(supervisor, 'real-timeout', '0.145.0')
     .start({ cwd, prompt: prompt('time out'), promptId: 'real-timeout', env: {} }, (event) => events.push(event));
 
-  await waitFor(() => events.some((event) => event.type === 'stopped'), 'real request timeout', 3_000);
+  await waitFor(() => events.some((event) => event.type === 'stopped'), 'real request timeout', 7_000);
   assert.deepEqual(events.filter((event) => event.type === 'stopped').map((event) => event.code), [
     'codex_request_timed_out',
   ]);
