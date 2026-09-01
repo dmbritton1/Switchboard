@@ -33,13 +33,23 @@ The successful real no-turn run against the installed `0.145.0` executable repor
 
 ## Deterministic production decision
 
-**Choose SDK-only.**
+**SDK default with explicit account-level app-server opt-in.**
 
-The decision is final for this phase, not unresolved. Version-matched schema generation, initialization, authentication-state reading, and clean shutdown now have successful real no-turn evidence. The required live evidence for vendor-thread continuity and turn lifecycle still does not exist. Under the approved decision rules, absence of an authorized paid/live continuity smoke defaults production to SDK-only.
+This is the current production decision for the opt-in turn-transport phase.
+New Codex sessions remain SDK-owned unless their configured account explicitly
+selects app-server; every session then retains that transport for its lifetime.
+Version-matched schema generation, initialization, authentication-state
+reading, and clean shutdown have successful real no-turn evidence. Paid live
+turn evidence and vendor-thread migration evidence still do not exist, so fake
+evidence does not justify a broader default.
 
-The approval-bridge hybrid is rejected. The prototype does not prove that the SDK and app-server safely share the same vendor thread with one process owner; fixture identifiers cannot supply that proof.
+The approval-bridge hybrid remains rejected. SDK and app-server never share or
+migrate the same vendor thread; fixture identifiers cannot supply that proof.
 
-An app-server replacement is not a production candidate. Although the version-matched stable schema, real no-turn handshake, and offline fixture gates pass, there is no explicitly authorized non-CI live smoke proving new turn, follow-up, resume, cancellation, approvals, and existing vendor-thread continuity. Even if those gates later pass, replacement would require a separate design and implementation plan before any production adapter or transport change.
+An app-server replacement or new-session default cutover is not part of this
+decision. Either would require the later live compatibility gates, a soak
+period, and a separate explicit decision. The current production change is
+limited to the account-level opt-in documented below.
 
 ## Opt-in turn-transport gate
 
