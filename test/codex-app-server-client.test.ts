@@ -159,7 +159,6 @@ test('deterministic bootstrap gate waits for child readiness before measuring ma
   const entered = join(directory, 'entered');
   const release = join(directory, 'release');
   const ready = join(directory, 'ready');
-  t.after(async () => rm(directory, { recursive: true, force: true }));
   const client = clientFor({
     mode: 'malformed',
     overrides: {
@@ -172,16 +171,28 @@ test('deterministic bootstrap gate waits for child readiness before measuring ma
     await writeFile(release, 'release').catch(() => {});
     await client.close().catch(() => {});
   });
+  t.after(async () => rm(directory, { recursive: true, force: true }));
 
   const request = observePending(client.request('initialize'));
   await waitForFile(entered);
+  let behaviorClockStarted = false;
+  let markReadinessWaitEntered!: () => void;
+  const readinessWaitEntered = new Promise<void>((resolve) => { markReadinessWaitEntered = resolve; });
+  const rejection = observePending((async () => {
+    markReadinessWaitEntered();
+    await waitForFakeChildReady(ready);
+    behaviorClockStarted = true;
+    await rejectsWithin(
+      request,
+      250,
+      (error) => error instanceof Error && /invalid JSON/i.test(error.message),
+    );
+  })());
+
+  await readinessWaitEntered;
+  assert.equal(behaviorClockStarted, false, 'the behavior deadline must not start before child readiness');
   await writeFile(release, 'release');
-  await waitForFakeChildReady(ready);
-  await rejectsWithin(
-    request,
-    250,
-    (error) => error instanceof Error && /invalid JSON/i.test(error.message),
-  );
+  await rejection;
 });
 
 test('rejects an unknown response ID', async (t) => {

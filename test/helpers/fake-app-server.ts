@@ -939,11 +939,6 @@ if (mode === 'hang' || mode === 'ignore-term') {
   if (pidFile) writeFileSync(pidFile, String(process.pid));
 }
 
-maybePauseBootstrap();
-
-const readyMarker = process.env.FAKE_APP_SERVER_READY_MARKER;
-if (readyMarker) writeFileSync(readyMarker, 'ready');
-
 const lines = readline.createInterface({ input: process.stdin });
 lines.on('line', (line) => {
   let message: Message;
@@ -963,3 +958,8 @@ lines.on('close', () => {
   }
   if (mode === 'normal' && serverResolvers.size > 0) fail('client closed with unresolved server requests');
 });
+
+maybePauseBootstrap();
+
+const readyMarker = process.env.FAKE_APP_SERVER_READY_MARKER;
+if (readyMarker) writeFileSync(readyMarker, 'ready');
