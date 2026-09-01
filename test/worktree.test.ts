@@ -2,10 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignLanes, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
+import { assignLanes, changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from '../src/worktree.ts';
 
 const run = promisify(execFile);
 
@@ -58,6 +58,40 @@ test('createWorktree rejects a path that is not a git repo', async (t) => {
   await assert.rejects(() => createWorktree(dir, 'x'), /not a git repository/i);
 });
 
+test('createWorktree branches from a given start point instead of repo HEAD', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const first = await createWorktree(repo, 'feat/first');
+  await writeFile(join(first, 'only-on-first.txt'), 'source work\n');
+  await run('git', ['add', '.'], { cwd: first });
+  await run('git', ['commit', '-m', 'work on first'], { cwd: first });
+
+  const second = await createWorktree(repo, 'feat/second', 'feat/first');
+
+  assert.equal(
+    await readFile(join(second, 'only-on-first.txt'), 'utf8'), 'source work\n',
+    'the new worktree should carry the start-point branch\'s commits',
+  );
+  // Exits non-zero when it is not an ancestor, which rejects and fails the test.
+  await run('git', ['merge-base', '--is-ancestor', 'feat/first', 'feat/second'], { cwd: repo });
+});
+
+test('createWorktree still branches from repo HEAD when no start point is given', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const first = await createWorktree(repo, 'feat/a');
+  await writeFile(join(first, 'only-on-a.txt'), 'x\n');
+  await run('git', ['add', '.'], { cwd: first });
+  await run('git', ['commit', '-m', 'work on a'], { cwd: first });
+
+  const second = await createWorktree(repo, 'feat/b');
+
+  await assert.rejects(
+    access(join(second, 'only-on-a.txt')),
+    'omitting the start point must keep branching from HEAD, not from the last worktree',
+  );
+});
+
 test('worktreeStatus reports clean, then dirty with line counts', async (t) => {
   const repo = await makeRepo();
   t.after(() => rm(repo, { recursive: true, force: true }));
@@ -101,6 +135,22 @@ test('worktreeStatus ignores uploads/, which is conversation input, not work', a
   await writeFile(join(wt, 'uploads', 'paste-1-image.png'), 'a\nb\nc\n');
 
   assert.deepEqual(await worktreeStatus(wt), { branch: 'feat/up', added: 0, removed: 0, dirty: false });
+});
+
+test('worktreeStatus ignores a pasted upload, which is conversation input, not work', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/pasted');
+
+  // The name writeContainedUpload actually produces (src/upload.ts): a direct
+  // child of the worktree root, not the `uploads/` directory /upload stopped
+  // using. Counting a screenshot as +N added lines made the card's only
+  // progress indicator report work nobody did.
+  await writeFile(
+    join(wt, '.switchboard-upload-0123456789abcdef0123456789abcdef-shot.png'), 'a\nb\nc\n',
+  );
+
+  assert.deepEqual(await worktreeStatus(wt), { branch: 'feat/pasted', added: 0, removed: 0, dirty: false });
 });
 
 test('assignLanes reuses a lane once a branch has merged back', () => {
@@ -327,4 +377,52 @@ test('worktreeDiff on a clean worktree is an empty list, not a throw', async (t)
   t.after(() => rm(repo, { recursive: true, force: true }));
 
   assert.deepEqual(await worktreeDiff(repo), []);
+});
+
+test('changedPaths unions committed and uncommitted work', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/paths');
+
+  await writeFile(join(wt, 'committed.txt'), 'done\n');
+  await run('git', ['add', '.'], { cwd: wt });
+  await run('git', ['commit', '-m', 'a commit'], { cwd: wt });
+  await writeFile(join(wt, 'dirty.txt'), 'in progress\n');
+  await writeFile(join(wt, 'a.txt'), 'modified\n');
+
+  assert.deepEqual(
+    await changedPaths(wt, 'main'),
+    ['a.txt', 'committed.txt', 'dirty.txt'],
+  );
+});
+
+test('changedPaths excludes conversation inputs', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/inputs');
+
+  await writeFile(join(wt, 'real.txt'), 'work\n');
+  // The name writeContainedUpload actually produces (src/upload.ts) — without
+  // the exclusion every session that ever had a screenshot pasted into it would
+  // register as overlapping with every other one.
+  await writeFile(join(wt, '.switchboard-upload-0123456789abcdef0123456789abcdef-shot.png'), 'png\n');
+  await mkdir(join(wt, '.switchboard'), { recursive: true });
+  await writeFile(join(wt, '.switchboard', 'handoff.md'), '# Handoff\n');
+
+  assert.deepEqual(await changedPaths(wt, 'main'), ['real.txt']);
+});
+
+test('changedPaths skips the committed half when there is no base branch', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const wt = await createWorktree(repo, 'feat/detached');
+
+  await writeFile(join(wt, 'committed.txt'), 'done\n');
+  await run('git', ['add', '.'], { cwd: wt });
+  await run('git', ['commit', '-m', 'a commit'], { cwd: wt });
+  await writeFile(join(wt, 'dirty.txt'), 'in progress\n');
+
+  // A detached base repo yields '' from currentBranch. Degrade to the
+  // uncommitted half rather than failing the whole status response.
+  assert.deepEqual(await changedPaths(wt, ''), ['dirty.txt']);
 });

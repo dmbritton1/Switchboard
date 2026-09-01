@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, couplingBadges, decideSpecs, selectionState, triggerLabel, targetLabel,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
   groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken,
+  mentionMenu, mentionInsert,
   attributeBranches, branchHues, HUES, readTheme, ACCENTS, CANVASES,
   pastedName, composeMessage, diffSummary, patchLineClass,
   transcriptView, detailKey, requestOnce, needsDetailFetch, detailPresentation,
@@ -252,6 +253,29 @@ test('cardAction ignores queue items for other sessions, other kinds, and dead s
   assert.deepEqual(
     cardAction(s, [{ id: 'q', state: 'waiting', trigger: { kind: 'at', time: 1 }, action: { kind: 'resume', sessionId: 'a' } }]),
     { kind: 'resume' }, 'time-triggered, not a reset wait');
+});
+
+test('handoffTargets offers other accounts only for finished or stopped sessions', () => {
+  const accounts = [
+    { name: 'claude-main', provider: 'claude' },
+    { name: 'claude-alt', provider: 'claude' },
+    { name: 'codex', provider: 'codex' },
+  ];
+  const names = (status) =>
+    handoffTargets({ id: 's1', account: 'claude-main', status }, accounts).map((a) => a.name);
+
+  // A running agent's half-written files must not be committed underneath it —
+  // the same rule the handoff command enforces server-side.
+  assert.deepEqual(names('working'), []);
+  assert.deepEqual(names('needs-you'), []);
+  // The source's own account is excluded: handing off to it goes nowhere.
+  assert.deepEqual(names('done'), ['claude-alt', 'codex']);
+  assert.deepEqual(names('stopped'), ['claude-alt', 'codex']);
+});
+
+test('handoffTargets is empty when the only account is the session\'s own', () => {
+  const accounts = [{ name: 'claude-main', provider: 'claude' }];
+  assert.deepEqual(handoffTargets({ id: 's1', account: 'claude-main', status: 'done' }, accounts), []);
 });
 
 test('selectionState labels a single-repo selection with the repo name', () => {
@@ -1482,6 +1506,30 @@ test('a newline ends the command token, for the multi-line new-session prompt', 
   assert.equal(commandMenu('/compact\nthen carry on', 12, CMDS), null);
 });
 
+const SESSIONS = [
+  { id: 's1', branch: 'feat/login', account: 'claude-main', status: 'working', repo: '/r' },
+  { id: 's2', branch: 'feat/auth', account: 'claude-alt', status: 'done', repo: '/r' },
+];
+
+test('the mention menu opens on @ and filters by branch', () => {
+  assert.deepEqual(mentionMenu('@', 1, SESSIONS).matches.length, 2);
+  assert.deepEqual(mentionMenu('ask @log', 8, SESSIONS).matches.map((s) => s.branch), ['feat/login']);
+  assert.equal(mentionMenu('ask @zzz', 8, SESSIONS).matches.length, 0);
+});
+
+test('the mention menu stays shut without an @ under the caret', () => {
+  assert.equal(mentionMenu('plain text', 10, SESSIONS), null);
+  // Past the mention: the caret has moved on to ordinary prose.
+  assert.equal(mentionMenu('@feat/login and then some', 25, SESSIONS), null);
+});
+
+test('a mention inserts text naming what the token is', () => {
+  const inserted = mentionInsert(SESSIONS[0]);
+  assert.match(inserted, /feat\/login/);
+  assert.match(inserted, /send_to_session/,
+    'the agent is told how to reach it rather than left to infer it from an @');
+});
+
 test('readTheme falls back to the default for anything that is not a known pair', () => {
   const dflt = { accent: 'coral', canvas: 'obsidian' };
   assert.deepEqual(readTheme(null), dflt);
@@ -1740,4 +1788,56 @@ test('linkView relabels the cancel control to Dismiss once the link has failed',
     identity: null, suggestedName: null, error: null,
   });
   assert.equal(starting.cancelLabel, 'Cancel sign-in');
+});
+
+test('couplingBadges shows a talking pair as talking, not as a collision', () => {
+  const badges = couplingBadges({
+    talking: [{ id: 'b', branch: 'feat/b' }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 1, files: ['src/auth.ts'] }],
+  });
+
+  assert.match(badges.text, /↔ feat\/b/);
+  assert.doesNotMatch(badges.text, /⚠/, 'a pair that is talking has already coordinated');
+});
+
+test('couplingBadges flags overlap only when the pair is not talking', () => {
+  const badges = couplingBadges({
+    talking: [],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 2, files: ['src/auth.ts', 'src/session.ts'] }],
+  });
+
+  assert.match(badges.text, /⚠ 2 files also in feat\/b/);
+  assert.match(badges.title, /src\/auth\.ts/);
+  assert.match(badges.title, /src\/session\.ts/);
+});
+
+test('couplingBadges reports each pair on its own terms', () => {
+  const badges = couplingBadges({
+    talking: [{ id: 'a', branch: 'feat/a' }],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 1, files: ['src/auth.ts'] }],
+  });
+
+  assert.match(badges.text, /↔ feat\/a/);
+  assert.match(badges.text, /⚠ 1 file also in feat\/b/);
+});
+
+test('couplingBadges is empty when there is nothing to say', () => {
+  assert.deepEqual(couplingBadges({ talking: [], overlapping: [] }), { text: '', title: '' });
+  assert.deepEqual(couplingBadges(null), { text: '', title: '' });
+});
+
+test('couplingBadges reports the true count in the badge text even when the wire list is pre-capped', () => {
+  // /status now caps `files` at MAX_LISTED_PATHS itself and sends the true
+  // total separately as `count` — this is what a 12-file overlap looks like
+  // over the wire, not the un-capped array a client-side cap used to see.
+  const files = Array.from({ length: 10 }, (_, i) => `src/file${i}.ts`);
+  const badges = couplingBadges({
+    talking: [],
+    overlapping: [{ id: 'b', branch: 'feat/b', count: 12, files }],
+  });
+
+  assert.match(badges.text, /⚠ 12 files also in feat\/b/, 'the badge must report the true count, not the capped list length');
+  assert.match(badges.title, /and 2 more/);
+  assert.doesNotMatch(badges.title, /file10\.ts/);
+  assert.doesNotMatch(badges.title, /file11\.ts/);
 });

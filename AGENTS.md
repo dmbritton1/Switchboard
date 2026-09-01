@@ -27,6 +27,9 @@ Registry and git worktrees, then into a provider adapter.
 - `src/link.ts` owns the login child process and the pending-link state machine.
 - `web/` renders browser state and command failures.
 - `test/` covers those boundaries offline.
+- `src/handoff.ts` owns the transcript render and the successor's opening prompt.
+- `src/relay.ts` owns cross-session messaging rules and open-channel state.
+- `src/overlap.ts` owns the changed-path cache and the overlap computation.
 
 ## Safety boundaries
 
@@ -65,6 +68,22 @@ Registry and git worktrees, then into a provider adapter.
   logged, never in the SSE snapshot, never persisted.
 - Link tests must never bind port 1455, open a browser, or spawn a real
   `claude`/`codex` binary.
+- Handoff renders a transcript to disk. Reasoning is never included, and
+  `.switchboard/` is excluded from the outstanding-work commit so a handoff
+  document can never reach a merge target.
+- Relay channels are process-local and keyed by session pair. Never persist them
+  or move them onto `Session`: a channel names two live handles, and a restart
+  forces every session to `stopped`.
+- A relay tool never takes a sender. The sending session's identity comes from
+  the closure the server built in launch(), never from a tool argument.
+- Overlap is advisory. It must never gate a merge, an edit, or a relay, and UI
+  copy must say "also changed in" rather than anything implying a lock.
+- The path cache is process-local and carries its own TTL. That TTL is a rate
+  limit, not a freshness preference: `/status` is polled every four seconds per
+  visible card, and collecting on each call would spawn git hundreds of times a
+  minute.
+- Path collection applies `CONVERSATION_INPUTS`. Without it a pasted upload
+  registers as overlapping work.
 
 ## Test isolation
 

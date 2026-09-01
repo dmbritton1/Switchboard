@@ -115,6 +115,65 @@ credential directory only when it is exactly the one Switchboard created for
 that name (`~/.switchboard/accounts/<name>/`) — a hand-written entry like the
 `claude-alt` one above, pointing at `~/.claude-alt`, is never touched.
 
+"Hand off…" (in a session's menu) moves work to another account. It is offered
+on `done` and `stopped` sessions only — handing off commits the source
+worktree, and a `working` agent's half-written files must not be captured
+underneath it. Pick a target account and a branch name, and Switchboard commits
+whatever the source left outstanding, branches the new session's worktree from
+the source branch, and opens the new session onto
+`.switchboard/handoff.md` — the previous session's prompts, actions and replies,
+rendered to markdown. The successor reads that for itself, so the account being
+handed away from spends nothing; it works when that account is out of budget,
+which is the case handoff exists for.
+
+Reasoning is never written to that file, and `.switchboard/` is excluded from
+the outstanding-work commit the same way pasted uploads are, so a handoff
+document can never reach a merge target. The source session is stopped — Resume still
+works, but leaving it running would let it edit a branch the new session is
+already based on.
+
+A Claude session can message another session on the same repository. It has two
+tools: one lists the sessions it can reach, one sends to a chosen session. A
+relayed message arrives the way a message you type does, so a session mid-turn
+picks it up when that turn ends — and a Codex session can receive one even
+though it cannot yet send.
+
+Approval is per conversation rather than per message. The first send between a
+pair raises the usual approval card showing the target and the message; once you
+allow it, that pair exchanges freely. After ten messages the channel closes
+itself and the next send asks again, which is where you decide whether the
+exchange is still worth what it is spending. Denying leaves it closed.
+
+`auto` means never ask about relays: a session with auto-approve on opens
+channels and carries past checkpoints without a card. That is the one setting
+that removes the loop protection, and an unattended pair spends two accounts
+rather than one.
+
+Typing `@` in the composer lists the other sessions on that repository and
+inserts a short note naming what the session is, so the agent knows the name
+refers to something it can reach. The mention itself sends nothing.
+
+Sessions on one repository are also checked against each other for overlapping
+work. A session's card shows `↔ feat/other` when the two have an open relay
+channel, and `⚠ 3 files also in feat/other` when they have changed the same
+files without one — the second is the one worth looking at, because it is a
+merge conflict that has not happened yet. Hovering names the files, capped at ten
+with "and N more" if there are more; the badge count is the true total. An agent
+learns about overlap through `list_sessions`, which it must call to find out — there
+is no push, injection, or interrupt, so an agent that never calls the tool never learns.
+With that information, a session can see who is in the file it is about to change and
+message just that session rather than all of them.
+
+Overlap counts committed work as well as uncommitted: two sessions that each
+committed a change to the same file have clean worktrees and still collide.
+Pasted uploads and handoff documents are excluded, the same way they are
+excluded from the outstanding-work commit.
+
+It is advisory and nothing more. It never blocks a merge, never refuses an edit,
+and never claims a file — it is "also changed in", not "locked by". The paths are
+recollected at most every thirty seconds per session, so a badge can lag a change
+by that much, and can briefly show on one side of a pair before the other.
+
 `accounts.json` and `state.json` are both gitignored. The app writes to
 `state.json` next to the server on every command and, coalesced to at most one
 write every two seconds, on any other state change — so a session that runs to

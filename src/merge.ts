@@ -22,12 +22,35 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * `uploads/` is excluded for the same reason the add below excludes it: those
- * files are conversation inputs, not work. Counting them as dirty would ask
- * for a commit that then stages nothing and fails on "nothing to commit".
+ * Paths that are inputs to the conversation rather than the agent's work, and so
+ * are kept out of every git view and every auto-commit: the files `/upload`
+ * drops for the agent to read by path, and the handoff document a successor
+ * session is pointed at. Counting them makes a card report work nobody did, and
+ * staging them commits every screenshot into the branch and then permanently
+ * into the merge target.
+ *
+ * One exported list because it used to be six inline copies across this file and
+ * worktree.ts, and they drifted: `.switchboard` was added here and not there,
+ * and `uploads` went stale everywhere. /upload has not written `uploads/` since
+ * writeContainedUpload landed — it writes `.switchboard-upload-<uuid>-<name>` as
+ * a direct child of the worktree root (upload.ts) — so the exclusion silently
+ * stopped matching and pasted files were being committed again. `uploads` stays
+ * for worktrees created before that change.
+ *
+ * ponytail: excludes by name pattern, so a repo tracking its own file that
+ * matches one of these loses auto-commit for it. Narrow to the paths the
+ * registry recorded if that ever bites.
  */
+export const CONVERSATION_INPUTS = [
+  ':(exclude)uploads',
+  ':(exclude).switchboard-upload-*',
+  ':(exclude).switchboard',
+];
+
 async function isDirty(cwd: string): Promise<boolean> {
-  const { stdout } = await run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd });
+  const { stdout } = await run(
+    'git', ['status', '--porcelain', '--', '.', ...CONVERSATION_INPUTS], { cwd },
+  );
   return stdout.trim().length > 0;
 }
 
@@ -50,6 +73,19 @@ async function isRepoDirty(repo: string): Promise<boolean> {
 export async function currentBranch(cwd: string): Promise<string> {
   const { stdout } = await run('git', ['branch', '--show-current'], { cwd });
   return stdout.trim();
+}
+
+/**
+ * Commits everything outstanding in one worktree, so a branch point or a merge
+ * sees the agent's work rather than the last explicit commit. A clean worktree
+ * is a no-op. Throws on git failure; callers frame the message.
+ *
+ * What it leaves alone is CONVERSATION_INPUTS; see there for why.
+ */
+export async function commitOutstanding(cwd: string, branch: string): Promise<void> {
+  if (!(await isDirty(cwd))) return;
+  await run('git', ['add', '-A', '--', '.', ...CONVERSATION_INPUTS], { cwd });
+  await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
 }
 
 export type MergeResult =
@@ -93,20 +129,10 @@ export async function mergeWorktrees(
       if (branch === target) {
         return { ok: false, merged, error: `"${branch}" is already ${repo}'s checked-out branch` };
       }
-      if (await isDirty(cwd)) {
-        try {
-          // `uploads/` is where /upload drops pasted and attached files so the
-          // agent can read them by path. They are inputs to the conversation,
-          // not work product, and staging them here committed every screenshot
-          // into the branch and then permanently into the merge target.
-          // ponytail: excludes the whole directory, so a repo that tracks its
-          // own `uploads/` loses auto-commit for it. Narrow to the paths the
-          // registry recorded if that ever bites.
-          await run('git', ['add', '-A', '--', '.', ':(exclude)uploads'], { cwd });
-          await run('git', ['commit', '-m', `Switchboard: outstanding changes on ${branch}`], { cwd });
-        } catch (err) {
-          return { ok: false, merged, error: `committing "${branch}" failed: ${errMsg(err)}` };
-        }
+      try {
+        await commitOutstanding(cwd, branch);
+      } catch (err) {
+        return { ok: false, merged, error: `committing "${branch}" failed: ${errMsg(err)}` };
       }
       try {
         await run(

@@ -2,9 +2,18 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { readFile } from 'node:fs/promises';
 import {
-  normalizeClaude, approvalQueue, probeLimits, questionOptions, renderClaudePrompt, resultText,
+  normalizeClaude, approvalQueue, probeLimits, questionOptions, relayDecision, renderClaudePrompt, resultText,
+  summarize,
 } from '../src/agents/claude.ts';
+import { relayServer } from '../src/agents/relay-tools.ts';
 import type { AdapterEvent } from '../src/types.ts';
+// Only route to genuinely list what an SdkMcpServer registers: `_registeredTools`
+// on the MCP SDK's McpServer is private, so the supported way to enumerate tools
+// is the protocol itself — connect a real client over an in-memory transport and
+// ask. Both classes are public API of @modelcontextprotocol/sdk, the same
+// transitive dependency relay-tools.ts already reaches past for zod.
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 const fixture = JSON.parse(
   await readFile(new URL('./fixtures/claude-basic.json', import.meta.url), 'utf8'),
@@ -404,4 +413,110 @@ test('init reports the CLI slash commands, and only when there are some', () => 
   for (const absent of [init, { ...init, slash_commands: [] }, { ...init, slash_commands: 'nope' }]) {
     assert.deepEqual(normalizeClaude(absent as never), [{ type: 'vendor-session-id', id: 's1' }]);
   }
+});
+
+test('the approval card names the target and the message', () => {
+  assert.equal(
+    summarize('mcp__relay__send_to_session', { session: 'feat/login', text: 'auth moved' }),
+    '→ feat/login: auth moved',
+  );
+});
+
+test('a relay summary survives a missing field', () => {
+  assert.equal(summarize('mcp__relay__send_to_session', {}), 'mcp__relay__send_to_session');
+});
+
+test('a relay summary is clamped so an agent-authored body cannot blow up the card', () => {
+  const long = 'x'.repeat(500);
+  const summary = summarize('mcp__relay__send_to_session', { session: 'feat/login', text: long });
+  assert.ok(summary.length < 450, `expected a clamped summary, got ${summary.length} chars`);
+  assert.ok(summary.endsWith('…'), 'a truncated summary must say so');
+
+  // Short bodies are untouched — the clamp must not touch the other branches
+  // or a normal-length relay.
+  const short = summarize('mcp__relay__send_to_session', { session: 'feat/login', text: 'auth moved' });
+  assert.equal(short, '→ feat/login: auth moved');
+});
+
+test('relayDecision: an open gate allows regardless of auto', () => {
+  assert.equal(relayDecision({ ask: false }, false, false), 'allow');
+  assert.equal(relayDecision({ ask: false }, true, false), 'allow');
+});
+
+test('relayDecision: a gate that asks still allows silently under auto — that is what auto means for relays', () => {
+  assert.equal(relayDecision({ ask: true }, true, false), 'allow');
+});
+
+test('relayDecision: a gate that asks with auto off asks', () => {
+  assert.equal(relayDecision({ ask: true }, false, false), 'ask');
+});
+
+test('relayDecision: no gate falls through to the ordinary auto && !isQuestion rule, unchanged', () => {
+  assert.equal(relayDecision(null, true, false), 'allow');
+  assert.equal(relayDecision(null, true, true), 'ask', 'a question is exempt from auto even with no gate');
+  assert.equal(relayDecision(null, false, false), 'ask');
+});
+
+test('relayServer exposes exactly the two relay tools', async () => {
+  const server = relayServer({ sessions: () => [], send: () => ({ ok: true, queued: false }) });
+  assert.equal(server.name, 'relay');
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+  const { tools } = await client.listTools();
+  assert.deepEqual(
+    tools.map((t) => t.name).sort(),
+    ['list_sessions', 'send_to_session'],
+  );
+});
+
+test('list_sessions renders branch, status, account, id, and any shared files per row', async () => {
+  const rows = [
+    {
+      id: 'sess-b', branch: 'feat/b', account: 'claude-alt', status: 'working',
+      files: ['src/auth.ts', 'src/session.ts'],
+    },
+    { id: 'sess-c', branch: 'feat/c', account: 'claude-main', status: 'done', files: [] },
+  ];
+  const server = relayServer({ sessions: async () => rows, send: () => ({ ok: true, queued: false }) });
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+
+  const result = await client.callTool({ name: 'list_sessions', arguments: {} });
+  const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+  const lines = text.split('\n');
+
+  assert.equal(
+    lines[0],
+    'feat/b — working, on account claude-alt (id sess-b) — also changed src/auth.ts, src/session.ts',
+  );
+  assert.equal(
+    lines[1],
+    'feat/c — done, on account claude-main (id sess-c)',
+    'a sibling with no shared paths gets no "also changed" tail',
+  );
+});
+
+test('list_sessions reports there are no other sessions rather than an empty body', async () => {
+  const server = relayServer({ sessions: async () => [], send: () => ({ ok: true, queued: false }) });
+
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 'test-client', version: '0.0.0' });
+  await Promise.all([
+    server.instance.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+
+  const result = await client.callTool({ name: 'list_sessions', arguments: {} });
+  const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+  assert.equal(text, 'No other sessions on this repository.');
 });

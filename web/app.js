@@ -1,5 +1,5 @@
 import {
-  sortSessions, visibleSessions, cardAction, decideSpecs, selectionState, triggerLabel, targetLabel,
+  sortSessions, visibleSessions, cardAction, handoffTargets, couplingBadges, decideSpecs, selectionState, triggerLabel, targetLabel,
   postCommand, commandFailure, retainedSessionError, commandErrorText, CODEX_FAILURE_LABEL,
   transcriptView, requestOnce, fetchToolDetail,
   createDetailController, changeDetailSession, setDetailExpanded,
@@ -11,7 +11,8 @@ import {
   beginAttachmentSend, completeAttachmentSend,
   codexSettingsFromForm, codexSettingsSummary, usageLines,
   accountView, freestAccount, resetScheduleView, usageWindowLine, newlyNotifiable, linkView,
-  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, attributeBranches, branchHues,
+  groupTranscript, toolRunLabel, resultMeta, promptFold, commandMenu, commandToken, mentionMenu, mentionInsert,
+  attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
 
@@ -451,6 +452,19 @@ let forceDiffFetch = false;
 // than teaching renderDiffPane() to also feed a consumer it doesn't know about.
 let sidebarDiffFor = null;
 let sidebarDiffText = '';
+// Cached beside the text and restored with it: #sidebar-diffstat is rewritten on
+// every render (see below), so a title set only by the poll would outlive the
+// session it describes and hang the previous session's file list on the next one.
+let sidebarDiffTitle = '';
+
+/** The element is written from three places; keeping them in one function is
+ *  what stops a title outliving the text it belongs to. */
+function applySidebarDiff(text, title) {
+  const el = $('#sidebar-diffstat');
+  el.textContent = text;
+  if (title) el.title = title;
+  else el.removeAttribute('title');
+}
 
 function pollSidebarDiff() {
   if (!openId) return;
@@ -458,8 +472,12 @@ function pollSidebarDiff() {
   fetch(`/status?id=${id}`).then((r) => r.json()).then((d) => {
     if (openId !== id) return; // switched or closed while the request was in flight
     sidebarDiffFor = id;
-    sidebarDiffText = d ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}` : '';
-    $('#sidebar-diffstat').textContent = sidebarDiffText;
+    const badges = d ? couplingBadges(d) : { text: '', title: '' };
+    sidebarDiffText = d
+      ? `+${d.added} −${d.removed} · ${d.dirty ? 'dirty' : 'clean'}${badges.text ? ` · ${badges.text}` : ''}`
+      : '';
+    sidebarDiffTitle = badges.title;
+    applySidebarDiff(sidebarDiffText, sidebarDiffTitle);
   }).catch(() => {});
 }
 setInterval(pollSidebarDiff, STATUS_THROTTLE_MS);
@@ -703,6 +721,10 @@ function overflowMenu(s) {
   if (s.status === 'working' || s.status === 'needs-you') {
     menu.append(menuItem('Stop', async () => { await runSessionCommand({ cmd: 'stop', id: s.id }); }));
   }
+  const handoffAccounts = handoffTargets(s, state.accounts);
+  if (handoffAccounts.length) {
+    menu.append(menuItem('Hand off…', () => openHandoff(s, handoffAccounts)));
+  }
   menu.append(
     menuItem('Graph', () => openTab(s.id, 'graph')),
     menuItem('Copy worktree path', () => navigator.clipboard?.writeText(s.cwd)),
@@ -721,6 +743,48 @@ function confirmDelete(s) {
   dialog.dataset.id = s.id;
   dialog.showModal();
 }
+
+let handoffSource = null;
+
+function openHandoff(s, targets) {
+  const dialog = $('#handoff');
+  $('#handoff-from').textContent = `From ${s.branch} on ${s.account}`;
+  $('#handoff-error').textContent = '';
+  $('#handoff-branch').value = state.settings.branchPrefix;
+  $('#handoff-account').replaceChildren(...targets.map((a) => {
+    const o = document.createElement('option');
+    o.value = a.name;
+    o.textContent = a.name;
+    return o;
+  }));
+  dialog.returnValue = '';
+  handoffSource = s.id;
+  dialog.showModal();
+}
+
+$('#handoff').addEventListener('close', async (e) => {
+  const dialog = e.target;
+  // Consumed here for the same reason #new consumes its own: Escape closes a
+  // dialog without setting returnValue, so an unconsumed 'handoff' would make
+  // the next Escape re-POST a still-populated form — an unintended worktree and
+  // a paid agent launch from a keypress that means "cancel".
+  const go = dialog.returnValue === 'handoff';
+  dialog.returnValue = '';
+  if (!go || !handoffSource) return;
+  const result = await postCommand({
+    cmd: 'handoff',
+    id: handoffSource,
+    account: $('#handoff-account').value,
+    branch: $('#handoff-branch').value,
+  });
+  if (!result.ok) {
+    $('#handoff-error').textContent = commandFailure(result);
+    dialog.showModal();
+    return;
+  }
+  handoffSource = null;
+  render();
+});
 
 function openCodexSettings(s) {
   const dialog = $('#codex-settings-dialog');
@@ -877,7 +941,12 @@ function card(s, fetchStatus) {
     fetch(`/status?id=${s.id}`).then((r) => r.json()).then((data) => {
       if (!data) return;
       const live = document.querySelector(`.card[data-id="${s.id}"] > .wt`);
-      if (live) live.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`;
+      if (!live) return;
+      const badges = couplingBadges(data);
+      live.textContent = `+${data.added} −${data.removed} · ${data.dirty ? 'dirty' : 'clean'}`
+        + (badges.text ? ` · ${badges.text}` : '');
+      if (badges.title) live.title = badges.title;
+      else live.removeAttribute('title');
     }).catch(() => {});
   }
 
@@ -1016,7 +1085,8 @@ function openTab(id, which) {
   // left. Carried over, the cache would suppress the first render of the new
   // session's diff whenever the two happened to be byte-identical.
   if (switching) {
-    sidebarDiffFor = null; sidebarDiffText = ''; diffOpen.clear(); lastDiffText = '';
+    sidebarDiffFor = null; sidebarDiffText = ''; sidebarDiffTitle = '';
+    diffOpen.clear(); lastDiffText = '';
     pollSidebarDiff();
   }
 }
@@ -1095,7 +1165,8 @@ function renderSession() {
   // snapshot, the 30s timer) doesn't need to trigger a fetch of its own — it
   // only needs to make sure a session switch doesn't show the previous
   // session's leftover number for the instant before the next poll lands.
-  $('#sidebar-diffstat').textContent = sidebarDiffFor === s.id ? sidebarDiffText : '';
+  const mine = sidebarDiffFor === s.id;
+  applySidebarDiff(mine ? sidebarDiffText : '', mine ? sidebarDiffTitle : '');
   renderSidebarAccount(s);
   renderSidebarSwitch(s);
 
@@ -1714,11 +1785,23 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   let index = 0;
 
   function close() {
+    // Cheap early-out for the common case, and makes the guard below obvious:
+    // an already-closed menu still needs no work.
+    if (menu.hidden) return;
     matches = [];
     menu.hidden = true;
     menu.replaceChildren();
-    field.setAttribute('aria-expanded', 'false');
-    field.removeAttribute('aria-activedescendant');
+    // Only surrender the field's ARIA state if it currently describes THIS
+    // menu. #prompt is shared with wireMentionMenu, so a menu that closes in
+    // the same event another opens must not clear attributes the other just
+    // set — and which of the two runs last is an accident of registration
+    // order, not something to depend on. Delimiter-aware (`${ids}-`, not
+    // bare `ids`) so a future id namespace that happens to start with this
+    // one's text can't match by the same kind of accident.
+    if ((field.getAttribute('aria-activedescendant') ?? '').startsWith(`${ids}-`)) {
+      field.setAttribute('aria-expanded', 'false');
+      field.removeAttribute('aria-activedescendant');
+    }
   }
 
   /**
@@ -1842,6 +1925,97 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   return paint;
 }
 
+/**
+ * Session autocomplete for the chat composer.
+ *
+ * A sibling of wireCommandMenu rather than a second mode inside it. The two
+ * menus share a shape but nothing else, and folding them together would mean
+ * editing a working, untested closure to add a case — where a mistake breaks
+ * slash commands silently, since no test loads this file.
+ *
+ * `sessions()` is supplied by the caller because this factory must not know how
+ * the grid stores state; it returns the sessions the open one may mention.
+ */
+function wireMentionMenu({ field, menu, ids, sessions }) {
+  let matches = [];
+  let index = 0;
+
+  function close() {
+    // Same ownership guard as wireCommandMenu's close() — see its comment.
+    if (menu.hidden) return;
+    menu.hidden = true;
+    matches = [];
+    if ((field.getAttribute('aria-activedescendant') ?? '').startsWith(`${ids}-`)) {
+      field.removeAttribute('aria-activedescendant');
+      field.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  function highlight() {
+    [...menu.children].forEach((li, i) => li.setAttribute('aria-selected', String(i === index)));
+    field.setAttribute('aria-activedescendant', `${ids}-${index}`);
+    menu.children[index]?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function apply(session) {
+    const caret = field.selectionStart ?? 0;
+    const at = field.value.slice(0, caret).lastIndexOf('@');
+    const inserted = mentionInsert(session);
+    field.value = field.value.slice(0, at) + inserted + field.value.slice(caret);
+    const end = at + inserted.length;
+    field.setSelectionRange(end, end);
+    growPrompt();
+    close();
+    field.focus();
+  }
+
+  function render() {
+    const found = mentionMenu(field.value, field.selectionStart ?? 0, sessions());
+    if (!found || !found.matches.length) { close(); return; }
+    // Only reset the highlight when the list itself changed, so a caret move
+    // does not throw away an arrow-key selection.
+    const keys = found.matches.map((m) => m.id).join('\n');
+    if (keys !== matches.map((m) => m.id).join('\n')) index = 0;
+    matches = found.matches;
+
+    menu.replaceChildren(...matches.map((session, i) => {
+      const li = document.createElement('li');
+      li.id = `${ids}-${i}`;
+      li.setAttribute('role', 'option');
+      const account = document.createElement('span');
+      account.className = 'ns';
+      account.textContent = ` ${session.account}`;
+      li.append(`@${session.branch}`, account);
+      // mousedown, not click: preventDefault keeps focus in the field so the
+      // menu never races its own blur handler.
+      li.addEventListener('mousedown', (e) => { e.preventDefault(); apply(session); });
+      return li;
+    }));
+    menu.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    highlight();
+  }
+
+  for (const evt of ['input', 'click', 'keyup']) field.addEventListener(evt, render);
+  field.addEventListener('blur', close);
+
+  field.addEventListener('keydown', (e) => {
+    if (!matches.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      index = (index + (e.key === 'ArrowDown' ? 1 : -1) + matches.length) % matches.length;
+      highlight();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      apply(matches[index]);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+}
+
 const paintMirror = wireCommandMenu({
   field: $('#prompt'), box: $('#prompt-box'), mirror: $('#prompt-mirror'),
   menu: $('#cmd-menu'), ids: 'cmd-opt',
@@ -1850,6 +2024,18 @@ const paintMirror = wireCommandMenu({
 const paintNewMirror = wireCommandMenu({
   field: $('#prompt-input'), box: $('#new-prompt-box'), mirror: $('#new-prompt-mirror'),
   menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
+});
+
+// Only the chat composer gets this: the new-session prompt has no open
+// session yet, so there is nothing for `@` to be relative to there.
+wireMentionMenu({
+  field: $('#prompt'), menu: $('#mention-menu'), ids: 'mention-opt',
+  sessions: () => {
+    const open = state.sessions.find((x) => x.id === openId);
+    return open
+      ? state.sessions.filter((x) => x.id !== open.id && x.repo === open.repo)
+      : [];
+  },
 });
 
 /**

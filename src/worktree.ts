@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, stat as fsStat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { currentBranch } from './merge.ts';
+import { CONVERSATION_INPUTS, currentBranch } from './merge.ts';
 
 const run = promisify(execFile);
 
@@ -11,7 +11,12 @@ function slug(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-export async function createWorktree(repo: string, branch: string): Promise<string> {
+/**
+ * `from` is a commit-ish the new branch starts at, rather than the repo's
+ * current HEAD. Handoff passes the source session's branch so the successor
+ * inherits its work; every other caller wants HEAD and omits it.
+ */
+export async function createWorktree(repo: string, branch: string, from?: string): Promise<string> {
   try {
     await run('git', ['rev-parse', '--git-dir'], { cwd: repo });
   } catch {
@@ -20,7 +25,7 @@ export async function createWorktree(repo: string, branch: string): Promise<stri
 
   const path = join(repo, '.claude', 'worktrees', slug(branch));
   try {
-    await run('git', ['worktree', 'add', '-b', branch, path], { cwd: repo });
+    await run('git', ['worktree', 'add', '-b', branch, path, ...(from ? [from] : [])], { cwd: repo });
   } catch (err) {
     const msg = String((err as { stderr?: string }).stderr ?? err);
     if (/already exists/i.test(msg)) throw new Error(`branch already exists: ${branch}`);
@@ -192,14 +197,14 @@ async function readUntracked(
 export async function worktreeStatus(cwd: string): Promise<{
   branch: string; added: number; removed: number; dirty: boolean;
 }> {
+  // Excluded from all three: counting a pasted screenshot as +N added lines made
+  // the card's progress indicator report work nobody did.
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
   const [branch, stat, porcelain, others] = await Promise.all([
     run('git', ['branch', '--show-current'], { cwd }),
-    // `uploads/` is excluded from all three: /upload drops pasted and attached files
-    // there for the agent to read, and counting a screenshot as +N added lines
-    // made the card's progress indicator report work nobody did.
-    run('git', ['diff', 'HEAD', '--numstat', '--', '.', ':!uploads'], { cwd }),
-    run('git', ['status', '--porcelain', '--', '.', ':!uploads'], { cwd }),
-    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
+    run('git', ['diff', 'HEAD', '--numstat', ...SPEC], { cwd }),
+    run('git', ['status', '--porcelain', ...SPEC], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
   ]);
 
   let added = 0;
@@ -227,6 +232,35 @@ export async function worktreeStatus(cwd: string): Promise<{
     removed,
     dirty: porcelain.stdout.trim().length > 0,
   };
+}
+
+/**
+ * Every path this session has changed relative to `base`, committed work and
+ * uncommitted work together.
+ *
+ * The committed half is not optional: two sessions that each committed a change
+ * to one file have clean worktrees and still collide at merge, which is the
+ * collision most worth warning about and the one a dirty-file check misses.
+ *
+ * `base` is a branch name — the base repo's currently checked-out branch, which
+ * is what mergeWorktrees merges into. An empty string means the base repo is on
+ * a detached HEAD; the committed half is skipped rather than failing, because a
+ * partial advisory signal beats none.
+ */
+export async function changedPaths(cwd: string, base: string): Promise<string[]> {
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
+  const [tracked, untracked, committed] = await Promise.all([
+    run('git', ['diff', 'HEAD', '--name-only', '-z', ...SPEC], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
+    base
+      ? run('git', ['diff', '--name-only', '-z', `${base}...HEAD`, ...SPEC], { cwd })
+      : Promise.resolve({ stdout: '' }),
+  ]);
+  const paths = new Set<string>();
+  for (const out of [tracked.stdout, untracked.stdout, committed.stdout]) {
+    for (const rel of out.split('\0')) if (rel) paths.add(rel);
+  }
+  return [...paths].sort();
 }
 
 export type FileDiff = {
@@ -298,7 +332,7 @@ function parseNumstat(stdout: string): Omit<FileDiff, 'patch' | 'truncated'>[] {
  * that measured a different range would look like a bug rather than a feature.
  */
 export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
-  const SPEC = ['--', '.', ':!uploads'];
+  const SPEC = ['--', '.', ...CONVERSATION_INPUTS];
   const [numstat, patch, others] = await Promise.all([
     // quotePath=false keeps a non-ASCII path readable in the patch headers, which
     // is what the sanity check below matches against.
@@ -311,7 +345,7 @@ export async function worktreeDiff(cwd: string): Promise<FileDiff[]> {
       ['-c', 'core.quotePath=false', 'diff', 'HEAD', '--patch', '--no-color', '--no-ext-diff', ...SPEC],
       { cwd, maxBuffer: 32 * 1024 * 1024 },
     ).catch(() => ({ stdout: '' })),
-    run('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude)uploads'], { cwd }),
+    run('git', ['ls-files', '--others', '--exclude-standard', '-z', ...SPEC], { cwd }),
   ]);
 
   const rows = parseNumstat(numstat.stdout);

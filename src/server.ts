@@ -1,25 +1,30 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Server } from 'node:http';
-import { readFile, readdir, rm, stat, lstat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, lstat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
-import { join, extname, basename, resolve } from 'node:path';
+import { join, extname, basename, resolve, dirname } from 'node:path';
 import { Registry } from './sessions.ts';
 import { Usage } from './usage.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from './account-limits.ts';
 import { Scheduler } from './schedule.ts';
-import { commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
-import { mergeWorktrees, pushRepo } from './merge.ts';
+import { changedPaths, commitGraph, createWorktree, worktreeDiff, worktreeStatus } from './worktree.ts';
+import { commitOutstanding, currentBranch, mergeWorktrees, pushRepo } from './merge.ts';
+import { dropPaths, MAX_LISTED_PATHS, overlaps, refreshPaths, type PathCache } from './overlap.ts';
+import { HANDOFF_FILE, HANDOFF_PROMPT, renderHandoff } from './handoff.ts';
 import { claudeAdapter, probeLimits } from './agents/claude.ts';
 import { createCodexAdapter } from './agents/codex.ts';
 import { CodexProviderPool, type CodexTransport } from './agents/codex-provider.ts';
 import { validateCodexSettings } from './agents/codex-settings.ts';
 import { safeCodexDetail } from './agents/codex-detail.ts';
 import { resolveAgentPrompt } from './prompt-input.ts';
+import {
+  channelKey, channelOpen, dropChannels, dropSeen, relay, RELAY_CHECKPOINT, type Channels,
+} from './relay.ts';
 import { UploadChangedError, writeContainedUpload } from './upload.ts';
 import {
-  CodexRuntimeError, prepareCodexRuntime, redactValues,
+  CodexRuntimeError, prepareCodexRuntime, redactCodexText, redactValues,
 } from './agents/codex-runtime.ts';
 import {
   createAccountStore, loadAccounts, ACCOUNT_NAME_RE, type Account, type AccountStore,
@@ -470,6 +475,27 @@ export function createServer(opts: {
   const prepare = injectedPrepare ?? prepareProvider;
   const handles = new Map<string, AgentHandle>();
   const createReservations = new Map<string, symbol>();
+  // Process-local like the handle map, and for the same reason: a channel names
+  // two live sessions, and Registry.load forces every session to `stopped` on
+  // start, so none could survive a restart in a usable form.
+  const channels: Channels = new Map();
+  // Pairs that have talked before, so the card can say which question it is
+  // asking. Never cleared on checkpoint, only when a session goes away.
+  const seenChannels = new Set<string>();
+  // Paths each session has changed, with the time they were collected. Process-
+  // local like the channel maps, and for the same reason — this describes live
+  // worktrees, and Registry.load forces every session to `stopped` on start.
+  const paths: PathCache = new Map();
+  // Pairs related by handoff — the successor's branch point is the source's own
+  // branch, so they share every committed path and would otherwise land in the
+  // silent (unwarned-collision) bucket and cry wolf on a pair that shares
+  // history rather than colliding. Process-local, same lifecycle as the other
+  // maps: a restart loses it and a handed-off pair can show a false warning
+  // again until one side changes something. A `git merge-base --is-ancestor`
+  // check would survive a restart and be correct instead of remembered, but it
+  // is a git call per pair against an O(n^2) pairing — bookkeeping was chosen
+  // over that cost, not missed.
+  const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
 
   async function prepareForSession(account: Account, session: Session): Promise<PreparedProvider> {
@@ -587,8 +613,58 @@ export function createServer(opts: {
     const session = registry.get(sessionId);
     const auto = session?.auto ?? false;
     const codexSettings = session?.codexSettings;
+    // The tool schema and the @ mention both hand the model a branch, not an id
+    // — but relay() and the channel map key on id. Resolve here, once, so the
+    // gate and the send agree on the same canonical key: an exact id match
+    // first (deterministic even if a branch name is ever ambiguous), then a
+    // same-repo branch lookup, then the raw target unchanged so relay() can
+    // still report unknown-session on genuine nonsense.
+    const resolve = (target: string) => registry.all()
+      .find((s) => s.id === target || (s.repo === session?.repo && s.branch === target))?.id ?? target;
     try {
-      const handle = adapter.start({ cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings }, (e) => {
+      const handle = adapter.start({
+        cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings,
+        relay: (target, text) => {
+          const to = resolve(target);
+          const result = relay({ registry, handles, channels }, sessionId, to, redactCodexText(text, account.env));
+          if (result.ok) seenChannels.add(channelKey(sessionId, to));
+          return result;
+        },
+        relayGate: (target) => {
+          const to = resolve(target);
+          if (channelOpen(channels, sessionId, to)) return { ask: false };
+          return seenChannels.has(channelKey(sessionId, to))
+            ? { ask: true, note: `${RELAY_CHECKPOINT} messages exchanged — continue?` }
+            : { ask: true };
+        },
+        relaySessions: async () => {
+          // `session` is read once at launch; without it there is no repo to scope
+          // by and currentBranch would run against the server's own cwd.
+          if (!session) return [];
+          const siblings = registry.all().filter((s) => s.id !== sessionId && s.repo === session.repo);
+          // Agents call this rarely, and a tool that reports no overlap because
+          // nobody happened to open the card is a tool that quietly lies. Refresh
+          // anything stale — refreshPaths skips whatever is already fresh.
+          const base = await currentBranch(session.repo).catch(() => '');
+          const now = Date.now();
+          // In parallel, not a sequential loop: each refreshPaths is three git
+          // invocations, so N sessions serialized is N round trips the agent
+          // waits through for no benefit. refreshPaths is per-key and never
+          // throws, so concurrent calls cannot interfere.
+          await Promise.all(
+            [...siblings, session].map((s) => refreshPaths(paths, s.id, () => changedPaths(s.cwd, base), now)),
+          );
+          const shared = new Map(
+            overlaps(paths, sessionId, siblings.map((s) => ({ id: s.id, branch: s.branch })))
+              .filter((o) => !lineage.has(channelKey(sessionId, o.id)))
+              .map((o) => [o.id, o.files]),
+          );
+          return siblings.map((s) => ({
+            id: s.id, branch: s.branch, account: s.account, status: s.status,
+            files: shared.get(s.id) ?? [],
+          }));
+        },
+      }, (e) => {
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {
           // Optional Codex breakdowns are informational subsets, not account pace.
@@ -826,6 +902,99 @@ export function createServer(opts: {
         }
       }
 
+      case 'handoff': {
+        const source = registry.get(String(body.id));
+        if (!source) return { status: 404, json: { error: 'no such session' } };
+        // The same guard merge applies, for the same reason: a running agent's
+        // half-written files must not be committed underneath it.
+        if (source.status === 'working' || source.status === 'needs-you') {
+          return { status: 409, json: { error: 'stop the session before handing it off' } };
+        }
+        const account = accounts.find((a) => a.name === body.account);
+        if (!account) return { status: 400, json: { error: `unknown account: ${body.account}` } };
+        try {
+          await commitOutstanding(source.cwd, source.branch);
+        } catch (err) {
+          return {
+            status: 400,
+            json: { error: `committing "${source.branch}" failed: ${(err as Error).message}` },
+          };
+        }
+        const branch = String(body.branch);
+        let cwd: string;
+        try {
+          cwd = await createWorktree(source.repo, branch, source.branch);
+        } catch (err) {
+          return { status: 400, json: { error: (err as Error).message } };
+        }
+        try {
+          await mkdir(join(cwd, dirname(HANDOFF_FILE)), { recursive: true });
+          // Load-bearing, not incidental: this ignores the whole directory for
+          // git status/diff/add, not just commits. Without it the handoff file
+          // (deliberately never committed) reads as untracked "+N added" work on
+          // every /status poll for the life of the session, shows up as a fake
+          // diff, and — since a pathspec exclusion only stops *this* commit, not
+          // whatever the successor runs later — is one `git add -A` away from
+          // landing in a merge target.
+          await writeFile(join(cwd, dirname(HANDOFF_FILE), '.gitignore'), '*\n', 'utf8');
+          await writeFile(join(cwd, HANDOFF_FILE), renderHandoff(source), 'utf8');
+        } catch (err) {
+          // The worktree is left behind, exactly as `create` leaves one when
+          // launch fails. Inventing a cleanup path here that create does not
+          // have would leave the two inconsistent for no gain.
+          return { status: 500, json: { error: `writing the handoff file failed: ${(err as Error).message}` } };
+        }
+        const session = registry.create({
+          provider: account.provider,
+          account: account.name,
+          repo: source.repo,
+          cwd,
+          branch,
+          title: branch,
+          ...(account.provider === 'codex' ? { codexTransport: account.codexTransport ?? 'sdk' } : {}),
+        });
+        let prepared: PreparedProvider;
+        try {
+          prepared = await prepareForSession(account, session);
+        } catch (error) {
+          return preparationFailure(session, account, error, 'create');
+        }
+        if (account.provider === 'codex' && prepared.runtimeVersion) {
+          registry.recordCodexRuntimeVersion(session.id, prepared.runtimeVersion);
+        }
+        // The successor branches from the source at the source's own commit, so
+        // the two share every committed path and would otherwise report a
+        // guaranteed, permanent false overlap warning on each other — see the
+        // `lineage` comment above.
+        lineage.add(channelKey(source.id, session.id));
+        const promptId = registry.appendPrompt(
+          session.id, HANDOFF_PROMPT, account.provider === 'codex' ? 'queued' : 'sent',
+        );
+        if (registry.settings().autoApprove) registry.setAuto(session.id, true);
+        const launchError = launch(
+          session.id, account, prepared.adapter, cwd,
+          { text: HANDOFF_PROMPT, attachments: [] }, undefined, promptId,
+        );
+        if (launchError) return { status: 500, json: launchError };
+        // Stopped last: every failure above leaves the source exactly as it was.
+        // Delete before stop — see the emit callback in launch().
+        const handle = handles.get(source.id);
+        handles.delete(source.id);
+        handle?.stop();
+        // A rate-limit stop can have already queued "resume A when account
+        // resets" (see the emit callback above). Left in place, that item fires
+        // after handoff and relaunches A onto a branch B has already moved past,
+        // diverging the two — exactly what stopping A here is meant to prevent.
+        // It also blocks unlinking the (now exhausted) source account, since
+        // unlink refuses while reset-triggered items for it remain queued.
+        for (const item of scheduler.all()) {
+          if (item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === source.id) {
+            scheduler.remove(item.id);
+          }
+        }
+        return { status: 200, json: { id: session.id } };
+      }
+
       case 'send': {
         const sessionId = String(body.id);
         const session = registry.get(sessionId);
@@ -1029,6 +1198,10 @@ export function createServer(opts: {
         // the remove() below would then drop the session while that agent is
         // still running, leaving it with no card and no stop().
         registry.remove(sessionId);
+        dropChannels(channels, sessionId);
+        dropSeen(seenChannels, sessionId);
+        dropSeen(lineage, sessionId);
+        dropPaths(paths, sessionId);
         if (session && body.removeWorktree) {
           await beforeWorktreeRemoval?.(session.cwd);
           await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
@@ -1353,8 +1526,45 @@ export function createServer(opts: {
         const session = registry.get(id);
         if (!session) { res.writeHead(404).end('{}'); return; }
         const status = await worktreeStatus(session.cwd).catch(() => null);
+        if (!status) {
+          // The worktree is gone, permanently as far as this process is
+          // concerned — every later attempt will fail the same way. Drop the
+          // cached paths rather than leaving them for siblings to keep
+          // intersecting against forever: a transient git hiccup is what
+          // refreshPaths' stale-on-failure is for, but this caller has the
+          // liveness signal that says this is not that.
+          dropPaths(paths, id);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('null');
+          return;
+        }
+        // Collected here rather than on a timer of its own: this route is
+        // already polled per card, and refreshPaths' TTL is what stops a
+        // four-second poll from spawning git on every call.
+        //
+        // currentBranch resolves INSIDE the closure, not before it. Outside, it
+        // would run on every poll even when the paths are fresh — and it is the
+        // same answer for every session in the repo, so a ten-session grid would
+        // ask it 150 times a minute to learn one thing. Inside, it rides the TTL
+        // that is already there and costs nothing when nothing is stale.
+        await refreshPaths(paths, id, async () => changedPaths(
+          session.cwd, await currentBranch(session.repo).catch(() => ''),
+        ), Date.now());
+        const siblings = registry.all()
+          .filter((s) => s.id !== id && s.repo === session.repo)
+          .map((s) => ({ id: s.id, branch: s.branch }));
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(status));
+        res.end(JSON.stringify({
+          ...status,
+          talking: siblings.filter((s) => channelOpen(channels, id, s.id)),
+          // The count is the true total; the file list is capped so a full
+          // intersection (a codemod across thousands of files, polled every
+          // four seconds per visible card) is never serialized whole — nothing
+          // downstream reads past MAX_LISTED_PATHS anyway.
+          overlapping: overlaps(paths, id, siblings)
+            .filter((o) => !lineage.has(channelKey(id, o.id)))
+            .map((o) => ({ id: o.id, branch: o.branch, count: o.files.length, files: o.files.slice(0, MAX_LISTED_PATHS) })),
+        }));
         return;
       }
 

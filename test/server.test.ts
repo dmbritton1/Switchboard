@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-  chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
+  access, chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -13,7 +13,8 @@ import { Usage } from '../src/usage.ts';
 import { Scheduler } from '../src/schedule.ts';
 import { createServer, refreshLimits, accountLoad, shouldRequeue, parseSettingsPatch, type Account } from '../src/server.ts';
 import { resolveAgentPrompt } from '../src/prompt-input.ts';
-import { createWorktree } from '../src/worktree.ts';
+import { createWorktree, worktreeStatus } from '../src/worktree.ts';
+import { HANDOFF_PROMPT } from '../src/handoff.ts';
 import { createAccountLimitCoordinator, type AccountLimitCoordinator } from '../src/account-limits.ts';
 import { resetScheduleView } from '../web/lib.js';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
@@ -278,7 +279,10 @@ function untilLink(linker: Linker, predicate: (link: PublicLink | null) => boole
  * so a test can assert on what launch() actually passed (e.g. `auto`) rather
  * than just the registry's end state. `stop()` emits `stopped` itself,
  * matching the real adapters (both re-enter the emit callback from their
- * own stop()).
+ * own stop()) — via the `emit` captured by that specific `start()` call, not
+ * the shared `cb`, so a handoff test that keeps two sessions live on one
+ * fakeAdapter instance and stops the older one after the newer one starts
+ * still notifies the right session.
  */
 function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; starts: StartOpts[] } {
   let cb: ((e: AdapterEvent) => void) | null = null;
@@ -291,7 +295,7 @@ function fakeAdapter(): { adapter: Adapter; emit: (e: AdapterEvent) => void; sta
         send() {},
         decide() {},
         setAuto() {},
-        stop() { cb?.({ type: 'stopped', reason: 'stopped by handle' }); },
+        stop() { emit({ type: 'stopped', reason: 'stopped by handle' }); },
       };
     },
   };
@@ -477,10 +481,19 @@ test('Codex create, scheduled create, and resume route exclusively through the p
   assert.deepEqual(routes.map((route) => route.transport), ['app-server']);
 
   await fixture.command({ cmd: 'stop', id: appSession.id });
+  const handoff = await fixture.command({
+    cmd: 'handoff', id: appSession.id, account: 'codex', branch: 'app-route-handoff',
+  });
+  assert.equal(handoff.status, 200);
+  const handoffSession = fixture.registry.get(handoff.data.id)!;
+  assert.equal(handoffSession.codexTransport, 'app-server');
+  assert.equal(handoffSession.codexRuntimeVersion, '0.145.0');
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server']);
+
   fixture.account.codexTransport = 'sdk';
   const resumed = await fixture.command({ cmd: 'resume', id: appSession.id, prompt: 'resume' });
   assert.equal(resumed.status, 200);
-  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server']);
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server', 'app-server']);
   assert.equal(appStarts.at(-1)!.resumeId, appSession.vendorSessionId ?? undefined);
   assert.equal(sdkStarts.length, 0);
 
@@ -493,7 +506,7 @@ test('Codex create, scheduled create, and resume route exclusively through the p
   await fixture.server.tick();
   const scheduled = fixture.registry.all().find((session) => session.branch === 'scheduled-sdk')!;
   assert.equal(scheduled.codexTransport, 'sdk');
-  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server', 'sdk']);
+  assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server', 'app-server', 'sdk']);
 
   await fixture.command({ cmd: 'delete', id: appSession.id });
   assert.equal(closes, 0, 'detaching a session must not close the account-owned process');
@@ -1696,6 +1709,131 @@ test('POST /command push rejects worktrees selected from two different repos', a
 
   assert.equal(res.status, 400);
   assert.match((await res.json()).error, /different repos/i);
+});
+
+test('handoff branches from the source, writes the transcript, and stops the source', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/src', account: 'claude-main', prompt: 'do the thing' }),
+  }).then((r) => r.json());
+  const source = registry.get(created.id)!;
+  await writeFile(join(source.cwd, 'work.txt'), 'uncommitted work\n');
+  registry.apply(created.id, { type: 'status', status: 'done' });
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/dest' }),
+  });
+  const { id } = await res.json();
+
+  assert.equal(res.status, 200);
+  const dest = registry.get(id)!;
+  assert.equal(dest.account, 'codex');
+  assert.equal(dest.branch, 'feat/dest');
+  assert.equal(
+    await readFile(join(dest.cwd, 'work.txt'), 'utf8'), 'uncommitted work\n',
+    'the source\'s uncommitted work should have been committed and inherited',
+  );
+  const doc = await readFile(join(dest.cwd, '.switchboard', 'handoff.md'), 'utf8');
+  assert.match(doc, /do the thing/);
+  await run('git', ['merge-base', '--is-ancestor', 'feat/src', 'feat/dest'], { cwd: repo });
+  assert.equal(registry.get(created.id)!.status, 'stopped');
+
+  // The handoff document lives under .switchboard/, which is now .gitignore'd
+  // inside the successor's own worktree — so it must not read back as
+  // uncommitted work the successor never did.
+  const status = await worktreeStatus(dest.cwd);
+  assert.equal(status.added, 0, 'the handoff document must not be counted as added lines');
+  assert.equal(status.dirty, false, 'the handoff document must not mark the successor dirty');
+
+  assert.equal(starts.length, 2, 'the source and the successor should each have started once');
+  assert.equal(starts[1].prompt.text, HANDOFF_PROMPT);
+});
+
+test('handoff refuses a working source and creates nothing', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/busy', account: 'claude-main', prompt: 'go' }),
+  }).then((r) => r.json());
+  assert.equal(registry.get(created.id)!.status, 'working');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/nope' }),
+  });
+
+  assert.equal(res.status, 409);
+  assert.equal(registry.all().length, 1, 'no session should have been created');
+  await assert.rejects(access(join(repo, '.claude', 'worktrees', 'feat-nope')));
+});
+
+test('handoff rejects an unknown target account before touching the source worktree', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/keep', account: 'claude-main', prompt: 'go' }),
+  }).then((r) => r.json());
+  registry.apply(created.id, { type: 'status', status: 'done' });
+  await writeFile(join(registry.get(created.id)!.cwd, 'still-dirty.txt'), 'x\n');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'nobody', branch: 'feat/nope' }),
+  });
+
+  assert.equal(res.status, 400);
+  const { stdout } = await run('git', ['status', '--porcelain'], { cwd: registry.get(created.id)!.cwd });
+  assert.ok(stdout.includes('still-dirty.txt'), 'the source worktree should not have been committed');
+  assert.equal(registry.get(created.id)!.status, 'done', 'the source should not have been stopped');
+});
+
+// The flagship scenario: a Claude session stops mid rate-limit, which queues an
+// automatic "resume when the account resets" (see the auto-requeue wiring
+// tests above), and the user hands off rather than waiting out the window. Left
+// in place, that queued item would later relaunch the source onto a branch the
+// successor has already moved past — exactly the divergence stopping the
+// source is meant to prevent (docs/superpowers/specs/2026-08-29-session-handoff-design.md).
+test('handoff prunes a queued auto-requeue resume for the session it hands off', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, emit } = fakeAdapter();
+  const { base, registry, scheduler } = await boot(t, adapter);
+
+  const created = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'create', repo, branch: 'feat/req', account: 'claude-main', prompt: 'do the thing' }),
+  }).then((r) => r.json());
+
+  // autoRequeue defaults to true (src/types.ts). The adapter dies on its own
+  // during a rate limit, which is the path that queues an automatic resume.
+  emit({ type: 'rate-limit', status: 'rejected', resetsAt: Date.now() + 3600_000 });
+  emit({ type: 'stopped', reason: 'rate limited' });
+  assert.equal(registry.get(created.id)!.status, 'stopped');
+  assert.equal(scheduler.all().length, 1, 'sanity: a resume should be queued before handoff');
+
+  const res = await fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/req-dest' }),
+  });
+  assert.equal(res.status, 200);
+
+  const stale = scheduler.all().filter((item) =>
+    item.state === 'waiting' && item.action.kind === 'resume' && item.action.sessionId === created.id);
+  assert.deepEqual(stale, [], 'no queued resume for the handed-off source should survive handoff');
 });
 
 test('POST /command merge then push: end to end against a real repo and remote', async (t) => {
@@ -3315,4 +3453,365 @@ test('unlink guard is not fooled by a sibling directory sharing a path prefix', 
 test('unlink of an unknown account is a 404', async (t) => {
   const h = await bootLinking(t);
   assert.equal((await post(h.base, { cmd: 'unlink', name: 'nope' })).status, 404);
+});
+
+test('launch hands a session relay callbacks scoped to itself', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  const fromA = starts[0];
+  assert.equal(typeof fromA.relay, 'function');
+  assert.equal(typeof fromA.relayGate, 'function');
+
+  // Closed channel: the first send is gated.
+  assert.equal(fromA.relayGate!(b.id).ask, true);
+
+  assert.deepEqual(fromA.relay!(b.id, 'ping'), { ok: true, queued: false });
+  assert.equal(
+    fromA.relayGate!(b.id).ask, false,
+    'a successful send opens the channel, so the next one is not gated',
+  );
+
+  const transcript = registry.get(b.id)!.transcript;
+  assert.equal((transcript.at(-1) as { text: string }).text, 'ping');
+  assert.equal(registry.get(a.id)!.transcript.length, 1, 'the sender is untouched');
+});
+
+test('a relay addressed by branch delivers, and the channel it opens is found by branch or id', async (t) => {
+  // The tool schema tells the model 'the target session id or branch', and the
+  // @ mention inserts a branch — so a branch-addressed send has to work, and
+  // the channel it opens has to be the same one the next relayGate call (which
+  // may itself be addressed by branch or by id, since either can recur) finds.
+  // Otherwise the human is asked again on every message, defeating the whole
+  // point of a channel.
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  const fromA = starts[0];
+  assert.equal(fromA.relayGate!('feat/b').ask, true, 'closed channel: addressed by branch, still gated');
+
+  const result = fromA.relay!('feat/b', 'ping');
+  assert.deepEqual(result, { ok: true, queued: false }, 'a branch-addressed send must actually deliver');
+
+  const transcript = registry.get(b.id)!.transcript;
+  assert.equal((transcript.at(-1) as { text: string }).text, 'ping');
+
+  assert.equal(
+    fromA.relayGate!('feat/b').ask, false,
+    'the channel opened by a branch-addressed send must be found by the same branch',
+  );
+  assert.equal(
+    fromA.relayGate!(b.id).ask, false,
+    'and by the id, since the gate and the send must key on one canonical resolved id',
+  );
+});
+
+test('deleting a session drops its channels', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  starts[0].relay!(b.id, 'ping');
+  assert.equal(starts[0].relayGate!(b.id).ask, false, 'the channel is open before the delete');
+
+  await post({ cmd: 'delete', id: b.id });
+
+  // relayGate only reads the channel/seen maps, never the registry, so probing
+  // with b's own id post-delete is valid and is the thing dropChannels is
+  // supposed to have cleaned — a fresh, unrelated id would pass whether or not
+  // dropChannels ran at all.
+  assert.equal(
+    starts[0].relayGate!(b.id).ask, true,
+    'the channel is gone once its session is deleted',
+  );
+});
+
+test('relaySessions lists same-repo siblings and excludes the caller', async (t) => {
+  const repo = await makeRepo();
+  const other = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  t.after(() => rm(other, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo: other, branch: 'feat/elsewhere', account: 'claude-main', prompt: 'go' });
+
+  const listed = (await starts[0].relaySessions!()).map((s) => s.branch);
+  assert.deepEqual(listed, ['feat/b'], 'same repo only, self excluded');
+});
+
+test('relaySessions annotates each sibling with the paths it shares with the caller', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo, branch: 'feat/c', account: 'claude-main', prompt: 'go' });
+
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  // No /status has run, so nothing is cached — the tool must collect for itself
+  // rather than quietly reporting no overlap.
+  const listed = await starts[0].relaySessions!();
+
+  const byBranch = Object.fromEntries(listed.map((s) => [s.branch, s.files]));
+  assert.deepEqual(byBranch['feat/b'], ['shared.ts']);
+  assert.deepEqual(byBranch['feat/c'], [], 'a sibling with no shared path reports none');
+});
+
+test('deleting a session drops its seenChannels entry, not just its channel', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  starts[0].relay!(b.id, 'ping');
+
+  await post({ cmd: 'delete', id: b.id });
+
+  // Probing with b's own id (not a fresh, unrelated one) so this can actually
+  // fail: dropChannels alone would already make `ask` true, but a leaked
+  // seenChannels entry would still attach a checkpoint note here instead of a
+  // plain first-send gate.
+  const gate = starts[0].relayGate!(b.id);
+  assert.equal(gate.ask, true);
+  assert.equal(gate.note, undefined, 'a leaked seenChannels entry would set this');
+});
+
+test('the gate distinguishes a first send from a checkpoint', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  assert.equal(starts[0].relayGate!(b.id).note, undefined, 'a first send needs no explanation');
+
+  for (let i = 0; i < 10; i++) starts[0].relay!(b.id, `m${i}`);
+
+  const gate = starts[0].relayGate!(b.id);
+  assert.equal(gate.ask, true);
+  assert.match(gate.note!, /continue\?/);
+});
+
+// ---- /status: overlap and channel signals --------------------------------
+
+test('/status reports overlapping sessions on the same repo and ignores other repos', async (t) => {
+  const repo = await makeRepo();
+  const other = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  t.after(() => rm(other, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await post({ cmd: 'create', repo: other, branch: 'feat/elsewhere', account: 'claude-main', prompt: 'go' });
+
+  // Both touch one shared file; each also touches one of its own.
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(a.id)!.cwd, 'only-a.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  // Prime the cache for both, then read A: overlap is computed against what is
+  // cached, so B must have been collected before A can see it.
+  await status(b.id);
+  const seen = await status(a.id);
+
+  assert.deepEqual(
+    seen.overlapping,
+    [{ id: b.id, branch: 'feat/b', count: 1, files: ['shared.ts'] }],
+    'same repo and shared path only',
+  );
+  assert.equal(seen.added !== undefined && seen.dirty !== undefined, true, 'existing fields survive');
+});
+
+test('/status reports an open relay channel as talking', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter, starts } = fakeAdapter();
+  const { base } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+
+  assert.deepEqual((await status(a.id)).talking, [], 'no channel yet');
+
+  starts[0].relay!(b.id, 'ping');
+
+  assert.deepEqual(
+    (await status(a.id)).talking, [{ id: b.id, branch: 'feat/b' }],
+    'a successful relay opens the channel, which both ends can see',
+  );
+  assert.deepEqual(
+    (await status(b.id)).talking, [{ id: a.id, branch: 'feat/a' }],
+    'the channel is a pair, so it reads the same from either side',
+  );
+});
+
+test('a deleted session no longer appears as an overlap', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+  await status(b.id);
+  assert.equal((await status(a.id)).overlapping.length, 1, 'overlap is visible before the delete');
+
+  await post({ cmd: 'delete', id: b.id });
+
+  // This does NOT prove dropPaths runs. registry.remove already takes b out of
+  // registry.all(), and /status builds `siblings` from that list — so b is
+  // excluded from `overlapping` here whether or not its entry in the paths
+  // cache was ever dropped. A leaked entry would be invisible through this
+  // endpoint forever. dropPaths exists to bound the map's size in a
+  // long-running process, not to change any response, and nothing here
+  // exercises that.
+  assert.deepEqual(
+    (await status(a.id)).overlapping, [],
+    'a deleted session leaves no paths behind to overlap with',
+  );
+});
+
+// Regression guard for the whole-branch review's Fix 1: a handoff's successor
+// branches from the source's own branch at the same commit, so the two share
+// every committed path. Without the `lineage` set the pair lands in the silent
+// (unwarned-collision) bucket and both cards warn about each other forever —
+// a false positive on a first-class workflow, not a real conflict.
+test('a handoff does not warn the source and its successor about each other', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const created = await post({
+    cmd: 'create', repo, branch: 'feat/src', account: 'claude-main', prompt: 'do the thing',
+  });
+  await writeFile(join(registry.get(created.id)!.cwd, 'work.txt'), 'uncommitted work\n');
+  registry.apply(created.id, { type: 'status', status: 'done' });
+
+  const handoff = await post({ cmd: 'handoff', id: created.id, account: 'codex', branch: 'feat/dest' });
+
+  // Prime both caches, in both orders, so this actually exercises the pair
+  // symmetrically rather than relying on whichever side happens to be cached
+  // first (overlap is asymmetric until the cache fills — see src/overlap.ts).
+  await status(handoff.id);
+  const sourceSeen = await status(created.id);
+  const destSeen = await status(handoff.id);
+
+  assert.deepEqual(sourceSeen.overlapping, [], 'the source must not warn about its own successor');
+  assert.deepEqual(destSeen.overlapping, [], 'the successor must not warn about its source');
+});
+
+// Regression guard for the whole-branch review's Fix 2: refreshPaths
+// deliberately keeps a stale entry on a *transient* git failure, but a missing
+// worktree fails every later attempt too, so a sibling would report overlap
+// with a worktree that no longer exists for the life of the process. /status
+// already computes the liveness signal (worktreeStatus) and must act on it by
+// dropping the cached paths rather than discarding it.
+test('removing a worktree clears its phantom overlap once its own /status is polled', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+
+  const post = (body: Record<string, unknown>) => fetch(new URL('/command', base), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  const status = (id: string) => fetch(new URL(`/status?id=${id}`, base)).then((r) => r.json());
+
+  const a = await post({ cmd: 'create', repo, branch: 'feat/a', account: 'claude-main', prompt: 'go' });
+  const b = await post({ cmd: 'create', repo, branch: 'feat/b', account: 'claude-main', prompt: 'go' });
+  await writeFile(join(registry.get(a.id)!.cwd, 'shared.ts'), 'a\n');
+  await writeFile(join(registry.get(b.id)!.cwd, 'shared.ts'), 'b\n');
+
+  await status(b.id);
+  assert.equal((await status(a.id)).overlapping.length, 1, 'overlap is visible before the worktree vanishes');
+
+  // Remove b's worktree directly from disk, not through the `delete` command
+  // — this simulates the worktree disappearing out from under a session that
+  // is still registered, which is exactly the case refreshPaths' stale-on-
+  // failure behaviour was never meant to hide forever.
+  await rm(registry.get(b.id)!.cwd, { recursive: true, force: true });
+
+  assert.equal(await status(b.id), null, 'a missing worktree reports null status');
+
+  assert.deepEqual(
+    (await status(a.id)).overlapping, [],
+    'the sibling must stop reporting overlap with a worktree that no longer exists',
+  );
 });
