@@ -349,6 +349,13 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
   }
 }
 
+type PreflightGateArm = {
+  entered: Promise<void>;
+  reentered: Promise<void>;
+  release(): void;
+  count(): number;
+};
+
 type CodexFixture = Awaited<ReturnType<typeof boot>> & {
   usage: Usage;
   repo: string;
@@ -363,15 +370,30 @@ type CodexFixture = Awaited<ReturnType<typeof boot>> & {
   }>>;
   calls(): Promise<string[][]>;
   preflightGate?: {
-    enable(): {
-      entered: Promise<void>;
-      reentered: Promise<void>;
-      release(): void;
-      count(): number;
-    };
+    enable(): PreflightGateArm;
     release(): void;
   };
 };
+
+async function waitForGateCondition<T>(
+  arm: PreflightGateArm,
+  condition: Promise<T>,
+  description: string,
+  timeoutMs = 2_000,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      arm.release();
+      reject(new Error(`timed out waiting for ${description} after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([condition, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function createPreflightGate(t: { after: (fn: () => void) => void }) {
   type ArmState = {
@@ -438,7 +460,7 @@ test('in-process preflight gate creates phase-bounded entered and release arms',
 
   const first = gate.enable();
   const firstPrepare = gate.enter();
-  await first.entered;
+  await waitForGateCondition(first, first.entered, 'first phase preflight gate entry');
   assert.equal(first.count(), 1);
   first.release();
   first.release();
@@ -447,10 +469,21 @@ test('in-process preflight gate creates phase-bounded entered and release arms',
 
   const second = gate.enable();
   const secondPrepare = gate.enter();
-  await second.entered;
+  await waitForGateCondition(second, second.entered, 'second phase preflight gate entry');
   assert.equal(second.count(), 1);
   second.release();
   await secondPrepare;
+});
+
+test('in-process preflight gate bounds a never-entered arm and disarms it on timeout', async (t) => {
+  const gate = createPreflightGate(t);
+  const arm = gate.enable();
+
+  await assert.rejects(
+    waitForGateCondition(arm, arm.entered, 'never-entered preflight gate', 25),
+    /timed out waiting for never-entered preflight gate after 25ms/,
+  );
+  await waitForGateCondition(arm, gate.enter(), 'post-timeout unarmed prepare', 25);
 });
 
 async function bootCodex(
@@ -689,7 +722,7 @@ test('stopping a Codex session during gated create preflight cancels its launch'
   const creation = fixture.command({
     cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'stopped-create', prompt: 'must not launch',
   });
-  await arm.entered;
+  await waitForGateCondition(arm, arm.entered, 'stopped create preflight gate entry');
   const session = fixture.registry.all().find((candidate) => candidate.branch === 'stopped-create')!;
   assert.equal((await fixture.command({ cmd: 'stop', id: session.id })).status, 200);
   arm.release();
@@ -712,7 +745,7 @@ test('deleting a Codex session during gated create preflight prevents an orphane
   const creation = fixture.command({
     cmd: 'create', account: 'codex', repo: fixture.repo, branch: 'deleted-create', prompt: 'must not launch',
   });
-  await arm.entered;
+  await waitForGateCondition(arm, arm.entered, 'deleted create preflight gate entry');
   const session = fixture.registry.all().find((candidate) => candidate.branch === 'deleted-create')!;
   const deletion = await fixture.command({ cmd: 'delete', id: session.id, removeWorktree: true });
   assert.equal(deletion.status, 200);
@@ -1229,12 +1262,16 @@ test('concurrent Codex resumes reserve one session before preflight', async (t) 
   const arm = gate.enable();
 
   const first = fixture.command({ cmd: 'resume', id: created.id, prompt: 'first resume' });
-  await arm.entered;
+  await waitForGateCondition(arm, arm.entered, 'reserved resume preflight gate entry');
   const second = fixture.command({ cmd: 'resume', id: created.id, prompt: 'second resume' });
-  const firstObservable = await Promise.race([
-    second.then((response) => ({ kind: 'response' as const, response })),
-    arm.reentered.then(() => ({ kind: 'two-preflights' as const })),
-  ]);
+  const firstObservable = await waitForGateCondition(
+    arm,
+    Promise.race([
+      second.then((response) => ({ kind: 'response' as const, response })),
+      arm.reentered.then(() => ({ kind: 'two-preflights' as const })),
+    ]),
+    'duplicate resume response or second preflight gate entry',
+  );
   arm.release();
   const responses = await Promise.all([first, second]);
 
@@ -1255,7 +1292,7 @@ test('deleting a Codex session during gated resume prevents its later launch', a
   const arm = gate.enable();
 
   const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
-  await arm.entered;
+  await waitForGateCondition(arm, arm.entered, 'deleted resume preflight gate entry');
   assert.equal((await fixture.command({ cmd: 'delete', id: created.id })).status, 200);
   arm.release();
   const response = await resume;
@@ -1288,7 +1325,7 @@ test('deleting a Codex worktree during gated resume prevents an orphaned launch'
   const arm = gate.enable();
 
   const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
-  await arm.entered;
+  await waitForGateCondition(arm, arm.entered, 'deleted worktree resume preflight gate entry');
   const deletion = fixture.command({ cmd: 'delete', id: created.id, removeWorktree: true });
   // Delete is now parked mid-removal. Releasing resume here runs its final guard
   // inside that window — the exact interleaving the old ordering lost.
