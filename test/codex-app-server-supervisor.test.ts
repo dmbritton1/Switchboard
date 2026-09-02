@@ -1145,11 +1145,12 @@ test('allowlists session requests and routes only bound thread notifications', a
     clientFactory: (options) => {
       protocols.push(options);
       return {
-        request: async <T>(method: string, params?: unknown): Promise<T> => {
+        request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
           requests.push({ method, params });
           if (method === 'initialize') return { initialized: true } as T;
           if (method === 'account/read') return managedAccountResult() as T;
           if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          onDispatched?.();
           return { accepted: method } as T;
         },
         notify: () => {},
@@ -1182,7 +1183,10 @@ test('allowlists session requests and routes only bound thread notifications', a
 
   await supervisor.requestForSession('session-a', 'thread/start', { cwd: '/fixture-a' });
   await supervisor.requestForSession('session-a', 'thread/resume', { threadId: 'thread-a' });
-  await supervisor.requestForSession('session-b', 'turn/start', { threadId: 'thread-b' });
+  let dispatches = 0;
+  await supervisor.requestForSession(
+    'session-b', 'turn/start', { threadId: 'thread-b' }, () => { dispatches += 1; },
+  );
   await supervisor.requestForSession('session-b', 'turn/interrupt', { threadId: 'thread-b', turnId: 'turn-b' });
   await assert.rejects(
     supervisor.requestForSession('missing', 'turn/start', {}),
@@ -1209,6 +1213,7 @@ test('allowlists session requests and routes only bound thread notifications', a
     'turn/start',
     'turn/interrupt',
   ]);
+  assert.equal(dispatches, 1, 'the ready child acknowledges the accepted turn/start write');
 
   DENIED_SERVER_METHODS.forEach((method, index) => protocol.onServerRequest(index, method, { private: true }));
   protocol.onServerRequest('unknown', 'future/serverRequest', { private: true });
@@ -1217,7 +1222,63 @@ test('allowlists session requests and routes only bound thread notifications', a
   assert.ok(denied.every((entry) => entry.message.includes('current Switchboard phase')));
 });
 
-test('a turn-mode crash fatals only active routes, stales telemetry, and restarts without replay', async (t) => {
+test('active turn ids prevent stale completion from releasing a newer turn', async (t) => {
+  let protocol!: AppServerClientOptions;
+  let turnNumber = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return {
+        request: async <T>(method: string, _params?: unknown, onDispatched?: () => void): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          if (method === 'turn/start') {
+            onDispatched?.();
+            return { turn: { id: `turn-${++turnNumber}`, status: 'inProgress', error: null } } as T;
+          }
+          return {} as T;
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+
+  await supervisor.start();
+  await supervisor.ensureTurnTransport();
+  supervisor.registerSession('session', { onNotification: () => {}, onFatal: () => {} });
+  supervisor.bindThread('session', 'thread');
+
+  await supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: { id: 'turn-1', status: 'completed', error: null },
+  });
+  await supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: { id: 'turn-1', status: 'completed', error: null },
+  });
+
+  await assert.rejects(
+    supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' }),
+    /active turn/i,
+  );
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: { id: 'turn-2', status: 'completed', error: null },
+  });
+  const third = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(third.turn.id, 'turn-3');
+});
+
+test('a turn-mode crash fatals every route bound to the lost generation and restarts without replay', async (t) => {
   const observed = callbacks();
   const scheduled: Array<{ callback: () => void; delay: number }> = [];
   const clients: ScriptedClient[] = [];
@@ -1273,6 +1334,7 @@ test('a turn-mode crash fatals only active routes, stales telemetry, and restart
 
   assert.deepEqual(fatals.map(({ session, code }) => ({ session, code })), [
     { session: 'active', code: 'codex_transport_crashed' },
+    { session: 'idle', code: 'codex_transport_crashed' },
   ]);
   assert.ok(fatals.every(({ reason }) => !reason.includes('private child crash details')));
   assert.equal(observed.stale.at(-1), unavailable);
@@ -1282,6 +1344,12 @@ test('a turn-mode crash fatals only active routes, stales telemetry, and restart
   await supervisor.start();
   assert.equal(optionsSeen.at(-1)!.args.includes('hooks={}'), false);
   assert.equal(requestMethods.filter((method) => /^(thread|turn)\//.test(method)).length, sessionRequestCount);
+  await assert.rejects(
+    supervisor.requestForSession('idle', 'thread/resume', { threadId: 'thread-idle' }),
+    /registered|retired|manual resume/i,
+  );
+  const detach = supervisor.registerSession('idle', { onNotification: () => {}, onFatal: () => {} });
+  detach();
 });
 
 test('a failed replacement launch does not fatal the prior active route twice', async (t) => {

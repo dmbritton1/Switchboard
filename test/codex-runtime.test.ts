@@ -316,6 +316,26 @@ test('redaction removes bearer tokens and credential-shaped environment values',
   );
 });
 
+test('redaction removes complete absolute file URIs while preserving HTTPS and ordinary prose', () => {
+  const unsafe = [
+    'file:///Users/example/private.txt',
+    'file:%2F%2F%2FUsers%2Fexample%2Fencoded.txt',
+    'file://localhost/Users/example/local.txt',
+    'file://fileserver/share/private.txt',
+    'file:///C:/Users/example/private.txt',
+    'file:C:\\Users\\example\\private.txt',
+    'file:\\\\fileserver\\share\\private.txt',
+  ];
+  const safeUrl = 'https://example.test/a//b?file=public';
+  const ordinary = 'the file: notes.txt and file:notes.txt labels remain';
+  const redacted = redactValues(`${unsafe.join(' | ')} | ${safeUrl} | ${ordinary}`, []);
+
+  for (const uri of unsafe) assert.equal(redacted.includes(uri), false, `redacts ${uri}`);
+  assert.equal(redacted.match(/\[path omitted\]/g)?.length, unsafe.length);
+  assert.ok(redacted.includes(safeUrl));
+  assert.ok(redacted.includes(ordinary));
+});
+
 test('redaction leaves values too short to be a credential alone', () => {
   assert.equal(
     redactCodexText('--grep info found 1 match', { LOG_KEY: 'info', DEBUG_TOKEN: '1' }),

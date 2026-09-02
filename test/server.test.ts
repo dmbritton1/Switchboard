@@ -1282,6 +1282,29 @@ test('concurrent Codex resumes reserve one session before preflight', async (t) 
   assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first', 'first resume']);
 });
 
+test('stopping a Codex session during gated resume cancels its reservation and launch', async (t) => {
+  const fixture = await bootCodex(t, { gatedPreflight: true });
+  const created = await fixture.create('first');
+  await fixture.waitForSession(created.id, (session) => session.status === 'done');
+  await fixture.command({ cmd: 'stop', id: created.id });
+  await fixture.waitForSession(created.id, (session) => session.status === 'stopped');
+  const gate = fixture.preflightGate!;
+  const arm = gate.enable();
+
+  const resume = fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not launch' });
+  await waitForGateCondition(arm, arm.entered, 'stopped resume preflight gate entry');
+  const stopped = await fixture.command({ cmd: 'stop', id: created.id });
+  assert.equal(stopped.status, 200);
+  arm.release();
+  const response = await resume;
+
+  assert.equal(response.status, 409);
+  assert.equal(fixture.registry.get(created.id)?.status, 'stopped');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual((await fixture.invocations()).map((invocation) => invocation.prompt), ['first']);
+  assert.equal(JSON.stringify(fixture.registry.get(created.id)?.transcript).includes('must not launch'), false);
+});
+
 test('deleting a Codex session during gated resume prevents its later launch', async (t) => {
   const fixture = await bootCodex(t, { gatedPreflight: true });
   const created = await fixture.create('first');

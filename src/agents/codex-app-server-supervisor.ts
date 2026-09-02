@@ -20,7 +20,13 @@ type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondErr
 type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: false }>;
 type ReadOutcome = { invalidated: true } | { invalidated: false; snapshot: AccountLimitSnapshot };
 type ActiveRead = { revision: number; promise: Promise<ReadOutcome> };
-type SessionState = { route: CodexSessionRoute; threadId: string | null; activeTurn: boolean };
+type SessionState = {
+  route: CodexSessionRoute;
+  threadId: string | null;
+  generation: number | null;
+  activeTurnId: string | null;
+  pendingTurn: symbol | null;
+};
 type RouteFailure = { reason: string; code: CodexFailureCode };
 
 export type CodexLimitListener = {
@@ -63,6 +69,15 @@ function threadIdFrom(params: unknown): string | null {
   return typeof threadId === 'string' && threadId.length > 0 ? threadId : null;
 }
 
+function turnIdFrom(params: unknown): string | null {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+  const value = params as Record<string, unknown>;
+  if (typeof value.turnId === 'string' && value.turnId.length > 0) return value.turnId;
+  if (!value.turn || typeof value.turn !== 'object' || Array.isArray(value.turn)) return null;
+  const turnId = (value.turn as Record<string, unknown>).id;
+  return typeof turnId === 'string' && turnId.length > 0 ? turnId : null;
+}
+
 class UnsupportedTelemetryError extends Error {}
 
 export class CodexAppServerSupervisor {
@@ -75,6 +90,7 @@ export class CodexAppServerSupervisor {
   readonly #listenerRemovers = new WeakMap<CodexLimitListener, () => void>();
   readonly #sessions = new Map<string, SessionState>();
   readonly #threadOwners = new Map<string, string>();
+  readonly #clientGenerations = new WeakMap<SupervisorClient, number>();
   #mode: CodexAppServerMode = 'telemetry';
   #client: SupervisorClient | null = null;
   #readyClient: SupervisorClient | null = null;
@@ -88,6 +104,7 @@ export class CodexAppServerSupervisor {
   #staleReason: string | null = null;
   #restartTimer: TimerHandle | null = null;
   #restartAttempt = 0;
+  #nextGeneration = 1;
   #closed = false;
   #close: Promise<void> | null = null;
 
@@ -128,7 +145,7 @@ export class CodexAppServerSupervisor {
     if (this.#closed) return Promise.reject(unavailableError());
     if (this.#promotion) return this.#promotion;
     if (this.#mode === 'turns') return this.start();
-    if ([...this.#sessions.values()].some((session) => session.activeTurn)) {
+    if ([...this.#sessions.values()].some((session) => session.activeTurnId || session.pendingTurn)) {
       return Promise.reject(new Error('Cannot promote Codex transport while a session turn is active.'));
     }
     const promotion = Promise.resolve().then(() => this.#promoteNow());
@@ -143,7 +160,16 @@ export class CodexAppServerSupervisor {
     if (this.#closed) throw new Error('Codex app-server supervisor is closed.');
     if (this.#mode !== 'turns') throw new Error('Codex turn transport must be prepared before registration.');
     if (this.#sessions.has(sessionId)) throw new Error('Codex session is already registered.');
-    const state: SessionState = { route, threadId: null, activeTurn: false };
+    const ready = this.#readyClient;
+    const state: SessionState = {
+      route,
+      threadId: null,
+      generation: !this.#promotion && ready && ready === this.#client
+        ? this.#clientGenerations.get(ready) ?? null
+        : null,
+      activeTurnId: null,
+      pendingTurn: null,
+    };
     this.#sessions.set(sessionId, state);
     let active = true;
     return () => {
@@ -170,6 +196,7 @@ export class CodexAppServerSupervisor {
     sessionId: string,
     method: 'thread/start' | 'thread/resume' | 'turn/start' | 'turn/interrupt',
     params: unknown,
+    onDispatched?: () => void,
   ): Promise<T> {
     if (!(TURN_CLIENT_METHODS as readonly string[]).includes(method)) {
       throw new Error('Unsupported Codex session request.');
@@ -180,11 +207,29 @@ export class CodexAppServerSupervisor {
     if (!state) throw new Error('Codex session is not registered.');
     const client = this.#readyClient;
     if (!client || client !== this.#client) throw unavailableError();
-    if (method === 'turn/start') state.activeTurn = true;
+    const generation = this.#clientGenerations.get(client);
+    if (generation === undefined) throw unavailableError();
+    if (state.generation === null) state.generation = generation;
+    if (state.generation !== generation) {
+      throw new Error('Codex session transport was retired; resume the session manually.');
+    }
+    if (method !== 'turn/start') return client.request<T>(method, params, onDispatched);
+    if (state.activeTurnId || state.pendingTurn) throw new Error('Codex session already has an active turn.');
+    const pendingTurn = Symbol(sessionId);
+    state.pendingTurn = pendingTurn;
     try {
-      return await client.request<T>(method, params);
+      const response = await client.request<T>(method, params, onDispatched);
+      if (this.#sessions.get(sessionId) === state
+        && state.generation === generation
+        && state.pendingTurn === pendingTurn) {
+        state.pendingTurn = null;
+        state.activeTurnId = turnIdFrom(response);
+      }
+      return response;
     } catch (error) {
-      if (method === 'turn/start' && this.#client === client) state.activeTurn = false;
+      if (this.#sessions.get(sessionId) === state
+        && state.generation === generation
+        && state.pendingTurn === pendingTurn) state.pendingTurn = null;
       throw error;
     }
   }
@@ -308,6 +353,7 @@ export class CodexAppServerSupervisor {
       onServerRequest: (id, method, _params) => this.#serverRequest(client, id, method),
       onExit: (error) => this.#clientExit(client, error),
     });
+    this.#clientGenerations.set(client, this.#nextGeneration++);
     return client;
   }
 
@@ -338,14 +384,19 @@ export class CodexAppServerSupervisor {
     if (threadId === null) return;
     const sessionId = this.#threadOwners.get(threadId);
     const state = sessionId === undefined ? undefined : this.#sessions.get(sessionId);
-    if (!state || state.threadId !== threadId) return;
+    const generation = this.#clientGenerations.get(client);
+    if (!state || state.threadId !== threadId || generation === undefined || state.generation !== generation) return;
+    const turnId = turnIdFrom(params);
+    if (method === 'turn/started' && turnId) {
+      state.pendingTurn = null;
+      state.activeTurnId = turnId;
+    }
+    if (method === 'turn/completed' && turnId === state.activeTurnId) state.activeTurnId = null;
     try {
       state.route.onNotification(method, params);
     } catch {
       // Session observers cannot desynchronize shared process ownership.
     }
-    if (method === 'turn/started') state.activeTurn = true;
-    if (method === 'turn/completed') state.activeTurn = false;
   }
 
   #serverRequest(client: SupervisorClient, id: string | number, method: string): void {
@@ -372,13 +423,14 @@ export class CodexAppServerSupervisor {
 
   #clientExit(client: SupervisorClient, error: Error): void {
     if (client !== this.#client || this.#closed) return;
+    const generation = this.#clientGenerations.get(client);
     this.#client = null;
     this.#readyClient = null;
     const reason = redactValues(error.message, Object.values(this.#options.runtime.env));
     const routeFailure = /^Codex app-server request .+ timed out after \d+ms\.$/.test(reason)
       ? { reason, code: 'codex_request_timed_out' as const }
       : undefined;
-    this.#handleFailure(true, routeFailure);
+    this.#handleFailure(true, routeFailure, generation);
   }
 
   async #readCurrent(now: number): Promise<AccountLimitSnapshot> {
@@ -434,6 +486,7 @@ export class CodexAppServerSupervisor {
 
   async #retire(client: SupervisorClient, fatalRoutes: boolean): Promise<void> {
     if (client !== this.#client) return;
+    const generation = this.#clientGenerations.get(client);
     this.#client = null;
     this.#readyClient = null;
     try {
@@ -441,22 +494,33 @@ export class CodexAppServerSupervisor {
     } catch {
       // AppServerClient already bounded and sanitized shutdown.
     }
-    this.#handleFailure(fatalRoutes);
+    this.#handleFailure(fatalRoutes, undefined, generation);
   }
 
-  #handleFailure(fatalRoutes: boolean, routeFailure?: RouteFailure): void {
+  #handleFailure(fatalRoutes: boolean, routeFailure?: RouteFailure, generation?: number): void {
     if (this.#closed) return;
     this.#markStale(PUBLIC_UNAVAILABLE);
-    if (fatalRoutes && this.#mode === 'turns') this.#fatalRoutes(routeFailure);
+    if (fatalRoutes && this.#mode === 'turns' && generation !== undefined) {
+      this.#fatalRoutes(generation, routeFailure);
+    }
     this.#scheduleRestart();
   }
 
-  #fatalRoutes(failure: RouteFailure = {
+  #fatalRoutes(generation: number, failure: RouteFailure = {
     reason: PUBLIC_TRANSPORT_CRASH, code: 'codex_transport_crashed',
   }): void {
-    for (const state of [...this.#sessions.values()]) {
-      if (!state.activeTurn) continue;
-      state.activeTurn = false;
+    const failed: SessionState[] = [];
+    for (const [sessionId, state] of [...this.#sessions]) {
+      if (state.generation !== generation) continue;
+      this.#sessions.delete(sessionId);
+      if (state.threadId !== null && this.#threadOwners.get(state.threadId) === sessionId) {
+        this.#threadOwners.delete(state.threadId);
+      }
+      state.activeTurnId = null;
+      state.pendingTurn = null;
+      failed.push(state);
+    }
+    for (const state of failed) {
       try {
         state.route.onFatal(failure.reason, failure.code);
       } catch {

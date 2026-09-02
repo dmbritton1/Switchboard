@@ -276,6 +276,7 @@ export function createCodexAppServerAdapter(
           return;
         }
         if (method === 'error') {
+          if (value.willRetry === true) return;
           const error = object(value.error);
           finish(text(error?.message) ?? 'Codex app-server turn failed.', 'codex_stream_failed');
           return;
@@ -311,14 +312,20 @@ export function createCodexAppServerAdapter(
           try {
             if (stopped || queue[0] !== queued || !threadId || activeTurnId) return;
             emit({ type: 'status', status: 'working' });
-            queue.shift();
-            if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'sent' });
             turnRequestInFlight = true;
             let response: { turn?: unknown };
+            let dispatched = false;
+            const acknowledgeDispatch = () => {
+              if (dispatched) return;
+              dispatched = true;
+              const index = queue.indexOf(queued);
+              if (index !== -1) queue.splice(index, 1);
+              if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'sent' });
+            };
             try {
               response = await supervisor.requestForSession<{ turn?: unknown }>(sessionId, 'turn/start', {
                 threadId, input: codexAppServerPromptInput(prepared.prompt),
-              });
+              }, acknowledgeDispatch);
             } finally {
               turnRequestInFlight = false;
             }

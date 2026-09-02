@@ -277,6 +277,7 @@ test('turn profile requires the pinned request, item, turn, usage, and routing s
     'thread-items',
     'turn-status',
     'turn-error',
+    'error-will-retry',
     'token-usage',
     'routing-ids',
   ].entries()) {

@@ -1119,6 +1119,7 @@ export function createServer(opts: {
           return { status: 409, json: { error: 'session handoff is committing' } };
         }
         handoffReservations.delete(sessionId);
+        resumeReservations.delete(sessionId);
         if (createReservations.delete(sessionId)) {
           const session = registry.get(sessionId);
           registry.apply(sessionId, {

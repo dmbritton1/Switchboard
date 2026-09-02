@@ -100,12 +100,15 @@ type Request = { sessionId: string; method: string; params: unknown };
 class ScriptedSupervisor {
   readonly requests: Request[] = [];
   readonly trace: string[] = [];
+  readonly pendingDispatches: Array<() => void> = [];
   route: CodexSessionRoute | null = null;
   bound: { sessionId: string; threadId: string } | null = null;
   detached = 0;
   request: (request: Request) => Promise<unknown>;
+  readonly autoDispatch: boolean;
 
-  constructor(request?: (request: Request) => Promise<unknown>) {
+  constructor(request?: (request: Request) => Promise<unknown>, autoDispatch = true) {
+    this.autoDispatch = autoDispatch;
     let turnNumber = 0;
     this.request = request ?? (async ({ method, params }) => {
       if (method === 'thread/start') return safeThreadResponse('thread-new', (params as { cwd: string }).cwd);
@@ -139,11 +142,26 @@ class ScriptedSupervisor {
     this.trace.push(`thread:bound:${threadId}`);
   }
 
-  async requestForSession<T>(sessionId: string, method: Request['method'], params: unknown): Promise<T> {
+  async requestForSession<T>(
+    sessionId: string,
+    method: Request['method'],
+    params: unknown,
+    onDispatched?: () => void,
+  ): Promise<T> {
     const value = { sessionId, method, params };
     this.requests.push(value);
     this.trace.push(`request:${method}`);
+    if (method === 'turn/start' && onDispatched) {
+      if (this.autoDispatch) onDispatched();
+      else this.pendingDispatches.push(onDispatched);
+    }
     return this.request(value) as Promise<T>;
+  }
+
+  dispatchNext(): void {
+    const dispatch = this.pendingDispatches.shift();
+    assert.ok(dispatch, 'a turn/start dispatch acknowledgement is pending');
+    dispatch();
   }
 
   notify(method: string, params: unknown): void {
@@ -306,6 +324,44 @@ test('normalization scrubs every punctuation-delimited path without changing URL
   } });
 });
 
+test('normalization removes file URIs from public text, summaries, and details', () => {
+  const events = [
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'agentMessage', id: 'agent-uri', text: 'Read file:///private/worktree/result.txt via https://example.test/docs',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'reasoning', id: 'reason-uri', summary: ['Inspect file:%2F%2F%2Fprivate%2Freason.txt'],
+    }),
+    ...normalizeCodexAppServerItem('started', {
+      type: 'plan', id: 'plan-uri', text: 'Update file://localhost/private/worktree/result.txt',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'commandExecution', id: 'command-uri', status: 'completed',
+      command: 'inspect file:///C:/Users/example/input.txt',
+      aggregatedOutput: 'result at file:C:\\Users\\example\\output.txt',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'fileChange', id: 'change-uri', status: 'completed',
+      changes: [{ path: 'file://fileserver/share/changed.ts', kind: 'update' }],
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'mcpToolCall', id: 'mcp-uri', status: 'completed', server: 'safe', tool: 'inspect',
+      arguments: { uri: 'file:\\\\fileserver\\share\\input.txt' }, result: 'file:///private/result.json',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'webSearch', id: 'search-uri', status: 'completed', query: 'file:///private/query.txt',
+    }),
+    ...normalizeCodexAppServerItem('completed', {
+      type: 'error', id: 'error-uri', message: 'failed at file:///private/error.txt',
+    }),
+  ];
+
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /file:(?:\/|%2f|[A-Za-z]:|\\)/i);
+  assert.match(serialized, /\[path omitted\]/);
+  assert.match(serialized, /https:\/\/example\.test\/docs/);
+});
+
 test('thread setup binds before one-at-a-time FIFO turns and preserves delivery, usage, plan, and status order', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-fifo-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -361,7 +417,7 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
   await waitFor(() => supervisor.requests.filter(({ method }) => method === 'turn/start').length === 1, 'first turn/start');
   assert.deepEqual(supervisor.bound, { sessionId: 'session-fifo', threadId: 'thread-fifo' });
   assert.ok(events.some((event) => event.type === 'vendor-session-id' && event.id === 'thread-fifo'));
-  assert.ok(supervisor.trace.indexOf('delivery:prompt-1:sent') < supervisor.trace.indexOf('request:turn/start'));
+  assert.ok(supervisor.trace.indexOf('request:turn/start') < supervisor.trace.indexOf('delivery:prompt-1:sent'));
   assert.equal(supervisor.requests.filter(({ method }) => method === 'turn/start').length, 1, 'second prompt waits');
 
   supervisor.notify('turn/plan/updated', {
@@ -390,14 +446,91 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
   const usageIndex = supervisor.trace.indexOf('usage');
   const doneIndex = supervisor.trace.indexOf('status:done');
   const nextWorkingIndex = supervisor.trace.indexOf('status:working', doneIndex + 1);
+  const nextRequestIndex = supervisor.trace.lastIndexOf('request:turn/start');
   const nextDeliveryIndex = supervisor.trace.indexOf('delivery:prompt-2:sent');
   assert.ok(usageIndex !== -1 && usageIndex < doneIndex);
-  assert.ok(doneIndex < nextWorkingIndex && nextWorkingIndex < nextDeliveryIndex);
-  assert.ok(nextDeliveryIndex < supervisor.trace.lastIndexOf('request:turn/start'));
+  assert.ok(doneIndex < nextWorkingIndex && nextWorkingIndex < nextRequestIndex);
+  assert.ok(nextRequestIndex < nextDeliveryIndex);
   assert.deepEqual(events.find((event) => event.type === 'usage'), {
     type: 'usage', inputTokens: 10, outputTokens: 9, cachedInputTokens: 3,
     cacheWriteInputTokens: 2, reasoningOutputTokens: 4,
   });
+});
+
+test('dispatch acknowledgement distinguishes a pre-write failure from a lost response', async (t) => {
+  for (const acknowledged of [false, true]) {
+    const cwd = await mkdtemp(join(tmpdir(), `switchboard-app-adapter-dispatch-${acknowledged}-`));
+    t.after(() => rm(cwd, { recursive: true, force: true }));
+    const response = deferred<unknown>();
+    const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+      if (method === 'thread/start') return safeThreadResponse(`thread-dispatch-${acknowledged}`, (params as { cwd: string }).cwd);
+      if (method === 'turn/start') return response.promise;
+      throw new Error(`unexpected ${method}`);
+    }, false);
+    const events: AdapterEvent[] = [];
+    createCodexAppServerAdapter(
+      supervisor as unknown as CodexAppServerSupervisor,
+      `dispatch-${acknowledged}`,
+      '0.145.0',
+    ).start({ cwd, prompt: prompt('dispatch me'), promptId: 'dispatch-prompt', env: {} }, (event) => events.push(event));
+
+    await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'pending turn/start write');
+    assert.equal(events.some((event) => event.type === 'prompt-delivery'), false, 'the prompt stays queued before write acknowledgement');
+    if (acknowledged) {
+      supervisor.dispatchNext();
+      await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+    }
+    response.reject(new Error(acknowledged ? 'response lost after dispatch' : 'write rejected before dispatch'));
+    await waitFor(() => events.some((event) => event.type === 'stopped'), 'terminal request failure');
+
+    assert.deepEqual(events.filter((event) => event.type === 'prompt-delivery'), [{
+      type: 'prompt-delivery',
+      id: 'dispatch-prompt',
+      delivery: acknowledged ? 'sent' : 'unsent',
+    }]);
+  }
+});
+
+test('retryable error notifications retain the active turn, route, and image snapshot', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-retryable-error-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(
+    supervisor as unknown as CodexAppServerSupervisor,
+    'retryable-error',
+    '0.145.0',
+  ).start({ cwd, prompt: await imagePrompt(cwd), promptId: 'retryable-image', env: {} }, (event) => events.push(event));
+  handle.send(prompt('queued after retry'), 'after-retry');
+
+  await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.id === 'retryable-image' && event.delivery === 'sent'));
+  const firstStart = supervisor.requests.find(({ method }) => method === 'turn/start');
+  const snapshotPath = ((firstStart?.params as { input: Array<{ type: string; path?: string }> }).input)
+    .find((input) => input.type === 'localImage')?.path;
+  assert.ok(snapshotPath);
+  assert.equal(await pathExists(snapshotPath), true);
+
+  supervisor.notify('error', {
+    threadId: 'thread-new', turnId: 'turn-1', willRetry: true,
+    error: { message: 'temporary transport error', codexErrorInfo: null, additionalDetails: null },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.some((event) => event.type === 'stopped'), false);
+  assert.equal(supervisor.detached, 0);
+  assert.ok(supervisor.route);
+  assert.equal(await pathExists(snapshotPath), true, 'retry ownership keeps the image snapshot alive');
+  assert.equal(supervisor.requests.filter(({ method }) => method === 'turn/start').length, 1, 'the queued prompt still waits');
+
+  supervisor.notify('turn/completed', { threadId: 'thread-new', turn: turn('turn-1', 'completed') });
+  await waitFor(() => supervisor.requests.filter(({ method }) => method === 'turn/start').length === 2, 'post-retry queued turn');
+  await waitFor(async () => !await pathExists(snapshotPath), 'completed retry snapshot cleanup');
+  supervisor.notify('error', {
+    threadId: 'thread-new', turnId: 'turn-2', willRetry: false,
+    error: { message: 'terminal transport error', codexErrorInfo: null, additionalDetails: null },
+  });
+  await waitFor(() => events.some((event) => event.type === 'stopped'), 'non-retryable terminal error');
+  assert.equal(events.find((event) => event.type === 'stopped')?.code, 'codex_stream_failed');
+  assert.equal(supervisor.detached, 1);
 });
 
 test('adapter plan and terminal error events scrub embedded absolute paths', async (t) => {
@@ -411,20 +544,21 @@ test('adapter plan and terminal error events scrub embedded absolute paths', asy
 
   supervisor.notify('turn/plan/updated', {
     threadId: 'thread-new', turnId: 'turn-1',
-    plan: [{ step: 'Inspect /private/worktree/result.txt carefully', status: 'inProgress' }],
+    plan: [{ step: 'Inspect /private/worktree/result.txt and file:///private/worktree/plan.txt carefully', status: 'inProgress' }],
   });
   supervisor.notify('turn/completed', {
     threadId: 'thread-new',
     turn: turn('turn-1', 'failed', {
-      message: 'Failed at /private/worktree/result.txt: permission denied',
+      message: 'Failed at /private/worktree/result.txt and file://localhost/private/worktree/error.txt: permission denied',
       codexErrorInfo: null,
-      additionalDetails: '/private/provider/error.json',
+      additionalDetails: 'file:%2F%2F%2Fprivate%2Fprovider%2Ferror.json',
     }),
   });
   await waitFor(() => events.some((event) => event.type === 'stopped'), 'path-scrubbed terminal event');
 
   const serialized = JSON.stringify(events);
   assert.doesNotMatch(serialized, /\/private\/(?:worktree|provider)/);
+  assert.doesNotMatch(serialized, /file:(?:\/|%2f|[A-Za-z]:|\\)/i);
   assert.match(serialized, /Inspect|carefully|permission denied/);
 });
 

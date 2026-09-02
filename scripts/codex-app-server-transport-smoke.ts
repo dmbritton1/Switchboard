@@ -19,7 +19,7 @@ export type CodexAppServerTransportSmokeEvidence = {
   cleanProcessRestart: boolean;
   resume: boolean;
   interrupt: boolean;
-  multiSessionRouting: boolean;
+  multiSessionRouting?: boolean;
   noReplay: boolean;
   cleanShutdown: boolean;
   fixtureIds: string[];
@@ -266,7 +266,6 @@ async function realSmoke(
       version: '0.145.0', initialized: telemetry.includes('snapshot'), telemetryContinuity: telemetryContinuous(telemetry),
       newThread: vendorThread(events) !== null, firstTurn: hasDelivery(events, 'first-a', 'sent'), followUp: hasDelivery(events, 'follow-a', 'sent'),
       cleanProcessRestart: true, resume: hasDelivery(resumedEvents, 'resume-a', 'sent'), interrupt: stopped(interruptEvents, 'codex_user_stopped'),
-      multiSessionRouting: false,
       noReplay: hasDelivery(interruptEvents, 'interrupt-a', 'sent') && hasDelivery(interruptEvents, 'queued-a', 'unsent'),
       cleanShutdown: true, fixtureIds: ['fixture-a', 'fixture-resume'],
     };

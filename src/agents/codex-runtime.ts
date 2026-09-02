@@ -87,7 +87,13 @@ function parseVersion(output: string): string | null {
  * through here so no caller can reintroduce the ordering.
  */
 export function redactValues(text: string, values: Iterable<string>): string {
-  let safe = text.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+  let safe = text.replace(/\bfile:[^\s"'`<>{}\[\](),;]*/giu, (uri) => {
+    const target = uri.slice('file:'.length);
+    const absolute = /^(?:\/|\\|%2f|%5c)/i.test(target)
+      || /^[A-Za-z](?::|%3a)(?:\/|\\|%2f|%5c)/i.test(target);
+    return absolute ? '[path omitted]' : uri;
+  });
+  safe = safe.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
   const ordered = [...new Set(values)].filter(redactable).sort((a, b) => b.length - a.length);
   for (const value of ordered) safe = safe.replaceAll(value, '[REDACTED]');
   return safe;

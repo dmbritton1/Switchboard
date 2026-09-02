@@ -62,10 +62,12 @@ at it with an absolute path:
 Codex selects its runtime deterministically: an explicit account `bin`, then a
 compatible standard ChatGPT.app binary, then the SDK-bundled CLI fallback. An
 explicit path is authoritative and must be an executable whose exact published
-version matches the installed SDK (apart from build metadata); otherwise
-preflight fails before a worktree or session is created with an actionable
-error. A mismatched ChatGPT.app binary is skipped in favor of the SDK fallback.
-Switchboard is intentionally macOS-only.
+version matches the installed SDK (apart from build metadata). Create preflight
+runs after Switchboard owns the new session and worktree; a failure retains that
+stopped pair with an actionable error for diagnosis or retry. Handoff preflight
+runs before either source or successor state changes, so a failure leaves the
+handoff atomic. A mismatched ChatGPT.app binary is skipped in favor of the SDK
+fallback. Switchboard is intentionally macOS-only.
 
 The usual account uses automatic selection and the SDK transport:
 
@@ -403,8 +405,9 @@ without intentionally authorizing those paid turns.
   persistent session errors with stable codes and actionable remediation rather
   than a transient toast.
 - Every written initial prompt is displayed for both Claude and Codex. Codex
-  prompts are marked `queued`, then `sent` immediately before delivery; queued
-  prompts left by a failure, stop, or restart become `unsent` and remain visible.
+  prompts are marked `queued`, then `sent` once the child acknowledges the
+  accepted stdin write; queued prompts left by a failure, stop, or restart become
+  `unsent` and remain visible.
   They are never replayed automatically: copy or resend them after resume if
   still needed.
 - Transport is SSE (`GET /events`) + `POST /command`, not WebSocket — the

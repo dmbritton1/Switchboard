@@ -103,6 +103,73 @@ test('fake transport smoke drives the production pool and adapter without publis
   for (const worktree of observedWorktrees) await assert.rejects(access(worktree));
 });
 
+test('real smoke evidence omits the unmeasured multi-session routing field', async () => {
+  const createPool = (): CodexProviderPool => {
+    let listener: { onSnapshot(snapshot: never): void; onStale(reason: string): void } | undefined;
+    let promoted = false;
+    const pool = {
+      async limits(_account: Account, next: typeof listener) {
+        listener = next;
+        return {
+          async start() { listener?.onSnapshot({} as never); },
+        };
+      },
+      async prepare() {
+        if (!promoted && listener) {
+          promoted = true;
+          listener.onStale('fixture promotion');
+          listener.onSnapshot({} as never);
+        }
+        return {
+          runtimeVersion: '0.145.0',
+          adapter: {
+            start(opts: { prompt: { text: string }; promptId?: string }, emit: (event: any) => void) {
+              const held = opts.prompt.text.startsWith('Write a long neutral essay.');
+              const queued: string[] = [];
+              emit({ type: 'vendor-session-id', id: 'opaque-real-thread' });
+              if (opts.promptId) emit({ type: 'prompt-delivery', id: opts.promptId, delivery: 'sent' });
+              if (!held) queueMicrotask(() => emit({ type: 'status', status: 'done' }));
+              return {
+                send(_prompt: unknown, promptId?: string) {
+                  if (!promptId) return;
+                  if (held) queued.push(promptId);
+                  else {
+                    emit({ type: 'prompt-delivery', id: promptId, delivery: 'sent' });
+                    queueMicrotask(() => emit({ type: 'status', status: 'done' }));
+                  }
+                },
+                stop() {
+                  for (const promptId of queued) emit({ type: 'prompt-delivery', id: promptId, delivery: 'unsent' });
+                  emit({ type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped' });
+                },
+                decide() {},
+                setAuto() {},
+              };
+            },
+          },
+        };
+      },
+      async close() {},
+    };
+    return pool as unknown as CodexProviderPool;
+  };
+  const evidence = await runCodexAppServerTransportSmoke({
+    mode: 'real',
+    accountName: 'fixture-codex',
+    accounts: [account()],
+    env: { SWITCHBOARD_ALLOW_PAID_CODEX_SMOKE: '1' },
+    createPool,
+    createWorkspace: async () => ({
+      repository: '/opaque/repository',
+      worktrees: ['/opaque/worktree'],
+      async cleanup() {},
+    }),
+  });
+
+  assert.equal(Object.hasOwn(evidence, 'multiSessionRouting'), false);
+  assert.equal(JSON.stringify(evidence).includes('"multiSessionRouting":false'), false);
+});
+
 test('real-mode workspace helper creates one temporary git worktree and cleans it', async () => {
   const workspace = await createSmokeWorkspace('real');
   try {

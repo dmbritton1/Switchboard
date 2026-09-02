@@ -271,7 +271,9 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnCompletedNotification.ts'), 'export type TurnCompletedNotification = { threadId: string, turn: Turn };\n');
   writeFileSync(join(out, 'v2', 'ErrorNotification.ts'), [
-    'export type ErrorNotification = { error: TurnError, willRetry: boolean, threadId: string, ',
+    'export type ErrorNotification = { error: TurnError, ',
+    shape('error-will-retry', 'willRetry: boolean, '),
+    'threadId: string, ',
     shape('routing-ids', 'turnId: string'),
     ' };\n',
   ].join(''));
@@ -714,11 +716,6 @@ async function handle(message: Message): Promise<void> {
     process.stderr.write(`controlled crash ${process.env.PROBE_TOKEN ?? ''}\n`);
     process.exit(23);
   }
-  if (mode === 'write-failure') {
-    process.stdin.destroy();
-    setImmediate(() => process.exit(27));
-    return;
-  }
   if (mode === 'unknown-response') {
     send({ id: 999, result: { unexpected: true } });
     return;
@@ -962,4 +959,7 @@ lines.on('close', () => {
 maybePauseBootstrap();
 
 const readyMarker = process.env.FAKE_APP_SERVER_READY_MARKER;
-if (readyMarker) writeFileSync(readyMarker, 'ready');
+if (mode === 'write-failure') {
+  process.stdin.destroy();
+  process.exit(27);
+} else if (readyMarker) writeFileSync(readyMarker, 'ready');

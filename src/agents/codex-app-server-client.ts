@@ -28,6 +28,8 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  onDispatched?: () => void;
+  dispatched: boolean;
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -76,7 +78,7 @@ export class AppServerClient {
     });
   }
 
-  request<T>(method: string, params?: unknown): Promise<T> {
+  request<T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> {
     if (this.#terminalError) return Promise.reject(this.#terminalError);
     const id = this.#nextId++;
     return new Promise<T>((resolve, reject) => {
@@ -84,8 +86,12 @@ export class AppServerClient {
         if (!this.#pending.has(id)) return;
         this.#fail(`Codex app-server request ${method} timed out after ${this.#timeout()}ms.`, true);
       }, this.#timeout());
-      this.#pending.set(id, { resolve, reject, timer });
-      this.#send(params === undefined ? { method, id } : { method, id, params });
+      const pending: Pending = { resolve, reject, timer, onDispatched, dispatched: false };
+      this.#pending.set(id, pending);
+      this.#send(
+        params === undefined ? { method, id } : { method, id, params },
+        () => this.#ackDispatch(pending),
+      );
     });
   }
 
@@ -140,7 +146,7 @@ export class AppServerClient {
     return this.#options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
-  #send(message: Record<string, unknown>): void {
+  #send(message: Record<string, unknown>, onDispatched?: () => void): void {
     if (this.#child.stdin.destroyed) {
       this.#fail('Codex app-server input closed unexpectedly.');
       return;
@@ -148,6 +154,7 @@ export class AppServerClient {
     try {
       this.#child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
         if (error) this.#fail('Codex app-server input closed unexpectedly.');
+        else onDispatched?.();
       });
     } catch {
       this.#fail('Codex app-server input closed unexpectedly.');
@@ -180,6 +187,7 @@ export class AppServerClient {
         this.#fail('Codex app-server returned an unknown response id.');
         return;
       }
+      this.#ackDispatch(pending);
       this.#pending.delete(message.id);
       clearTimeout(pending.timer);
       if (message.error !== undefined) pending.reject(this.#error('Codex app-server request failed.'));
@@ -195,6 +203,12 @@ export class AppServerClient {
       return;
     }
     this.#fail('Codex app-server returned an invalid message.');
+  }
+
+  #ackDispatch(pending: Pending): void {
+    if (pending.dispatched) return;
+    pending.dispatched = true;
+    pending.onDispatched?.();
   }
 
   #reportServerRequest(id: string | number, method: string, params: unknown): void {

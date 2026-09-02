@@ -213,19 +213,53 @@ test('rejects an unknown response ID', async (t) => {
 });
 
 test('settles a request when its input write fails', async (t) => {
-  const ready = await createReadyMarker(t, 'switchboard-client-write-failure-');
+  let dispatches = 0;
+  let observeExit!: () => void;
+  const exited = new Promise<void>((resolve) => { observeExit = resolve; });
   const client = clientFor({
     mode: 'write-failure',
-    overrides: { FAKE_APP_SERVER_READY_MARKER: ready },
+    onExit: observeExit,
   });
   t.after(() => client.close());
 
-  const request = observePending(client.request('initialize'));
-  await waitForFakeChildReady(ready);
+  await exited;
+  const request = observePending(client.request('initialize', undefined, () => { dispatches += 1; }));
   await rejectsWithin(
     request,
     1_500,
     (error) => error instanceof Error && /input closed unexpectedly|exited unexpectedly/i.test(error.message),
+  );
+  assert.equal(dispatches, 0, 'a failed stdin write is never acknowledged as dispatched');
+});
+
+test('acknowledges an accepted stdin write before a pending response settles', async (t) => {
+  const ready = await createReadyMarker(t, 'switchboard-client-dispatch-ack-');
+  const client = clientFor({
+    mode: 'hang',
+    requestTimeoutMs: 2_000,
+    overrides: { FAKE_APP_SERVER_READY_MARKER: ready },
+  });
+  t.after(() => client.close().catch(() => {}));
+  let acknowledge!: () => void;
+  const acknowledged = new Promise<void>((resolve) => { acknowledge = resolve; });
+  const request = observePending(client.request('initialize', undefined, acknowledge));
+  await waitForFakeChildReady(ready);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      acknowledged,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('dispatch acknowledgement did not arrive')), 1_500);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  await rejectsWithin(
+    request,
+    3_000,
+    (error) => error instanceof Error && /timed out|closed|terminated/i.test(error.message),
   );
 });
 
