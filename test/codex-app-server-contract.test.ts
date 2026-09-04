@@ -362,6 +362,28 @@ test('turn profile requires a typed token-usage notification payload', async () 
   }
 });
 
+// Mutation caught: a substring check for `willRetry: boolean` accepts nullable,
+// widened, literal-only, and longer prefixed types instead of the exact field.
+test('turn profile requires an exact required willRetry boolean field', async () => {
+  for (const [index, shape] of [
+    'error-will-retry-optional',
+    'error-will-retry-nullable',
+    'error-will-retry-union',
+    'error-will-retry-literals',
+    'error-will-retry-no-delimiter',
+  ].entries()) {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-will-retry-${index}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+      `turn profile should reject incompatible ${shape}`,
+    );
+  }
+});
+
 test('generated contract rejects an omitted required member', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({

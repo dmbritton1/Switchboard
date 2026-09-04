@@ -396,8 +396,10 @@ without intentionally authorizing those paid turns.
   approval callback, only a start-of-thread `approvalPolicy`. Codex sessions run
   with `approvalPolicy: 'never'` and are sandboxed to their own worktree
   (`sandboxMode: 'workspace-write'`) instead; `decide()` on a Codex session is a
-  no-op. Runtime preflight validates a selected macOS binary and compatibility
-  before creating a worktree, and normally checks readiness with `codex login
+  no-op. Runtime preflight validates a selected macOS binary and compatibility.
+  Create preflight runs after Switchboard owns the stopped session and worktree,
+  retaining that pair on failure; handoff preflight is failure-atomic before
+  source or successor mutation. It normally checks readiness with `codex login
   status`: recognized logged-out errors fail with actionable remediation. If a
   compatible CLI does not support that subcommand, preflight records a
   diagnostic and defers authentication checking until Codex starts. Launch,

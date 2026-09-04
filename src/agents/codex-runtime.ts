@@ -15,9 +15,37 @@ const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
  * protection.
  */
 const MIN_REDACTABLE = 6;
+const FILE_URI_TOKEN = /\bfile:[^\s"`<>{}\[\]“”‘’]+/giu;
+const FILE_URI_TRAILING_PROSE = /[.,;:!?]/u;
 
 export function redactable(value: string): boolean {
   return typeof value === 'string' && value.length >= MIN_REDACTABLE;
+}
+
+function absoluteFileTarget(target: string): boolean {
+  return /^(?:\/|\\|%2f|%5c)/i.test(target)
+    || /^[A-Za-z](?::|%3a)(?:\/|\\|%2f|%5c)/i.test(target);
+}
+
+function absoluteFileUriEnd(token: string, offset: number, source: string): number | null {
+  let uriEnd = token.length;
+  while (uriEnd > 'file:'.length && FILE_URI_TRAILING_PROSE.test(token[uriEnd - 1]!)) uriEnd -= 1;
+  if (source[offset - 1] === '(' && token[uriEnd - 1] === ')') uriEnd -= 1;
+  const target = token.slice('file:'.length, uriEnd);
+  return absoluteFileTarget(target) ? uriEnd : null;
+}
+
+function redactFileUriToken(token: string, offset: number, source: string): string {
+  const uriEnd = absoluteFileUriEnd(token, offset, source);
+  if (uriEnd === null) return token;
+  return `[path omitted]${token.slice(uriEnd)}`;
+}
+
+export function containsAbsoluteFileUri(value: string): boolean {
+  for (const match of value.matchAll(FILE_URI_TOKEN)) {
+    if (absoluteFileUriEnd(match[0], match.index, value) !== null) return true;
+  }
+  return false;
 }
 const CHATGPT_PATH = '/Applications/ChatGPT.app/Contents/Resources/codex';
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 10_000;
@@ -87,12 +115,7 @@ function parseVersion(output: string): string | null {
  * through here so no caller can reintroduce the ordering.
  */
 export function redactValues(text: string, values: Iterable<string>): string {
-  let safe = text.replace(/\bfile:[^\s"'`<>{}\[\](),;]*/giu, (uri) => {
-    const target = uri.slice('file:'.length);
-    const absolute = /^(?:\/|\\|%2f|%5c)/i.test(target)
-      || /^[A-Za-z](?::|%3a)(?:\/|\\|%2f|%5c)/i.test(target);
-    return absolute ? '[path omitted]' : uri;
-  });
+  let safe = text.replace(FILE_URI_TOKEN, redactFileUriToken);
   safe = safe.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
   const ordered = [...new Set(values)].filter(redactable).sort((a, b) => b.length - a.length);
   for (const value of ordered) safe = safe.replaceAll(value, '[REDACTED]');

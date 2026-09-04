@@ -176,6 +176,67 @@ function scriptedClient(options: AppServerClientOptions, fail = false): Scripted
   };
 }
 
+function routedTurn(id: string, status: 'inProgress' | 'completed' = 'inProgress'): Record<string, unknown> {
+  return {
+    id,
+    items: [],
+    itemsView: 'full',
+    status,
+    error: null,
+    startedAt: 1,
+    completedAt: status === 'completed' ? 2 : null,
+    durationMs: status === 'completed' ? 1 : null,
+  };
+}
+
+async function turnRoutingHarness(
+  t: { after(fn: () => unknown): void },
+  respondToStart: (number: number) => unknown | Promise<unknown>,
+): Promise<{
+  supervisor: CodexAppServerSupervisor;
+  protocol: AppServerClientOptions;
+  routed: Array<{ method: string; params: unknown }>;
+  turnStarts(): number;
+}> {
+  let protocol!: AppServerClientOptions;
+  let starts = 0;
+  const routed: Array<{ method: string; params: unknown }> = [];
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      protocol = options;
+      return {
+        request: async <T>(method: string, _params?: unknown, onDispatched?: () => void): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          if (method === 'turn/start') {
+            starts += 1;
+            onDispatched?.();
+            return await respondToStart(starts) as T;
+          }
+          if (method === 'turn/interrupt') return {} as T;
+          throw new Error(`unexpected ${method}`);
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {},
+      };
+    },
+  });
+  t.after(() => supervisor.close());
+  await supervisor.ensureTurnTransport();
+  supervisor.registerSession('session', {
+    onNotification: (method, params) => routed.push({ method, params }),
+    onFatal: () => assert.fail('turn routing harness must remain live'),
+  });
+  supervisor.bindThread('session', 'thread');
+  return { supervisor, protocol, routed, turnStarts: () => starts };
+}
+
 test('verifies before one child starts, initializes before reads, coalesces reads, and issues no turn RPCs', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-supervisor-lifecycle-'));
   const callLog = join(directory, 'calls.jsonl');
@@ -1276,6 +1337,123 @@ test('active turn ids prevent stale completion from releasing a newer turn', asy
     'session', 'turn/start', { threadId: 'thread' },
   );
   assert.equal(third.turn.id, 'turn-3');
+});
+
+// Mutation caught: treating any routed turn/started notification as a new
+// owner lets a stale notification block a fresh turn while the session is idle.
+test('a stale turn/started notification cannot take ownership while idle', async (t) => {
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => ({ turn: routedTurn(`turn-${start}`) }),
+  );
+
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('stale-id'),
+  });
+  const started = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+
+  assert.equal(started.turn.id, 'turn-1');
+  assert.equal(turnStarts(), 1);
+});
+
+// Mutation caught: replacing an already-active owner with a stale start makes
+// the real completion invisible and permanently blocks the next turn.
+test('a stale turn/started notification cannot replace another active turn', async (t) => {
+  const { supervisor, protocol } = await turnRoutingHarness(
+    t,
+    (start) => ({ turn: routedTurn(`turn-${start}`) }),
+  );
+
+  await supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('stale-id'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: failing to let a matching start notification establish the
+// pending request's owner breaks legitimate notification-before-response order.
+test('turn/started notification before its matching response preserves ownership', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('turn-1'),
+  });
+  response.resolve({ turn: routedTurn('turn-1') });
+  const started = await pending;
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+
+  assert.equal(started.turn.id, 'turn-1');
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: clearing ownership on a delayed matching notification breaks
+// legitimate response-before-notification order.
+test('turn/start response before its matching notification preserves ownership', async (t) => {
+  const { supervisor, protocol } = await turnRoutingHarness(
+    t,
+    (start) => ({ turn: routedTurn(`turn-${start}`) }),
+  );
+
+  const started = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('turn-1'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+
+  assert.equal(started.turn.id, 'turn-1');
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: clearing pending correlation when turn/started arrives lets
+// a conflicting response silently migrate ownership to a different turn.
+test('turn/start rejects a response id that conflicts with its start notification', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    () => response.promise,
+  );
+
+  const pending = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('notification-turn'),
+  });
+  response.resolve({ turn: routedTurn('response-turn') });
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof Error && /protocol/i.test(error.message),
+  );
 });
 
 test('a turn-mode crash fatals every route bound to the lost generation and restarts without replay', async (t) => {

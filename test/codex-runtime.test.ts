@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import {
   CodexRuntimeError,
   prepareCodexRuntime,
@@ -334,6 +335,47 @@ test('redaction removes complete absolute file URIs while preserving HTTPS and o
   assert.equal(redacted.match(/\[path omitted\]/g)?.length, unsafe.length);
   assert.ok(redacted.includes(safeUrl));
   assert.ok(redacted.includes(ordinary));
+});
+
+// Mutation caught: stopping the absolute file-URI match at a comma, semicolon,
+// or parenthesis leaves the remainder of a provider filename in public text.
+test('redaction consumes every valid absolute file URI path character', () => {
+  const generated = pathToFileURL('/private/generated,report;v1(balanced).txt').href;
+  const unsafe = [
+    'file:///private/literal,report;v1(balanced).txt',
+    generated,
+    'file:%2F%2F%2Fprivate%2Fencoded%2Creport%3Bv1%28balanced%29.txt',
+    'file://localhost/private/local,report;v1(unbalanced.txt',
+    'file://fileserver/share/unc,report;v1)unbalanced.txt',
+    'file:///C:/Users/example/windows,report;v1(balanced).txt',
+    'file:C:\\Users\\example\\windows,report;v1(unbalanced.txt',
+    'file:\\\\fileserver\\share\\unc,report;v1)unbalanced.txt',
+  ];
+
+  for (const uri of unsafe) {
+    assert.equal(
+      redactValues(`unsafe ${uri} safe`, []),
+      'unsafe [path omitted] safe',
+      uri,
+    );
+  }
+});
+
+// Mutation caught: greedily consuming the surrounding token after finding an
+// absolute file URI deletes punctuation or unrelated prose along with the URI.
+test('redaction preserves punctuation and prose after an absolute file URI', () => {
+  const safeUrl = 'https://example.test/a//b?file=public';
+  const ordinary = 'file:notes.txt';
+  assert.equal(
+    redactValues(
+      `See (file:///private/report,final;v1(approved).txt), then continue. `
+      + `Failure at file://localhost/private/error.json: permission denied. `
+      + `${safeUrl} and ${ordinary} remain.`,
+      [],
+    ),
+    `See ([path omitted]), then continue. Failure at [path omitted]: permission denied. `
+      + `${safeUrl} and ${ordinary} remain.`,
+  );
 });
 
 test('redaction leaves values too short to be a credential alone', () => {

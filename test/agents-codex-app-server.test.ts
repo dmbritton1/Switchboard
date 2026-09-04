@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,7 @@ import {
   CodexAppServerSupervisor,
   type CodexSessionRoute,
 } from '../src/agents/codex-app-server-supervisor.ts';
+import { Registry } from '../src/sessions.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AdapterEvent, AgentPrompt, CodexFailureCode } from '../src/types.ts';
 
@@ -360,6 +361,150 @@ test('normalization removes file URIs from public text, summaries, and details',
   assert.doesNotMatch(serialized, /file:(?:\/|%2f|[A-Za-z]:|\\)/i);
   assert.match(serialized, /\[path omitted\]/);
   assert.match(serialized, /https:\/\/example\.test\/docs/);
+});
+
+// Mutation caught: accepting an unsafe thread response emits and persists the
+// raw value as vendor-session-id, then binds future resume traffic to it.
+test('an absolute file URI in a provider thread id fails closed before binding or emission', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-thread-id-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const unsafeId = 'thread:file:///private/provider,thread;(secret).json';
+  const supervisor = new ScriptedSupervisor(async ({ method }) => {
+    if (method === 'thread/start') return safeThreadResponse(unsafeId, cwd);
+    if (method === 'turn/start') return { turn: turn('safe-turn', 'inProgress') };
+    throw new Error(`unexpected ${method}`);
+  });
+  const events: AdapterEvent[] = [];
+
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-thread', '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-thread-prompt', env: {} }, (event) => events.push(event));
+
+  await waitFor(
+    () => events.some((event) => event.type === 'stopped' || event.type === 'vendor-session-id'),
+    'unsafe thread-id decision',
+    500,
+  );
+  assert.equal(supervisor.bound, null);
+  assert.equal(supervisor.requests.some(({ method }) => method === 'turn/start'), false);
+  assert.equal(events.some((event) => event.type === 'vendor-session-id'), false);
+  assert.ok(events.some((event) => event.type === 'stopped' && event.code === 'codex_protocol_mismatch'));
+  assert.equal(JSON.stringify(events).includes(unsafeId), false);
+});
+
+// Mutation caught: forwarding a legacy unsafe vendor thread id to thread/resume
+// attempts provider recovery with an identifier that must instead fail closed.
+test('an unsafe stored thread id is rejected before resume without rewriting it', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-resume-id-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const unsafeId = 'thread:file:///private/provider,resume;(secret).json';
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-resume', '0.145.0')
+    .start({
+      cwd, prompt: prompt('continue'), promptId: 'unsafe-resume-prompt', env: {}, resumeId: unsafeId,
+    }, (event) => events.push(event));
+
+  await waitFor(
+    () => events.some((event) => event.type === 'stopped')
+      || supervisor.requests.some(({ method }) => method === 'thread/resume'),
+    'unsafe stored thread-id decision',
+    500,
+  );
+  assert.equal(supervisor.requests.some(({ method }) => method === 'thread/resume'), false);
+  assert.ok(events.some((event) => event.type === 'stopped' && event.code === 'codex_protocol_mismatch'));
+  assert.equal(JSON.stringify(events).includes(unsafeId), false);
+});
+
+// Mutation caught: accepting an unsafe turn/start response lets the raw turn
+// id become active and later derives a public todo id from it.
+test('an absolute file URI in a provider turn id fails closed before public id derivation', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-turn-id-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const unsafeId = 'turn:file:///private/provider,turn;(secret).json';
+  const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+    if (method === 'thread/start') return safeThreadResponse('safe-thread', (params as { cwd: string }).cwd);
+    if (method === 'turn/start') return { turn: turn(unsafeId, 'inProgress') };
+    throw new Error(`unexpected ${method}`);
+  });
+  const events: AdapterEvent[] = [];
+
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-turn', '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-turn-prompt', env: {} }, (event) => events.push(event));
+
+  await waitFor(
+    () => events.some((event) => event.type === 'stopped')
+      || events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'),
+    'unsafe turn-id decision',
+    500,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  supervisor.notify('turn/plan/updated', {
+    threadId: 'safe-thread', turnId: unsafeId,
+    plan: [{ step: 'must not publish', status: 'inProgress' }],
+  });
+
+  assert.ok(events.some((event) => event.type === 'stopped' && event.code === 'codex_protocol_mismatch'));
+  assert.equal(events.some((event) => event.type === 'upsert-msg' && event.msg.kind === 'todo'), false);
+  assert.equal(JSON.stringify(events).includes(unsafeId), false);
+});
+
+// Mutation caught: forwarding an unsafe ThreadItem.id admits that raw value as
+// a Registry upsert key even if every human-readable field is redacted.
+test('an absolute file URI in a provider item id fails closed before Registry admission', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-item-id-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const unsafeId = 'item:file:///private/provider,item;(secret).json';
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-item', '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-item-prompt', env: {} }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+
+  supervisor.notify('item/started', {
+    threadId: 'thread-new', turnId: 'turn-1',
+    item: {
+      type: 'commandExecution', id: unsafeId, command: 'printf safe',
+      status: 'inProgress', aggregatedOutput: null,
+    },
+  });
+
+  assert.ok(events.some((event) => event.type === 'stopped' && event.code === 'codex_protocol_mismatch'));
+  assert.equal(events.some((event) => event.type === 'upsert-msg' && event.msg.id === unsafeId), false);
+  assert.equal(JSON.stringify(events).includes(unsafeId), false);
+});
+
+// Mutation caught: relying on text redaction after emitting an unsafe item id
+// allows the raw upsert key into Registry persistence and its SSE projection.
+test('unsafe provider ids stay out of Registry persistence and public projection', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-public-id-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const statePath = join(cwd, 'state.json');
+  const registry = new Registry(statePath);
+  const session = registry.create({
+    provider: 'codex', account: 'codex', repo: cwd, cwd, branch: 'unsafe-id',
+    title: 'unsafe id', codexTransport: 'app-server',
+  });
+  const unsafeId = 'item:file:///private/provider,public;(secret).json';
+  const supervisor = new ScriptedSupervisor();
+
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-public-prompt', env: {} },
+      (event) => registry.apply(session.id, event));
+  await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
+  supervisor.notify('item/started', {
+    threadId: 'thread-new', turnId: 'turn-1',
+    item: {
+      type: 'commandExecution', id: unsafeId, command: 'printf safe',
+      status: 'inProgress', aggregatedOutput: null,
+    },
+  });
+  await registry.save();
+
+  assert.equal(registry.get(session.id)?.stoppedCode, 'codex_protocol_mismatch');
+  assert.equal(JSON.stringify(registry.publicSessions()).includes(unsafeId), false);
+  assert.equal((await readFile(statePath, 'utf8')).includes(unsafeId), false);
 });
 
 test('thread setup binds before one-at-a-time FIFO turns and preserves delivery, usage, plan, and status order', async (t) => {

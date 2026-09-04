@@ -1,6 +1,6 @@
 import { safeCodexDetail } from './codex-detail.ts';
 import { classifyCodexFailure } from './codex.ts';
-import { redactCodexText } from './codex-runtime.ts';
+import { containsAbsoluteFileUri, redactCodexText } from './codex-runtime.ts';
 import { validateCodexSettings } from './codex-settings.ts';
 import { snapshotCodexPrompt } from '../prompt-input.ts';
 import type { CodexAppServerSupervisor } from './codex-app-server-supervisor.ts';
@@ -23,6 +23,18 @@ function object(value: unknown): Record<string, unknown> | null {
 
 function text(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+function unsafeProviderIdentifier(value: unknown): boolean {
+  return typeof value === 'string' && containsAbsoluteFileUri(value);
+}
+
+function notificationHasUnsafeIdentifier(value: Record<string, unknown>): boolean {
+  const thread = object(value.thread);
+  const turn = object(value.turn);
+  const item = object(value.item);
+  return [value.threadId, value.turnId, thread?.id, turn?.id, item?.id]
+    .some(unsafeProviderIdentifier);
 }
 
 function toolStatus(value: unknown, phase: ItemPhase): ToolMsg['status'] {
@@ -78,6 +90,7 @@ export function normalizeCodexAppServerItem(
 ): AdapterEvent[] {
   const value = object(item);
   if (!value || typeof value.type !== 'string' || typeof value.id !== 'string') return [];
+  if (unsafeProviderIdentifier(value.id)) return [];
   const id = value.id;
   switch (value.type) {
     case 'agentMessage':
@@ -136,7 +149,7 @@ function threadResponse(value: unknown, cwd: string): string | null {
   const thread = response && object(response.thread);
   const sandbox = response && object(response.sandbox);
   const id = thread && text(thread.id);
-  if (!response || !thread || !sandbox || !id
+  if (!response || !thread || !sandbox || !id || unsafeProviderIdentifier(id)
     || response.cwd !== cwd || thread.cwd !== cwd
     || response.approvalPolicy !== 'never' || sandbox.type !== 'workspaceWrite') return null;
   return id;
@@ -246,6 +259,10 @@ export function createCodexAppServerAdapter(
         if (stopped) return;
         const value = object(params);
         if (!value) return;
+        if (notificationHasUnsafeIdentifier(value)) {
+          finish('Codex app-server returned an unsafe provider identifier.', 'codex_protocol_mismatch');
+          return;
+        }
         const receivedTurn = text(value.turnId) ?? text(object(value.turn)?.id);
         if (receivedTurn && !activeTurnId && turnRequestInFlight) {
           bufferedNotifications.push({ method, params });
@@ -331,7 +348,7 @@ export function createCodexAppServerAdapter(
             }
             const turn = object(response)?.turn;
             const id = turn && text(turn.id);
-            if (!id) {
+            if (!id || unsafeProviderIdentifier(id)) {
               if (stopped) detachRoute();
               else finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
               return;
@@ -370,6 +387,10 @@ export function createCodexAppServerAdapter(
           settings = validateCodexSettings(opts.codexSettings);
         } catch (error) {
           finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
+          return;
+        }
+        if (opts.resumeId && unsafeProviderIdentifier(opts.resumeId)) {
+          finish('Codex app-server stored thread identifier is unsafe.', 'codex_protocol_mismatch');
           return;
         }
         const config = settingsConfig(settings);

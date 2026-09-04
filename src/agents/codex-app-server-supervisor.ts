@@ -26,6 +26,7 @@ type SessionState = {
   generation: number | null;
   activeTurnId: string | null;
   pendingTurn: symbol | null;
+  pendingStartTurnId: string | null;
 };
 type RouteFailure = { reason: string; code: CodexFailureCode };
 
@@ -169,6 +170,7 @@ export class CodexAppServerSupervisor {
         : null,
       activeTurnId: null,
       pendingTurn: null,
+      pendingStartTurnId: null,
     };
     this.#sessions.set(sessionId, state);
     let active = true;
@@ -217,19 +219,35 @@ export class CodexAppServerSupervisor {
     if (state.activeTurnId || state.pendingTurn) throw new Error('Codex session already has an active turn.');
     const pendingTurn = Symbol(sessionId);
     state.pendingTurn = pendingTurn;
+    state.pendingStartTurnId = null;
     try {
       const response = await client.request<T>(method, params, onDispatched);
       if (this.#sessions.get(sessionId) === state
         && state.generation === generation
         && state.pendingTurn === pendingTurn) {
+        const notifiedTurnId = state.pendingStartTurnId;
+        const responseTurnId = turnIdFrom(response);
         state.pendingTurn = null;
-        state.activeTurnId = turnIdFrom(response);
+        state.pendingStartTurnId = null;
+        if (notifiedTurnId !== null && responseTurnId !== notifiedTurnId) {
+          if (state.activeTurnId === notifiedTurnId) state.activeTurnId = null;
+          throw new CodexRuntimeError(
+            'codex_protocol_mismatch',
+            'Codex app-server protocol mismatch between turn response and start notification.',
+          );
+        }
+        state.activeTurnId = responseTurnId;
       }
       return response;
     } catch (error) {
       if (this.#sessions.get(sessionId) === state
         && state.generation === generation
-        && state.pendingTurn === pendingTurn) state.pendingTurn = null;
+        && state.pendingTurn === pendingTurn) {
+        const notifiedTurnId = state.pendingStartTurnId;
+        state.pendingTurn = null;
+        state.pendingStartTurnId = null;
+        if (state.activeTurnId === notifiedTurnId) state.activeTurnId = null;
+      }
       throw error;
     }
   }
@@ -388,8 +406,14 @@ export class CodexAppServerSupervisor {
     if (!state || state.threadId !== threadId || generation === undefined || state.generation !== generation) return;
     const turnId = turnIdFrom(params);
     if (method === 'turn/started' && turnId) {
-      state.pendingTurn = null;
-      state.activeTurnId = turnId;
+      if (state.pendingTurn !== null) {
+        if (state.pendingStartTurnId === null) {
+          state.pendingStartTurnId = turnId;
+          state.activeTurnId = turnId;
+        } else if (state.pendingStartTurnId !== turnId) {
+          return;
+        }
+      } else if (state.activeTurnId !== turnId) return;
     }
     if (method === 'turn/completed' && turnId === state.activeTurnId) state.activeTurnId = null;
     try {
@@ -518,6 +542,7 @@ export class CodexAppServerSupervisor {
       }
       state.activeTurnId = null;
       state.pendingTurn = null;
+      state.pendingStartTurnId = null;
       failed.push(state);
     }
     for (const state of failed) {

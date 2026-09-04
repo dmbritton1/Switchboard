@@ -272,7 +272,27 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'TurnCompletedNotification.ts'), 'export type TurnCompletedNotification = { threadId: string, turn: Turn };\n');
   writeFileSync(join(out, 'v2', 'ErrorNotification.ts'), [
     'export type ErrorNotification = { error: TurnError, ',
-    shape('error-will-retry', 'willRetry: boolean, '),
+    shape('error-will-retry', changedShape(
+      'error-will-retry-optional',
+      changedShape(
+        'error-will-retry-nullable',
+        changedShape(
+          'error-will-retry-union',
+          changedShape(
+            'error-will-retry-literals',
+            changedShape(
+              'error-will-retry-no-delimiter',
+              'willRetry: boolean, ',
+              'willRetry: booleanFuture, ',
+            ),
+            'willRetry: true | false, ',
+          ),
+          'willRetry: boolean | string, ',
+        ),
+        'willRetry: boolean | null, ',
+      ),
+      'willRetry?: boolean, ',
+    )),
     'threadId: string, ',
     shape('routing-ids', 'turnId: string'),
     ' };\n',

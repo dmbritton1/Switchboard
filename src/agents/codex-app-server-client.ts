@@ -5,10 +5,22 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 250;
 const SIGKILL_WAIT_MS = 1_000;
 
+type AppServerChild = Pick<
+  ChildProcessWithoutNullStreams,
+  'stdin' | 'stdout' | 'stderr' | 'once' | 'kill'
+>;
+
+export type AppServerChildFactory = (
+  command: string,
+  args: string[],
+  env: Record<string, string>,
+) => AppServerChild;
+
 export type AppServerClientOptions = {
   command: string;
   args: string[];
   env: Record<string, string>;
+  childFactory?: AppServerChildFactory;
   requestTimeoutMs?: number;
   redact: (text: string) => string;
   onNotification: (method: string, params: unknown) => void;
@@ -42,7 +54,7 @@ function delay(milliseconds: number): Promise<void> {
 
 export class AppServerClient {
   readonly #options: AppServerClientOptions;
-  readonly #child: ChildProcessWithoutNullStreams;
+  readonly #child: AppServerChild;
   readonly #lines: readline.Interface;
   readonly #pending = new Map<number, Pending>();
   readonly #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -56,7 +68,9 @@ export class AppServerClient {
 
   constructor(options: AppServerClientOptions) {
     this.#options = options;
-    this.#child = spawn(options.command, options.args, { env: options.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    this.#child = options.childFactory
+      ? options.childFactory(options.command, options.args, options.env)
+      : spawn(options.command, options.args, { env: options.env, stdio: ['pipe', 'pipe', 'pipe'] });
     this.#child.stderr.on('data', () => {
       // stderr can include credentials, account metadata, or absolute paths.
     });

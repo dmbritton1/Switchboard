@@ -238,6 +238,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const jsonValueContract = /export\s+type\s+JsonValue\s*=\s*number\s*\|\s*string\s*\|\s*boolean\s*\|\s*Array\s*<\s*JsonValue\s*>\s*\|\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*;/;
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
+  const requiredWillRetry = /(?:^|[,{;])\s*willRetry\s*:\s*boolean\s*(?=[,;}])/m;
   const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
   const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
   if (!approvalPolicy || !sandboxMode || !jsonValue || !threadStart || !threadResume
@@ -277,7 +278,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
     || !routing.test(itemCompleted) || !/item\s*:\s*ThreadItem/.test(itemCompleted)
     || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnCompleted)
     || !routing.test(error) || !/error\s*:\s*TurnError/.test(error)
-    || !/willRetry\s*:\s*boolean/.test(error)) {
+    || !requiredWillRetry.test(error)) {
     throw new Error('generated schema differs from the turn contract');
   }
 }

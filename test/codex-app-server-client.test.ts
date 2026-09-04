@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { AppServerClient } from '../src/agents/codex-app-server-client.ts';
@@ -102,6 +104,53 @@ async function createReadyMarker(t: { after: (fn: () => Promise<void> | void) =>
   const directory = await mkdtemp(join(tmpdir(), prefix));
   t.after(async () => rm(directory, { recursive: true, force: true }));
   return join(directory, 'ready');
+}
+
+function asynchronousWriteFailureChild(): {
+  child: EventEmitter & {
+    stdin: PassThrough;
+    stdout: PassThrough;
+    stderr: PassThrough;
+    kill(signal?: NodeJS.Signals): boolean;
+  };
+  writes(): number;
+  callbacks(): number;
+  cleanup(): void;
+} {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let writes = 0;
+  let callbacks = 0;
+  stdin.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean => {
+    void chunk;
+    writes += 1;
+    const done = typeof encoding === 'function' ? encoding : callback;
+    setImmediate(() => {
+      callbacks += 1;
+      done?.(new Error('test stdin callback failure'));
+    });
+    return true;
+  }) as typeof stdin.write;
+  const child = Object.assign(new EventEmitter(), {
+    stdin,
+    stdout,
+    stderr,
+    kill(signal?: NodeJS.Signals): boolean {
+      setImmediate(() => child.emit('close', 0, signal ?? null));
+      return true;
+    },
+  });
+  return {
+    child,
+    writes: () => writes,
+    callbacks: () => callbacks,
+    cleanup: () => {
+      stdin.destroy();
+      stdout.destroy();
+      stderr.destroy();
+    },
+  };
 }
 
 test('correlates out-of-order responses while delivering notifications and colliding server requests', async (t) => {
@@ -212,7 +261,7 @@ test('rejects an unknown response ID', async (t) => {
   );
 });
 
-test('settles a request when its input write fails', async (t) => {
+test('rejects a request after terminal child readiness', async (t) => {
   let dispatches = 0;
   let observeExit!: () => void;
   const exited = new Promise<void>((resolve) => { observeExit = resolve; });
@@ -230,6 +279,38 @@ test('settles a request when its input write fails', async (t) => {
     (error) => error instanceof Error && /input closed unexpectedly|exited unexpectedly/i.test(error.message),
   );
   assert.equal(dispatches, 0, 'a failed stdin write is never acknowledged as dispatched');
+});
+
+// Mutation caught: ignoring an asynchronous stdin.write callback error marks a
+// prompt dispatched even though the child never accepted its JSON-RPC request.
+test('rejects a pending request when its stdin write callback fails asynchronously', async (t) => {
+  const fixture = asynchronousWriteFailureChild();
+  let dispatches = 0;
+  const client = new AppServerClient({
+    command: '/not-used-when-child-is-injected',
+    args: [],
+    env: env(),
+    redact: (text) => text,
+    onNotification: () => {},
+    onServerRequest: () => {},
+    onExit: () => {},
+    childFactory: () => fixture.child,
+  });
+  t.after(async () => {
+    await client.close().catch(() => {});
+    fixture.cleanup();
+  });
+
+  const request = observePending(client.request('initialize', undefined, () => { dispatches += 1; }));
+  await rejectsWithin(
+    request,
+    500,
+    (error) => error instanceof Error && /input closed unexpectedly/i.test(error.message),
+  );
+
+  assert.equal(fixture.writes(), 1, 'the test must enter stdin.write while the request is pending');
+  assert.equal(fixture.callbacks(), 1, 'the test must deliver an asynchronous write callback error');
+  assert.equal(dispatches, 0, 'a callback-error write is never acknowledged as dispatched');
 });
 
 test('acknowledges an accepted stdin write before a pending response settles', async (t) => {
