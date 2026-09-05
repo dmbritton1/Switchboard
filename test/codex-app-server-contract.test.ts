@@ -390,6 +390,9 @@ for (const [shape, location] of [
   ['error-will-retry-nested-decoy', 'nested member'],
   ['error-will-retry-comment-decoy', 'block comment'],
   ['error-will-retry-string-decoy', 'string literal'],
+  ['error-will-retry-function-decoy', 'function parameter'],
+  ['error-will-retry-tuple-decoy', 'tuple member'],
+  ['error-will-retry-computed-function-decoy', 'computed function member'],
 ] as const) {
   test(`turn profile ignores a willRetry decoy in a ${location}`, async () => {
     await assert.rejects(

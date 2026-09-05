@@ -292,17 +292,29 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'willRetry?: boolean, ',
   );
   const willRetry = changedShape(
-    'error-will-retry-nested-decoy',
+    'error-will-retry-function-decoy',
     changedShape(
-      'error-will-retry-comment-decoy',
+      'error-will-retry-tuple-decoy',
       changedShape(
-        'error-will-retry-string-decoy',
-        exactWillRetry,
-        'willRetry?: boolean, decoy: ", willRetry: boolean,", ',
+        'error-will-retry-computed-function-decoy',
+        changedShape(
+          'error-will-retry-nested-decoy',
+          changedShape(
+            'error-will-retry-comment-decoy',
+            changedShape(
+              'error-will-retry-string-decoy',
+              exactWillRetry,
+              'willRetry?: boolean, decoy: ", willRetry: boolean,", ',
+            ),
+            'willRetry?: boolean, /*, willRetry: boolean, */ ',
+          ),
+          'willRetry?: boolean, nested: { willRetry: boolean }, ',
+        ),
+        'willRetry?: boolean, [Symbol.iterator]: (x: string, willRetry: boolean, y: number) => void, ',
       ),
-      'willRetry?: boolean, /*, willRetry: boolean, */ ',
+      'willRetry?: boolean, decoy: [x: string, willRetry: boolean, y: number], ',
     ),
-    'willRetry?: boolean, nested: { willRetry: boolean }, ',
+    'willRetry?: boolean, decoy: (x: string, willRetry: boolean, y: number) => void, ',
   );
   writeFileSync(join(out, 'v2', 'ErrorNotification.ts'), [
     'export type ErrorNotification = { error: TurnError, ',

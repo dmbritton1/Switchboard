@@ -116,64 +116,71 @@ function outerObjectMembers(source: string): string | null {
   const assignment = source.indexOf('=');
   const opening = source.indexOf('{', assignment + 1);
   if (assignment === -1 || opening === -1) return null;
-  let depth = 0;
   let members = '';
+  const nestedClosers: string[] = [];
   let quote: '"' | "'" | '`' | null = null;
   let escaped = false;
   let lineComment = false;
   let blockComment = false;
-  for (let index = opening; index < source.length; index += 1) {
+  const atOuterLevel = (): boolean => nestedClosers.length === 0;
+  for (let index = opening + 1; index < source.length; index += 1) {
     const character = source[index]!;
     const next = source[index + 1];
     if (lineComment) {
       if (character === '\n') {
         lineComment = false;
-        if (depth === 1) members += '\n';
-      } else if (depth === 1) members += ' ';
+        if (atOuterLevel()) members += '\n';
+      } else if (atOuterLevel()) members += ' ';
       continue;
     }
     if (blockComment) {
       if (character === '*' && next === '/') {
-        if (depth === 1) members += '  ';
+        if (atOuterLevel()) members += '  ';
         blockComment = false;
         index += 1;
-      } else if (depth === 1) members += character === '\n' ? '\n' : ' ';
+      } else if (atOuterLevel()) members += character === '\n' ? '\n' : ' ';
       continue;
     }
     if (quote !== null) {
-      if (depth === 1) members += ' ';
+      if (atOuterLevel()) members += ' ';
       if (escaped) escaped = false;
       else if (character === '\\') escaped = true;
       else if (character === quote) quote = null;
       continue;
     }
     if (character === '/' && next === '/') {
-      if (depth === 1) members += '  ';
+      if (atOuterLevel()) members += '  ';
       lineComment = true;
       index += 1;
       continue;
     }
     if (character === '/' && next === '*') {
-      if (depth === 1) members += '  ';
+      if (atOuterLevel()) members += '  ';
       blockComment = true;
       index += 1;
       continue;
     }
     if (character === '"' || character === "'" || character === '`') {
-      if (depth === 1) members += ' ';
+      if (atOuterLevel()) members += ' ';
       quote = character;
       continue;
     }
-    if (character === '{') {
-      depth += 1;
+    const closer = character === '{' ? '}'
+      : character === '(' ? ')'
+        : character === '[' ? ']'
+          : character === '<' ? '>'
+            : null;
+    if (closer !== null) {
+      if (atOuterLevel()) members += ' ';
+      nestedClosers.push(closer);
       continue;
     }
-    if (character === '}') {
-      if (depth === 1) return members;
-      depth -= 1;
+    if (nestedClosers.at(-1) === character) {
+      nestedClosers.pop();
       continue;
     }
-    if (depth === 1) members += character;
+    if (character === '}' && atOuterLevel()) return members;
+    if (atOuterLevel()) members += character;
   }
   return null;
 }

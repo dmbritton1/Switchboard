@@ -95,10 +95,15 @@ type ScriptedClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (error: Error) => void;
 } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
 }
 
 function managedAccountResult(): Record<string, unknown> {
@@ -1485,6 +1490,112 @@ test('completion before its response cannot reactivate a pending turn without st
     'session', 'turn/start', { threadId: 'thread' },
   );
   assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: retaining only the most recent early completion forgets a
+// terminal response id when a stale completion arrives afterward.
+test('multiple early completions retain a terminal response id before a later stale completion', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('stale-id', 'completed'),
+  });
+  response.resolve({ turn: routedTurn('turn-1') });
+  await pending;
+
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: retaining only the most recent early completion also loses
+// the response id when the same two terminal notifications arrive inversely.
+test('multiple early completions retain a terminal response id in inverse order', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('stale-id', 'completed'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  response.resolve({ turn: routedTurn('stale-id') });
+  await pending;
+
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+test('stale early completions do not suppress a nonterminal response id', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await waitFor(() => turnStarts() === 1);
+  for (const turnId of ['stale-a', 'stale-b']) {
+    protocol.onNotification('turn/completed', {
+      threadId: 'thread', turn: routedTurn(turnId, 'completed'),
+    });
+  }
+  response.resolve({ turn: routedTurn('turn-1') });
+  await pending;
+
+  await assert.rejects(
+    supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' }),
+    /active turn/i,
+  );
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+test('request errors clear every early terminal id before the next request', async (t) => {
+  const failedResponse = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? failedResponse.promise : { turn: routedTurn('turn-1') },
+  );
+
+  const failed = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await waitFor(() => turnStarts() === 1);
+  for (const turnId of ['turn-1', 'stale-id']) {
+    protocol.onNotification('turn/completed', {
+      threadId: 'thread', turn: routedTurn(turnId, 'completed'),
+    });
+  }
+  failedResponse.reject(new Error('request failed'));
+  await assert.rejects(failed, /request failed/);
+
+  await supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  await assert.rejects(
+    supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' }),
+    /active turn/i,
+  );
 });
 
 // Mutation caught: clearing pending correlation when turn/started arrives lets
