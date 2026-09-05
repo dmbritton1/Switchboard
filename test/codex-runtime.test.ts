@@ -10,8 +10,10 @@ import {
   prepareCodexRuntime,
   redactCodexText,
   redactValues,
+  unsafeCodexProviderIdentifier,
 } from '../src/agents/codex-runtime.ts';
 import { writeFakeCodex } from './helpers/fake-codex.ts';
+import { opaqueProviderIdentifiers, unsafeProviderIdentifiers } from './helpers/provider-identifiers.ts';
 
 async function fixture(t: { after(fn: () => unknown): void }): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'switchboard-codex-runtime-'));
@@ -316,6 +318,11 @@ test('redaction removes bearer tokens and credential-shaped environment values',
     redactCodexText('Bearer abc123 failed with super-secret', { CODEX_TOKEN: 'abc123', CUSTOM_SECRET: 'super-secret' }),
     'Bearer [REDACTED] failed with [REDACTED]',
   );
+});
+
+test('provider identifier admission accepts opaque IDs and rejects absolute filesystem IDs', () => {
+  for (const id of opaqueProviderIdentifiers) assert.equal(unsafeCodexProviderIdentifier(id), false, id);
+  for (const id of unsafeProviderIdentifiers) assert.equal(unsafeCodexProviderIdentifier(id), true, id);
 });
 
 test('redaction removes complete absolute file URIs while preserving HTTPS and ordinary prose', () => {

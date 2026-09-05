@@ -249,7 +249,8 @@ test('opaque provider identifiers survive binding, resume and public persistence
     const supervisor = new ScriptedSupervisor();
     const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
       .start({ cwd, prompt: prompt('inspect'), env: {}, resumeId: id }, (event) => registry.apply(session.id, event));
-    await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
+    await waitFor(() => session.status === 'stopped' || supervisor.requests.some(({ method }) => method === 'turn/start'));
+    assert.notEqual(session.status, 'stopped', id);
     assert.equal(supervisor.bound?.threadId, id);
     assert.equal(session.vendorSessionId, id);
     assert.equal((supervisor.requests[0].params as { threadId: string }).threadId, id);

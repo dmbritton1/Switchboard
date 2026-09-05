@@ -6,4 +6,7 @@ export const unsafeProviderIdentifiers = [
   'opaque (\\\\server\\share\\id)', 'file:notes,file:///private/provider/id',
 ] as const;
 
-export const opaqueProviderIdentifiers = ['thread-01', 'opaque:Ab_C-9', 'relative/id', 'file:notes'] as const;
+export const opaqueProviderIdentifiers = [
+  'thread-01', 'opaque:Ab_C-9', 'relative/id', 'file:notes',
+  'https://opaque.example/thread-01', 'urn:opaque:/thread-01',
+] as const;

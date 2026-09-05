@@ -17,6 +17,9 @@ const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
 const MIN_REDACTABLE = 6;
 const FILE_URI_CANDIDATE = /\b(?=(file:[^\s"`<>{}\[\]“”‘’]+))/giu;
 const FILE_URI_TRAILING_PROSE = /[.,;:!?]/u;
+// Ignore only an unambiguous leading URI delimiter: a qualified authority or
+// an opaque namespace. A one-letter namespace before `:/` is a Windows drive.
+const OPAQUE_URI_PREFIX = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/(?=[^/\\\s]*\.)|[A-Za-z][A-Za-z0-9+.-]*:(?![A-Za-z]:\/)[^:/\\\s]+:\/)/u;
 
 export function redactable(value: string): boolean {
   return typeof value === 'string' && value.length >= MIN_REDACTABLE;
@@ -50,8 +53,10 @@ export function containsAbsoluteFileUri(value: string): boolean {
 
 /** Admission check only: never rewrite an opaque identifier into another ID. */
 export function unsafeCodexProviderIdentifier(value: unknown): boolean {
-  return typeof value === 'string' && (containsAbsoluteFileUri(value)
-    || /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u.test(value));
+  if (typeof value !== 'string') return false;
+  const scanFrom = value.match(OPAQUE_URI_PREFIX)?.[0].length ?? 0;
+  return containsAbsoluteFileUri(value)
+    || /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u.test(value.slice(scanFrom));
 }
 
 function redactAbsoluteFileUris(value: string): string {

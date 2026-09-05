@@ -15,7 +15,7 @@ import {
 import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AccountLimitSnapshot, CodexFailureCode } from '../src/types.ts';
-import { unsafeProviderIdentifiers } from './helpers/provider-identifiers.ts';
+import { opaqueProviderIdentifiers, unsafeProviderIdentifiers } from './helpers/provider-identifiers.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 const unavailable = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
@@ -37,6 +37,20 @@ test('absolute-path-shaped thread and turn IDs cannot acquire supervisor ownersh
         });
       const next = await supervisor.requestForSession<{ turn: { id: string } }>('session', 'turn/start', { threadId: 'thread' });
       assert.equal(next.turn.id, 'safe-turn');
+    });
+  }
+});
+
+test('opaque thread and turn IDs acquire supervisor ownership byte for byte', async (t) => {
+  for (const [index, id] of opaqueProviderIdentifiers.entries()) {
+    await t.test(String(index), async (t) => {
+      const { supervisor } = await turnRoutingHarness(t, () => ({ turn: routedTurn(id) }));
+      supervisor.registerSession('other', { onNotification() {}, onFatal() {} });
+      assert.doesNotThrow(() => supervisor.bindThread('other', id));
+      const response = await supervisor.requestForSession<{ turn: { id: string } }>(
+        'session', 'turn/start', { threadId: 'thread' },
+      );
+      assert.equal(response.turn.id, id);
     });
   }
 });
