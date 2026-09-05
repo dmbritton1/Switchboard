@@ -52,6 +52,14 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds).unref());
 }
 
+/** Valid RPC rejection, with all provider diagnostics discarded. */
+export class AppServerRequestError extends Error {
+  constructor() {
+    super('Codex app-server request failed.');
+    this.name = 'AppServerRequestError';
+  }
+}
+
 export class AppServerClient {
   readonly #options: AppServerClientOptions;
   readonly #child: AppServerChild;
@@ -201,10 +209,17 @@ export class AppServerClient {
         this.#fail('Codex app-server returned an unknown response id.');
         return;
       }
+      if (message.error !== undefined && (!isObject(message.error)
+        || !Number.isInteger(message.error.code)
+        || typeof message.error.message !== 'string'
+        || message.result !== undefined)) {
+        this.#fail('Codex app-server returned an invalid error response.');
+        return;
+      }
       this.#ackDispatch(pending);
       this.#pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error !== undefined) pending.reject(this.#error('Codex app-server request failed.'));
+      if (message.error !== undefined) pending.reject(new AppServerRequestError());
       else pending.resolve(message.result);
       return;
     }

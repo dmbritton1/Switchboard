@@ -107,6 +107,10 @@ export class Usage {
     this.#limitSnapshots.set(account, { snapshot, error: null });
   }
 
+  forgetLimitSnapshot(account: string): void {
+    this.#limitSnapshots.delete(account);
+  }
+
   failLimitSnapshot(account: string, error: string): void {
     const previous = this.#limitSnapshots.get(account)?.snapshot ?? null;
     this.#limitSnapshots.set(account, {

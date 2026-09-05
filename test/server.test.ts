@@ -24,7 +24,8 @@ import { writeFakeLoginCli } from './helpers/fake-login.ts';
 import { createAccountStore, type Account } from '../src/accounts.ts';
 import { Linker, type PublicLink } from '../src/link.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
-import type { CodexProviderPool, CodexTransport } from '../src/agents/codex-provider.ts';
+import { CodexProviderPool, type CodexTransport } from '../src/agents/codex-provider.ts';
+import { CodexAppServerSupervisor } from '../src/agents/codex-app-server-supervisor.ts';
 
 const run = promisify(execFile);
 
@@ -3556,6 +3557,56 @@ test('the snapshot never contains the staging path or the submitted code', async
 });
 
 // ---- unlink -------------------------------------------------------------
+
+test('HTTP unlink and same-name relink retire runtime and telemetry identity after durable removal', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-retire-'));
+  const bin = await writeFakeLoginCli(dir, { provider: 'codex' });
+  const accountsPath = join(dir, 'accounts.json');
+  const configured: Account[] = [{ name: 'relinked', provider: 'codex', budget: 1000, env: { CODEX_HOME: join(dir, 'hand-owned') } }];
+  await mkdir(configured[0].env.CODEX_HOME);
+  await writeFile(accountsPath, JSON.stringify(configured));
+  const prepared: Account[] = [];
+  const pool = new CodexProviderPool({
+    prepareRuntime: async (account) => {
+      prepared.push(account);
+      return { source: 'explicit', version: '0.145.0', diagnostics: [],
+        commandPath: join(process.cwd(), 'test/helpers/fake-app-server.ts'), env: { ...process.env, ...account.env } as Record<string, string> };
+    },
+    createSupervisor: (options) => new CodexAppServerSupervisor({ ...options, verifyContract: async () => {} }),
+    createSdkAdapter: () => fakeAdapter().adapter,
+  });
+  const usage = new Usage();
+  const coordinator = createAccountLimitCoordinator({ accounts: configured, usage, codexPool: pool, onChange() {} });
+  const linker = new Linker({ accountsRoot: join(dir, 'accounts'), accounts: () => configured,
+    spawnLogin: (_provider, env) => spawn(bin, ['login'], { env: { ...process.env, ...env } }) });
+  const registry = new Registry(join(dir, 'state.json'));
+  const server = createServer({ registry, usage, accounts: configured, linker,
+    accountStore: createAccountStore(accountsPath), limitCoordinator: coordinator, codexPool: pool });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await coordinator.close(); await pool.close(); await rm(dir, { recursive: true, force: true });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  await coordinator.reconcile();
+  const old = configured[0];
+  const oldSupervisor = await pool.limits(old, { onSnapshot() {}, onStale() {} });
+  await pool.prepare(old, 'sdk', 'old');
+  assert.equal((await post(base, { cmd: 'unlink', name: old.name })).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(accountsPath, 'utf8')), []);
+  await access(old.env.CODEX_HOME);
+  await assert.rejects(oldSupervisor.start());
+  assert.equal(usage.getLimitSnapshot(old.name).snapshot, null);
+  assert.equal((await post(base, { cmd: 'link-start', provider: 'codex' })).status, 200);
+  await untilLink(linker, (value) => value?.phase === 'naming');
+  assert.equal((await post(base, { cmd: 'link-confirm', name: old.name })).status, 200);
+  await coordinator.reconcile();
+  await pool.prepare(configured[0], 'sdk', 'new');
+  assert.equal(prepared.length, 2);
+  assert.notEqual(prepared[0], prepared[1]);
+  assert.notEqual(prepared[0].env.CODEX_HOME, prepared[1].env.CODEX_HOME);
+  assert.equal(usage.getLimitSnapshot(old.name).snapshot?.fresh, true);
+});
 
 /** Full link-start + link-confirm against a fake login CLI, producing a real
  *  account entry in accounts.json and a real credential dir under the root. */

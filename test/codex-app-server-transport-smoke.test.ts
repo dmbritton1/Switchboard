@@ -13,10 +13,35 @@ import {
   type CodexAppServerTransportSmokeEvidence,
 } from '../scripts/codex-app-server-transport-smoke.ts';
 import type { Account } from '../src/accounts.ts';
+import * as transportSmoke from '../scripts/codex-app-server-transport-smoke.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 const secret = 'fixture-transport-secret';
 const run = promisify(execFile);
+
+test('smoke observation deadlines keep fake mode fast and give live mode a separate bounded window offline', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const fake = transportSmoke.waitForSmokeObservation('fake', () => false, 'fixture evidence');
+  const fakeFailure = assert.rejects(fake, /did not observe fixture evidence/);
+  t.mock.timers.tick(8_000);
+  await fakeFailure;
+
+  let ready = false;
+  let settled = false;
+  const live = transportSmoke.waitForSmokeObservation('real', () => ready, 'live evidence');
+  void live.then(() => { settled = true; }, () => { settled = true; });
+  t.mock.timers.tick(8_000);
+  await Promise.resolve();
+  assert.equal(settled, false, 'live observations must survive the fake deadline');
+  ready = true;
+  t.mock.timers.tick(10);
+  await live;
+
+  const bounded = transportSmoke.waitForSmokeObservation('real', () => false, 'bounded evidence');
+  const boundedFailure = assert.rejects(bounded, /did not observe bounded evidence/);
+  t.mock.timers.tick(120_000);
+  await boundedFailure;
+});
 
 function account(): Account {
   return { name: 'fixture-codex', provider: 'codex', budget: 1_000, env: { CODEX_TOKEN: secret } };

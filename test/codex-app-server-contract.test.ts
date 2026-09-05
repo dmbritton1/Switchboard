@@ -386,6 +386,14 @@ test('turn profile requires an exact required willRetry boolean field', async ()
 
 // Mutation caught: searching the whole generated file lets an exact-looking
 // nested member, block comment, or string satisfy an optional outer field.
+for (const shape of ['error-will-retry-multiline-nullable', 'error-will-retry-multiline-union']) {
+  test(`willRetry rejects ${shape} across a newline before the outer delimiter`, async () => {
+    await assert.rejects(verifyAppServerContract(runtime({
+      version: `0.145.0+${shape}`, env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+    }), 'turns'), { message: 'Codex app-server turn contract verification failed.' });
+  });
+}
+
 for (const [shape, location] of [
   ['error-will-retry-nested-decoy', 'nested member'],
   ['error-will-retry-comment-decoy', 'block comment'],

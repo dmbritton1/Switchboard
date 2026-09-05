@@ -115,7 +115,7 @@ type PreparedProvider = {
 
 type SessionPreparation = { sessionId: string; transport?: CodexTransport };
 type SessionOwnership = Pick<Session, 'id' | 'provider' | 'codexTransport'>;
-type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare'>>;
+type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare' | 'retire'>>;
 
 async function prepareProvider(account: Account, _session?: SessionPreparation): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
@@ -1374,6 +1374,8 @@ export function createServer(opts: {
         // at nothing.
         await accountStore.remove(name);
         accounts.splice(index, 1);
+        await limitCoordinator?.forget(account);
+        await codexPool?.retire?.(account);
 
         // Only ever delete a directory that is exactly <accountsRoot>/<name>.
         // A hand-written accounts.json entry can point its credential dir

@@ -1,6 +1,6 @@
 import { safeCodexDetail } from './codex-detail.ts';
 import { classifyCodexFailure } from './codex.ts';
-import { containsAbsoluteFileUri, redactCodexText } from './codex-runtime.ts';
+import { unsafeCodexProviderIdentifier, redactCodexText } from './codex-runtime.ts';
 import { validateCodexSettings } from './codex-settings.ts';
 import { snapshotCodexPrompt } from '../prompt-input.ts';
 import type { CodexAppServerSupervisor } from './codex-app-server-supervisor.ts';
@@ -25,16 +25,12 @@ function text(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
-function unsafeProviderIdentifier(value: unknown): boolean {
-  return typeof value === 'string' && containsAbsoluteFileUri(value);
-}
-
 function notificationHasUnsafeIdentifier(value: Record<string, unknown>): boolean {
   const thread = object(value.thread);
   const turn = object(value.turn);
   const item = object(value.item);
   return [value.threadId, value.turnId, thread?.id, turn?.id, item?.id]
-    .some(unsafeProviderIdentifier);
+    .some(unsafeCodexProviderIdentifier);
 }
 
 function toolStatus(value: unknown, phase: ItemPhase): ToolMsg['status'] {
@@ -50,6 +46,21 @@ function scrubAbsolutePaths(value: string): string {
 
 function safePublicText(value: string, env: Record<string, string>): string {
   return scrubAbsolutePaths(redactCodexText(value, env));
+}
+
+/** Internal recovery seam; this phase intentionally keeps both cases terminal. */
+export type CodexAppServerTurnFailure =
+  | { kind: 'UsageLimitExceeded'; reason: string }
+  | { kind: 'Other'; reason: string };
+
+export function classifyCodexAppServerTurnFailure(
+  error: unknown, env: Record<string, string>,
+): CodexAppServerTurnFailure {
+  const value = object(error);
+  const reason = safePublicText(text(value?.message) ?? 'Codex app-server turn failed.', env);
+  return value?.codexErrorInfo === 'usageLimitExceeded'
+    ? { kind: 'UsageLimitExceeded', reason }
+    : { kind: 'Other', reason };
 }
 
 function withoutAbsolutePaths(value: unknown): unknown {
@@ -90,7 +101,7 @@ export function normalizeCodexAppServerItem(
 ): AdapterEvent[] {
   const value = object(item);
   if (!value || typeof value.type !== 'string' || typeof value.id !== 'string') return [];
-  if (unsafeProviderIdentifier(value.id)) return [];
+  if (unsafeCodexProviderIdentifier(value.id)) return [];
   const id = value.id;
   switch (value.type) {
     case 'agentMessage':
@@ -149,7 +160,7 @@ function threadResponse(value: unknown, cwd: string): string | null {
   const thread = response && object(response.thread);
   const sandbox = response && object(response.sandbox);
   const id = thread && text(thread.id);
-  if (!response || !thread || !sandbox || !id || unsafeProviderIdentifier(id)
+  if (!response || !thread || !sandbox || !id || unsafeCodexProviderIdentifier(id)
     || response.cwd !== cwd || thread.cwd !== cwd
     || response.approvalPolicy !== 'never' || sandbox.type !== 'workspaceWrite') return null;
   return id;
@@ -158,7 +169,6 @@ function threadResponse(value: unknown, cwd: string): string | null {
 function settingsConfig(settings: StartOpts['codexSettings']): Record<string, unknown> | undefined {
   if (!settings) return undefined;
   const config: Record<string, unknown> = {};
-  if (settings.modelReasoningEffort !== undefined) config.effort = settings.modelReasoningEffort;
   if (settings.webSearchMode !== undefined) config.web_search = settings.webSearchMode;
   if (settings.networkAccessEnabled !== undefined) {
     config.sandbox_workspace_write = { network_access: settings.networkAccessEnabled };
@@ -184,6 +194,7 @@ export function createCodexAppServerAdapter(
 ): Adapter {
   return {
     start(opts, emit): AgentHandle {
+      let settings: StartOpts['codexSettings'];
       const queue: QueueEntry[] = [{ prompt: opts.prompt, promptId: opts.promptId }];
       let detach: (() => void) | null = null;
       let threadId: string | null = null;
@@ -226,6 +237,20 @@ export function createCodexAppServerAdapter(
       const finishRequest = (error: unknown, fallback: CodexFailureCode): void => {
         const reason = String((error as Error)?.message ?? error);
         finish(reason, classifyCodexFailure(reason, fallback));
+      };
+
+      const finishTurnFailure = (error: unknown): void => {
+        const failure = classifyCodexAppServerTurnFailure(error, opts.env);
+        switch (failure.kind) {
+          case 'UsageLimitExceeded':
+            // Later recovery may branch here. This phase keeps the existing
+            // terminal outcome and never schedules, retries, or replays work.
+            finish(failure.reason, 'codex_stream_failed');
+            return;
+          case 'Other':
+            finish(failure.reason, 'codex_stream_failed');
+            return;
+        }
       };
 
       const interruptActiveTurn = (): void => {
@@ -294,8 +319,7 @@ export function createCodexAppServerAdapter(
         }
         if (method === 'error') {
           if (value.willRetry === true) return;
-          const error = object(value.error);
-          finish(text(error?.message) ?? 'Codex app-server turn failed.', 'codex_stream_failed');
+          finishTurnFailure(value.error);
           return;
         }
         if (method === 'turn/completed') {
@@ -306,8 +330,7 @@ export function createCodexAppServerAdapter(
           } else if (status === 'interrupted' && interrupted) {
             // stop() already produced the one terminal event.
           } else {
-            const error = object(completed?.error);
-            finish(text(error?.message) ?? 'Codex app-server turn failed.', 'codex_stream_failed');
+            finishTurnFailure(completed?.error);
           }
         }
       }
@@ -342,13 +365,14 @@ export function createCodexAppServerAdapter(
             try {
               response = await supervisor.requestForSession<{ turn?: unknown }>(sessionId, 'turn/start', {
                 threadId, input: codexAppServerPromptInput(prepared.prompt),
+                ...(settings?.modelReasoningEffort !== undefined ? { effort: settings.modelReasoningEffort } : {}),
               }, acknowledgeDispatch);
             } finally {
               turnRequestInFlight = false;
             }
             const turn = object(response)?.turn;
             const id = turn && text(turn.id);
-            if (!id || unsafeProviderIdentifier(id)) {
+            if (!id || unsafeCodexProviderIdentifier(id)) {
               if (stopped) detachRoute();
               else finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
               return;
@@ -382,14 +406,13 @@ export function createCodexAppServerAdapter(
         return { send() {}, decide() {}, setAuto() {}, stop() {} };
       }
       void (async () => {
-        let settings: StartOpts['codexSettings'];
         try {
           settings = validateCodexSettings(opts.codexSettings);
         } catch (error) {
           finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
           return;
         }
-        if (opts.resumeId && unsafeProviderIdentifier(opts.resumeId)) {
+        if (opts.resumeId && unsafeCodexProviderIdentifier(opts.resumeId)) {
           finish('Codex app-server stored thread identifier is unsafe.', 'codex_protocol_mismatch');
           return;
         }

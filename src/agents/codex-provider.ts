@@ -24,6 +24,8 @@ export type CodexProviderPoolOptions = {
 };
 
 type ProviderEntry = {
+  account: Account;
+  retired: boolean;
   runtime: Promise<PreparedCodexRuntime>;
   supervisor: Promise<CodexAppServerSupervisor> | null;
 };
@@ -37,6 +39,7 @@ export class CodexProviderPool {
   readonly #createSdkAdapter: (runtime: PreparedCodexRuntime) => Adapter;
   readonly #createAppServerAdapter: CodexProviderPoolOptions['createAppServerAdapter'];
   readonly #entries = new Map<string, ProviderEntry>();
+  readonly #retired = new WeakSet<Account>();
   #closed = false;
   #close: Promise<void> | null = null;
 
@@ -55,6 +58,7 @@ export class CodexProviderPool {
   async limits(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {
     const supervisor = await this.#supervisor(account);
     this.#assertOpen();
+    this.#assertAccount(account);
     supervisor.subscribe(listener);
     return supervisor;
   }
@@ -68,7 +72,7 @@ export class CodexProviderPool {
     this.#assertCodex(account);
     const entry = this.#entry(account);
     const runtime = await entry.runtime;
-    this.#assertOpen();
+    this.#assertEntry(entry);
     if (transport === 'sdk') {
       return { adapter: this.#createSdkAdapter(runtime), runtimeVersion: runtime.version };
     }
@@ -77,7 +81,7 @@ export class CodexProviderPool {
     if (!adapterFactory) throw new Error(ADAPTER_UNAVAILABLE);
     const supervisor = await this.#supervisorForEntry(entry, runtime);
     await supervisor.ensureTurnTransport();
-    this.#assertOpen();
+    this.#assertEntry(entry);
     return {
       adapter: adapterFactory(supervisor, sessionId, runtime.version),
       runtimeVersion: runtime.version,
@@ -90,12 +94,22 @@ export class CodexProviderPool {
     return this.#close;
   }
 
+  async retire(account: Account): Promise<void> {
+    this.#retired.add(account);
+    const entry = this.#entries.get(account.name);
+    if (!entry || entry.account !== account) return;
+    entry.retired = true;
+    this.#entries.delete(account.name);
+    const supervisor = await entry.supervisor?.catch(() => null);
+    await supervisor?.close();
+  }
+
   async #supervisor(account: Account): Promise<CodexAppServerSupervisor> {
     this.#assertOpen();
     this.#assertCodex(account);
     const entry = this.#entry(account);
     const runtime = await entry.runtime;
-    this.#assertOpen();
+    this.#assertEntry(entry);
     return this.#supervisorForEntry(entry, runtime);
   }
 
@@ -105,7 +119,7 @@ export class CodexProviderPool {
   ): Promise<CodexAppServerSupervisor> {
     if (entry.supervisor) return entry.supervisor;
     const supervisor = Promise.resolve().then(() => {
-      this.#assertOpen();
+      this.#assertEntry(entry);
       return this.#createSupervisor({ runtime });
     });
     entry.supervisor = supervisor;
@@ -113,10 +127,16 @@ export class CodexProviderPool {
   }
 
   #entry(account: Account): ProviderEntry {
+    this.#assertAccount(account);
     const existing = this.#entries.get(account.name);
     if (existing) return existing;
     const entry: ProviderEntry = {
-      runtime: Promise.resolve().then(() => this.#prepareRuntime(account)),
+      account,
+      retired: false,
+      runtime: Promise.resolve().then(() => {
+        this.#assertEntry(entry);
+        return this.#prepareRuntime(account);
+      }),
       supervisor: null,
     };
     this.#entries.set(account.name, entry);
@@ -128,6 +148,15 @@ export class CodexProviderPool {
 
   #assertOpen(): void {
     if (this.#closed) throw new Error(POOL_CLOSED);
+  }
+
+  #assertAccount(account: Account): void {
+    if (this.#retired.has(account)) throw new Error('Codex account identity was retired.');
+  }
+
+  #assertEntry(entry: ProviderEntry): void {
+    this.#assertOpen();
+    if (entry.retired) throw new Error('Codex account identity was retired.');
   }
 
   #assertCodex(account: Account): void {

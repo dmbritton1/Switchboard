@@ -303,7 +303,9 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
             'error-will-retry-comment-decoy',
             changedShape(
               'error-will-retry-string-decoy',
-              exactWillRetry,
+              changedShape('error-will-retry-multiline-nullable',
+                changedShape('error-will-retry-multiline-union', exactWillRetry, 'willRetry: boolean\n | string, '),
+                'willRetry: boolean\n | null, '),
               'willRetry?: boolean, decoy: ", willRetry: boolean,", ',
             ),
             'willRetry?: boolean, /*, willRetry: boolean, */ ',
@@ -823,7 +825,8 @@ async function handle(message: Message): Promise<void> {
         return;
       }
       const configuredRateLimitError = fromJsonEnvironment('FAKE_APP_SERVER_RATE_LIMITS_ERROR', null);
-      if (configuredRateLimitError !== null) {
+      if (configuredRateLimitError !== null
+        && rateLimitReads > Number(process.env.FAKE_APP_SERVER_RATE_LIMITS_ERROR_AFTER ?? 0)) {
         send({ id: message.id, error: configuredRateLimitError });
         return;
       }

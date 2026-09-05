@@ -39,6 +39,8 @@ export type CodexAppServerTransportSmokeOptions = {
 };
 
 const PAID_GUARD = 'SWITCHBOARD_ALLOW_PAID_CODEX_SMOKE=1';
+const FAKE_OBSERVATION_DEADLINE_MS = 8_000;
+const LIVE_OBSERVATION_DEADLINE_MS = 120_000;
 type EventLog = AdapterEvent[];
 type TelemetryEvent = 'snapshot' | 'stale';
 export type CodexTransportSmokeWorkspace = {
@@ -67,8 +69,8 @@ async function accountFor(options: CodexAppServerTransportSmokeOptions): Promise
   return account;
 }
 
-async function waitFor(predicate: () => boolean, description: string): Promise<void> {
-  const deadline = Date.now() + 8_000;
+export async function waitForSmokeObservation(mode: 'fake' | 'real', predicate: () => boolean, description: string): Promise<void> {
+  const deadline = Date.now() + (mode === 'fake' ? FAKE_OBSERVATION_DEADLINE_MS : LIVE_OBSERVATION_DEADLINE_MS);
   while (!predicate()) {
     if (Date.now() >= deadline) throw fail(`Codex transport smoke did not observe ${description}.`);
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -156,6 +158,7 @@ async function fakeSmoke(
   worktrees: string[],
   onTelemetryEvent?: (event: TelemetryEvent) => void,
 ): Promise<CodexAppServerTransportSmokeEvidence> {
+  const waitFor = (predicate: () => boolean, description: string) => waitForSmokeObservation('fake', predicate, description);
   const [worktreeA, worktreeB, crashWorktree, resumeWorktree] = worktrees;
   if (!worktreeA || !worktreeB || !crashWorktree || !resumeWorktree) throw fail('Fake Codex transport smoke requires four worktrees.');
   const pool = createPool();
@@ -223,6 +226,7 @@ async function realSmoke(
   worktree: string,
   onTelemetryEvent?: (event: TelemetryEvent) => void,
 ): Promise<CodexAppServerTransportSmokeEvidence> {
+  const waitFor = (predicate: () => boolean, description: string) => waitForSmokeObservation('real', predicate, description);
   const pool = createPool();
   let restarted: CodexProviderPool | null = null;
   try {

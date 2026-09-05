@@ -3,6 +3,10 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { AppServerClient } from '../src/agents/codex-app-server-client.ts';
+import * as appServerAdapter from '../src/agents/codex-app-server.ts';
 import { fileURLToPath } from 'node:url';
 import {
   codexAppServerPromptInput,
@@ -14,6 +18,7 @@ import {
   type CodexSessionRoute,
 } from '../src/agents/codex-app-server-supervisor.ts';
 import { Registry } from '../src/sessions.ts';
+import { unsafeProviderIdentifiers, opaqueProviderIdentifiers } from './helpers/provider-identifiers.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AdapterEvent, AgentPrompt, CodexFailureCode } from '../src/types.ts';
 
@@ -193,6 +198,68 @@ test('prompt conversion keeps app-server wire input distinct and never writes ab
   ]);
   assert.doesNotMatch(String((input[0] as { text: string }).text), /validated\/worktree/);
   assert.equal(JSON.stringify(input).includes('local_image'), false, 'SDK local_image never crosses the app-server wire');
+});
+
+test('absolute-path-shaped identifiers fail before item, thread, resume, turn, Registry and persistence admission', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-path-identifiers-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const [index, unsafeId] of unsafeProviderIdentifiers.entries()) {
+    for (const location of ['item', 'thread', 'resume', 'turn', 'plan'] as const) {
+      await t.test(`${index}:${location}`, async () => {
+        const statePath = join(cwd, `${index}-${location}.json`);
+        const registry = new Registry(statePath);
+        const session = registry.create({ provider: 'codex', account: 'codex', repo: cwd, cwd,
+          branch: 'test', title: 'test', codexTransport: 'app-server' });
+        const supervisor = new ScriptedSupervisor(async ({ method }) => {
+          if (method.startsWith('thread/')) return safeThreadResponse(location === 'thread' ? unsafeId : 'thread-new', cwd);
+          if (method === 'turn/start') return { turn: turn(location === 'turn' ? unsafeId : 'turn-1', 'inProgress') };
+          return {};
+        });
+        const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+          .start({ cwd, prompt: prompt('inspect'), env: {}, ...(location === 'resume' ? { resumeId: unsafeId } : {}) },
+            (event) => registry.apply(session.id, event));
+        await waitFor(() => session.status === 'stopped' || supervisor.requests.some(({ method }) => method === 'turn/start'));
+        if (location === 'item') {
+          assert.deepEqual(normalizeCodexAppServerItem('started', { type: 'plan', id: unsafeId, text: 'unsafe' }), []);
+          supervisor.notify('item/started', { threadId: 'thread-new', turnId: 'turn-1',
+            item: { type: 'plan', id: unsafeId, text: 'unsafe' } });
+        }
+        if (location === 'plan') supervisor.notify('turn/plan/updated', {
+          threadId: 'thread-new', turnId: unsafeId, plan: [{ step: 'unsafe', status: 'inProgress' }],
+        });
+        assert.equal(session.stoppedCode, 'codex_protocol_mismatch');
+        if (location === 'thread' || location === 'resume') assert.equal(supervisor.bound, null);
+        if (location === 'resume') assert.equal(supervisor.requests.length, 0);
+        await registry.save();
+        assert.equal(JSON.stringify(registry.publicSessions()).includes(unsafeId), false);
+        assert.equal((await readFile(statePath, 'utf8')).includes(unsafeId), false);
+        handle.stop();
+      });
+    }
+  }
+});
+
+test('opaque provider identifiers survive binding, resume and public persistence byte for byte', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-opaque-identifiers-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const id of opaqueProviderIdentifiers) {
+    const registry = new Registry(join(cwd, 'state.json'));
+    const session = registry.create({ provider: 'codex', account: 'codex', repo: cwd, cwd,
+      branch: 'test', title: 'test', codexTransport: 'app-server' });
+    const supervisor = new ScriptedSupervisor();
+    const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+      .start({ cwd, prompt: prompt('inspect'), env: {}, resumeId: id }, (event) => registry.apply(session.id, event));
+    await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
+    assert.equal(supervisor.bound?.threadId, id);
+    assert.equal(session.vendorSessionId, id);
+    assert.equal((supervisor.requests[0].params as { threadId: string }).threadId, id);
+    registry.apply(session.id, ...normalizeCodexAppServerItem('started', { type: 'plan', id, text: 'safe' }) as [AdapterEvent]);
+    await registry.save();
+    const reloaded = await Registry.load(join(cwd, 'state.json'));
+    assert.equal(reloaded.get(session.id)?.vendorSessionId, id);
+    assert.ok(reloaded.publicSessions()[0].transcript.some((msg) => 'id' in msg && msg.id === id));
+    handle.stop();
+  }
 });
 
 test('app-server item normalization emits provider-neutral rows, summaries only for reasoning, and bounded redacted detail', () => {
@@ -551,7 +618,6 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
       sandbox: 'workspace-write',
       model: 'gpt-5.4',
       config: {
-        effort: 'high',
         web_search: 'live',
         sandbox_workspace_write: { network_access: true },
       },
@@ -582,6 +648,10 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
   supervisor.notify('turn/completed', { threadId: 'thread-fifo', turn: turn('turn-1', 'completed') });
 
   await waitFor(() => supervisor.requests.filter(({ method }) => method === 'turn/start').length === 2, 'second turn/start');
+  assert.deepEqual(supervisor.requests.filter(({ method }) => method === 'turn/start').map(({ params }) => params), [
+    { threadId: 'thread-fifo', effort: 'high', input: [{ type: 'text', text: 'first', text_elements: [] }] },
+    { threadId: 'thread-fifo', effort: 'high', input: [{ type: 'text', text: 'second', text_elements: [] }] },
+  ]);
   const planEvents = events.filter((event) => event.type === 'upsert-msg' && event.msg.kind === 'todo');
   assert.equal(planEvents.length, 1);
   assert.deepEqual(planEvents[0], { type: 'upsert-msg', msg: {
@@ -633,6 +703,99 @@ test('dispatch acknowledgement distinguishes a pre-write failure from a lost res
       id: 'dispatch-prompt',
       delivery: acknowledged ? 'sent' : 'unsent',
     }]);
+  }
+});
+
+test('delayed stdin callbacks after stop correct only the accepted prompt through the production boundary', async (t) => {
+  for (const accepted of [true, false]) {
+    await t.test(accepted ? 'successful callback' : 'failed callback', async (t) => {
+      const cwd = await mkdtemp(join(tmpdir(), 'sb-delivery-stop-'));
+      const registry = new Registry(join(cwd, 'state.json'));
+      const session = registry.create({ provider: 'codex', account: 'codex', repo: cwd, cwd,
+        branch: 'race', title: 'race', codexTransport: 'app-server' });
+      const firstId = registry.appendPrompt(session.id, 'first', 'queued');
+      const requests: Array<{ id: number; method: string; params?: any }> = [];
+      const callbacks: Array<(error?: Error | null) => void> = [];
+      const stdout = new PassThrough();
+      const stdin = new PassThrough();
+      const stderr = new PassThrough();
+      const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr,
+        kill() { queueMicrotask(() => child.emit('close', 0, null)); return true; } });
+      stdin.on('finish', () => child.emit('close', 0, null));
+      const respond = (id: number, result: unknown) => stdout.write(`${JSON.stringify({ id, result })}\n`);
+      stdin.write = ((chunk: string, callback: (error?: Error | null) => void) => {
+        const request = JSON.parse(String(chunk));
+        requests.push(request);
+        if (request.method === 'turn/start') { callbacks.push(callback); return true; }
+        callback?.();
+        if (request.id === undefined) return true;
+        let result: unknown = {};
+        if (request.method === 'account/read') result = { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true };
+        if (request.method === 'account/rateLimits/read') result = { rateLimits: { limitId: null, limitName: null,
+          primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+          credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+          rateLimitsByLimitId: null, rateLimitResetCredits: null };
+        if (request.method.startsWith('thread/')) result = safeThreadResponse('delivery-thread', cwd);
+        queueMicrotask(() => respond(request.id, result));
+        return true;
+      }) as typeof stdin.write;
+      const supervisor = new CodexAppServerSupervisor({
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        verifyContract: async () => {},
+        clientFactory: (options) => new AppServerClient({ ...options, childFactory: () => child }),
+      });
+      t.after(async () => {
+        await supervisor.close(); stdin.destroy(); stdout.destroy(); stderr.destroy();
+        await rm(cwd, { recursive: true, force: true });
+      });
+      await supervisor.ensureTurnTransport();
+      const events: AdapterEvent[] = [];
+      const emit = (event: AdapterEvent) => { events.push(event); registry.apply(session.id, event); };
+      const handle = createCodexAppServerAdapter(supervisor, session.id, '0.145.0')
+        .start({ cwd, prompt: prompt('first'), promptId: firstId, env: {} }, emit);
+      await waitFor(() => callbacks.length === 1);
+      const otherId = registry.appendPrompt(session.id, 'queued second', 'queued');
+      handle.send(prompt('queued second'), otherId);
+      handle.stop();
+      const terminal = { status: session.status, reason: session.stoppedReason, code: session.stoppedCode, since: session.statusSince };
+      callbacks[0](accepted ? null : new Error('private write failure'));
+      if (accepted) {
+        const request = requests.find((value) => value.method === 'turn/start')!;
+        respond(request.id, { turn: turn('old-turn', 'inProgress') });
+        await waitFor(() => requests.some((value) => value.method === 'turn/interrupt'));
+      } else await new Promise((resolve) => setImmediate(resolve));
+      const delivery = (id: string) => session.transcript.find((msg) => msg.kind === 'user' && msg.id === id);
+      assert.equal((delivery(firstId) as { delivery: string }).delivery, accepted ? 'sent' : 'unsent');
+      assert.equal((delivery(otherId) as { delivery: string }).delivery, 'unsent');
+      assert.deepEqual({ status: session.status, reason: session.stoppedReason, code: session.stoppedCode, since: session.statusSince }, terminal);
+      assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
+      const before = JSON.stringify(session);
+      for (const event of [
+        { type: 'status', status: 'working' }, { type: 'msg', msg: { kind: 'text', text: 'late' } },
+        { type: 'stopped', reason: 'replacement', code: 'codex_stream_failed' },
+        { type: 'prompt-delivery', id: 'unknown', delivery: 'sent' },
+        { type: 'prompt-delivery', id: firstId, delivery: 'unsent' },
+      ] as AdapterEvent[]) registry.apply(session.id, event);
+      assert.equal(JSON.stringify(session), before);
+      await registry.save();
+      const loaded = await Registry.load(join(cwd, 'state.json'));
+      assert.equal((loaded.get(session.id)!.transcript.find((msg) => msg.kind === 'user' && msg.id === firstId) as { delivery: string }).delivery,
+        accepted ? 'sent' : 'unsent');
+      if (accepted) {
+        registry.revive(session.id);
+        const resumeId = registry.appendPrompt(session.id, 'resume only', 'queued');
+        const resumed = createCodexAppServerAdapter(supervisor, session.id, '0.145.0')
+          .start({ cwd, prompt: prompt('resume only'), promptId: resumeId, resumeId: 'delivery-thread', env: {} }, emit);
+        await waitFor(() => callbacks.length === 2);
+        callbacks[1](null);
+        const starts = requests.filter((value) => value.method === 'turn/start');
+        respond(starts[1].id, { turn: turn('new-turn', 'inProgress') });
+        assert.deepEqual(starts.map((value) => value.params.input[0].text), ['first', 'resume only']);
+        assert.equal((delivery(otherId) as { delivery: string }).delivery, 'unsent');
+        assert.equal((delivery(resumeId) as { delivery: string }).delivery, 'sent');
+        resumed.stop();
+      }
+    });
   }
 });
 
@@ -707,6 +870,66 @@ test('adapter plan and terminal error events scrub embedded absolute paths', asy
   assert.match(serialized, /Inspect|carefully|permission denied/);
 });
 
+test('typed UsageLimitExceeded failures are classified internally on both terminal paths without recovery or details', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-typed-turn-failure-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const path of ['notification', 'failed-turn'] as const) {
+    for (const [codexErrorInfo, kind] of [
+      ['usageLimitExceeded', 'UsageLimitExceeded'],
+      [null, 'Other'],
+      [{ httpConnectionFailed: { httpStatusCode: 429 } }, 'Other'],
+      ['future-error', 'Other'],
+    ] as const) {
+      const failure = () => {
+        let typedReads = 0;
+        return {
+          typedReads: () => typedReads,
+          value: {
+            message: 'Failure at /private/provider/data.txt',
+            get codexErrorInfo(): unknown { typedReads += 1; return codexErrorInfo; },
+            get additionalDetails(): never { throw new Error('additionalDetails must never be read'); },
+          },
+        };
+      };
+      const direct = failure();
+      assert.deepEqual(appServerAdapter.classifyCodexAppServerTurnFailure(direct.value, {}), {
+        kind, reason: 'Failure at [path omitted]',
+      });
+      assert.equal(direct.typedReads(), 1);
+      const terminal = failure();
+      const registry = new Registry(join(cwd, 'state.json'));
+      const session = registry.create({ provider: 'codex', account: 'codex', repo: cwd, cwd,
+        branch: 'failure', title: 'failure', codexTransport: 'app-server' });
+      const firstId = registry.appendPrompt(session.id, 'first', 'queued');
+      const supervisor = new ScriptedSupervisor();
+      const events: AdapterEvent[] = [];
+      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+        .start({ cwd, prompt: prompt('first'), promptId: firstId, env: {} }, (event) => {
+          events.push(event); registry.apply(session.id, event);
+        });
+      await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
+      const queuedId = registry.appendPrompt(session.id, 'queued', 'queued');
+      handle.send(prompt('queued'), queuedId);
+      if (path === 'notification') supervisor.notify('error', {
+        threadId: 'thread-new', turnId: 'turn-1', willRetry: false, error: terminal.value,
+      });
+      else supervisor.notify('turn/completed', { threadId: 'thread-new', turn: turn('turn-1', 'failed', terminal.value) });
+      await waitFor(() => session.status === 'stopped');
+      assert.equal(terminal.typedReads(), 1, `${path} must retain the typed discriminator`);
+      assert.equal(session.stoppedCode, 'codex_stream_failed');
+      assert.equal(session.stoppedReason, 'Failure at [path omitted]');
+      assert.equal(supervisor.detached, 1);
+      assert.equal(supervisor.requests.filter(({ method }) => method === 'turn/start').length, 1);
+      assert.deepEqual(session.transcript.filter((msg) => msg.kind === 'user').map((msg) => msg.delivery), ['sent', 'unsent']);
+      assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
+      await registry.save();
+      for (const serialized of [JSON.stringify(events), JSON.stringify(registry.publicSessions()), await readFile(join(cwd, 'state.json'), 'utf8')]) {
+        assert.doesNotMatch(serialized, /codex_usage_limited|UsageLimitExceeded|usageLimitExceeded|codexErrorInfo|additionalDetails|\/private\/provider/);
+      }
+    }
+  }
+});
+
 test('thread safety mismatches fail closed before turn/start', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-safety-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -754,6 +977,27 @@ test('resume uses only the stored thread ID', async (t) => {
   ]);
   assert.deepEqual(supervisor.bound, { sessionId: 'session-resume', threadId: 'stored-thread' });
   assert.ok(events.some((event) => event.type === 'vendor-session-id' && event.id === 'stored-thread'));
+});
+
+test('reasoning effort is top-level per turn for start and resume, and omitted when inherited', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-effort-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  for (const resumeId of [undefined, 'stored-thread']) {
+    for (const effort of [undefined, 'high'] as const) {
+      const supervisor = new ScriptedSupervisor();
+      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'effort', '0.145.0')
+        .start({ cwd, prompt: prompt('effort'), env: {}, resumeId,
+          ...(effort ? { codexSettings: { modelReasoningEffort: effort } } : {}) }, () => {});
+      await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
+      const setup = supervisor.requests[0].params as Record<string, unknown>;
+      assert.equal(Object.hasOwn(setup, 'config'), false);
+      const request = supervisor.requests.find(({ method }) => method === 'turn/start')!.params as Record<string, unknown>;
+      assert.equal(Object.hasOwn(request, 'effort'), effort !== undefined);
+      assert.equal(request.effort, effort);
+      assert.equal(Object.hasOwn(request, 'config'), false);
+      handle.stop();
+    }
+  }
 });
 
 test('stop interrupts once, marks queued prompts unsent, and settles once despite late completion', async (t) => {

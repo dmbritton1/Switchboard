@@ -10,6 +10,31 @@ import { AppServerClient } from '../src/agents/codex-app-server-client.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 
+test('RPC application errors are sanitized and typed while malformed error envelopes remain terminal', async (t) => {
+  for (const malformed of [false, true]) {
+    const exits: Error[] = [];
+    const client = clientFor({ overrides: { FAKE_APP_SERVER_RATE_LIMITS_ERROR: JSON.stringify(malformed
+      ? { code: 'invalid', message: 'private /secret' }
+      : { code: -32000, message: 'private /secret', data: 'additional private detail' }) },
+      onExit: (error) => exits.push(error) });
+    t.after(() => client.close().catch(() => {}));
+    await client.request('initialize', { clientInfo: { name: 'test', title: 'test', version: '1' }, capabilities: null });
+    client.notify('initialized');
+    await assert.rejects(client.request('account/rateLimits/read'), (error: Error) => {
+      assert.doesNotMatch(JSON.stringify(error) + error.message, /private|secret/);
+      assert.equal(error.name, malformed ? 'Error' : 'AppServerRequestError');
+      return true;
+    });
+    if (malformed) {
+      assert.equal(exits.length, 1);
+      await assert.rejects(client.request('account/read', { refreshToken: false }));
+    } else {
+      assert.deepEqual(exits, []);
+      await client.request('account/read', { refreshToken: false });
+    }
+  }
+});
+
 function env(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     ...Object.fromEntries(

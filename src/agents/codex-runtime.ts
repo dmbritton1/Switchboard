@@ -48,6 +48,12 @@ export function containsAbsoluteFileUri(value: string): boolean {
   return false;
 }
 
+/** Admission check only: never rewrite an opaque identifier into another ID. */
+export function unsafeCodexProviderIdentifier(value: unknown): boolean {
+  return typeof value === 'string' && (containsAbsoluteFileUri(value)
+    || /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u.test(value));
+}
+
 function redactAbsoluteFileUris(value: string): string {
   let safe = '';
   let offset = 0;

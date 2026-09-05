@@ -15,12 +15,75 @@ import {
 import { DENIED_SERVER_METHODS } from '../src/agents/codex-app-server-contract.ts';
 import type { PreparedCodexRuntime } from '../src/agents/codex-runtime.ts';
 import type { AccountLimitSnapshot, CodexFailureCode } from '../src/types.ts';
+import { unsafeProviderIdentifiers } from './helpers/provider-identifiers.ts';
 
 const fakeCommand = fileURLToPath(new URL('./helpers/fake-app-server.ts', import.meta.url));
 const unavailable = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
 const signedOut = 'Codex account telemetry is unavailable while signed out.';
 const externalHeaders = 'Codex account telemetry is unavailable for external header authentication.';
 const externalTokens = 'Codex account telemetry is unavailable for external ChatGPT token authentication.';
+
+test('absolute-path-shaped thread and turn IDs cannot acquire supervisor ownership', async (t) => {
+  for (const [index, id] of unsafeProviderIdentifiers.entries()) {
+    await t.test(String(index), async (t) => {
+      const { supervisor } = await turnRoutingHarness(t, (start) => ({ turn: routedTurn(start === 1 ? id : 'safe-turn') }));
+      supervisor.registerSession('other', { onNotification() {}, onFatal() {} });
+      assert.throws(() => supervisor.bindThread('other', id), /identifier|invalid/i);
+      await assert.rejects(supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' }),
+        (error: Error) => {
+          assert.equal((error as { code?: string }).code, 'codex_protocol_mismatch');
+          assert.equal(error.message.includes(id), false);
+          return true;
+        });
+      const next = await supervisor.requestForSession<{ turn: { id: string } }>('session', 'turn/start', { threadId: 'thread' });
+      assert.equal(next.turn.id, 'safe-turn');
+    });
+  }
+});
+
+test('a telemetry RPC application error retains the real child and healthy active session routes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'sb-telemetry-rpc-'));
+  const log = join(dir, 'calls.jsonl');
+  const observed = callbacks();
+  const fatal: string[] = [];
+  const completed: string[] = [];
+  const supervisor = new CodexAppServerSupervisor({
+    verifyContract: async () => {},
+    runtime: runtime({ FAKE_APP_SERVER_MODE: 'turn-multi-session', FAKE_APP_SERVER_CALL_LOG: log,
+      FAKE_APP_SERVER_RATE_LIMITS_ERROR_AFTER: '1',
+      FAKE_APP_SERVER_RATE_LIMITS_ERROR: JSON.stringify({ code: -32000, message: 'private /secret/service', data: { token: 'secret' } }),
+    }), ...observed,
+  });
+  t.after(async () => { await supervisor.close(); await rm(dir, { recursive: true, force: true }); });
+  await supervisor.ensureTurnTransport();
+  const threads: string[] = [];
+  for (const session of ['a', 'b']) {
+    supervisor.registerSession(session, {
+      onFatal: (reason) => fatal.push(reason),
+      onNotification: (method) => { if (method === 'turn/completed') completed.push(session); },
+    });
+    const response = await supervisor.requestForSession<{ thread: { id: string } }>(session, 'thread/start', { cwd: `/fixture/${session}` });
+    threads.push(response.thread.id);
+    supervisor.bindThread(session, response.thread.id);
+    await supervisor.requestForSession(session, 'turn/start', { threadId: response.thread.id,
+      input: [{ type: 'text', text: `hold-${session}`, text_elements: [] }] });
+  }
+  await assert.rejects(supervisor.reconcile(), { message: unavailable });
+  assert.deepEqual(fatal, []);
+  assert.equal(observed.stale.at(-1), unavailable);
+  // Ownership remains active and bound to the same process generation.
+  await assert.rejects(supervisor.requestForSession('a', 'turn/start', { threadId: threads[0] }), /active turn/);
+  for (const [index, session] of ['a', 'b'].entries()) {
+    await supervisor.requestForSession(session, 'turn/interrupt', { threadId: threads[index], turnId: `multi-turn-${index + 1}` });
+  }
+  await waitFor(() => completed.length === 2);
+  await supervisor.requestForSession('a', 'turn/start', { threadId: threads[0],
+    input: [{ type: 'text', text: 'session-a follow-up', text_elements: [] }] });
+  await waitFor(() => completed.length === 3);
+  assert.deepEqual(fatal, []);
+  const recorded = await calls(log);
+  assert.equal(recorded.filter((entry) => entry.method === 'initialize').length, 1);
+});
 
 type LegacyObservedOptions = CodexAppServerSupervisorOptions & {
   onSnapshot: (snapshot: AccountLimitSnapshot) => void;

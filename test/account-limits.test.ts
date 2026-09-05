@@ -40,6 +40,39 @@ function runtime(): PreparedCodexRuntime {
   };
 }
 
+test('forget retires subscriptions and ignores old reads across same-name relink and close', async () => {
+  const configured = [{ ...accounts[1] }];
+  const usage = new Usage();
+  const pending = deferred<AccountLimitSnapshot>();
+  const publishers: Array<(value: AccountLimitSnapshot) => void> = [];
+  let reads = 0;
+  const coordinator = createAccountLimitCoordinator({
+    accounts: configured, usage, onChange() {}, prepareCodex: async () => runtime(),
+    supervisorFactory: ({ onSnapshot }) => {
+      publishers.push(onSnapshot);
+      return { reconcile: async () => ++reads === 1 ? availableSnapshot() : pending.promise,
+        readAtResetBoundary: async () => availableSnapshot(), close: async () => {} };
+    },
+  });
+  await coordinator.start();
+  const oldRead = coordinator.reconcile();
+  await waitFor(() => reads === 2);
+  const old = configured.shift()!;
+  await coordinator.forget(old);
+  configured.push({ ...old, env: {} });
+  pending.resolve(availableSnapshot({ plan: 'old-read' }));
+  await oldRead;
+  assert.equal(usage.getLimitSnapshot(old.name).snapshot, null);
+  await coordinator.reconcile();
+  assert.equal(publishers.length, 2);
+  publishers[1](availableSnapshot({ plan: 'replacement' }));
+  publishers[0](availableSnapshot({ plan: 'retired' }));
+  assert.equal(usage.getLimitSnapshot(old.name).snapshot?.plan, 'replacement');
+  await coordinator.close();
+  publishers[1](availableSnapshot({ plan: 'closed' }));
+  assert.equal(usage.getLimitSnapshot(old.name).snapshot?.plan, 'replacement');
+});
+
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(error: Error): void } {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -520,6 +553,7 @@ test('coordinators share an external Codex pool, unsubscribe independently, and 
     close: async () => assert.fail('only the application-level pool owner closes supervisors'),
   };
   const pool = {
+    retire: async () => {},
     limits: async (configured: typeof accounts[number], listener: Listener) => {
       limitCalls.push(configured.name);
       sharedSupervisor.subscribe(listener);

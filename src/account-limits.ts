@@ -27,6 +27,7 @@ type FactoryCodexSupervisor = Pick<
 
 export type CodexLimitPool = {
   limits(account: Account, listener: CodexLimitListener): Promise<CodexLimitSupervisor>;
+  retire(account: Account): Promise<void>;
   close(): Promise<void>;
 };
 
@@ -38,6 +39,7 @@ export type CodexSupervisorFactory = (options: {
 }) => FactoryCodexSupervisor;
 
 export interface AccountLimitCoordinator {
+  forget(account: Account): Promise<void>;
   start(): Promise<void>;
   reconcile(): Promise<void>;
   codexResetEligibility(
@@ -109,6 +111,8 @@ class FactoryCodexPool implements CodexLimitPool {
     surface: CodexLimitSupervisor;
   }>>();
   #closed = false;
+  readonly #retired = new WeakSet<Account>();
+  readonly #identities = new Map<string, Account>();
   #close: Promise<void> | null = null;
 
   constructor(prepare: typeof prepareCodexRuntime, factory: CodexSupervisorFactory) {
@@ -117,10 +121,11 @@ class FactoryCodexPool implements CodexLimitPool {
   }
 
   async limits(account: Account, listener: CodexLimitListener): Promise<CodexLimitSupervisor> {
-    if (this.#closed) throw new Error(CODEX_FAILURE);
+    if (this.#closed || this.#retired.has(account)) throw new Error(CODEX_FAILURE);
     let entry = this.#entries.get(account.name);
     if (!entry) {
       entry = this.#create(account);
+      this.#identities.set(account.name, account);
       this.#entries.set(account.name, entry);
       const created = entry;
       void created.catch(() => {
@@ -128,9 +133,19 @@ class FactoryCodexPool implements CodexLimitPool {
       });
     }
     const { surface } = await entry;
-    if (this.#closed) throw new Error(CODEX_FAILURE);
+    if (this.#closed || this.#retired.has(account)) throw new Error(CODEX_FAILURE);
     surface.subscribe(listener);
     return surface;
+  }
+
+  async retire(account: Account): Promise<void> {
+    this.#retired.add(account);
+    if (this.#identities.get(account.name) !== account) return;
+    const entry = this.#entries.get(account.name);
+    this.#entries.delete(account.name);
+    this.#identities.delete(account.name);
+    const prepared = await entry?.catch(() => null);
+    await prepared?.supervisor.close();
   }
 
   close(): Promise<void> {
@@ -156,7 +171,7 @@ class FactoryCodexPool implements CodexLimitPool {
       }
     };
     const runtime = await this.#prepare({ bin: account.bin, env: account.env });
-    if (this.#closed) throw new Error(CODEX_FAILURE);
+    if (this.#closed || this.#retired.has(account)) throw new Error(CODEX_FAILURE);
     const supervisor = this.#factory({
       account,
       runtime,
@@ -202,6 +217,7 @@ class Coordinator implements AccountLimitCoordinator {
   readonly #now: () => number;
   readonly #boundaryTimeoutMs: number;
   readonly #subscriptions = new Map<string, {
+    account: Account;
     listener: CodexLimitListener;
     unsubscribe: (() => void) | null;
   }>();
@@ -212,6 +228,7 @@ class Coordinator implements AccountLimitCoordinator {
   #reconciliationChanged = false;
   #close: Promise<void> | null = null;
   #closed = false;
+  readonly #retired = new WeakSet<Account>();
 
   constructor(options: AccountLimitCoordinatorOptions) {
     this.#accounts = options.accounts;
@@ -242,6 +259,22 @@ class Coordinator implements AccountLimitCoordinator {
 
   start(): Promise<void> {
     return this.reconcile();
+  }
+
+  async forget(account: Account): Promise<void> {
+    this.#retired.add(account);
+    const subscription = this.#subscriptions.get(account.name);
+    if (subscription?.account === account) {
+      subscription.unsubscribe?.();
+      this.#subscriptions.delete(account.name);
+    }
+    this.#boundaryReads.delete(account.name);
+    this.#usage.forgetLimitSnapshot(account.name);
+    await this.#codexPool.retire(account);
+  }
+
+  #current(account: Account): boolean {
+    return !this.#closed && !this.#retired.has(account) && this.#accounts.includes(account);
   }
 
   reconcile(): Promise<void> {
@@ -298,7 +331,8 @@ class Coordinator implements AccountLimitCoordinator {
   async #reconcileAccount(account: Account): Promise<void> {
     if (account.provider === 'claude') {
       try {
-        this.#storeSnapshot(account.name, await this.#probeClaude(account.env));
+        const snapshot = await this.#probeClaude(account.env);
+        if (this.#current(account)) this.#storeSnapshot(account.name, snapshot);
       } catch (error) {
         this.#fail(account, error, CLAUDE_FAILURE);
       }
@@ -306,7 +340,8 @@ class Coordinator implements AccountLimitCoordinator {
     }
     try {
       const supervisor = await this.#supervisor(account);
-      this.#storeSnapshot(account.name, await supervisor.reconcile());
+      const snapshot = await supervisor.reconcile();
+      if (this.#current(account)) this.#storeSnapshot(account.name, snapshot);
     } catch (error) {
       this.#fail(account, error, CODEX_FAILURE);
     }
@@ -317,6 +352,7 @@ class Coordinator implements AccountLimitCoordinator {
     try {
       const supervisor = await this.#supervisor(account);
       const result = await this.#withBoundaryTimeout(supervisor.readAtResetBoundary(now));
+      if (!this.#current(account)) return { ready: false, reason: CODEX_FAILURE };
       if (result.timedOut) return { ready: false, reason: BOUNDARY_TIMEOUT };
       if (!isCleanSnapshot(result.snapshot)) {
         this.#fail(account, new Error(CODEX_FAILURE), CODEX_FAILURE);
@@ -367,11 +403,15 @@ class Coordinator implements AccountLimitCoordinator {
   }
 
   #supervisor(account: Account): Promise<CodexLimitSupervisor> {
+    if (!this.#current(account)) return Promise.reject(new Error(CODEX_FAILURE));
     let subscription = this.#subscriptions.get(account.name);
     if (!subscription) {
       subscription = {
+        account,
         listener: {
-          onSnapshot: (snapshot) => this.#storeSnapshot(account.name, snapshot),
+          onSnapshot: (snapshot) => {
+            if (this.#current(account)) this.#storeSnapshot(account.name, snapshot);
+          },
           onStale: (reason) => this.#fail(account, reason, CODEX_FAILURE),
         },
         unsubscribe: null,
@@ -382,8 +422,8 @@ class Coordinator implements AccountLimitCoordinator {
     const access = this.#codexPool.limits(account, current.listener).then((supervisor) => {
       const unsubscribe = supervisor.subscribe(current.listener);
       if (current.unsubscribe === null) current.unsubscribe = unsubscribe;
-      if (this.#closed) {
-        current.unsubscribe?.();
+      if (!this.#current(account) || this.#subscriptions.get(account.name) !== current) {
+        unsubscribe();
         throw new Error(CODEX_FAILURE);
       }
       return supervisor;
@@ -394,6 +434,7 @@ class Coordinator implements AccountLimitCoordinator {
   }
 
   #fail(account: Account, error: unknown, fallback: string): void {
+    if (!this.#current(account)) return;
     // Always redact before this crosses the Usage/SSE boundary. The public value
     // remains a stable action rather than a provider diagnostic.
     const message = redactValues(error instanceof Error ? error.message : String(error), Object.values(account.env));

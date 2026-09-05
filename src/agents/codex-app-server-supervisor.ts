@@ -1,4 +1,4 @@
-import { AppServerClient, type AppServerClientOptions } from './codex-app-server-client.ts';
+import { AppServerClient, AppServerRequestError, type AppServerClientOptions } from './codex-app-server-client.ts';
 import {
   DENIED_SERVER_METHODS, PRIVATE_NOTIFICATIONS, TURN_CLIENT_METHODS, TURN_NOTIFICATIONS,
   appServerArgs, verifyAppServerContract, type CodexAppServerMode,
@@ -7,7 +7,7 @@ import {
   CODEX_TELEMETRY_REASONS, normalizeCodexAccountRead, normalizeCodexAuthUpdate,
   normalizeCodexRateLimits, type CodexTelemetryAuth,
 } from './codex-limits.ts';
-import { CodexRuntimeError, redactValues, type PreparedCodexRuntime } from './codex-runtime.ts';
+import { CodexRuntimeError, redactValues, unsafeCodexProviderIdentifier, type PreparedCodexRuntime } from './codex-runtime.ts';
 import type { AccountLimitSnapshot, CodexFailureCode } from '../types.ts';
 
 const PUBLIC_UNAVAILABLE = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
@@ -190,7 +190,9 @@ export class CodexAppServerSupervisor {
   bindThread(sessionId: string, threadId: string): void {
     const state = this.#sessions.get(sessionId);
     if (!state) throw new Error('Codex session is not registered.');
-    if (typeof threadId !== 'string' || threadId.length === 0) throw new Error('Codex thread id is invalid.');
+    if (typeof threadId !== 'string' || threadId.length === 0 || unsafeCodexProviderIdentifier(threadId)) {
+      throw new CodexRuntimeError('codex_protocol_mismatch', 'Codex thread identifier is invalid.');
+    }
     if (state.threadId !== null || this.#threadOwners.has(threadId)) throw new Error('Codex thread is already bound.');
     state.threadId = threadId;
     this.#threadOwners.set(threadId, sessionId);
@@ -230,6 +232,9 @@ export class CodexAppServerSupervisor {
         && state.pendingTurn === pendingTurn) {
         const notifiedTurnId = state.pendingStartTurnId;
         const responseTurnId = turnIdFrom(response);
+        if (unsafeCodexProviderIdentifier(responseTurnId)) {
+          throw new CodexRuntimeError('codex_protocol_mismatch', 'Codex turn identifier is invalid.');
+        }
         const responseWasTerminal = responseTurnId !== null
           && state.pendingTerminalTurnIds.has(responseTurnId);
         state.pendingTurn = null;
@@ -352,7 +357,12 @@ export class CodexAppServerSupervisor {
         this.#markStale(account.reason);
         return;
       }
-      await this.#readFrom(client, this.#now());
+      try {
+        await this.#readFrom(client, this.#now());
+      } catch (error) {
+        // Only the optional limit read may fail after successful initialization.
+        if (!(error instanceof AppServerRequestError)) throw error;
+      }
     } catch {
       if (client !== null) await this.#retire(client, true);
       else this.#handleFailure(false);
@@ -412,6 +422,14 @@ export class CodexAppServerSupervisor {
     const generation = this.#clientGenerations.get(client);
     if (!state || state.threadId !== threadId || generation === undefined || state.generation !== generation) return;
     const turnId = turnIdFrom(params);
+    if (unsafeCodexProviderIdentifier(turnId)) {
+      this.#sessions.delete(sessionId!);
+      this.#threadOwners.delete(threadId);
+      try {
+        state.route.onFatal('Codex turn identifier is invalid.', 'codex_protocol_mismatch');
+      } catch { /* observer isolation */ }
+      return;
+    }
     if (method === 'turn/started' && turnId) {
       if (state.pendingTurn !== null) {
         if (state.pendingStartTurnId === null) {
@@ -474,7 +492,12 @@ export class CodexAppServerSupervisor {
     if (!this.#auth?.supported) throw new Error(this.#auth?.reason ?? PUBLIC_UNAVAILABLE);
     const client = this.#client;
     if (!client) throw unavailableError();
-    return this.#readFrom(client, now);
+    try {
+      return await this.#readFrom(client, now);
+    } catch (error) {
+      if (error instanceof AppServerRequestError) throw unavailableError();
+      throw error;
+    }
   }
 
   async #readFrom(client: SupervisorClient, now: number): Promise<AccountLimitSnapshot> {
@@ -516,6 +539,10 @@ export class CodexAppServerSupervisor {
       return { invalidated: false, snapshot };
     } catch (error) {
       if (error instanceof UnsupportedTelemetryError) throw error;
+      if (error instanceof AppServerRequestError) {
+        this.#markStale(PUBLIC_UNAVAILABLE);
+        throw error;
+      }
       await this.#retire(client, true);
       throw unavailableError();
     }

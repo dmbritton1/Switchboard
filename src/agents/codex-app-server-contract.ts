@@ -312,7 +312,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
   const errorMembers = error ? outerObjectMembers(error) : null;
-  const requiredWillRetry = /(?:^|[,;])\s*willRetry\s*:\s*boolean\s*(?=[,;]|$)/m;
+  const requiredWillRetry = /(?:^|[,;])\s*willRetry\s*:\s*boolean\s*(?=[,;]|(?![\s\S]))/;
   const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
   const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
   if (!approvalPolicy || !sandboxMode || !jsonValue || !threadStart || !threadResume

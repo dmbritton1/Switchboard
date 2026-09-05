@@ -225,6 +225,21 @@ test('unknown prompt delivery ids leave accepted prompts unchanged', () => {
   });
 });
 
+test('terminal delivery correction is limited to sent app-server prompts after a user stop', () => {
+  for (const code of ['codex_user_stopped', 'codex_stream_failed'] as const) {
+    const reg = new Registry('/dev/null');
+    const s = reg.create({ provider: 'codex', account: 'codex', repo: '/r', cwd: '/r', branch: 'b', title: 'b', codexTransport: 'app-server' });
+    const id = reg.appendPrompt(s.id, 'prompt', 'queued');
+    reg.apply(s.id, { type: 'prompt-delivery', id, delivery: 'unsent' });
+    reg.apply(s.id, { type: 'stopped', code, reason: 'original stop' });
+    reg.apply(s.id, { type: 'prompt-delivery', id, delivery: 'sent' });
+    assert.equal((s.transcript[0] as { delivery: string }).delivery, code === 'codex_user_stopped' ? 'sent' : 'unsent');
+    assert.equal(s.status, 'stopped');
+    assert.equal(s.stoppedCode, code);
+    assert.equal(s.stoppedReason, 'original stop');
+  }
+});
+
 test('load migrates legacy and interrupted prompts without replaying them', async (t) => {
   const path = await writePromptMigrationState(t, [
     { kind: 'user', text: 'legacy' },

@@ -289,3 +289,69 @@ test('concurrent app-server prepares share a transient preflight failure and a l
   assert.equal(fixture.sdkAdapters.length, 0);
   assert.deepEqual(fixture.launches.get('retry'), [appServerArgs('turns')]);
 });
+
+test('retirement closes the old child and relinking prepares fresh SDK and app-server ownership', async (t) => {
+  const f = await harness(t);
+  const old = account('relinked');
+  await f.pool.prepare(old, 'sdk', 'old-sdk');
+  await f.pool.prepare(old, 'app-server', 'old-app');
+  const oldSupervisor = f.appSupervisors[0];
+  await f.pool.retire(old);
+  assert.equal(f.closes.get(old.name), 1);
+  await assert.rejects(oldSupervisor.start());
+  await assert.rejects(f.pool.prepare(old, 'sdk', 'retired'), /retired/);
+  const replacement = account(old.name);
+  await f.pool.prepare(replacement, 'sdk', 'new-sdk');
+  await f.pool.prepare(replacement, 'app-server', 'new-app');
+  assert.deepEqual(f.prepared, ['relinked', 'relinked']);
+  assert.notEqual(f.appSupervisors[1], oldSupervisor);
+  await f.pool.retire(old); // An old identity cannot retire its replacement.
+  await f.appSupervisors[1].start();
+  assert.equal(f.closes.get(old.name), 1);
+});
+
+test('retirement fails closed during SDK, app-server, and telemetry runtime preparation', async () => {
+  for (const transport of ['sdk', 'app-server', 'limits'] as const) {
+    let resolve!: (value: any) => void;
+    let created = 0;
+    const pool = new CodexProviderPool({
+      prepareRuntime: () => new Promise((r) => { resolve = r; }),
+      createSdkAdapter: () => { created++; return adapter('unexpected'); },
+      createSupervisor: () => { created++; throw new Error('unexpected supervisor'); },
+    });
+    const old = account('pending');
+    const pending = transport === 'limits' ? pool.limits(old, listener([])) : pool.prepare(old, transport, 'pending');
+    const rejected = assert.rejects(pending, /retired/);
+    await Promise.resolve();
+    await pool.retire(old);
+    resolve({ source: 'explicit', commandPath: '/fixture/codex', version: '0.145.0', env: {}, diagnostics: [] });
+    await rejected;
+    assert.equal(created, 0);
+    await pool.close();
+  }
+});
+
+test('retirement during supervisor preparation prevents adapter creation', async () => {
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  const gate = new Promise<void>((r) => { release = r; });
+  let adapters = 0;
+  const pool = new CodexProviderPool({
+    prepareRuntime: async () => ({ source: 'explicit', commandPath: '/fixture/codex', version: '0.145.0', env: {}, diagnostics: [] }),
+    createSupervisor: (options) => new CodexAppServerSupervisor({
+      ...options, verifyContract: async () => { entered(); await gate; },
+      clientFactory: () => { throw new Error('retired preparation must not launch'); },
+    }),
+    createAppServerAdapter: () => { adapters++; return adapter('unexpected'); },
+  });
+  const old = account('preparing');
+  const pending = pool.prepare(old, 'app-server', 'session');
+  const rejected = assert.rejects(pending);
+  await started;
+  const retired = pool.retire(old);
+  release();
+  await Promise.all([retired, rejected]);
+  assert.equal(adapters, 0);
+  await pool.close();
+});

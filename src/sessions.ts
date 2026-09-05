@@ -258,7 +258,18 @@ export class Registry {
     const s = this.#sessions.get(id);
     if (!s) return;
     // A stopped session is terminal until an explicit resume replaces it.
-    if (s.status === 'stopped' && e.type !== 'vendor-session-id') return;
+    if (s.status === 'stopped' && e.type !== 'vendor-session-id') {
+      // A successful stdin callback can arrive after stop marked the pending
+      // prompt unsent. Correct that one stable row without reopening admission
+      // for status, transcript, or terminal events from the stopped adapter.
+      if (s.codexTransport !== 'app-server' || s.stoppedCode !== 'codex_user_stopped'
+        || e.type !== 'prompt-delivery' || e.delivery !== 'sent') return;
+      const prompt = s.transcript.find((msg) => msg.kind === 'user' && msg.id === e.id && msg.delivery === 'unsent');
+      if (!prompt || prompt.kind !== 'user') return;
+      prompt.delivery = 'sent';
+      this.#notify();
+      return;
+    }
 
     switch (e.type) {
       case 'status':
