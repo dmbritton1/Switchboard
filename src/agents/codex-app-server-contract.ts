@@ -112,6 +112,72 @@ function taggedUnionMember(source: string, type: string): string | undefined {
   return source.match(new RegExp(`\\{\\s*"type"\\s*:\\s*"${escaped}"\\s*,[\\s\\S]*?\\}`))?.[0];
 }
 
+function outerObjectMembers(source: string): string | null {
+  const assignment = source.indexOf('=');
+  const opening = source.indexOf('{', assignment + 1);
+  if (assignment === -1 || opening === -1) return null;
+  let depth = 0;
+  let members = '';
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = opening; index < source.length; index += 1) {
+    const character = source[index]!;
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === '\n') {
+        lineComment = false;
+        if (depth === 1) members += '\n';
+      } else if (depth === 1) members += ' ';
+      continue;
+    }
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        if (depth === 1) members += '  ';
+        blockComment = false;
+        index += 1;
+      } else if (depth === 1) members += character === '\n' ? '\n' : ' ';
+      continue;
+    }
+    if (quote !== null) {
+      if (depth === 1) members += ' ';
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      if (depth === 1) members += '  ';
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '/' && next === '*') {
+      if (depth === 1) members += '  ';
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      if (depth === 1) members += ' ';
+      quote = character;
+      continue;
+    }
+    if (character === '{') {
+      depth += 1;
+      continue;
+    }
+    if (character === '}') {
+      if (depth === 1) return members;
+      depth -= 1;
+      continue;
+    }
+    if (depth === 1) members += character;
+  }
+  return null;
+}
+
 async function generatedFiles(directory: string): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   async function walk(current: string, relative = ''): Promise<void> {
@@ -238,7 +304,8 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const jsonValueContract = /export\s+type\s+JsonValue\s*=\s*number\s*\|\s*string\s*\|\s*boolean\s*\|\s*Array\s*<\s*JsonValue\s*>\s*\|\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*;/;
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
-  const requiredWillRetry = /(?:^|[,{;])\s*willRetry\s*:\s*boolean\s*(?=[,;}])/m;
+  const errorMembers = error ? outerObjectMembers(error) : null;
+  const requiredWillRetry = /(?:^|[,;])\s*willRetry\s*:\s*boolean\s*(?=[,;]|$)/m;
   const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
   const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
   if (!approvalPolicy || !sandboxMode || !jsonValue || !threadStart || !threadResume
@@ -278,7 +345,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
     || !routing.test(itemCompleted) || !/item\s*:\s*ThreadItem/.test(itemCompleted)
     || !/threadId\s*:\s*string[\s\S]*turn\s*:\s*Turn/.test(turnCompleted)
     || !routing.test(error) || !/error\s*:\s*TurnError/.test(error)
-    || !requiredWillRetry.test(error)) {
+    || !errorMembers || !requiredWillRetry.test(errorMembers)) {
     throw new Error('generated schema differs from the turn contract');
   }
 }

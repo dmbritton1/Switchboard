@@ -27,6 +27,7 @@ type SessionState = {
   activeTurnId: string | null;
   pendingTurn: symbol | null;
   pendingStartTurnId: string | null;
+  pendingTerminalTurnId: string | null;
 };
 type RouteFailure = { reason: string; code: CodexFailureCode };
 
@@ -171,6 +172,7 @@ export class CodexAppServerSupervisor {
       activeTurnId: null,
       pendingTurn: null,
       pendingStartTurnId: null,
+      pendingTerminalTurnId: null,
     };
     this.#sessions.set(sessionId, state);
     let active = true;
@@ -220,15 +222,18 @@ export class CodexAppServerSupervisor {
     const pendingTurn = Symbol(sessionId);
     state.pendingTurn = pendingTurn;
     state.pendingStartTurnId = null;
+    state.pendingTerminalTurnId = null;
     try {
       const response = await client.request<T>(method, params, onDispatched);
       if (this.#sessions.get(sessionId) === state
         && state.generation === generation
         && state.pendingTurn === pendingTurn) {
         const notifiedTurnId = state.pendingStartTurnId;
+        const terminalTurnId = state.pendingTerminalTurnId;
         const responseTurnId = turnIdFrom(response);
         state.pendingTurn = null;
         state.pendingStartTurnId = null;
+        state.pendingTerminalTurnId = null;
         if (notifiedTurnId !== null && responseTurnId !== notifiedTurnId) {
           if (state.activeTurnId === notifiedTurnId) state.activeTurnId = null;
           throw new CodexRuntimeError(
@@ -236,7 +241,7 @@ export class CodexAppServerSupervisor {
             'Codex app-server protocol mismatch between turn response and start notification.',
           );
         }
-        state.activeTurnId = responseTurnId;
+        state.activeTurnId = responseTurnId === terminalTurnId ? null : responseTurnId;
       }
       return response;
     } catch (error) {
@@ -246,6 +251,7 @@ export class CodexAppServerSupervisor {
         const notifiedTurnId = state.pendingStartTurnId;
         state.pendingTurn = null;
         state.pendingStartTurnId = null;
+        state.pendingTerminalTurnId = null;
         if (state.activeTurnId === notifiedTurnId) state.activeTurnId = null;
       }
       throw error;
@@ -409,13 +415,19 @@ export class CodexAppServerSupervisor {
       if (state.pendingTurn !== null) {
         if (state.pendingStartTurnId === null) {
           state.pendingStartTurnId = turnId;
-          state.activeTurnId = turnId;
+          if (state.pendingTerminalTurnId !== turnId) state.activeTurnId = turnId;
         } else if (state.pendingStartTurnId !== turnId) {
           return;
         }
       } else if (state.activeTurnId !== turnId) return;
     }
-    if (method === 'turn/completed' && turnId === state.activeTurnId) state.activeTurnId = null;
+    if (method === 'turn/completed' && turnId) {
+      if (state.pendingTurn !== null
+        && (state.pendingStartTurnId === null || state.pendingStartTurnId === turnId)) {
+        state.pendingTerminalTurnId = turnId;
+      }
+      if (turnId === state.activeTurnId) state.activeTurnId = null;
+    }
     try {
       state.route.onNotification(method, params);
     } catch {
@@ -543,6 +555,7 @@ export class CodexAppServerSupervisor {
       state.activeTurnId = null;
       state.pendingTurn = null;
       state.pendingStartTurnId = null;
+      state.pendingTerminalTurnId = null;
       failed.push(state);
     }
     for (const state of failed) {

@@ -384,6 +384,25 @@ test('turn profile requires an exact required willRetry boolean field', async ()
   }
 });
 
+// Mutation caught: searching the whole generated file lets an exact-looking
+// nested member, block comment, or string satisfy an optional outer field.
+for (const [shape, location] of [
+  ['error-will-retry-nested-decoy', 'nested member'],
+  ['error-will-retry-comment-decoy', 'block comment'],
+  ['error-will-retry-string-decoy', 'string literal'],
+] as const) {
+  test(`turn profile ignores a willRetry decoy in a ${location}`, async () => {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+turn-will-retry-${shape}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+    );
+  });
+}
+
 test('generated contract rejects an omitted required member', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({

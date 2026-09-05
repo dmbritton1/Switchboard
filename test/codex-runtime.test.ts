@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
   CodexRuntimeError,
+  containsAbsoluteFileUri,
   prepareCodexRuntime,
   redactCodexText,
   redactValues,
@@ -376,6 +377,18 @@ test('redaction preserves punctuation and prose after an absolute file URI', () 
     `See ([path omitted]), then continue. Failure at [path omitted]: permission denied. `
       + `${safeUrl} and ${ordinary} remain.`,
   );
+});
+
+// Mutation caught: consuming the whole contiguous token from an earlier
+// non-absolute file: marker can hide a later absolute URI in that same token.
+test('redaction scans every file marker within a mixed token', () => {
+  const mixed = 'prefix file:notes,file:///private/hidden,report.txt suffix';
+
+  assert.equal(
+    redactValues(mixed, []),
+    'prefix file:notes,[path omitted] suffix',
+  );
+  assert.equal(containsAbsoluteFileUri(mixed), true);
 });
 
 test('redaction leaves values too short to be a credential alone', () => {

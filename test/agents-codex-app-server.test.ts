@@ -475,9 +475,9 @@ test('an absolute file URI in a provider item id fails closed before Registry ad
   assert.equal(JSON.stringify(events).includes(unsafeId), false);
 });
 
-// Mutation caught: relying on text redaction after emitting an unsafe item id
-// allows the raw upsert key into Registry persistence and its SSE projection.
-test('unsafe provider ids stay out of Registry persistence and public projection', async (t) => {
+// Mutation caught: a non-absolute file: prefix can mask a later absolute URI,
+// allowing the mixed raw upsert key into persistence and public projection.
+test('a non-absolute file prefix cannot hide an unsafe provider id from Registry', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-public-id-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const statePath = join(cwd, 'state.json');
@@ -486,7 +486,7 @@ test('unsafe provider ids stay out of Registry persistence and public projection
     provider: 'codex', account: 'codex', repo: cwd, cwd, branch: 'unsafe-id',
     title: 'unsafe id', codexTransport: 'app-server',
   });
-  const unsafeId = 'item:file:///private/provider,public;(secret).json';
+  const unsafeId = 'item:file:notes,file:///private/provider,public;(secret).json';
   const supervisor = new ScriptedSupervisor();
 
   createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')

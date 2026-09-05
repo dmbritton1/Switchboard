@@ -270,29 +270,43 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     ' completedAtMs: number };\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnCompletedNotification.ts'), 'export type TurnCompletedNotification = { threadId: string, turn: Turn };\n');
+  const exactWillRetry = changedShape(
+    'error-will-retry-optional',
+    changedShape(
+      'error-will-retry-nullable',
+      changedShape(
+        'error-will-retry-union',
+        changedShape(
+          'error-will-retry-literals',
+          changedShape(
+            'error-will-retry-no-delimiter',
+            'willRetry: boolean, ',
+            'willRetry: booleanFuture, ',
+          ),
+          'willRetry: true | false, ',
+        ),
+        'willRetry: boolean | string, ',
+      ),
+      'willRetry: boolean | null, ',
+    ),
+    'willRetry?: boolean, ',
+  );
+  const willRetry = changedShape(
+    'error-will-retry-nested-decoy',
+    changedShape(
+      'error-will-retry-comment-decoy',
+      changedShape(
+        'error-will-retry-string-decoy',
+        exactWillRetry,
+        'willRetry?: boolean, decoy: ", willRetry: boolean,", ',
+      ),
+      'willRetry?: boolean, /*, willRetry: boolean, */ ',
+    ),
+    'willRetry?: boolean, nested: { willRetry: boolean }, ',
+  );
   writeFileSync(join(out, 'v2', 'ErrorNotification.ts'), [
     'export type ErrorNotification = { error: TurnError, ',
-    shape('error-will-retry', changedShape(
-      'error-will-retry-optional',
-      changedShape(
-        'error-will-retry-nullable',
-        changedShape(
-          'error-will-retry-union',
-          changedShape(
-            'error-will-retry-literals',
-            changedShape(
-              'error-will-retry-no-delimiter',
-              'willRetry: boolean, ',
-              'willRetry: booleanFuture, ',
-            ),
-            'willRetry: true | false, ',
-          ),
-          'willRetry: boolean | string, ',
-        ),
-        'willRetry: boolean | null, ',
-      ),
-      'willRetry?: boolean, ',
-    )),
+    shape('error-will-retry', willRetry),
     'threadId: string, ',
     shape('routing-ids', 'turnId: string'),
     ' };\n',

@@ -1434,6 +1434,59 @@ test('turn/start response before its matching notification preserves ownership',
   assert.equal(next.turn.id, 'turn-2');
 });
 
+// Mutation caught: clearing only active ownership on completion forgets that
+// the pending request's turn is terminal, so its later response revives it.
+test('completion before its response cannot reactivate a started pending turn', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('turn-1'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  response.resolve({ turn: routedTurn('turn-1') });
+  await pending;
+
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(next.turn.id, 'turn-2');
+});
+
+// Mutation caught: a completion can be the first notification for a pending
+// turn; ignoring it lets the matching response create a phantom active owner.
+test('completion before its response cannot reactivate a pending turn without start notification', async (t) => {
+  const response = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1 ? response.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  const pending = supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  await waitFor(() => turnStarts() === 1);
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('turn-1', 'completed'),
+  });
+  response.resolve({ turn: routedTurn('turn-1') });
+  await pending;
+
+  const next = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(next.turn.id, 'turn-2');
+});
+
 // Mutation caught: clearing pending correlation when turn/started arrives lets
 // a conflicting response silently migrate ownership to a different turn.
 test('turn/start rejects a response id that conflicts with its start notification', async (t) => {
