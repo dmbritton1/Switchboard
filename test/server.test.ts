@@ -26,6 +26,8 @@ import { Linker, type PublicLink } from '../src/link.ts';
 import type { Adapter, AdapterEvent, StartOpts } from '../src/types.ts';
 import { CodexProviderPool, type CodexTransport } from '../src/agents/codex-provider.ts';
 import { CodexAppServerSupervisor } from '../src/agents/codex-app-server-supervisor.ts';
+import { createCodexAppServerAdapter } from '../src/agents/codex-app-server.ts';
+import type { AppServerClientOptions } from '../src/agents/codex-app-server-client.ts';
 
 const run = promisify(execFile);
 
@@ -1792,6 +1794,152 @@ test('POST /command resume is rejected unless the session is stopped', async (t)
   });
   assert.equal(res.status, 409, 'resume must not launch a second agent into a live worktree');
   assert.equal(registry.get(s.id)!.status, 'working', 'and must not have revived anything');
+});
+
+test('launch never publishes a handle returned after a synchronous terminal callback', async (t) => {
+  for (const account of accounts) {
+    await t.test(account.provider, async (t) => {
+      const repo = await makeRepo();
+      t.after(() => rm(repo, { recursive: true, force: true }));
+      let starts = 0;
+      const adapter: Adapter = {
+        start(_opts, emit) {
+          starts += 1;
+          if (starts === 1) {
+            emit({ type: 'stopped', reason: 'synchronous terminal start',
+              ...(account.provider === 'codex' ? { code: 'codex_start_failed' as const } : {}) });
+          }
+          return {
+            send() {}, decide() {}, setAuto() {},
+            stop() { emit({ type: 'stopped', reason: 'stopped by handle' }); },
+          };
+        },
+      };
+      const { base, registry } = await boot(t, adapter, { accounts: [account] });
+      const created = await post(base, {
+        cmd: 'create', repo, branch: `sync-${account.provider}`, account: account.name, prompt: 'first',
+      });
+      assert.equal(created.status, 200);
+      const { id } = await created.json();
+      assert.equal(registry.get(id)?.status, 'stopped');
+
+      const resumed = await post(base, { cmd: 'resume', id, prompt: 'later' });
+      assert.equal(resumed.status, 200, 'the synchronous terminal handle must not block the next start');
+      assert.equal(starts, 2);
+      await post(base, { cmd: 'stop', id });
+    });
+  }
+});
+
+test('an unresolved app-server stop serializes immediate resume and releases a later resume without replay', async (t) => {
+  for (const interruptOutcome of ['success', 'failure'] as const) {
+    await t.test(interruptOutcome, async (t) => {
+      let resolveFirstTurn!: (value: unknown) => void;
+      const firstTurn = new Promise<unknown>((resolve) => { resolveFirstTurn = resolve; });
+      const protocols: AppServerClientOptions[] = [];
+      const scheduled: Array<() => void> = [];
+      const turnInputs: string[] = [];
+      const adapterEvents: Array<{ start: number; event: AdapterEvent }> = [];
+      let turnStarts = 0;
+      let interrupts = 0;
+      const supervisor = new CodexAppServerSupervisor({
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        verifyContract: async () => {},
+        clientFactory: (options) => {
+          protocols.push(options);
+          return {
+            request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
+              if (method === 'initialize') return { initialized: true } as T;
+              if (method === 'account/read') {
+                return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+              }
+              if (method === 'account/rateLimits/read') {
+                return { rateLimits: { limitId: null, limitName: null,
+                  primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+                  credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+                rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+              }
+              if (method === 'thread/start' || method === 'thread/resume') {
+                const value = params as { cwd: string; threadId?: string };
+                const id = value.threadId ?? 'server-stop-thread';
+                return { thread: { id, cwd: value.cwd }, cwd: value.cwd, approvalPolicy: 'never',
+                  sandbox: { type: 'workspaceWrite' } } as T;
+              }
+              if (method === 'turn/start') {
+                onDispatched?.();
+                const input = (params as { input: Array<{ type: string; text?: string }> }).input;
+                turnInputs.push(input.find((item) => item.type === 'text')?.text ?? '');
+                turnStarts += 1;
+                return (turnStarts === 1
+                  ? firstTurn
+                  : Promise.resolve({ turn: { id: `server-turn-${turnStarts}`, status: 'inProgress' } })) as Promise<T>;
+              }
+              if (method === 'turn/interrupt') {
+                interrupts += 1;
+                if (interruptOutcome === 'failure' && interrupts === 1) {
+                  throw new Error('private interrupt failure at /private/provider/secret.json');
+                }
+                return {} as T;
+              }
+              throw new Error(`unexpected ${method}`);
+            },
+            notify: () => {},
+            respondError: () => {},
+            close: async () => {},
+          };
+        },
+        setTimer: (callback) => { scheduled.push(callback); return callback; },
+        clearTimer: () => {},
+      });
+      const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+        async prepare(_account, transport, sessionId) {
+          assert.equal(transport, 'app-server');
+          assert.ok(sessionId);
+          await supervisor.ensureTurnTransport();
+          const startNumber = adapterEvents.filter(({ event }) => event.type === 'vendor-session-id').length + 1;
+          const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0');
+          return { runtimeVersion: '0.145.0', adapter: {
+            start(opts, emit) {
+              return real.start(opts, (event) => {
+                adapterEvents.push({ start: startNumber, event });
+                emit(event);
+              });
+            },
+          } };
+        },
+        close: () => supervisor.close(),
+      };
+      const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+      const created = await fixture.create(`stop-resume-${interruptOutcome}`);
+      await waitFor(() => turnInputs.length === 1);
+
+      assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
+      const immediate = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'too-soon' });
+      resolveFirstTurn({ turn: { id: 'server-turn-1', status: 'inProgress' } });
+      await waitFor(() => interrupts === 1);
+      await new Promise((resolve) => setImmediate(resolve));
+      if (interruptOutcome === 'failure' && scheduled[0]) {
+        scheduled[0]();
+        await waitFor(() => protocols.length === 2);
+      }
+
+      const later = await fixture.command({ cmd: 'resume', id: created.id, prompt: 'later' });
+      assert.deepEqual([immediate.status, later.status], [409, 200]);
+      if (interruptOutcome === 'failure') {
+        assert.equal(scheduled.length, 1, 'a rejected interrupt retires and restarts the generation');
+      }
+      await waitFor(() => turnInputs.length === 2);
+      assert.deepEqual(turnInputs, [`stop-resume-${interruptOutcome}`, 'later']);
+      const userText = fixture.registry.get(created.id)!.transcript
+        .filter((message) => message.kind === 'user').map((message) => message.text);
+      assert.deepEqual(userText, [`stop-resume-${interruptOutcome}`, 'later']);
+      assert.equal(adapterEvents.filter(({ start, event }) => start === 1 && event.type === 'stopped').length, 1);
+      assert.equal(JSON.stringify(adapterEvents).includes('/private/provider/secret.json'), false);
+
+      assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
+      await waitFor(() => interrupts === 2);
+    });
+  }
 });
 
 test('POST /command delete removes the session', async (t) => {

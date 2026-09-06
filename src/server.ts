@@ -476,6 +476,7 @@ export function createServer(opts: {
   } = opts;
   const prepare = injectedPrepare ?? prepareProvider;
   const handles = new Map<string, AgentHandle>();
+  const launchOwners = new Map<string, symbol>();
   const createReservations = new Map<string, symbol>();
   // Process-local like the handle map, and for the same reason: a channel names
   // two live sessions, and Registry.load forces every session to `stopped` on
@@ -626,6 +627,9 @@ export function createServer(opts: {
     const session = registry.get(sessionId);
     const auto = session?.auto ?? false;
     const codexSettings = session?.codexSettings;
+    const owner = Symbol(sessionId);
+    launchOwners.set(sessionId, owner);
+    let handle: AgentHandle | null = null;
     // The tool schema and the @ mention both hand the model a branch, not an id
     // — but relay() and the channel map key on id. Resolve here, once, so the
     // gate and the send agree on the same canonical key: an exact id match
@@ -635,7 +639,7 @@ export function createServer(opts: {
     const resolve = (target: string) => registry.all()
       .find((s) => s.id === target || (s.repo === session?.repo && s.branch === target))?.id ?? target;
     try {
-      const handle = adapter.start({
+      handle = adapter.start({
         cwd, prompt, promptId, env: account.env, resumeId, auto, codexSettings,
         relay: (target, text) => {
           const to = resolve(target);
@@ -678,6 +682,7 @@ export function createServer(opts: {
           }));
         },
       }, (e) => {
+        if (launchOwners.get(sessionId) !== owner) return;
         const safeEvent = sanitizeCodexEvent(e, account);
         if (safeEvent.type === 'usage') {
           // Optional Codex breakdowns are informational subsets, not account pace.
@@ -709,8 +714,9 @@ export function createServer(opts: {
       // pass finds no handle and cannot recurse; apply before stop(), so the real
       // reason is recorded and the re-entrant "stopped from switchboard" is the one
       // the terminal guard drops, not the other way round.
-        const dead = handles.get(sessionId);
-        handles.delete(sessionId);
+        const dead = handle !== null && handles.get(sessionId) === handle ? handle : undefined;
+        launchOwners.delete(sessionId);
+        if (dead) handles.delete(sessionId);
         registry.apply(sessionId, safeEvent);
         // Before stop(), for the same reason apply() is: stop() re-enters this
         // callback, and by then `dead` is gone and the requeue would be skipped.
@@ -724,9 +730,10 @@ export function createServer(opts: {
         }
         dead?.stop();
       });
-      handles.set(sessionId, handle);
+      if (launchOwners.get(sessionId) === owner) handles.set(sessionId, handle);
       return null;
     } catch (error) {
+      if (launchOwners.get(sessionId) === owner) launchOwners.delete(sessionId);
       const reason = account.provider === 'codex'
         ? redactAccountValue(String((error as Error).message ?? error), account)
         : String((error as Error).message ?? error);
@@ -1257,6 +1264,7 @@ export function createServer(opts: {
         const session = registry.get(sessionId);
         const handle = handles.get(sessionId);
         handles.delete(sessionId);
+        launchOwners.delete(sessionId);
         handle?.stop();
         // Deregister before the worktree await, not after. Concurrent resume
         // clears its final guard on Registry identity (see the resume case); if

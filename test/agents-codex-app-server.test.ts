@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { AppServerClient } from '../src/agents/codex-app-server-client.ts';
+import { AppServerClient, type AppServerClientOptions } from '../src/agents/codex-app-server-client.ts';
 import * as appServerAdapter from '../src/agents/codex-app-server.ts';
 import { fileURLToPath } from 'node:url';
 import {
@@ -176,6 +176,10 @@ class ScriptedSupervisor {
 
   fatal(reason: string, code: CodexFailureCode): void {
     this.route?.onFatal(reason, code);
+  }
+
+  async retireSessionGeneration(): Promise<void> {
+    this.fatal('Codex app-server transport crashed. Retry the session manually.', 'codex_transport_crashed');
   }
 }
 
@@ -758,17 +762,21 @@ test('delayed stdin callbacks after stop correct only the accepted prompt throug
       const otherId = registry.appendPrompt(session.id, 'queued second', 'queued');
       handle.send(prompt('queued second'), otherId);
       handle.stop();
-      const terminal = { status: session.status, reason: session.stoppedReason, code: session.stoppedCode, since: session.statusSince };
+      assert.equal(session.status, 'working', 'stop remains settling until the pending turn ownership resolves');
+      assert.equal(events.some((event) => event.type === 'stopped'), false);
       callbacks[0](accepted ? null : new Error('private write failure'));
       if (accepted) {
         const request = requests.find((value) => value.method === 'turn/start')!;
         respond(request.id, { turn: turn('old-turn', 'inProgress') });
         await waitFor(() => requests.some((value) => value.method === 'turn/interrupt'));
       } else await new Promise((resolve) => setImmediate(resolve));
+      await waitFor(() => events.some((event) => event.type === 'stopped'));
       const delivery = (id: string) => session.transcript.find((msg) => msg.kind === 'user' && msg.id === id);
       assert.equal((delivery(firstId) as { delivery: string }).delivery, accepted ? 'sent' : 'unsent');
       assert.equal((delivery(otherId) as { delivery: string }).delivery, 'unsent');
-      assert.deepEqual({ status: session.status, reason: session.stoppedReason, code: session.stoppedCode, since: session.statusSince }, terminal);
+      assert.deepEqual({ status: session.status, reason: session.stoppedReason, code: session.stoppedCode }, {
+        status: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped',
+      });
       assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
       const before = JSON.stringify(session);
       for (const event of [
@@ -1034,6 +1042,99 @@ test('stop interrupts once, marks queued prompts unsent, and settles once despit
     { type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped' },
   ]);
   assert.equal(supervisor.detached, 1);
+});
+
+test('a rejected established interrupt retires the shared generation and every sibling route before restart', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-rejected-interrupt-'));
+  const cwdA = join(root, 'a');
+  const cwdB = join(root, 'b');
+  await Promise.all([mkdir(cwdA), mkdir(cwdB)]);
+  const scheduled: Array<() => void> = [];
+  const protocols: AppServerClientOptions[] = [];
+  const closed: boolean[] = [];
+  const turnInputs: string[] = [];
+  let turnNumber = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    verifyContract: async () => {},
+    clientFactory: (options) => {
+      const generation = protocols.push(options) - 1;
+      closed[generation] = false;
+      return {
+        request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') {
+            return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+          }
+          if (method === 'account/rateLimits/read') {
+            return { rateLimits: { limitId: null, limitName: null,
+              primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+              credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+            rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+          }
+          if (method === 'thread/start' || method === 'thread/resume') {
+            const value = params as { cwd: string; threadId?: string };
+            const id = value.threadId ?? (value.cwd === cwdA ? 'thread-a' : 'thread-b');
+            return safeThreadResponse(id, value.cwd) as T;
+          }
+          if (method === 'turn/start') {
+            onDispatched?.();
+            const input = (params as { input: Array<{ type: string; text?: string }> }).input;
+            turnInputs.push(input.find((item) => item.type === 'text')?.text ?? '');
+            return { turn: turn(`turn-${++turnNumber}`, 'inProgress') } as T;
+          }
+          if (method === 'turn/interrupt') {
+            throw new Error('private interrupt rejection at /private/provider/token.json');
+          }
+          throw new Error(`unexpected ${method}`);
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => { closed[generation] = true; },
+      };
+    },
+    setTimer: (callback) => { scheduled.push(callback); return callback; },
+    clearTimer: () => {},
+  });
+  t.after(async () => {
+    await supervisor.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  await supervisor.ensureTurnTransport();
+
+  const eventsA: AdapterEvent[] = [];
+  const eventsB: AdapterEvent[] = [];
+  const handleA = createCodexAppServerAdapter(supervisor, 'rejected-a', '0.145.0')
+    .start({ cwd: cwdA, prompt: prompt('first-a'), promptId: 'first-a', env: {} }, (event) => eventsA.push(event));
+  createCodexAppServerAdapter(supervisor, 'rejected-b', '0.145.0')
+    .start({ cwd: cwdB, prompt: prompt('first-b'), promptId: 'first-b', env: {} }, (event) => eventsB.push(event));
+  await waitFor(() => turnInputs.length === 2, 'two established turns');
+
+  handleA.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(closed[0], true, 'the rejected interrupt must terminate the writer generation');
+  assert.equal(eventsA.filter((event) => event.type === 'stopped').length, 1);
+  assert.equal(eventsB.filter((event) => event.type === 'stopped').length, 1);
+  assert.ok(eventsA.some((event) => event.type === 'stopped' && event.code === 'codex_user_stopped'));
+  assert.ok(eventsB.some((event) => event.type === 'stopped' && event.code === 'codex_transport_crashed'));
+  assert.equal(JSON.stringify([...eventsA, ...eventsB]).includes('/private/provider/token.json'), false);
+  assert.deepEqual(eventsA.filter((event) => event.type === 'prompt-delivery'), [
+    { type: 'prompt-delivery', id: 'first-a', delivery: 'sent' },
+  ]);
+  assert.deepEqual(eventsB.filter((event) => event.type === 'prompt-delivery'), [
+    { type: 'prompt-delivery', id: 'first-b', delivery: 'sent' },
+  ]);
+  assert.equal(scheduled.length, 1, 'generation retirement keeps the existing restart policy');
+
+  scheduled[0]();
+  await waitFor(() => protocols.length === 2, 'replacement generation');
+  const resumedEvents: AdapterEvent[] = [];
+  createCodexAppServerAdapter(supervisor, 'rejected-a', '0.145.0')
+    .start({ cwd: cwdA, prompt: prompt('later-a'), promptId: 'later-a', env: {}, resumeId: 'thread-a' },
+      (event) => resumedEvents.push(event));
+  await waitFor(() => resumedEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
+  assert.deepEqual(turnInputs, ['first-a', 'first-b', 'later-a'], 'restart never replays an accepted prompt');
 });
 
 test('stop interrupts a turn accepted just before its response returns', async (t) => {

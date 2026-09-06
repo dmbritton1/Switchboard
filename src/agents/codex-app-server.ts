@@ -1,6 +1,6 @@
 import { safeCodexDetail } from './codex-detail.ts';
 import { classifyCodexFailure } from './codex.ts';
-import { unsafeCodexProviderIdentifier, redactCodexText } from './codex-runtime.ts';
+import { CodexRuntimeError, unsafeCodexProviderIdentifier, redactCodexText } from './codex-runtime.ts';
 import { validateCodexSettings } from './codex-settings.ts';
 import { snapshotCodexPrompt } from '../prompt-input.ts';
 import type { CodexAppServerSupervisor } from './codex-app-server-supervisor.ts';
@@ -234,6 +234,10 @@ export function createCodexAppServerAdapter(
         emit({ type: 'stopped', reason: safePublicText(reason, opts.env), code });
       };
 
+      const finishUserStop = (): void => {
+        finish('Stopped by user.', 'codex_user_stopped');
+      };
+
       const finishRequest = (error: unknown, fallback: CodexFailureCode): void => {
         const reason = String((error as Error)?.message ?? error);
         finish(reason, classifyCodexFailure(reason, fallback));
@@ -258,7 +262,15 @@ export function createCodexAppServerAdapter(
         interruptSent = true;
         void supervisor.requestForSession(sessionId, 'turn/interrupt', {
           threadId, turnId: activeTurnId,
-        }).catch(() => {});
+        }).then(
+          () => {
+            if (interrupted) finishUserStop();
+          },
+          async () => {
+            if (stopped || !interrupted) return;
+            await supervisor.retireSessionGeneration(sessionId);
+          },
+        );
       };
 
       const completeTurn = async (turnId: string): Promise<void> => {
@@ -325,10 +337,12 @@ export function createCodexAppServerAdapter(
         if (method === 'turn/completed') {
           const completed = object(value.turn);
           const status = completed?.status;
+          if (interrupted) {
+            finishUserStop();
+            return;
+          }
           if (status === 'completed') {
             void completeTurn(receivedTurn);
-          } else if (status === 'interrupted' && interrupted) {
-            // stop() already produced the one terminal event.
           } else {
             finishTurnFailure(completed?.error);
           }
@@ -336,13 +350,15 @@ export function createCodexAppServerAdapter(
       }
 
       const onFatal = (reason: string, code: CodexFailureCode): void => {
-        if (code === 'codex_transport_crashed') {
+        if (interrupted) {
+          finishUserStop();
+        } else if (code === 'codex_transport_crashed') {
           finish('Codex app-server transport crashed. Retry the session manually.', code);
         } else finish(reason, code);
       };
 
       const drain = async (): Promise<void> => {
-        if (draining || completing || stopped || !threadId || activeTurnId || queue.length === 0) return;
+        if (draining || completing || stopped || interrupted || !threadId || activeTurnId || queue.length === 0) return;
         draining = true;
         try {
           const queued = queue[0];
@@ -350,7 +366,7 @@ export function createCodexAppServerAdapter(
           activeSnapshotCleanup = prepared.cleanup;
           let retainSnapshot = false;
           try {
-            if (stopped || queue[0] !== queued || !threadId || activeTurnId) return;
+            if (stopped || interrupted || queue[0] !== queued || !threadId || activeTurnId) return;
             emit({ type: 'status', status: 'working' });
             turnRequestInFlight = true;
             let response: { turn?: unknown };
@@ -373,26 +389,27 @@ export function createCodexAppServerAdapter(
             const turn = object(response)?.turn;
             const id = turn && text(turn.id);
             if (!id || unsafeCodexProviderIdentifier(id)) {
-              if (stopped) detachRoute();
+              if (interrupted) {
+                void supervisor.retireSessionGeneration(sessionId);
+              } else if (stopped) detachRoute();
               else finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
               return;
             }
             activeTurnId = id;
-            if (stopped) {
-              if (interrupted) interruptActiveTurn();
-              detachRoute();
-              return;
-            }
             retainSnapshot = true;
             const early = bufferedNotifications.splice(0);
             for (const notification of early) onNotification(notification.method, notification.params);
+            if (interrupted && !stopped) interruptActiveTurn();
           } finally {
             if (!retainSnapshot && activeSnapshotCleanup === prepared.cleanup) {
               await cleanupActiveSnapshot();
             }
           }
         } catch (error) {
-          if (stopped) detachRoute();
+          if (interrupted && error instanceof CodexRuntimeError && error.code === 'codex_protocol_mismatch') {
+            await supervisor.retireSessionGeneration(sessionId);
+          } else if (interrupted) finishUserStop();
+          else if (stopped) detachRoute();
           else finishRequest(error, 'codex_app_server_unavailable');
         } finally {
           draining = false;
@@ -441,17 +458,20 @@ export function createCodexAppServerAdapter(
 
       return {
         send(prompt, promptId) {
-          if (stopped) return;
+          if (stopped || interrupted) return;
           queue.push({ prompt, promptId });
           void drain();
         },
         decide() {},
         setAuto() {},
         stop() {
-          if (stopped) return;
+          if (stopped || interrupted) return;
           interrupted = true;
+          for (const queued of queue.splice(0)) {
+            if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'unsent' });
+          }
           interruptActiveTurn();
-          finish('Stopped by user.', 'codex_user_stopped', !turnRequestInFlight, !turnRequestInFlight);
+          if (!turnRequestInFlight && !activeTurnId) finishUserStop();
         },
       };
     },

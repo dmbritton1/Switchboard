@@ -264,6 +264,15 @@ export class CodexAppServerSupervisor {
     }
   }
 
+  async retireSessionGeneration(sessionId: string): Promise<void> {
+    const state = this.#sessions.get(sessionId);
+    const client = this.#client;
+    if (!state || state.generation === null || !client) return;
+    const generation = this.#clientGenerations.get(client);
+    if (generation === undefined || state.generation !== generation) return;
+    await this.#retire(client, true);
+  }
+
   async reconcile(): Promise<AccountLimitSnapshot> {
     await this.start();
     if (this.#promotion) await this.#promotion;
