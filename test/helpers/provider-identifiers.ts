@@ -4,6 +4,13 @@ export const unsafeProviderIdentifiers = [
   '\\\\server\\share\\id', 'thread://server/share/id',
   'file:notes,/private/provider/id', 'opaque;C:\\Users\\example\\id',
   'opaque (\\\\server\\share\\id)', 'file:notes,file:///private/provider/id',
+  'https://opaque.example//private/provider/id',
+  'https://opaque.example/\\\\server\\share\\id',
+  'urn:opaque:/thread-01//private/provider/id',
+  'https://opaque.example/C:\\Users\\example\\id',
+  'urn:opaque:/thread-01/C:\\Users\\example\\id',
+  'https://opaque.example/file:///private/provider/id',
+  'urn:opaque:/thread-01/file:///private/provider/id',
 ] as const;
 
 export const opaqueProviderIdentifiers = [

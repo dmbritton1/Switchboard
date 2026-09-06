@@ -17,9 +17,12 @@ const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
 const MIN_REDACTABLE = 6;
 const FILE_URI_CANDIDATE = /\b(?=(file:[^\s"`<>{}\[\]“”‘’]+))/giu;
 const FILE_URI_TRAILING_PROSE = /[.,;:!?]/u;
-// Ignore only an unambiguous leading URI delimiter: a qualified authority or
-// an opaque namespace. A one-letter namespace before `:/` is a Windows drive.
-const OPAQUE_URI_PREFIX = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/(?=[^/\\\s]*\.)|[A-Za-z][A-Za-z0-9+.-]*:(?![A-Za-z]:\/)[^:/\\\s]+:\/)/u;
+// Enter the payload only after an unambiguous leading URI boundary: a
+// qualified authority or an opaque namespace. A one-letter namespace before
+// `:/` is a Windows drive.
+const OPAQUE_URI_PAYLOAD = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/(?=[^/\\\s?#]*\.)[^/\\\s?#]*(?:\/|(?=[?#]|$))|[A-Za-z][A-Za-z0-9+.-]*:(?![A-Za-z]:\/)[^:/\\\s]+:\/)/u;
+const ABSOLUTE_PATH_CANDIDATE = /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
+const URI_PAYLOAD_ABSOLUTE_PATH_CANDIDATE = /(?:^|[^\p{L}\p{N}_.\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
 
 export function redactable(value: string): boolean {
   return typeof value === 'string' && value.length >= MIN_REDACTABLE;
@@ -54,9 +57,12 @@ export function containsAbsoluteFileUri(value: string): boolean {
 /** Admission check only: never rewrite an opaque identifier into another ID. */
 export function unsafeCodexProviderIdentifier(value: unknown): boolean {
   if (typeof value !== 'string') return false;
-  const scanFrom = value.match(OPAQUE_URI_PREFIX)?.[0].length ?? 0;
+  const uriBoundary = value.match(OPAQUE_URI_PAYLOAD)?.[0];
+  const candidate = uriBoundary ? value.slice(uriBoundary.length) : value;
   return containsAbsoluteFileUri(value)
-    || /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u.test(value.slice(scanFrom));
+    || (uriBoundary
+      ? URI_PAYLOAD_ABSOLUTE_PATH_CANDIDATE.test(candidate)
+      : ABSOLUTE_PATH_CANDIDATE.test(candidate));
 }
 
 function redactAbsoluteFileUris(value: string): string {
