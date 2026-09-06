@@ -17,10 +17,22 @@ const CREDENTIAL_KEY = /(token|key|secret|password|authorization|credential)/i;
 const MIN_REDACTABLE = 6;
 const FILE_URI_CANDIDATE = /\b(?=(file:[^\s"`<>{}\[\]“”‘’]+))/giu;
 const FILE_URI_TRAILING_PROSE = /[.,;:!?]/u;
-// Enter the payload only after an unambiguous leading URI boundary: a
-// qualified authority or an opaque namespace. A one-letter namespace before
-// `:/` is a Windows drive.
-const OPAQUE_URI_PAYLOAD = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/(?=[^/\\\s?#]*\.)[^/\\\s?#]*(?:\/|(?=[?#]|$))|[A-Za-z][A-Za-z0-9+.-]*:(?![A-Za-z]:\/)[^:/\\\s]+:\/)/u;
+const URI_SCHEME = String.raw`[A-Za-z][A-Za-z0-9+.-]*`;
+const URI_USERINFO = String.raw`(?:[A-Za-z0-9._~!$&'()*+,;=:%-]*@)?`;
+const QUALIFIED_URI_HOST = String.raw`(?=[^:/\\\s?#]*\.)[A-Za-z0-9._~!$&'()*+,;=%-]+`;
+const URI_OPAQUE_NAMESPACE = String.raw`[A-Za-z0-9._~!$&'()*+,;=%-]+`;
+// Enter a payload only after a syntactic URI boundary. Qualified authorities
+// may have userinfo and a numeric port; arbitrary colons cannot hide a drive.
+// A one-letter opaque namespace before `:/` is also a Windows drive.
+const AUTHORITY_URI_PAYLOAD = new RegExp(
+  String.raw`^${URI_SCHEME}:\/\/${URI_USERINFO}${QUALIFIED_URI_HOST}(?::[0-9]+)?(?:\/|(?=[?#]|$))`,
+  'u',
+);
+const OPAQUE_NAMESPACE_URI_PAYLOAD = new RegExp(
+  String.raw`^${URI_SCHEME}:(?![A-Za-z]:[\\/])${URI_OPAQUE_NAMESPACE}:\/`,
+  'u',
+);
+const URI_SCHEME_CHARACTER = /[A-Za-z0-9+.-]/u;
 const ABSOLUTE_PATH_CANDIDATE = /(?:^|[^\p{L}\p{N}_./\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
 const URI_PAYLOAD_ABSOLUTE_PATH_CANDIDATE = /(?:^|[^\p{L}\p{N}_.\\-])(?:\/|[A-Za-z]:[\\/]|\\\\)/u;
 
@@ -54,15 +66,44 @@ export function containsAbsoluteFileUri(value: string): boolean {
   return false;
 }
 
+function uriPayloadEndAt(value: string, start: number): number | null {
+  if (start > 0 && URI_SCHEME_CHARACTER.test(value[start - 1]!)) return null;
+  const candidate = value.slice(start);
+  const boundary = candidate.match(AUTHORITY_URI_PAYLOAD)
+    ?? candidate.match(OPAQUE_NAMESPACE_URI_PAYLOAD);
+  return boundary ? start + boundary[0].length : null;
+}
+
+function nextUriPayload(value: string): { start: number; end: number } | null {
+  for (let start = 0; start < value.length; start += 1) {
+    const end = uriPayloadEndAt(value, start);
+    if (end !== null) return { start, end };
+  }
+  return null;
+}
+
+function containsAbsolutePathCandidate(value: string): boolean {
+  let candidate = value;
+  let uriPayload = false;
+  while (candidate.length > 0) {
+    const nestedUri = nextUriPayload(candidate);
+    const prefix = nestedUri ? candidate.slice(0, nestedUri.start) : candidate;
+    const pathCandidate = uriPayload
+      ? URI_PAYLOAD_ABSOLUTE_PATH_CANDIDATE
+      : ABSOLUTE_PATH_CANDIDATE;
+    if (pathCandidate.test(prefix)) return true;
+    if (!nestedUri) return false;
+    candidate = candidate.slice(nestedUri.end);
+    uriPayload = true;
+  }
+  return false;
+}
+
 /** Admission check only: never rewrite an opaque identifier into another ID. */
 export function unsafeCodexProviderIdentifier(value: unknown): boolean {
   if (typeof value !== 'string') return false;
-  const uriBoundary = value.match(OPAQUE_URI_PAYLOAD)?.[0];
-  const candidate = uriBoundary ? value.slice(uriBoundary.length) : value;
   return containsAbsoluteFileUri(value)
-    || (uriBoundary
-      ? URI_PAYLOAD_ABSOLUTE_PATH_CANDIDATE.test(candidate)
-      : ABSOLUTE_PATH_CANDIDATE.test(candidate));
+    || containsAbsolutePathCandidate(value);
 }
 
 function redactAbsoluteFileUris(value: string): string {

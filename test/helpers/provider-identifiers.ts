@@ -11,9 +11,16 @@ export const unsafeProviderIdentifiers = [
   'urn:opaque:/thread-01/C:\\Users\\example\\id',
   'https://opaque.example/file:///private/provider/id',
   'urn:opaque:/thread-01/file:///private/provider/id',
+  'https://user.name@C:/Users/example/id',
+  'https://opaque.example:C:/Users/example/id',
 ] as const;
 
 export const opaqueProviderIdentifiers = [
   'thread-01', 'opaque:Ab_C-9', 'relative/id', 'file:notes',
   'https://opaque.example/thread-01', 'urn:opaque:/thread-01',
+  'https://opaque.example/thread-01?next=https://nested.example/thread-02',
+  'https://opaque.example/thread-01#next=https://nested.example/thread-02',
+  'https://opaque.example/thread-01?next=urn:opaque:/thread-02',
+  'urn:opaque:/thread-01?next=https://nested.example/thread-02',
+  'urn:opaque:/thread-01#next=urn:nested:/thread-02',
 ] as const;
