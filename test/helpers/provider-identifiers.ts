@@ -13,6 +13,12 @@ export const unsafeProviderIdentifiers = [
   'urn:opaque:/thread-01/file:///private/provider/id',
   'https://user.name@C:/Users/example/id',
   'https://opaque.example:C:/Users/example/id',
+  'C://opaque.example/private/provider/id',
+  'c://user@opaque.example:443/private/provider/id',
+  'X://127.0.0.1/Users/example/id',
+  'opaque=C://opaque.example/private/provider/id',
+  'https://outer.example/thread?next=C://opaque.example/private/provider/id',
+  'urn:outer:/thread#next=C://opaque.example/private/provider/id',
 ] as const;
 
 export const opaqueProviderIdentifiers = [

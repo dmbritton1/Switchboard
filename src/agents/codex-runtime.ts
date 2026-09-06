@@ -18,6 +18,7 @@ const MIN_REDACTABLE = 6;
 const FILE_URI_CANDIDATE = /\b(?=(file:[^\s"`<>{}\[\]“”‘’]+))/giu;
 const FILE_URI_TRAILING_PROSE = /[.,;:!?]/u;
 const URI_SCHEME = String.raw`[A-Za-z][A-Za-z0-9+.-]*`;
+const AUTHORITY_URI_SCHEME = String.raw`[A-Za-z][A-Za-z0-9+.-]+`;
 const URI_USERINFO = String.raw`(?:[A-Za-z0-9._~!$&'()*+,;=:%-]*@)?`;
 const QUALIFIED_URI_HOST = String.raw`(?=[^:/\\\s?#]*\.)[A-Za-z0-9._~!$&'()*+,;=%-]+`;
 const URI_OPAQUE_NAMESPACE = String.raw`[A-Za-z0-9._~!$&'()*+,;=%-]+`;
@@ -25,7 +26,7 @@ const URI_OPAQUE_NAMESPACE = String.raw`[A-Za-z0-9._~!$&'()*+,;=%-]+`;
 // may have userinfo and a numeric port; arbitrary colons cannot hide a drive.
 // A one-letter opaque namespace before `:/` is also a Windows drive.
 const AUTHORITY_URI_PAYLOAD = new RegExp(
-  String.raw`^${URI_SCHEME}:\/\/${URI_USERINFO}${QUALIFIED_URI_HOST}(?::[0-9]+)?(?:\/|(?=[?#]|$))`,
+  String.raw`^${AUTHORITY_URI_SCHEME}:\/\/${URI_USERINFO}${QUALIFIED_URI_HOST}(?::[0-9]+)?(?:\/|(?=[?#]|$))`,
   'u',
 );
 const OPAQUE_NAMESPACE_URI_PAYLOAD = new RegExp(
