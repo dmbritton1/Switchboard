@@ -14,12 +14,14 @@ const PUBLIC_UNAVAILABLE = 'Codex account telemetry is temporarily unavailable. 
 const PUBLIC_TRANSPORT_CRASH = 'Codex app-server transport crashed. Retry the session manually.';
 const RESTART_DELAYS_MS = [1_000, 2_000, 4_000, 8_000] as const;
 const MAX_RESTART_DELAY_MS = 30_000;
+const TERMINAL_TURN_HISTORY = 32;
 
 type TimerHandle = unknown;
 type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError' | 'close'>;
 type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: false }>;
 type ReadOutcome = { invalidated: true } | { invalidated: false; snapshot: AccountLimitSnapshot };
 type ActiveRead = { revision: number; promise: Promise<ReadOutcome> };
+type ActiveRetirement = { client: SupervisorClient; generation: number | undefined; promise: Promise<void> };
 type SessionState = {
   route: CodexSessionRoute;
   threadId: string | null;
@@ -28,8 +30,10 @@ type SessionState = {
   pendingTurn: symbol | null;
   pendingStartTurnId: string | null;
   pendingTerminalTurnIds: Set<string>;
+  terminalTurnIds: Set<string>;
 };
-type RouteFailure = { reason: string; code: CodexFailureCode };
+
+export type CodexSessionFailure = { reason: string; code: CodexFailureCode };
 
 export type CodexLimitListener = {
   onSnapshot(snapshot: AccountLimitSnapshot): void;
@@ -80,6 +84,16 @@ function turnIdFrom(params: unknown): string | null {
   return typeof turnId === 'string' && turnId.length > 0 ? turnId : null;
 }
 
+function rememberTerminalTurn(state: SessionState, turnId: string): void {
+  state.terminalTurnIds.delete(turnId);
+  state.terminalTurnIds.add(turnId);
+  while (state.terminalTurnIds.size > TERMINAL_TURN_HISTORY) {
+    const oldest = state.terminalTurnIds.values().next().value;
+    if (oldest === undefined) break;
+    state.terminalTurnIds.delete(oldest);
+  }
+}
+
 class UnsupportedTelemetryError extends Error {}
 
 export class CodexAppServerSupervisor {
@@ -98,6 +112,7 @@ export class CodexAppServerSupervisor {
   #readyClient: SupervisorClient | null = null;
   #launch: Promise<void> | null = null;
   #promotion: Promise<void> | null = null;
+  #retirement: ActiveRetirement | null = null;
   #read: ActiveRead | null = null;
   #limitRevision = 0;
   #auth: CodexTelemetryAuth | null = null;
@@ -136,6 +151,7 @@ export class CodexAppServerSupervisor {
 
   start(): Promise<void> {
     if (this.#closed) return Promise.reject(unavailableError());
+    if (this.#retirement) return Promise.reject(unavailableError());
     if (this.#promotion) return this.#promotion;
     if (this.#launch) return this.#launch;
     if (this.#client) return Promise.resolve();
@@ -145,6 +161,7 @@ export class CodexAppServerSupervisor {
 
   ensureTurnTransport(): Promise<void> {
     if (this.#closed) return Promise.reject(unavailableError());
+    if (this.#retirement) return Promise.reject(unavailableError());
     if (this.#promotion) return this.#promotion;
     if (this.#mode === 'turns') return this.start();
     if ([...this.#sessions.values()].some((session) => session.activeTurnId || session.pendingTurn)) {
@@ -173,6 +190,7 @@ export class CodexAppServerSupervisor {
       pendingTurn: null,
       pendingStartTurnId: null,
       pendingTerminalTurnIds: new Set(),
+      terminalTurnIds: new Set(),
     };
     this.#sessions.set(sessionId, state);
     let active = true;
@@ -233,7 +251,9 @@ export class CodexAppServerSupervisor {
         const notifiedTurnId = state.pendingStartTurnId;
         const responseTurnId = turnIdFrom(response);
         if (unsafeCodexProviderIdentifier(responseTurnId)) {
-          throw new CodexRuntimeError('codex_protocol_mismatch', 'Codex turn identifier is invalid.');
+          const error = new CodexRuntimeError('codex_protocol_mismatch', 'Codex turn identifier is invalid.');
+          await this.#retire(client, true, { reason: error.message, code: error.code }, sessionId);
+          throw error;
         }
         const responseWasTerminal = responseTurnId !== null
           && state.pendingTerminalTurnIds.has(responseTurnId);
@@ -242,11 +262,14 @@ export class CodexAppServerSupervisor {
         state.pendingTerminalTurnIds.clear();
         if (notifiedTurnId !== null && responseTurnId !== notifiedTurnId) {
           if (state.activeTurnId === notifiedTurnId) state.activeTurnId = null;
-          throw new CodexRuntimeError(
+          const error = new CodexRuntimeError(
             'codex_protocol_mismatch',
             'Codex app-server protocol mismatch between turn response and start notification.',
           );
+          await this.#retire(client, true, { reason: error.message, code: error.code }, sessionId);
+          throw error;
         }
+        if (responseWasTerminal && responseTurnId !== null) rememberTerminalTurn(state, responseTurnId);
         state.activeTurnId = responseWasTerminal ? null : responseTurnId;
       }
       return response;
@@ -264,13 +287,19 @@ export class CodexAppServerSupervisor {
     }
   }
 
-  async retireSessionGeneration(sessionId: string): Promise<void> {
+  async retireSessionGeneration(sessionId: string, failure?: CodexSessionFailure): Promise<void> {
     const state = this.#sessions.get(sessionId);
+    if (!state || state.generation === null) return;
+    const retirement = this.#retirement;
+    if (retirement && retirement.generation === state.generation) {
+      await retirement.promise;
+      return;
+    }
     const client = this.#client;
-    if (!state || state.generation === null || !client) return;
+    if (!client) return;
     const generation = this.#clientGenerations.get(client);
     if (generation === undefined || state.generation !== generation) return;
-    await this.#retire(client, true);
+    await this.#retire(client, true, failure, failure ? sessionId : undefined);
   }
 
   async reconcile(): Promise<AccountLimitSnapshot> {
@@ -432,15 +461,14 @@ export class CodexAppServerSupervisor {
     if (!state || state.threadId !== threadId || generation === undefined || state.generation !== generation) return;
     const turnId = turnIdFrom(params);
     if (unsafeCodexProviderIdentifier(turnId)) {
-      this.#sessions.delete(sessionId!);
-      this.#threadOwners.delete(threadId);
-      try {
-        state.route.onFatal('Codex turn identifier is invalid.', 'codex_protocol_mismatch');
-      } catch { /* observer isolation */ }
+      void this.#retire(client, true, {
+        reason: 'Codex turn identifier is invalid.', code: 'codex_protocol_mismatch',
+      }, sessionId).catch(() => {});
       return;
     }
     if (method === 'turn/started' && turnId) {
       if (state.pendingTurn !== null) {
+        if (state.terminalTurnIds.has(turnId)) return;
         if (state.pendingStartTurnId === null) {
           state.pendingStartTurnId = turnId;
           if (!state.pendingTerminalTurnIds.has(turnId)) state.activeTurnId = turnId;
@@ -454,7 +482,10 @@ export class CodexAppServerSupervisor {
         && (state.pendingStartTurnId === null || state.pendingStartTurnId === turnId)) {
         state.pendingTerminalTurnIds.add(turnId);
       }
-      if (turnId === state.activeTurnId) state.activeTurnId = null;
+      if (turnId === state.activeTurnId) {
+        state.activeTurnId = null;
+        rememberTerminalTurn(state, turnId);
+      }
     }
     try {
       state.route.onNotification(method, params);
@@ -557,32 +588,77 @@ export class CodexAppServerSupervisor {
     }
   }
 
-  async #retire(client: SupervisorClient, fatalRoutes: boolean): Promise<void> {
-    if (client !== this.#client) return;
+  #retire(
+    client: SupervisorClient,
+    fatalRoutes: boolean,
+    routeFailure?: CodexSessionFailure,
+    routeSessionId?: string,
+  ): Promise<void> {
+    const active = this.#retirement;
+    if (active?.client === client) return active.promise;
+    if (client !== this.#client) return Promise.resolve();
     const generation = this.#clientGenerations.get(client);
     this.#client = null;
     this.#readyClient = null;
+    let resolveRetirement!: () => void;
+    let rejectRetirement!: (error: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveRetirement = resolve;
+      rejectRetirement = reject;
+    });
+    const retirement: ActiveRetirement = { client, generation, promise };
+    this.#retirement = retirement;
+    void this.#retireNow(client, fatalRoutes, generation, routeFailure, routeSessionId).then(
+      () => {
+        if (this.#retirement === retirement) this.#retirement = null;
+        resolveRetirement();
+      },
+      (error) => {
+        if (this.#retirement === retirement) this.#retirement = null;
+        rejectRetirement(error);
+      },
+    );
+    return promise;
+  }
+
+  async #retireNow(
+    client: SupervisorClient,
+    fatalRoutes: boolean,
+    generation: number | undefined,
+    routeFailure?: CodexSessionFailure,
+    routeSessionId?: string,
+  ): Promise<void> {
     try {
       await client.close();
     } catch {
       // AppServerClient already bounded and sanitized shutdown.
     }
-    this.#handleFailure(fatalRoutes, undefined, generation);
+    this.#handleFailure(fatalRoutes, routeFailure, generation, routeSessionId);
   }
 
-  #handleFailure(fatalRoutes: boolean, routeFailure?: RouteFailure, generation?: number): void {
+  #handleFailure(
+    fatalRoutes: boolean,
+    routeFailure?: CodexSessionFailure,
+    generation?: number,
+    routeSessionId?: string,
+  ): void {
     if (this.#closed) return;
     this.#markStale(PUBLIC_UNAVAILABLE);
     if (fatalRoutes && this.#mode === 'turns' && generation !== undefined) {
-      this.#fatalRoutes(generation, routeFailure);
+      this.#fatalRoutes(generation, routeFailure, routeSessionId);
     }
     this.#scheduleRestart();
   }
 
-  #fatalRoutes(generation: number, failure: RouteFailure = {
-    reason: PUBLIC_TRANSPORT_CRASH, code: 'codex_transport_crashed',
-  }): void {
-    const failed: SessionState[] = [];
+  #fatalRoutes(
+    generation: number,
+    routeFailure?: CodexSessionFailure,
+    routeSessionId?: string,
+  ): void {
+    const transportFailure: CodexSessionFailure = {
+      reason: PUBLIC_TRANSPORT_CRASH, code: 'codex_transport_crashed',
+    };
+    const failed: Array<{ state: SessionState; failure: CodexSessionFailure }> = [];
     for (const [sessionId, state] of [...this.#sessions]) {
       if (state.generation !== generation) continue;
       this.#sessions.delete(sessionId);
@@ -593,11 +669,17 @@ export class CodexAppServerSupervisor {
       state.pendingTurn = null;
       state.pendingStartTurnId = null;
       state.pendingTerminalTurnIds.clear();
-      failed.push(state);
+      state.terminalTurnIds.clear();
+      failed.push({
+        state,
+        failure: routeFailure && (routeSessionId === undefined || routeSessionId === sessionId)
+          ? routeFailure
+          : transportFailure,
+      });
     }
-    for (const state of failed) {
+    for (const failedRoute of failed) {
       try {
-        state.route.onFatal(failure.reason, failure.code);
+        failedRoute.state.route.onFatal(failedRoute.failure.reason, failedRoute.failure.code);
       } catch {
         // One route observer cannot hide the crash from sibling sessions.
       }
@@ -652,6 +734,7 @@ export class CodexAppServerSupervisor {
       this.#restartTimer = null;
     }
     const client = this.#client;
+    const retirement = this.#retirement?.promise;
     this.#client = null;
     this.#readyClient = null;
     this.#sessions.clear();
@@ -664,6 +747,7 @@ export class CodexAppServerSupervisor {
         // Closing stays idempotent after bounded forced termination.
       }
     }
+    await retirement?.catch(() => {});
     await this.#launch?.catch(() => {});
     await this.#promotion?.catch(() => {});
   }

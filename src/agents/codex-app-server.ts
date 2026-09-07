@@ -207,6 +207,7 @@ export function createCodexAppServerAdapter(
       let interrupted = false;
       let interruptSent = false;
       let turnRequestInFlight = false;
+      let protocolRetiring = false;
       const bufferedNotifications: Array<{ method: string; params: unknown }> = [];
 
       const detachRoute = (): void => {
@@ -240,7 +241,17 @@ export function createCodexAppServerAdapter(
 
       const finishRequest = (error: unknown, fallback: CodexFailureCode): void => {
         const reason = String((error as Error)?.message ?? error);
-        finish(reason, classifyCodexFailure(reason, fallback));
+        finish(reason, error instanceof CodexRuntimeError ? error.code : classifyCodexFailure(reason, fallback));
+      };
+
+      const retireProtocolFailure = (reason: string): void => {
+        if (stopped || protocolRetiring) return;
+        protocolRetiring = true;
+        const failure = { reason, code: 'codex_protocol_mismatch' as const };
+        void supervisor.retireSessionGeneration(sessionId, failure).then(
+          () => { if (!stopped) finish(failure.reason, failure.code); },
+          () => { if (!stopped) finish(failure.reason, failure.code); },
+        );
       };
 
       const finishTurnFailure = (error: unknown): void => {
@@ -297,7 +308,7 @@ export function createCodexAppServerAdapter(
         const value = object(params);
         if (!value) return;
         if (notificationHasUnsafeIdentifier(value)) {
-          finish('Codex app-server returned an unsafe provider identifier.', 'codex_protocol_mismatch');
+          retireProtocolFailure('Codex app-server returned an unsafe provider identifier.');
           return;
         }
         const receivedTurn = text(value.turnId) ?? text(object(value.turn)?.id);
@@ -358,7 +369,8 @@ export function createCodexAppServerAdapter(
       };
 
       const drain = async (): Promise<void> => {
-        if (draining || completing || stopped || interrupted || !threadId || activeTurnId || queue.length === 0) return;
+        if (draining || completing || stopped || interrupted || protocolRetiring
+          || !threadId || activeTurnId || queue.length === 0) return;
         draining = true;
         try {
           const queued = queue[0];
@@ -366,7 +378,7 @@ export function createCodexAppServerAdapter(
           activeSnapshotCleanup = prepared.cleanup;
           let retainSnapshot = false;
           try {
-            if (stopped || interrupted || queue[0] !== queued || !threadId || activeTurnId) return;
+            if (stopped || interrupted || protocolRetiring || queue[0] !== queued || !threadId || activeTurnId) return;
             emit({ type: 'status', status: 'working' });
             turnRequestInFlight = true;
             let response: { turn?: unknown };
@@ -392,7 +404,7 @@ export function createCodexAppServerAdapter(
               if (interrupted) {
                 void supervisor.retireSessionGeneration(sessionId);
               } else if (stopped) detachRoute();
-              else finish('Codex app-server returned an invalid turn response.', 'codex_protocol_mismatch');
+              else retireProtocolFailure('Codex app-server returned an invalid turn response.');
               return;
             }
             activeTurnId = id;
@@ -458,14 +470,14 @@ export function createCodexAppServerAdapter(
 
       return {
         send(prompt, promptId) {
-          if (stopped || interrupted) return;
+          if (stopped || interrupted || protocolRetiring) return;
           queue.push({ prompt, promptId });
           void drain();
         },
         decide() {},
         setAuto() {},
         stop() {
-          if (stopped || interrupted) return;
+          if (stopped || interrupted || protocolRetiring) return;
           interrupted = true;
           for (const queued of queue.splice(0)) {
             if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'unsent' });

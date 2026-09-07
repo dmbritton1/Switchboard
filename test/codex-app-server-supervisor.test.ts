@@ -23,7 +23,7 @@ const signedOut = 'Codex account telemetry is unavailable while signed out.';
 const externalHeaders = 'Codex account telemetry is unavailable for external header authentication.';
 const externalTokens = 'Codex account telemetry is unavailable for external ChatGPT token authentication.';
 
-test('absolute-path-shaped thread and turn IDs cannot acquire supervisor ownership', async (t) => {
+test('absolute-path-shaped thread and turn IDs cannot acquire ownership and unsafe responses retire the generation', async (t) => {
   for (const [index, id] of unsafeProviderIdentifiers.entries()) {
     await t.test(String(index), async (t) => {
       const { supervisor } = await turnRoutingHarness(t, (start) => ({ turn: routedTurn(start === 1 ? id : 'safe-turn') }));
@@ -35,10 +35,76 @@ test('absolute-path-shaped thread and turn IDs cannot acquire supervisor ownersh
           assert.equal(error.message.includes(id), false);
           return true;
         });
-      const next = await supervisor.requestForSession<{ turn: { id: string } }>('session', 'turn/start', { threadId: 'thread' });
-      assert.equal(next.turn.id, 'safe-turn');
+      await assert.rejects(
+        supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' }),
+        /registered|retired|unavailable/i,
+      );
     });
   }
+});
+
+// Mutation caught: clearing current-client ownership before close without
+// retaining an in-flight retirement lets joiners return early and a second
+// generation launch while the exact writer generation is still closing.
+test('protocol retirement remains joinable and blocks replacement launch until the exact child closes', async (t) => {
+  const closeGate = deferred<void>();
+  let closeStarts = 0;
+  let clients = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(),
+    onSnapshot: () => {},
+    onStale: () => {},
+    verifyContract: async () => {},
+    clientFactory: () => {
+      clients += 1;
+      const clientNumber = clients;
+      return {
+        request: async <T>(method: string, _params?: unknown, onDispatched?: () => void): Promise<T> => {
+          if (method === 'initialize') return { initialized: true } as T;
+          if (method === 'account/read') return managedAccountResult() as T;
+          if (method === 'account/rateLimits/read') return rateLimitsResult() as T;
+          if (method === 'turn/start') {
+            onDispatched?.();
+            return { turn: routedTurn('turn:file:///private/provider/secret.json') } as T;
+          }
+          throw new Error(`unexpected ${method}`);
+        },
+        notify: () => {},
+        respondError: () => {},
+        close: async () => {
+          closeStarts += 1;
+          if (clientNumber === 1) await closeGate.promise;
+        },
+      };
+    },
+    setTimer: () => ({}),
+    clearTimer: () => {},
+  });
+  t.after(async () => {
+    closeGate.resolve();
+    await supervisor.close();
+  });
+  await supervisor.ensureTurnTransport();
+  supervisor.registerSession('session', { onNotification() {}, onFatal() {} });
+  supervisor.bindThread('session', 'thread');
+
+  const rejected = supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  void rejected.catch(() => {});
+  await waitFor(() => closeStarts === 1);
+  let joined = false;
+  const retirement = supervisor.retireSessionGeneration('session').then(() => { joined = true; });
+
+  await assert.rejects(supervisor.ensureTurnTransport(), /unavailable/i);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(joined, false, 'matching retirement waits for the exact child close');
+  assert.equal(clients, 1, 'no replacement child launches during exact-generation retirement');
+
+  closeGate.resolve();
+  await retirement;
+  await assert.rejects(rejected, (error: Error) => {
+    assert.equal((error as { code?: string }).code, 'codex_protocol_mismatch');
+    return true;
+  });
 });
 
 test('opaque thread and turn IDs acquire supervisor ownership byte for byte', async (t) => {
@@ -1514,6 +1580,42 @@ test('turn/start response before its matching notification preserves ownership',
 
   assert.equal(started.turn.id, 'turn-1');
   assert.equal(next.turn.id, 'turn-2');
+});
+
+test('a delayed terminal start cannot claim a later pending request', async (t) => {
+  const secondResponse = deferred<unknown>();
+  const { supervisor, protocol, turnStarts } = await turnRoutingHarness(
+    t,
+    (start) => start === 1
+      ? { turn: routedTurn('old-turn') }
+      : start === 2 ? secondResponse.promise : { turn: routedTurn(`turn-${start}`) },
+  );
+
+  await supervisor.requestForSession('session', 'turn/start', { threadId: 'thread' });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('old-turn', 'completed'),
+  });
+  const pending = supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  await waitFor(() => turnStarts() === 2);
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('old-turn'),
+  });
+  secondResponse.resolve({ turn: routedTurn('new-turn') });
+
+  const started = await pending;
+  assert.equal(started.turn.id, 'new-turn');
+  protocol.onNotification('turn/started', {
+    threadId: 'thread', turn: routedTurn('new-turn'),
+  });
+  protocol.onNotification('turn/completed', {
+    threadId: 'thread', turn: routedTurn('new-turn', 'completed'),
+  });
+  const third = await supervisor.requestForSession<{ turn: { id: string } }>(
+    'session', 'turn/start', { threadId: 'thread' },
+  );
+  assert.equal(third.turn.id, 'turn-3');
 });
 
 // Mutation caught: clearing only active ownership on completion forgets that

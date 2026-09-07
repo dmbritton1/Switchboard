@@ -178,8 +178,14 @@ class ScriptedSupervisor {
     this.route?.onFatal(reason, code);
   }
 
-  async retireSessionGeneration(): Promise<void> {
-    this.fatal('Codex app-server transport crashed. Retry the session manually.', 'codex_transport_crashed');
+  async retireSessionGeneration(
+    _sessionId?: string,
+    failure?: { reason: string; code: CodexFailureCode },
+  ): Promise<void> {
+    this.fatal(
+      failure?.reason ?? 'Codex app-server transport crashed. Retry the session manually.',
+      failure?.code ?? 'codex_transport_crashed',
+    );
   }
 }
 
@@ -1134,7 +1140,198 @@ test('a rejected established interrupt retires the shared generation and every s
     .start({ cwd: cwdA, prompt: prompt('later-a'), promptId: 'later-a', env: {}, resumeId: 'thread-a' },
       (event) => resumedEvents.push(event));
   await waitFor(() => resumedEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
-  assert.deepEqual(turnInputs, ['first-a', 'first-b', 'later-a'], 'restart never replays an accepted prompt');
+  assert.deepEqual(turnInputs.slice(0, 2).sort(), ['first-a', 'first-b']);
+  assert.equal(turnInputs[2], 'later-a', 'restart never replays an accepted prompt');
+});
+
+test('post-dispatch protocol failures retire the exact generation before terminal publication and settle siblings once', async (t) => {
+  for (const scenario of ['unsafe response', 'response/start mismatch', 'unsafe routed turn', 'unsafe nested item'] as const) {
+    await t.test(scenario, async (t) => {
+      const root = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-protocol-retire-'));
+      const cwdA = join(root, 'a');
+      const cwdB = join(root, 'b');
+      await Promise.all([mkdir(cwdA), mkdir(cwdB)]);
+      const responseA = deferred<unknown>();
+      const responseB = deferred<unknown>();
+      const closeGate = deferred<void>();
+      const scheduled: Array<() => void> = [];
+      const trace: string[] = [];
+      let protocol!: AppServerClientOptions;
+      let closeStarts = 0;
+      let turnStarts = 0;
+      const supervisor = new CodexAppServerSupervisor({
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        verifyContract: async () => {},
+        clientFactory: (options) => {
+          protocol = options;
+          return {
+            request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
+              if (method === 'initialize') return { initialized: true } as T;
+              if (method === 'account/read') {
+                return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+              }
+              if (method === 'account/rateLimits/read') {
+                return { rateLimits: { limitId: null, limitName: null,
+                  primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+                  credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+                rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+              }
+              if (method === 'thread/start') {
+                const value = params as { cwd: string };
+                return safeThreadResponse(value.cwd === cwdA ? 'thread-a' : 'thread-b', value.cwd) as T;
+              }
+              if (method === 'turn/start') {
+                onDispatched?.();
+                turnStarts += 1;
+                const threadId = (params as { threadId: string }).threadId;
+                return (threadId === 'thread-a' ? responseA.promise : responseB.promise) as Promise<T>;
+              }
+              throw new Error(`unexpected ${method}`);
+            },
+            notify: () => {},
+            respondError: () => {},
+            close: async () => {
+              closeStarts += 1;
+              trace.push('close:start');
+              await closeGate.promise;
+              trace.push('close:done');
+            },
+          };
+        },
+        setTimer: (callback) => { scheduled.push(callback); return callback; },
+        clearTimer: () => {},
+      });
+      t.after(async () => {
+        closeGate.resolve();
+        await supervisor.close();
+        await rm(root, { recursive: true, force: true });
+      });
+      await supervisor.ensureTurnTransport();
+
+      const eventsA: AdapterEvent[] = [];
+      const eventsB: AdapterEvent[] = [];
+      createCodexAppServerAdapter(supervisor, `protocol-a-${scenario}`, '0.145.0')
+        .start({ cwd: cwdA, prompt: prompt('first-a'), promptId: 'first-a', env: {} }, (event) => {
+          eventsA.push(event);
+          if (event.type === 'stopped') trace.push(`a:stopped:${event.code}`);
+        });
+      createCodexAppServerAdapter(supervisor, `protocol-b-${scenario}`, '0.145.0')
+        .start({ cwd: cwdB, prompt: prompt('first-b'), promptId: 'first-b', env: {} }, (event) => {
+          eventsB.push(event);
+          if (event.type === 'stopped') trace.push(`b:stopped:${event.code}`);
+        });
+      await waitFor(() => turnStarts === 2, 'two accepted protocol test turns');
+
+      responseB.resolve({ turn: turn('turn-b', 'inProgress') });
+      if (scenario === 'unsafe response') {
+        responseA.resolve({ turn: turn('turn:file:///private/provider/secret.json', 'inProgress') });
+      } else if (scenario === 'response/start mismatch') {
+        protocol.onNotification('turn/started', {
+          threadId: 'thread-a', turn: turn('notification-turn-a', 'inProgress'),
+        });
+        responseA.resolve({ turn: turn('response-turn-a', 'inProgress') });
+      } else {
+        responseA.resolve({ turn: turn('turn-a', 'inProgress') });
+        await new Promise((resolve) => setImmediate(resolve));
+        if (scenario === 'unsafe routed turn') {
+          protocol.onNotification('item/started', {
+            threadId: 'thread-a', turnId: 'turn:file:///private/provider/secret.json',
+            item: { type: 'commandExecution', id: 'safe-item', command: 'true', status: 'inProgress' },
+          });
+        } else {
+          protocol.onNotification('item/started', {
+            threadId: 'thread-a', turnId: 'turn-a',
+            item: {
+              type: 'commandExecution', id: 'item:file:///private/provider/secret.json',
+              command: 'true', status: 'inProgress', aggregatedOutput: null,
+            },
+          });
+        }
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      try {
+        assert.equal(closeStarts, 1, 'the exact writer generation begins retirement');
+        assert.equal(eventsA.some((event) => event.type === 'stopped'), false,
+          'the affected route cannot publish terminal state before child retirement');
+        assert.equal(eventsB.some((event) => event.type === 'stopped'), false,
+          'the sibling route remains owned until child retirement');
+        assert.throws(
+          () => supervisor.registerSession(`protocol-a-${scenario}`, { onNotification() {}, onFatal() {} }),
+          /already registered/i,
+          'resume registration remains unavailable during retirement',
+        );
+      } finally {
+        closeGate.resolve();
+      }
+
+      await waitFor(() => eventsA.some((event) => event.type === 'stopped')
+        && eventsB.some((event) => event.type === 'stopped'), 'protocol generation settlement');
+      protocol.onNotification('item/started', {
+        threadId: 'thread-a', turnId: 'turn-a', item: { type: 'commandExecution', id: 'late-item' },
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(eventsA.filter((event) => event.type === 'stopped').length, 1);
+      assert.equal(eventsB.filter((event) => event.type === 'stopped').length, 1);
+      assert.ok(eventsA.some((event) => event.type === 'stopped' && event.code === 'codex_protocol_mismatch'));
+      assert.ok(eventsB.some((event) => event.type === 'stopped' && event.code === 'codex_transport_crashed'));
+      assert.ok(trace.indexOf('close:done') < trace.findIndex((entry) => entry.startsWith('a:stopped:')));
+      assert.ok(trace.indexOf('close:done') < trace.findIndex((entry) => entry.startsWith('b:stopped:')));
+      assert.equal(scheduled.length, 1, 'retirement retains the existing bounded restart policy');
+      assert.doesNotMatch(JSON.stringify([...eventsA, ...eventsB]), /private\/provider|secret\.json/);
+    });
+  }
+});
+
+test('a typed supervisor protocol mismatch stays typed and sanitized through the production adapter', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-typed-protocol-'));
+  let closes = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    verifyContract: async () => {},
+    clientFactory: () => ({
+      request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
+        if (method === 'initialize') return { initialized: true } as T;
+        if (method === 'account/read') {
+          return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+        }
+        if (method === 'account/rateLimits/read') {
+          return { rateLimits: { limitId: null, limitName: null,
+            primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+            credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+          rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+        }
+        if (method === 'thread/start') return safeThreadResponse('typed-thread', (params as { cwd: string }).cwd) as T;
+        if (method === 'turn/start') {
+          onDispatched?.();
+          return { turn: turn('turn:file:///private/provider/typed-secret.json', 'inProgress') } as T;
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+      notify: () => {},
+      respondError: () => {},
+      close: async () => { closes += 1; },
+    }),
+    setTimer: () => ({}),
+    clearTimer: () => {},
+  });
+  t.after(async () => {
+    await supervisor.close();
+    await rm(cwd, { recursive: true, force: true });
+  });
+  await supervisor.ensureTurnTransport();
+  const events: AdapterEvent[] = [];
+
+  createCodexAppServerAdapter(supervisor, 'typed-protocol', '0.145.0')
+    .start({ cwd, prompt: prompt('inspect'), promptId: 'typed-prompt', env: {} }, (event) => events.push(event));
+  await waitFor(() => events.some((event) => event.type === 'stopped'), 'typed protocol stop');
+
+  assert.equal(closes, 1);
+  assert.deepEqual(events.filter((event) => event.type === 'stopped'), [{
+    type: 'stopped', reason: 'Codex turn identifier is invalid.', code: 'codex_protocol_mismatch',
+  }]);
+  assert.doesNotMatch(JSON.stringify(events), /private\/provider|typed-secret/);
 });
 
 test('stop interrupts a turn accepted just before its response returns', async (t) => {
