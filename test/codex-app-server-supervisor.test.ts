@@ -107,6 +107,109 @@ test('protocol retirement remains joinable and blocks replacement launch until t
   });
 });
 
+// Mutation caught: relying only on ensureTurnTransport's public retirement
+// guard lets a queued promotion miss a retirement that starts before its body
+// runs, launching a second child while the old generation is still closing.
+test('queued promotion joins an intervening telemetry retirement before replacement or shutdown', async (t) => {
+  for (const outcome of ['promote', 'replacement-failure', 'shutdown'] as const) {
+    await t.test(outcome, async (t) => {
+      const closeGate = deferred<void>();
+      const clientOptions: AppServerClientOptions[] = [];
+      const scheduled: Array<() => void> = [];
+      let clearedTimers = 0;
+      let firstCloseStarted = false;
+      let firstCloseFinished = false;
+      let replacementCloseStartedAfterFirstClose = false;
+      let firstRateLimitReads = 0;
+      const supervisor = new CodexAppServerSupervisor({
+        runtime: runtime(),
+        onSnapshot: () => {},
+        onStale: () => {},
+        verifyContract: async () => {},
+        clientFactory: (options) => {
+          clientOptions.push(options);
+          const clientNumber = clientOptions.length;
+          return {
+            request: async <T>(method: string): Promise<T> => {
+              if (clientNumber === 2 && outcome === 'replacement-failure' && method === 'initialize') {
+                throw new Error('replacement initialization failed');
+              }
+              if (method === 'initialize') return { initialized: true } as T;
+              if (method === 'account/read') return managedAccountResult() as T;
+              if (method === 'account/rateLimits/read') {
+                if (clientNumber === 1 && ++firstRateLimitReads === 2) return { malformed: true } as T;
+                return rateLimitsResult() as T;
+              }
+              throw new Error(`unexpected ${method}`);
+            },
+            notify: () => {},
+            respondError: () => {},
+            close: async () => {
+              if (clientNumber === 1) {
+                firstCloseStarted = true;
+                await closeGate.promise;
+                firstCloseFinished = true;
+              } else if (clientNumber === 2) {
+                replacementCloseStartedAfterFirstClose = firstCloseFinished;
+              }
+            },
+          };
+        },
+        setTimer: (callback) => { scheduled.push(callback); return callback; },
+        clearTimer: () => { clearedTimers += 1; },
+      });
+      t.after(async () => {
+        closeGate.resolve();
+        await supervisor.close();
+      });
+      await supervisor.start();
+
+      clientOptions[0]!.onNotification('account/rateLimits/updated', {
+        rateLimits: { limitId: null },
+      });
+      const promotion = supervisor.ensureTurnTransport();
+      void promotion.catch(() => {});
+      await waitFor(() => firstCloseStarted);
+      const concurrentPromotion = supervisor.ensureTurnTransport();
+      void concurrentPromotion.catch(() => {});
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(clientOptions.length, 1, 'the queued promotion cannot overlap the retiring telemetry child');
+      assert.equal(concurrentPromotion, promotion,
+        'concurrent callers join the already-published promotion during retirement');
+
+      if (outcome === 'promote') {
+        closeGate.resolve();
+        await promotion;
+        assert.equal(clientOptions.length, 2);
+        assert.equal(clientOptions[1]!.args.includes('hooks={}'), false,
+          'the deterministic replacement uses the turn-capable profile');
+        assert.equal(scheduled.length, 1, 'retirement keeps the existing restart scheduling step');
+        assert.equal(clearedTimers, 1, 'promotion consumes the scheduled restart before its replacement launch');
+      } else if (outcome === 'replacement-failure') {
+        closeGate.resolve();
+        await assert.rejects(promotion, /initialization failed/i);
+        assert.equal(clientOptions.length, 2);
+        assert.equal(replacementCloseStartedAfterFirstClose, true,
+          'a failing replacement cannot overwrite ownership of the old retirement');
+        assert.equal(scheduled.length, 2,
+          'the old retirement and failed replacement each retain their restart scheduling step');
+        assert.equal(clearedTimers, 1,
+          'promotion consumes only the old retirement restart before replacement launch');
+      } else {
+        let shutdownSettled = false;
+        const shutdown = supervisor.close().then(() => { shutdownSettled = true; });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(shutdownSettled, false, 'shutdown joins the exact old retirement');
+        closeGate.resolve();
+        await assert.rejects(promotion, /unavailable/i);
+        await shutdown;
+        assert.equal(clientOptions.length, 1, 'shutdown cannot launch a replacement after retirement');
+      }
+    });
+  }
+});
+
 test('opaque thread and turn IDs acquire supervisor ownership byte for byte', async (t) => {
   for (const [index, id] of opaqueProviderIdentifiers.entries()) {
     await t.test(String(index), async (t) => {

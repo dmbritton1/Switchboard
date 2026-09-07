@@ -161,8 +161,8 @@ export class CodexAppServerSupervisor {
 
   ensureTurnTransport(): Promise<void> {
     if (this.#closed) return Promise.reject(unavailableError());
-    if (this.#retirement) return Promise.reject(unavailableError());
     if (this.#promotion) return this.#promotion;
+    if (this.#retirement) return Promise.reject(unavailableError());
     if (this.#mode === 'turns') return this.start();
     if ([...this.#sessions.values()].some((session) => session.activeTurnId || session.pendingTurn)) {
       return Promise.reject(new Error('Cannot promote Codex transport while a session turn is active.'));
@@ -321,9 +321,13 @@ export class CodexAppServerSupervisor {
   }
 
   async #promoteNow(): Promise<void> {
+    const queuedRetirement = this.#retirement;
+    if (queuedRetirement) await queuedRetirement.promise;
     const existingLaunch = this.#launch;
     if (existingLaunch) await existingLaunch.catch(() => {});
     if (this.#launch === existingLaunch) this.#launch = null;
+    const launchRetirement = this.#retirement;
+    if (launchRetirement) await launchRetirement.promise;
     if (this.#closed) throw unavailableError();
     if (this.#mode === 'turns') return this.start();
     this.#mode = 'turns';
