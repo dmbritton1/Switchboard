@@ -290,6 +290,9 @@ export type AgentHandle = {
   decide(allow: boolean, answer?: string): void;
   setAuto(on: boolean): void;
   stop(): void;
+  /** Present when stop has asynchronous writer ownership to settle. The promise
+   *  resolves only after that writer is quiescent and never rejects. */
+  quiescence?: Promise<void>;
 };
 
 export type Adapter = {

@@ -1942,6 +1942,138 @@ test('an unresolved app-server stop serializes immediate resume and releases a l
   }
 });
 
+test('active app-server delete retains ownership and worktree until bounded quiescence', async (t) => {
+  for (const interruptOutcome of ['success', 'failure'] as const) {
+    for (const removeWorktree of [false, true] as const) {
+      await t.test(`${interruptOutcome}, removeWorktree=${removeWorktree}`, async (t) => {
+        let releaseInterrupt!: () => void;
+        let rejectInterrupt!: (error: Error) => void;
+        const interruptGate = new Promise<void>((resolve, reject) => {
+          releaseInterrupt = resolve;
+          rejectInterrupt = reject;
+        });
+        let markInterruptEntered!: () => void;
+        const interruptEntered = new Promise<void>((resolve) => { markInterruptEntered = resolve; });
+        let releaseClose!: () => void;
+        const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+        let markCloseEntered!: () => void;
+        const closeEntered = new Promise<void>((resolve) => { markCloseEntered = resolve; });
+        let closeStarts = 0;
+        const turnInputs: string[] = [];
+        const scheduled: Array<() => void> = [];
+        let protocol!: AppServerClientOptions;
+        const supervisor = new CodexAppServerSupervisor({
+          runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+          verifyContract: async () => {},
+          clientFactory: (options) => {
+            protocol = options;
+            return {
+              request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
+                if (method === 'initialize') return { initialized: true } as T;
+                if (method === 'account/read') {
+                  return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+                }
+                if (method === 'account/rateLimits/read') {
+                  return { rateLimits: { limitId: null, limitName: null,
+                    primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+                    credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+                  rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+                }
+                if (method === 'thread/start') {
+                  const value = params as { cwd: string };
+                  return { thread: { id: 'delete-thread', cwd: value.cwd }, cwd: value.cwd,
+                    approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' } } as T;
+                }
+                if (method === 'turn/start') {
+                  onDispatched?.();
+                  const input = (params as { input: Array<{ type: string; text?: string }> }).input;
+                  turnInputs.push(input.find((item) => item.type === 'text')?.text ?? '');
+                  return { turn: { id: 'delete-turn', status: 'inProgress' } } as T;
+                }
+                if (method === 'turn/interrupt') {
+                  markInterruptEntered();
+                  await interruptGate;
+                  return {} as T;
+                }
+                throw new Error(`unexpected ${method}`);
+              },
+              notify: () => {},
+              respondError: () => {},
+              close: async () => {
+                closeStarts += 1;
+                if (interruptOutcome === 'failure') {
+                  markCloseEntered();
+                  await closeGate;
+                }
+              },
+            };
+          },
+          setTimer: (callback) => { scheduled.push(callback); return callback; },
+          clearTimer: () => {},
+        });
+        t.after(() => {
+          releaseInterrupt();
+          releaseClose();
+        });
+        const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+          async prepare(_account, transport, sessionId) {
+            assert.equal(transport, 'app-server');
+            await supervisor.ensureTurnTransport();
+            return {
+              runtimeVersion: '0.145.0',
+              adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0'),
+            };
+          },
+          close: () => supervisor.close(),
+        };
+        const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+        const created = await fixture.create(`delete-${interruptOutcome}-${removeWorktree}`);
+        await waitFor(() => turnInputs.length === 1);
+        const session = fixture.registry.get(created.id)!;
+        const observedStatuses: Array<string | undefined> = [];
+        const unsubscribe = fixture.registry.subscribe(() => observedStatuses.push(fixture.registry.get(created.id)?.status));
+        t.after(unsubscribe);
+
+        let deletionSettled = false;
+        const deletion = fixture.command({ cmd: 'delete', id: created.id, removeWorktree })
+          .finally(() => { deletionSettled = true; });
+        await interruptEntered;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(deletionSettled, false, 'delete waits for interrupt or exact-generation retirement');
+        assert.equal(fixture.registry.get(created.id), session, 'callback ownership stays registered while settling');
+        assert.equal(await stat(session.cwd).then(() => true, () => false), true);
+        assert.equal((await fixture.command({ cmd: 'send', id: created.id, text: 'must not send' })).status, 404);
+        assert.equal((await fixture.command({ cmd: 'resume', id: created.id, prompt: 'must not resume' })).status, 409);
+        assert.equal((await fixture.command({ cmd: 'delete', id: created.id, removeWorktree })).status, 409);
+
+        if (interruptOutcome === 'success') releaseInterrupt();
+        else rejectInterrupt(new Error('private interrupt rejection at /private/provider/secret.json'));
+        if (interruptOutcome === 'failure') {
+          await closeEntered;
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.equal(closeStarts, 1);
+          assert.equal(deletionSettled, false, 'rejected interrupt waits for exact writer-generation retirement');
+          assert.equal(fixture.registry.get(created.id), session);
+          releaseClose();
+        }
+
+        assert.deepEqual(await deletion, { status: 200, data: { ok: true } });
+        assert.equal(fixture.registry.get(created.id), undefined);
+        assert.equal(await stat(session.cwd).then(() => true, () => false), !removeWorktree);
+        assert.ok(observedStatuses.includes('stopped'), 'terminal callback remains owned through quiescence');
+        protocol.onNotification('turn/completed', {
+          threadId: 'delete-thread', turn: { id: 'delete-turn', status: 'interrupted' },
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(fixture.registry.get(created.id), undefined, 'late terminal state cannot revive a deleted session');
+        assert.deepEqual(turnInputs, [`delete-${interruptOutcome}-${removeWorktree}`], 'delete never replays work');
+        assert.equal(scheduled.length, interruptOutcome === 'failure' ? 1 : 0);
+      });
+    }
+  }
+});
+
 test('POST /command delete removes the session', async (t) => {
   const { base, registry } = await boot(t);
   const s = registry.create({

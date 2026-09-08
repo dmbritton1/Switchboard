@@ -209,6 +209,27 @@ export function createCodexAppServerAdapter(
       let turnRequestInFlight = false;
       let protocolRetiring = false;
       const bufferedNotifications: Array<{ method: string; params: unknown }> = [];
+      let resolveQuiescence!: () => void;
+      const quiescence = new Promise<void>((resolve) => { resolveQuiescence = resolve; });
+      let quiescenceSettled = false;
+      let worktreeOperations = 0;
+
+      const settleQuiescence = (): void => {
+        if (quiescenceSettled || !stopped || worktreeOperations > 0) return;
+        quiescenceSettled = true;
+        resolveQuiescence();
+      };
+
+      const beginWorktreeOperation = (): (() => void) => {
+        worktreeOperations += 1;
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          worktreeOperations -= 1;
+          settleQuiescence();
+        };
+      };
 
       const detachRoute = (): void => {
         detach?.();
@@ -232,7 +253,11 @@ export function createCodexAppServerAdapter(
         }
         if (detachNow) detachRoute();
         if (cleanupSnapshot) void cleanupActiveSnapshot().catch(() => {});
-        emit({ type: 'stopped', reason: safePublicText(reason, opts.env), code });
+        try {
+          emit({ type: 'stopped', reason: safePublicText(reason, opts.env), code });
+        } finally {
+          settleQuiescence();
+        }
       };
 
       const finishUserStop = (): void => {
@@ -279,7 +304,11 @@ export function createCodexAppServerAdapter(
           },
           async () => {
             if (stopped || !interrupted) return;
-            await supervisor.retireSessionGeneration(sessionId);
+            try {
+              await supervisor.retireSessionGeneration(sessionId);
+            } finally {
+              if (!stopped) finishUserStop();
+            }
           },
         );
       };
@@ -371,6 +400,7 @@ export function createCodexAppServerAdapter(
       const drain = async (): Promise<void> => {
         if (draining || completing || stopped || interrupted || protocolRetiring
           || !threadId || activeTurnId || queue.length === 0) return;
+        const releaseWorktree = beginWorktreeOperation();
         draining = true;
         try {
           const queued = queue[0];
@@ -425,6 +455,7 @@ export function createCodexAppServerAdapter(
           else finishRequest(error, 'codex_app_server_unavailable');
         } finally {
           draining = false;
+          releaseWorktree();
         }
       };
 
@@ -432,39 +463,44 @@ export function createCodexAppServerAdapter(
         detach = supervisor.registerSession(sessionId, { onNotification, onFatal });
       } catch (error) {
         finishRequest(error, 'codex_app_server_unavailable');
-        return { send() {}, decide() {}, setAuto() {}, stop() {} };
+        return { send() {}, decide() {}, setAuto() {}, stop() {}, quiescence };
       }
+      const releaseThreadSetup = beginWorktreeOperation();
       void (async () => {
         try {
-          settings = validateCodexSettings(opts.codexSettings);
-        } catch (error) {
-          finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
-          return;
-        }
-        if (opts.resumeId && unsafeCodexProviderIdentifier(opts.resumeId)) {
-          finish('Codex app-server stored thread identifier is unsafe.', 'codex_protocol_mismatch');
-          return;
-        }
-        const config = settingsConfig(settings);
-        const params = {
-          ...(opts.resumeId ? { threadId: opts.resumeId } : {}),
-          cwd: opts.cwd, approvalPolicy: 'never' as const, sandbox: 'workspace-write' as const,
-          ...(settings?.model !== undefined ? { model: settings.model } : {}),
-          ...(config ? { config } : {}),
-        };
-        try {
-          const response = await supervisor.requestForSession<unknown>(sessionId, opts.resumeId ? 'thread/resume' : 'thread/start', params);
-          const id = threadResponse(response, opts.cwd);
-          if (!id || (opts.resumeId && id !== opts.resumeId)) {
-            finish('Codex app-server thread response did not preserve the required sandbox.', 'codex_protocol_mismatch');
+          try {
+            settings = validateCodexSettings(opts.codexSettings);
+          } catch (error) {
+            finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
             return;
           }
-          threadId = id;
-          supervisor.bindThread(sessionId, id);
-          emit({ type: 'vendor-session-id', id });
-          void drain();
-        } catch (error) {
-          if (!stopped) finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
+          if (opts.resumeId && unsafeCodexProviderIdentifier(opts.resumeId)) {
+            finish('Codex app-server stored thread identifier is unsafe.', 'codex_protocol_mismatch');
+            return;
+          }
+          const config = settingsConfig(settings);
+          const params = {
+            ...(opts.resumeId ? { threadId: opts.resumeId } : {}),
+            cwd: opts.cwd, approvalPolicy: 'never' as const, sandbox: 'workspace-write' as const,
+            ...(settings?.model !== undefined ? { model: settings.model } : {}),
+            ...(config ? { config } : {}),
+          };
+          try {
+            const response = await supervisor.requestForSession<unknown>(sessionId, opts.resumeId ? 'thread/resume' : 'thread/start', params);
+            const id = threadResponse(response, opts.cwd);
+            if (!id || (opts.resumeId && id !== opts.resumeId)) {
+              finish('Codex app-server thread response did not preserve the required sandbox.', 'codex_protocol_mismatch');
+              return;
+            }
+            threadId = id;
+            supervisor.bindThread(sessionId, id);
+            emit({ type: 'vendor-session-id', id });
+            void drain();
+          } catch (error) {
+            if (!stopped) finishRequest(error, opts.resumeId ? 'codex_resume_failed' : 'codex_start_failed');
+          }
+        } finally {
+          releaseThreadSetup();
         }
       })();
 
@@ -485,6 +521,7 @@ export function createCodexAppServerAdapter(
           interruptActiveTurn();
           if (!turnRequestInFlight && !activeTurnId) finishUserStop();
         },
+        quiescence,
       };
     },
   };

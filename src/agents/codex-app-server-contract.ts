@@ -282,6 +282,7 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const approvalPolicy = files.get(join('v2', 'AskForApproval.ts'));
   const sandboxMode = files.get(join('v2', 'SandboxMode.ts'));
   const jsonValue = files.get(join('serde_json', 'JsonValue.ts'));
+  const reasoningEffort = files.get('ReasoningEffort.ts');
   const threadStart = files.get(join('v2', 'ThreadStartParams.ts'));
   const threadResume = files.get(join('v2', 'ThreadResumeParams.ts'));
   const turnStart = files.get(join('v2', 'TurnStartParams.ts'));
@@ -310,12 +311,16 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const threadConfig = /config\s*\?\s*:\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*,/;
   const jsonValueContract = /export\s+type\s+JsonValue\s*=\s*number\s*\|\s*string\s*\|\s*boolean\s*\|\s*Array\s*<\s*JsonValue\s*>\s*\|\s*\{\s*\[key\s+in\s+string\]\s*\?\s*:\s*JsonValue\s*\}\s*\|\s*null\s*;/;
   const turnInput = /threadId\s*:\s*string[\s\S]*clientUserMessageId\s*\?\s*:\s*string\s*\|\s*null[\s\S]*input\s*:\s*(?:Array\s*<\s*UserInput\s*>|UserInput\s*\[\])/;
+  const turnStartMembers = turnStart ? outerObjectMembers(turnStart) : null;
+  const turnEffort = /(?:^|[,;])\s*effort\s*\?\s*:\s*ReasoningEffort\s*\|\s*null\s*(?=[,;]|(?![\s\S]))/;
+  const turnEffortImport = /(?:^|\n)\s*import\s+type\s*\{\s*ReasoningEffort\s*\}\s+from\s+["']\.\.\/ReasoningEffort["']\s*;/;
+  const reasoningEffortAlias = /(?:^|\n)\s*export\s+type\s+ReasoningEffort\s*=\s*string\s*;\s*(?:\n|$)/;
   const routing = /threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/;
   const errorMembers = error ? outerObjectMembers(error) : null;
   const requiredWillRetry = /(?:^|[,;])\s*willRetry\s*:\s*boolean\s*(?=[,;]|(?![\s\S]))/;
   const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
   const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
-  if (!approvalPolicy || !sandboxMode || !jsonValue || !threadStart || !threadResume
+  if (!approvalPolicy || !sandboxMode || !jsonValue || !reasoningEffort || !threadStart || !threadResume
     || !turnStart || !turnInterrupt || !userInput || !threadItem
     || !turn || !turnStatus || !turnError || !tokenUsage || !tokenBreakdown || !thread
     || !threadStarted || !usageUpdated || !turnStarted || !planUpdated || !itemStarted
@@ -331,6 +336,8 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
     || !threadApproval.test(threadResume) || !threadSandbox.test(threadResume)
     || !threadConfig.test(threadResume)
     || !turnInput.test(turnStart)
+    || !turnStartMembers || !turnEffort.test(turnStartMembers)
+    || !turnEffortImport.test(turnStart) || !reasoningEffortAlias.test(reasoningEffort)
     || !/threadId\s*:\s*string[\s\S]*turnId\s*:\s*string/.test(turnInterrupt)
     || !textInput || !/text\s*:\s*string\s*,/.test(textInput)
     || !/text_elements\s*:\s*Array\s*<\s*TextElement\s*>\s*,\s*\}/.test(textInput)

@@ -293,6 +293,72 @@ test('turn profile requires the pinned request, item, turn, usage, and routing s
   }
 });
 
+for (const [shape, mismatch] of [
+  ['turn-effort', 'omitted outer field'],
+  ['turn-effort-required', 'required outer field'],
+  ['turn-effort-nonnullable', 'non-nullable outer field'],
+  ['turn-effort-type', 'wrong outer field type'],
+  ['turn-effort-union', 'widened outer field union'],
+] as const) {
+  test(`turn profile rejects the ${mismatch} for reasoning effort`, async () => {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+${shape}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+    );
+  });
+}
+
+for (const [shape, location] of [
+  ['turn-effort-nested-decoy', 'nested object'],
+  ['turn-effort-comment-decoy', 'block comment'],
+  ['turn-effort-string-decoy', 'string literal'],
+  ['turn-effort-function-decoy', 'function parameter'],
+  ['turn-effort-tuple-decoy', 'tuple member'],
+] as const) {
+  test(`turn profile ignores an exact-looking effort field in a ${location}`, async () => {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+${shape}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+    );
+  });
+}
+
+for (const [shape, mismatch] of [
+  ['turn-effort-import', 'missing generated import'],
+  ['turn-effort-import-path', 'wrong generated import path'],
+  ['reasoning-effort-alias', 'missing generated alias'],
+  ['reasoning-effort-alias-type', 'wrong generated alias type'],
+  ['reasoning-effort-alias-union', 'widened generated alias union'],
+] as const) {
+  test(`turn profile rejects the ${mismatch} for reasoning effort`, async () => {
+    await assert.rejects(
+      verifyAppServerContract(runtime({
+        version: `0.145.0+${shape}`,
+        env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      }), 'turns'),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Codex app-server turn contract verification failed.',
+    );
+  });
+}
+
+test('telemetry profile remains isolated from turn effort and alias mismatches', async () => {
+  for (const [index, shape] of ['turn-effort', 'reasoning-effort-alias'].entries()) {
+    await verifyAppServerContract(runtime({
+      version: `0.145.0+telemetry-effort-isolation-${index}`,
+      env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+    }), 'telemetry');
+  }
+});
+
 test('turn profile requires pinned thread safety aliases and config maps on start and resume', async () => {
   for (const [index, shape] of [
     'approval-never',

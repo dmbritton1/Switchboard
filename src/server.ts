@@ -478,6 +478,7 @@ export function createServer(opts: {
   const handles = new Map<string, AgentHandle>();
   const launchOwners = new Map<string, symbol>();
   const createReservations = new Map<string, symbol>();
+  const deletingSessions = new Set<string>();
   // Process-local like the handle map, and for the same reason: a channel names
   // two live sessions, and Registry.load forces every session to `stopped` on
   // start, so none could survive a restart in a usable form.
@@ -1144,6 +1145,9 @@ export function createServer(opts: {
 
       case 'resume': {
         const sessionId = String(body.id);
+        if (deletingSessions.has(sessionId)) {
+          return { status: 409, json: { error: 'session deletion is in progress' } };
+        }
         const session = registry.get(sessionId);
         if (!session) return { status: 404, json: { error: 'no such session' } };
         if (handoffReservations.has(sessionId)) {
@@ -1255,34 +1259,41 @@ export function createServer(opts: {
 
       case 'delete': {
         const sessionId = String(body.id);
+        if (deletingSessions.has(sessionId)) {
+          return { status: 409, json: { error: 'session deletion is already in progress' } };
+        }
         const handoff = handoffReservations.get(sessionId);
         if (handoff?.phase === 'committing') {
           return { status: 409, json: { error: 'session handoff is committing' } };
         }
-        handoffReservations.delete(sessionId);
-        createReservations.delete(sessionId);
-        const session = registry.get(sessionId);
-        const handle = handles.get(sessionId);
-        handles.delete(sessionId);
-        launchOwners.delete(sessionId);
-        handle?.stop();
-        // Deregister before the worktree await, not after. Concurrent resume
-        // clears its final guard on Registry identity (see the resume case); if
-        // the session were still registered across this await, resume would pass
-        // that guard and launch an agent into a directory being deleted — and
-        // the remove() below would then drop the session while that agent is
-        // still running, leaving it with no card and no stop().
-        registry.remove(sessionId);
-        dropChannels(channels, sessionId);
-        dropSeen(seenChannels, sessionId);
-        dropSeen(lineage, sessionId);
-        dropPaths(paths, sessionId);
-        if (session && body.removeWorktree) {
-          await beforeWorktreeRemoval?.(session.cwd);
-          await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
-            .catch(() => rm(session.cwd, { recursive: true, force: true }));
+        deletingSessions.add(sessionId);
+        try {
+          handoffReservations.delete(sessionId);
+          createReservations.delete(sessionId);
+          resumeReservations.delete(sessionId);
+          const session = registry.get(sessionId);
+          const handle = handles.get(sessionId);
+          // Stop accepting new work immediately, but retain launch ownership so
+          // the app-server's terminal callback can settle Registry state before
+          // deletion removes the card and optional worktree.
+          handles.delete(sessionId);
+          handle?.stop();
+          await handle?.quiescence;
+          launchOwners.delete(sessionId);
+          registry.remove(sessionId);
+          dropChannels(channels, sessionId);
+          dropSeen(seenChannels, sessionId);
+          dropSeen(lineage, sessionId);
+          dropPaths(paths, sessionId);
+          if (session && body.removeWorktree) {
+            await beforeWorktreeRemoval?.(session.cwd);
+            await run('git', ['worktree', 'remove', '--force', session.cwd], { cwd: session.repo })
+              .catch(() => rm(session.cwd, { recursive: true, force: true }));
+          }
+          return { status: 200, json: { ok: true } };
+        } finally {
+          deletingSessions.delete(sessionId);
         }
-        return { status: 200, json: { ok: true } };
       }
 
       case 'schedule': {

@@ -149,6 +149,15 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null;\n',
     'export type JsonValue = unknown;\n',
   ));
+  writeFileSync(join(out, 'ReasoningEffort.ts'), shape('reasoning-effort-alias', changedShape(
+    'reasoning-effort-alias-type',
+    changedShape(
+      'reasoning-effort-alias-union',
+      'export type ReasoningEffort = string;\n',
+      'export type ReasoningEffort = string | null;\n',
+    ),
+    'export type ReasoningEffort = number;\n',
+  )));
   writeFileSync(join(out, 'v2', 'ThreadStartParams.ts'), [
     'export type ThreadStartParams = {',
     shape('thread-params', [
@@ -193,9 +202,53 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     ].join('')),
     '};\n',
   ].join(''));
+  const exactTurnEffort = changedShape(
+    'turn-effort-required',
+    changedShape(
+      'turn-effort-nonnullable',
+      changedShape(
+        'turn-effort-type',
+        changedShape(
+          'turn-effort-union',
+          'effort?: ReasoningEffort | null,',
+          'effort?: ReasoningEffort | null | unknown,',
+        ),
+        'effort?: string | null,',
+      ),
+      'effort?: ReasoningEffort,',
+    ),
+    'effort: ReasoningEffort | null,',
+  );
+  const turnEffort = changedShape(
+    'turn-effort-nested-decoy',
+    changedShape(
+      'turn-effort-comment-decoy',
+      changedShape(
+        'turn-effort-string-decoy',
+        changedShape(
+          'turn-effort-function-decoy',
+          changedShape(
+            'turn-effort-tuple-decoy',
+            exactTurnEffort,
+            'effort?: unknown, decoy?: [effort?: ReasoningEffort | null],',
+          ),
+          'effort?: unknown, decoy?: (effort?: ReasoningEffort | null) => void,',
+        ),
+        'effort?: unknown, decoy?: "effort?: ReasoningEffort | null,",',
+      ),
+      'effort?: unknown, /* effort?: ReasoningEffort | null, */',
+    ),
+    'effort?: unknown, nested?: { effort?: ReasoningEffort | null },',
+  );
   writeFileSync(join(out, 'v2', 'TurnStartParams.ts'), [
+    shape('turn-effort-import', changedShape(
+      'turn-effort-import-path',
+      'import type { ReasoningEffort } from "../ReasoningEffort";\n',
+      'import type { ReasoningEffort } from "./ReasoningEffort";\n',
+    )),
     'export type TurnStartParams = { threadId: string,',
     shape('turn-params', 'clientUserMessageId?: string | null, input: Array<UserInput>,'),
+    shape('turn-effort', turnEffort),
     '};\n',
   ].join(''));
   writeFileSync(join(out, 'v2', 'TurnInterruptParams.ts'), 'export type TurnInterruptParams = { threadId: string, turnId: string };\n');

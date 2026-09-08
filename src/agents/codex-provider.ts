@@ -28,6 +28,7 @@ type ProviderEntry = {
   retired: boolean;
   runtime: Promise<PreparedCodexRuntime>;
   supervisor: Promise<CodexAppServerSupervisor> | null;
+  preparations: Set<Promise<unknown>>;
 };
 
 const POOL_CLOSED = 'Codex provider pool is closed.';
@@ -40,6 +41,9 @@ export class CodexProviderPool {
   readonly #createAppServerAdapter: CodexProviderPoolOptions['createAppServerAdapter'];
   readonly #entries = new Map<string, ProviderEntry>();
   readonly #retired = new WeakSet<Account>();
+  readonly #identityRetirements = new WeakMap<Account, Promise<void>>();
+  readonly #nameRetirements = new Map<string, Promise<void>>();
+  readonly #preparations = new Set<Promise<unknown>>();
   #closed = false;
   #close: Promise<void> | null = null;
 
@@ -55,7 +59,11 @@ export class CodexProviderPool {
     this.#createAppServerAdapter = options.createAppServerAdapter ?? createCodexAppServerAdapter;
   }
 
-  async limits(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {
+  limits(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {
+    return this.#trackPreparation(this.#limitsNow(account, listener));
+  }
+
+  async #limitsNow(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {
     const supervisor = await this.#supervisor(account);
     this.#assertOpen();
     this.#assertAccount(account);
@@ -63,14 +71,30 @@ export class CodexProviderPool {
     return supervisor;
   }
 
-  async prepare(
+  prepare(
+    account: Account,
+    transport: CodexTransport,
+    sessionId: string,
+  ): Promise<{ adapter: Adapter; runtimeVersion: string }> {
+    return this.#trackPreparation(this.#prepareNow(account, transport, sessionId));
+  }
+
+  async #prepareNow(
     account: Account,
     transport: CodexTransport,
     sessionId: string,
   ): Promise<{ adapter: Adapter; runtimeVersion: string }> {
     this.#assertOpen();
     this.#assertCodex(account);
-    const entry = this.#entry(account);
+    const entry = await this.#entry(account);
+    return this.#trackEntryPreparation(entry, this.#prepareEntry(entry, transport, sessionId));
+  }
+
+  async #prepareEntry(
+    entry: ProviderEntry,
+    transport: CodexTransport,
+    sessionId: string,
+  ): Promise<{ adapter: Adapter; runtimeVersion: string }> {
     const runtime = await entry.runtime;
     this.#assertEntry(entry);
     if (transport === 'sdk') {
@@ -96,18 +120,21 @@ export class CodexProviderPool {
 
   async retire(account: Account): Promise<void> {
     this.#retired.add(account);
+    const retirement = this.#identityRetirements.get(account);
+    if (retirement) return retirement;
     const entry = this.#entries.get(account.name);
     if (!entry || entry.account !== account) return;
-    entry.retired = true;
-    this.#entries.delete(account.name);
-    const supervisor = await entry.supervisor?.catch(() => null);
-    await supervisor?.close();
+    return this.#retireEntry(entry);
   }
 
   async #supervisor(account: Account): Promise<CodexAppServerSupervisor> {
     this.#assertOpen();
     this.#assertCodex(account);
-    const entry = this.#entry(account);
+    const entry = await this.#entry(account);
+    return this.#trackEntryPreparation(entry, this.#prepareSupervisor(entry));
+  }
+
+  async #prepareSupervisor(entry: ProviderEntry): Promise<CodexAppServerSupervisor> {
     const runtime = await entry.runtime;
     this.#assertEntry(entry);
     return this.#supervisorForEntry(entry, runtime);
@@ -126,24 +153,79 @@ export class CodexProviderPool {
     return supervisor;
   }
 
-  #entry(account: Account): ProviderEntry {
+  async #entry(account: Account): Promise<ProviderEntry> {
+    this.#assertOpen();
     this.#assertAccount(account);
-    const existing = this.#entries.get(account.name);
+    while (true) {
+      const existing = this.#entries.get(account.name);
+      if (existing) return existing;
+      const retirement = this.#nameRetirements.get(account.name);
+      if (retirement) {
+        await retirement;
+        if (this.#nameRetirements.get(account.name) === retirement) {
+          this.#nameRetirements.delete(account.name);
+        }
+        this.#assertOpen();
+        this.#assertAccount(account);
+        continue;
+      }
+      const entry: ProviderEntry = {
+        account,
+        retired: false,
+        runtime: Promise.resolve().then(() => {
+          this.#assertEntry(entry);
+          return this.#prepareRuntime(account);
+        }),
+        supervisor: null,
+        preparations: new Set(),
+      };
+      this.#entries.set(account.name, entry);
+      void entry.runtime.catch(() => {
+        if (this.#entries.get(account.name) === entry) this.#entries.delete(account.name);
+      });
+      return entry;
+    }
+  }
+
+  #retireEntry(entry: ProviderEntry): Promise<void> {
+    const existing = this.#identityRetirements.get(entry.account);
     if (existing) return existing;
-    const entry: ProviderEntry = {
-      account,
-      retired: false,
-      runtime: Promise.resolve().then(() => {
-        this.#assertEntry(entry);
-        return this.#prepareRuntime(account);
-      }),
-      supervisor: null,
-    };
-    this.#entries.set(account.name, entry);
-    void entry.runtime.catch(() => {
-      if (this.#entries.get(account.name) === entry) this.#entries.delete(account.name);
+    entry.retired = true;
+    const retirement = Promise.resolve().then(async () => {
+      await Promise.allSettled([entry.runtime]);
+      const supervisor = await entry.supervisor?.catch(() => null);
+      await supervisor?.close();
+      const joined = new Set<Promise<unknown>>();
+      while (true) {
+        const pending = [...entry.preparations].filter((operation) => !joined.has(operation));
+        if (pending.length === 0) return;
+        for (const operation of pending) joined.add(operation);
+        await Promise.allSettled(pending);
+      }
     });
-    return entry;
+    this.#identityRetirements.set(entry.account, retirement);
+    this.#nameRetirements.set(entry.account.name, retirement);
+    if (this.#entries.get(entry.account.name) === entry) {
+      this.#entries.delete(entry.account.name);
+    }
+    void retirement.then(() => {
+      if (this.#nameRetirements.get(entry.account.name) === retirement) {
+        this.#nameRetirements.delete(entry.account.name);
+      }
+    }, () => {});
+    return retirement;
+  }
+
+  #trackPreparation<T>(preparation: Promise<T>): Promise<T> {
+    this.#preparations.add(preparation);
+    void preparation.finally(() => this.#preparations.delete(preparation)).catch(() => {});
+    return preparation;
+  }
+
+  #trackEntryPreparation<T>(entry: ProviderEntry, preparation: Promise<T>): Promise<T> {
+    entry.preparations.add(preparation);
+    void preparation.finally(() => entry.preparations.delete(preparation)).catch(() => {});
+    return preparation;
   }
 
   #assertOpen(): void {
@@ -165,13 +247,16 @@ export class CodexProviderPool {
 
   async #closeNow(): Promise<void> {
     this.#closed = true;
-    const settled = await Promise.allSettled(
-      [...this.#entries.values()].flatMap((entry) => entry.supervisor ? [entry.supervisor] : []),
-    );
-    const supervisors = new Set<CodexAppServerSupervisor>();
-    for (const result of settled) {
-      if (result.status === 'fulfilled') supervisors.add(result.value);
+    const joined = new Set<Promise<unknown>>();
+    while (true) {
+      for (const entry of [...this.#entries.values()]) this.#retireEntry(entry);
+      const pending = [
+        ...this.#preparations,
+        ...this.#nameRetirements.values(),
+      ].filter((operation) => !joined.has(operation));
+      if (pending.length === 0) return;
+      for (const operation of pending) joined.add(operation);
+      await Promise.allSettled(pending);
     }
-    await Promise.allSettled([...supervisors].map((supervisor) => supervisor.close()));
   }
 }

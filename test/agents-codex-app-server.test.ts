@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import fs from 'node:fs';
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -1048,6 +1050,163 @@ test('stop interrupts once, marks queued prompts unsent, and settles once despit
     { type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped' },
   ]);
   assert.equal(supervisor.detached, 1);
+});
+
+test('handle quiescence waits for writer settlement and resolves once across a child-exit interrupt race', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-quiescence-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const interrupt = deferred<unknown>();
+  const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+    if (method === 'thread/start') return safeThreadResponse('thread-quiescence', (params as { cwd: string }).cwd);
+    if (method === 'turn/start') return { turn: turn('turn-quiescence', 'inProgress') };
+    if (method === 'turn/interrupt') return interrupt.promise;
+    throw new Error(`unexpected ${method}`);
+  });
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(
+    supervisor as unknown as CodexAppServerSupervisor,
+    'session-quiescence',
+    '0.145.0',
+  ).start({ cwd, prompt: prompt('hold'), promptId: 'active', env: {} }, (event) => events.push(event));
+
+  await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'active turn');
+  assert.ok(handle.quiescence, 'app-server handles expose writer quiescence');
+  let settled = 0;
+  void handle.quiescence.then(() => { settled += 1; });
+  handle.stop();
+  await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/interrupt'), 'gated interrupt');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, 0, 'interrupt dispatch alone does not prove writer quiescence');
+
+  supervisor.fatal('Codex app-server transport crashed. Retry the session manually.', 'codex_transport_crashed');
+  await handle.quiescence;
+  assert.equal(settled, 1, 'child exit proves the writer quiescent');
+  assert.deepEqual(events.filter((event) => event.type === 'stopped'), [
+    { type: 'stopped', reason: 'Stopped by user.', code: 'codex_user_stopped' },
+  ]);
+  assert.equal(supervisor.detached, 1);
+
+  interrupt.resolve({});
+  supervisor.notify('turn/completed', {
+    threadId: 'thread-quiescence', turn: turn('turn-quiescence', 'interrupted'),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, 1);
+  assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
+  assert.equal(supervisor.detached, 1);
+});
+
+test('handle quiescence joins an in-flight thread setup that may still access the worktree', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-setup-quiescence-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const setup = deferred<unknown>();
+  t.after(() => setup.resolve(safeThreadResponse('setup-thread', cwd)));
+  const supervisor = new ScriptedSupervisor(async ({ method, params }) => {
+    if (method === 'thread/start') return setup.promise;
+    if (method === 'turn/start') return { turn: turn('unexpected-turn', 'inProgress') };
+    throw new Error(`unexpected ${method}`);
+  });
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(
+    supervisor as unknown as CodexAppServerSupervisor,
+    'session-setup-quiescence',
+    '0.145.0',
+  ).start({ cwd, prompt: prompt('hold'), promptId: 'setup-prompt', env: {} }, (event) => events.push(event));
+
+  await waitFor(() => supervisor.requests.some(({ method }) => method === 'thread/start'), 'gated thread setup');
+  assert.ok(handle.quiescence);
+  let settled = false;
+  void handle.quiescence.then(() => { settled = true; });
+  handle.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'quiescence must retain setup ownership until its worktree request settles');
+
+  setup.resolve(safeThreadResponse('setup-thread', cwd));
+  await handle.quiescence;
+  assert.equal(settled, true);
+  assert.equal(supervisor.requests.some(({ method }) => method === 'turn/start'), false);
+  assert.deepEqual(events.filter((event) => event.type === 'prompt-delivery'), [
+    { type: 'prompt-delivery', id: 'setup-prompt', delivery: 'unsent' },
+  ]);
+});
+
+test('handle quiescence releases setup ownership when validation fails before a request', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-validation-quiescence-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(
+    supervisor as unknown as CodexAppServerSupervisor,
+    'session-validation-quiescence',
+    '0.145.0',
+  ).start({
+    cwd,
+    prompt: prompt('hold'),
+    promptId: 'validation-prompt',
+    env: {},
+    codexSettings: { modelReasoningEffort: 7 as unknown as string },
+  }, (event) => events.push(event));
+
+  let settled = false;
+  void handle.quiescence?.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, true, 'a pre-request setup failure must not retain worktree ownership');
+  assert.equal(supervisor.requests.length, 0);
+  assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
+});
+
+test('handle quiescence joins an in-flight image snapshot read before worktree removal', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-snapshot-quiescence-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const queuedPrompt = await imagePrompt(cwd);
+  const imagePath = await realpath(queuedPrompt.attachments[0].absolutePath);
+  const readEntered = deferred<void>();
+  const releaseRead = deferred<void>();
+  const originalOpen = fs.promises.open;
+  let gated = false;
+  (fs.promises as any).open = async (...args: any[]) => {
+    if (!gated && String(args[0]) === imagePath && typeof args[1] === 'number') {
+      gated = true;
+      readEntered.resolve();
+      await releaseRead.promise;
+    }
+    return originalOpen(...args as Parameters<typeof originalOpen>);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    releaseRead.resolve();
+    (fs.promises as any).open = originalOpen;
+    syncBuiltinESMExports();
+  });
+
+  const supervisor = new ScriptedSupervisor();
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(
+    supervisor as unknown as CodexAppServerSupervisor,
+    'session-snapshot-quiescence',
+    '0.145.0',
+  ).start({ cwd, prompt: queuedPrompt, promptId: 'snapshot-prompt', env: {} }, (event) => events.push(event));
+
+  await waitFor(
+    () => gated || supervisor.requests.some(({ method }) => method === 'turn/start'),
+    'gated snapshot read',
+  );
+  assert.equal(gated, true, 'the test must pause the production worktree read before turn dispatch');
+  assert.ok(handle.quiescence);
+  let settled = false;
+  void handle.quiescence.then(() => { settled = true; });
+  handle.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'quiescence must retain ownership while snapshotting reads the worktree');
+  assert.equal(supervisor.requests.some(({ method }) => method === 'turn/start'), false);
+
+  releaseRead.resolve();
+  await handle.quiescence;
+  assert.equal(settled, true);
+  assert.equal(supervisor.requests.some(({ method }) => method === 'turn/start'), false);
+  assert.deepEqual(events.filter((event) => event.type === 'prompt-delivery'), [
+    { type: 'prompt-delivery', id: 'snapshot-prompt', delivery: 'unsent' },
+  ]);
 });
 
 test('a rejected established interrupt retires the shared generation and every sibling route before restart', async (t) => {
