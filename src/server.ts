@@ -502,6 +502,34 @@ export function createServer(opts: {
   const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
   const handoffReservations = new Map<string, { token: symbol; phase: 'preparing' | 'committing' }>();
+  type WorktreeMutationKind = 'delete' | 'handoff' | 'merge' | 'upload';
+  type WorktreeMutationReservation = { token: symbol; sessionIds: string[]; kind: WorktreeMutationKind };
+  const worktreeMutations = new Map<string, { token: symbol; kind: WorktreeMutationKind }>();
+
+  function acquireWorktreeMutation(
+    sessionIds: string[], kind: WorktreeMutationKind,
+  ): WorktreeMutationReservation | { busy: { sessionId: string; kind: WorktreeMutationKind } } {
+    const uniqueIds = [...new Set(sessionIds)];
+    for (const sessionId of uniqueIds) {
+      const owner = worktreeMutations.get(sessionId);
+      if (owner) return { busy: { sessionId, kind: owner.kind } };
+    }
+    const token = Symbol(kind);
+    for (const sessionId of uniqueIds) worktreeMutations.set(sessionId, { token, kind });
+    return { token, sessionIds: uniqueIds, kind };
+  }
+
+  function releaseWorktreeMutation(reservation: WorktreeMutationReservation): void {
+    for (const sessionId of reservation.sessionIds) {
+      if (worktreeMutations.get(sessionId)?.token === reservation.token) {
+        worktreeMutations.delete(sessionId);
+      }
+    }
+  }
+
+  function worktreeMutationError(kind: WorktreeMutationKind): string {
+    return kind === 'delete' ? 'session deletion is in progress' : `session ${kind} is in progress`;
+  }
 
   async function prepareForSession(account: Account, session: SessionOwnership): Promise<PreparedProvider> {
     if (account.provider === 'codex' && codexPool?.prepare) {
@@ -926,6 +954,9 @@ export function createServer(opts: {
       case 'handoff': {
         const source = registry.get(String(body.id));
         if (!source) return { status: 404, json: { error: 'no such session' } };
+        if (deletingSessions.has(source.id)) {
+          return { status: 409, json: { error: 'session deletion is in progress' } };
+        }
         // The same guard merge applies, for the same reason: a running agent's
         // half-written files must not be committed underneath it.
         if (source.status === 'working' || source.status === 'needs-you') {
@@ -948,6 +979,7 @@ export function createServer(opts: {
         };
         handoffReservations.set(source.id, reservation);
         const sourceStatus = source.status;
+        let worktreeOwnership: WorktreeMutationReservation | undefined;
         const changedDuringPreparation = (): boolean => (
           handoffReservations.get(source.id) !== reservation
           || registry.get(source.id) !== source
@@ -971,9 +1003,15 @@ export function createServer(opts: {
           }
 
           // Preparation is the only long-running phase that stop/delete cancel.
-          // Once repository mutation begins, those commands reject until this
-          // synchronous admission/launch sequence completes or the operation
-          // fails, so they cannot remove either endpoint underneath the handoff.
+          // Acquire immediately before changing phase: this is the authoritative
+          // atomic admission check against delete, merge, upload, and another
+          // handoff. Once repository mutation begins, those commands reject until
+          // the successor is launched and the source is fully stopped.
+          const acquired = acquireWorktreeMutation([source.id], 'handoff');
+          if ('busy' in acquired) {
+            return { status: 409, json: { error: worktreeMutationError(acquired.busy.kind) } };
+          }
+          worktreeOwnership = acquired;
           reservation.phase = 'committing';
           try {
             await commitOutstanding(source.cwd, source.branch);
@@ -1037,6 +1075,7 @@ export function createServer(opts: {
           const handle = handles.get(source.id);
           handles.delete(source.id);
           handle?.stop();
+          await handle?.quiescence;
           // A rate-limit stop can have already queued "resume A when account
           // resets" (see the emit callback above). Left in place, that item fires
           // after handoff and relaunches A onto a branch B has already moved past,
@@ -1050,6 +1089,7 @@ export function createServer(opts: {
           }
           return { status: 200, json: { id: session.id } };
         } finally {
+          if (worktreeOwnership) releaseWorktreeMutation(worktreeOwnership);
           if (handoffReservations.get(source.id)?.token === reservation.token) {
             handoffReservations.delete(source.id);
           }
@@ -1244,9 +1284,21 @@ export function createServer(opts: {
         if (busy) {
           return { status: 409, json: { error: `"${busy.branch}" is still running — stop it or wait before merging` } };
         }
-        const result = await mergeWorktrees(sel.repo, sel.sessions.map((s) => ({ cwd: s.cwd, branch: s.branch })));
-        if (!result.ok) return { status: 409, json: { error: result.error, merged: result.merged } };
-        return { status: 200, json: result };
+        const changed = sel.sessions.find((session) => registry.get(session.id) !== session);
+        if (changed) {
+          return { status: 409, json: { error: `session changed before merging "${changed.branch}"` } };
+        }
+        const ownership = acquireWorktreeMutation(sel.sessions.map((session) => session.id), 'merge');
+        if ('busy' in ownership) {
+          return { status: 409, json: { error: worktreeMutationError(ownership.busy.kind) } };
+        }
+        try {
+          const result = await mergeWorktrees(sel.repo, sel.sessions.map((s) => ({ cwd: s.cwd, branch: s.branch })));
+          if (!result.ok) return { status: 409, json: { error: result.error, merged: result.merged } };
+          return { status: 200, json: result };
+        } finally {
+          releaseWorktreeMutation(ownership);
+        }
       }
 
       case 'push': {
@@ -1262,9 +1314,9 @@ export function createServer(opts: {
         if (deletingSessions.has(sessionId)) {
           return { status: 409, json: { error: 'session deletion is already in progress' } };
         }
-        const handoff = handoffReservations.get(sessionId);
-        if (handoff?.phase === 'committing') {
-          return { status: 409, json: { error: 'session handoff is committing' } };
+        const ownership = acquireWorktreeMutation([sessionId], 'delete');
+        if ('busy' in ownership) {
+          return { status: 409, json: { error: worktreeMutationError(ownership.busy.kind) } };
         }
         deletingSessions.add(sessionId);
         try {
@@ -1293,6 +1345,7 @@ export function createServer(opts: {
           return { status: 200, json: { ok: true } };
         } finally {
           deletingSessions.delete(sessionId);
+          releaseWorktreeMutation(ownership);
         }
       }
 
@@ -1714,7 +1767,8 @@ export function createServer(opts: {
           res.end(JSON.stringify({ error: 'cross-origin request blocked' }));
           return;
         }
-        const session = registry.get(url.searchParams.get('id') ?? '');
+        const sessionId = url.searchParams.get('id') ?? '';
+        const session = registry.get(sessionId);
         // No session means no worktree to write into — there is no sane default
         // target for the bytes, so this is a 404 rather than a guess.
         if (!session) {
@@ -1748,32 +1802,47 @@ export function createServer(opts: {
           }
           chunks.push(c as Buffer);
         }
-        // Preserve the explicit rejection for a tracked legacy uploads symlink,
-        // but do not write through that mutable directory at all. The contained
-        // writer creates an unpredictable direct child of the worktree root and
-        // binds all bytes to its already-opened file handle.
-        const uploadsDir = join(session.cwd, 'uploads');
-        if ((await lstat(uploadsDir).catch(() => null))?.isSymbolicLink()) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
+        if (registry.get(sessionId) !== session) {
+          res.writeHead(409, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'session changed while upload was streaming' }));
           return;
         }
-        let storedPath: string;
+        const ownership = acquireWorktreeMutation([sessionId], 'upload');
+        if ('busy' in ownership) {
+          res.writeHead(409, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: worktreeMutationError(ownership.busy.kind) }));
+          return;
+        }
         try {
-          storedPath = await writeContainedUpload(
-            session.cwd, name, Buffer.concat(chunks),
-            { ...(beforeUploadRootPin ? { beforeRootPin: beforeUploadRootPin } : {}),
-              ...(beforeUploadWrite ? { beforeWrite: beforeUploadWrite } : {}) },
-          );
-        } catch (error) {
-          const changed = error instanceof UploadChangedError;
-          res.writeHead(changed ? 409 : 400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: changed ? error.message : 'could not store upload' }));
+          // Preserve the explicit rejection for a tracked legacy uploads symlink,
+          // but do not write through that mutable directory at all. The contained
+          // writer creates an unpredictable direct child of the worktree root and
+          // binds all bytes to its already-opened file handle.
+          const uploadsDir = join(session.cwd, 'uploads');
+          if ((await lstat(uploadsDir).catch(() => null))?.isSymbolicLink()) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'refusing to follow symlink' }));
+            return;
+          }
+          let storedPath: string;
+          try {
+            storedPath = await writeContainedUpload(
+              session.cwd, name, Buffer.concat(chunks),
+              { ...(beforeUploadRootPin ? { beforeRootPin: beforeUploadRootPin } : {}),
+                ...(beforeUploadWrite ? { beforeWrite: beforeUploadWrite } : {}) },
+            );
+          } catch (error) {
+            const changed = error instanceof UploadChangedError;
+            res.writeHead(changed ? 409 : 400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: changed ? error.message : 'could not store upload' }));
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ path: storedPath }));
           return;
+        } finally {
+          releaseWorktreeMutation(ownership);
         }
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ path: storedPath }));
-        return;
       }
 
       const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);

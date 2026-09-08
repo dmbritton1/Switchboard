@@ -2074,6 +2074,81 @@ test('active app-server delete retains ownership and worktree until bounded quie
   }
 });
 
+test('pending app-server delete rejects handoff before preparation or Git mutation', async (t) => {
+  let releaseQuiescence!: () => void;
+  const quiescence = new Promise<void>((resolve) => { releaseQuiescence = resolve; });
+  let preparations = 0;
+  let starts = 0;
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      starts += 1;
+      return {
+        send() {},
+        decide() {},
+        setAuto() {},
+        stop() { emit({ type: 'stopped', reason: 'stopped while provider work drains' }); },
+        quiescence,
+      };
+    },
+  };
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() {
+      preparations += 1;
+      return { adapter, runtimeVersion: '0.145.0' };
+    },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+  const created = await fixture.create('pending-delete-handoff');
+  const source = fixture.registry.get(created.id)!;
+  await writeFile(join(source.cwd, 'must-stay-dirty.txt'), 'not committed\n');
+
+  let deletionSettled = false;
+  const deletion = fixture.command({ cmd: 'delete', id: source.id, removeWorktree: true })
+    .finally(() => { deletionSettled = true; });
+  t.after(() => releaseQuiescence());
+  await fixture.waitForSession(source.id, (session) => session.status === 'stopped');
+
+  try {
+    assert.equal(deletionSettled, false, 'delete remains pending while provider work drains');
+    const handoff = await fixture.command({
+      cmd: 'handoff', id: source.id, account: 'codex', branch: 'pending-delete-successor',
+    });
+
+    assert.equal(handoff.status, 409);
+    assert.match(handoff.data.error, /deletion is in progress/i);
+    const merge = await fixture.command({ cmd: 'merge', ids: [source.id] });
+    assert.equal(merge.status, 409);
+    assert.match(merge.data.error, /deletion is in progress/i);
+    const upload = await fetch(`${fixture.base}/upload?id=${source.id}&name=pending-delete.txt`, {
+      method: 'POST', body: 'must not be written',
+    });
+    assert.equal(upload.status, 409);
+    assert.match((await upload.json()).error, /deletion is in progress/i);
+    assert.equal(preparations, 1, 'handoff is rejected before provider preparation');
+    assert.equal(starts, 1, 'handoff never starts a successor adapter');
+    assert.deepEqual(fixture.registry.all().map((session) => session.id), [source.id]);
+    assert.match(
+      (await run('git', ['status', '--porcelain'], { cwd: source.cwd })).stdout,
+      /must-stay-dirty\.txt/,
+      'handoff never commits the source worktree',
+    );
+    assert.equal(
+      (await run('git', ['branch', '--list', 'pending-delete-successor'], { cwd: fixture.repo })).stdout,
+      '',
+      'handoff never creates the successor branch',
+    );
+    assert.deepEqual(
+      (await readdir(source.cwd)).filter((name) => name.includes('pending-delete.txt')),
+      [],
+      'upload never writes into a worktree owned by delete',
+    );
+  } finally {
+    releaseQuiescence();
+    await deletion;
+  }
+});
+
 test('POST /command delete removes the session', async (t) => {
   const { base, registry } = await boot(t);
   const s = registry.create({
@@ -2099,6 +2174,38 @@ async function makeRepo(): Promise<string> {
   await run('git', ['add', '.'], { cwd: dir });
   await run('git', ['commit', '-m', 'init'], { cwd: dir });
   return dir;
+}
+
+async function installCommitGate(
+  t: { after: (fn: () => void | Promise<void>) => void }, cwd: string,
+): Promise<{ entered: Promise<void>; release: () => Promise<void> }> {
+  const hooks = (await run('git', ['rev-parse', '--git-path', 'hooks'], { cwd })).stdout.trim();
+  await mkdir(hooks, { recursive: true });
+  const enteredPath = join(hooks, 'switchboard-test-commit-entered');
+  const releasePath = join(hooks, 'switchboard-test-commit-release');
+  const hook = join(hooks, 'pre-commit');
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    await writeFile(releasePath, 'release\n');
+  };
+  t.after(release);
+  await writeFile(hook, `#!/usr/bin/env node
+const { closeSync, existsSync, openSync } = require('node:fs');
+closeSync(openSync(${JSON.stringify(enteredPath)}, 'w'));
+const gate = new Int32Array(new SharedArrayBuffer(4));
+const deadline = Date.now() + 5000;
+while (!existsSync(${JSON.stringify(releasePath)})) {
+  if (Date.now() >= deadline) process.exit(1);
+  Atomics.wait(gate, 0, 0, 10);
+}
+`);
+  await chmod(hook, 0o755);
+  return {
+    entered: waitFor(() => stat(enteredPath).then(() => true, () => false), 5_000),
+    release,
+  };
 }
 
 test('POST /command merge rejects worktrees selected from two different repos', async (t) => {
@@ -2138,6 +2245,63 @@ test('POST /command merge rejects a session that is still working', async (t) =>
 
   assert.equal(res.status, 409);
   assert.match((await res.json()).error, /still running/i);
+});
+
+test('an in-flight merge owns every selected worktree until its exact reservation is released', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter);
+  const cwdA = await createWorktree(repo, 'merge-owner-a');
+  const cwdB = await createWorktree(repo, 'merge-owner-b');
+  await writeFile(join(cwdA, 'merge-owner.txt'), 'pending merge\n');
+  const a = registry.create({
+    provider: 'claude', account: 'claude-main', repo, cwd: cwdA, branch: 'merge-owner-a', title: 'a',
+  });
+  const b = registry.create({
+    provider: 'claude', account: 'claude-main', repo, cwd: cwdB, branch: 'merge-owner-b', title: 'b',
+  });
+  registry.apply(a.id, { type: 'stopped', reason: 'ready to merge' });
+  registry.apply(b.id, { type: 'stopped', reason: 'ready to merge' });
+  const gate = await installCommitGate(t, cwdA);
+  const post = async (body: Record<string, unknown>) => {
+    const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
+    return { status: response.status, data: await response.json() as any };
+  };
+
+  const merging = post({ cmd: 'merge', ids: [a.id, b.id] });
+  await gate.entered;
+  try {
+    for (const [session, removeWorktree] of [[a, false], [b, true]] as const) {
+      const deletion = await post({ cmd: 'delete', id: session.id, removeWorktree });
+      assert.equal(deletion.status, 409);
+      assert.match(deletion.data.error, /merge.*in progress|worktree mutation.*in progress/i);
+      assert.equal(registry.get(session.id), session, 'rejected delete retains every selected session');
+      assert.equal(await stat(session.cwd).then(() => true, () => false), true);
+    }
+    const handoff = await post({
+      cmd: 'handoff', id: a.id, account: 'codex', branch: 'merge-owner-successor',
+    });
+    assert.equal(handoff.status, 409);
+    assert.match(handoff.data.error, /merge.*in progress|worktree mutation.*in progress/i);
+
+    const upload = await fetch(`${base}/upload?id=${b.id}&name=merge-owned.txt`, {
+      method: 'POST', body: 'must not write',
+    });
+    assert.equal(upload.status, 409);
+    assert.match((await upload.json()).error, /merge.*in progress|worktree mutation.*in progress/i);
+
+    const duplicateMerge = await post({ cmd: 'merge', ids: [b.id, b.id] });
+    assert.equal(duplicateMerge.status, 409);
+    assert.match(duplicateMerge.data.error, /merge.*in progress|worktree mutation.*in progress/i);
+  } finally {
+    await gate.release();
+  }
+
+  const merged = await merging;
+  assert.equal(merged.status, 200);
+  const laterDelete = await post({ cmd: 'delete', id: b.id, removeWorktree: false });
+  assert.equal(laterDelete.status, 200, 'release permits a later worktree mutation');
 });
 
 test('POST /command push rejects worktrees selected from two different repos', async (t) => {
@@ -2202,6 +2366,91 @@ test('handoff branches from the source, writes the transcript, and stops the sou
 
   assert.equal(starts.length, 2, 'the source and the successor should each have started once');
   assert.equal(starts[1].prompt.text, HANDOFF_PROMPT);
+});
+
+test('handoff commit owns its source worktree until the exact reservation is released', async (t) => {
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  let markSourceStopEntered!: () => void;
+  let releaseSourceStop!: () => void;
+  const sourceStopEntered = new Promise<void>((resolve) => { markSourceStopEntered = resolve; });
+  const sourceQuiescence = new Promise<void>((resolve) => { releaseSourceStop = resolve; });
+  t.after(() => releaseSourceStop());
+  const { adapter: baseAdapter } = fakeAdapter();
+  let starts = 0;
+  const adapter: Adapter = {
+    start(opts, emit) {
+      starts += 1;
+      const handle = baseAdapter.start(opts, emit);
+      if (starts !== 1) return handle;
+      return {
+        ...handle,
+        stop() {
+          handle.stop();
+          markSourceStopEntered();
+        },
+        quiescence: sourceQuiescence,
+      };
+    },
+  };
+  const { base, registry } = await boot(t, adapter);
+  const post = async (body: Record<string, unknown>) => {
+    const response = await fetch(`${base}/command`, { method: 'POST', body: JSON.stringify(body) });
+    return { status: response.status, data: await response.json() as any };
+  };
+  const created = await post({
+    cmd: 'create', repo, branch: 'handoff-owner', account: 'claude-main', prompt: 'own the commit',
+  });
+  assert.equal(created.status, 200);
+  const source = registry.get(created.data.id)!;
+  registry.apply(source.id, { type: 'status', status: 'done' });
+  await writeFile(join(source.cwd, 'handoff-owner.txt'), 'pending handoff\n');
+  const gate = await installCommitGate(t, source.cwd);
+
+  let handoffSettled = false;
+  const handingOff = post({
+    cmd: 'handoff', id: source.id, account: 'codex', branch: 'handoff-owner-successor',
+  }).finally(() => { handoffSettled = true; });
+  await gate.entered;
+  try {
+    const upload = await fetch(`${base}/upload?id=${source.id}&name=handoff-owned.txt`, {
+      method: 'POST', body: 'must not write',
+    });
+    assert.equal(upload.status, 409);
+    assert.match((await upload.json()).error, /handoff.*in progress|worktree mutation.*in progress/i);
+
+    const merge = await post({ cmd: 'merge', ids: [source.id] });
+    assert.equal(merge.status, 409);
+    assert.match(merge.data.error, /handoff.*in progress|worktree mutation.*in progress/i);
+
+    for (const removeWorktree of [false, true]) {
+      const deletion = await post({ cmd: 'delete', id: source.id, removeWorktree });
+      assert.equal(deletion.status, 409);
+      assert.match(deletion.data.error, /handoff.*committing|handoff.*in progress/i);
+      assert.equal(registry.get(source.id), source);
+      assert.equal(await stat(source.cwd).then(() => true, () => false), true);
+    }
+
+    const duplicateHandoff = await post({
+      cmd: 'handoff', id: source.id, account: 'codex', branch: 'handoff-owner-duplicate',
+    });
+    assert.equal(duplicateHandoff.status, 409);
+  } finally {
+    await gate.release();
+  }
+
+  await sourceStopEntered;
+  assert.equal(handoffSettled, false, 'handoff retains ownership through asynchronous source stop');
+  const deleteWhileStopping = await post({ cmd: 'delete', id: source.id, removeWorktree: true });
+  assert.equal(deleteWhileStopping.status, 409);
+  assert.match(deleteWhileStopping.data.error, /handoff.*in progress/i);
+  releaseSourceStop();
+  const handoff = await handingOff;
+  assert.equal(handoff.status, 200);
+  const laterUpload = await fetch(`${base}/upload?id=${source.id}&name=after-handoff.txt`, {
+    method: 'POST', body: 'allowed after release',
+  });
+  assert.equal(laterUpload.status, 200, 'release permits a later upload');
 });
 
 test('handoff refuses a working source and creates nothing', async (t) => {
@@ -2414,6 +2663,62 @@ test('POST /upload writes the file into the session worktree', async (t) => {
   const body = await res.json() as { path: string };
   assert.match(body.path, /^\.switchboard-upload-[0-9a-f]{32}-notes\.txt$/);
   assert.equal(await readFile(join(wt, body.path), 'utf8'), 'hello file');
+});
+
+test('an in-flight upload rejects delete until its exact worktree ownership is released', async (t) => {
+  let markWriteEntered!: () => void;
+  let releaseWrite!: () => void;
+  const writeEntered = new Promise<void>((resolve) => { markWriteEntered = resolve; });
+  const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const { adapter } = fakeAdapter();
+  const { base, registry } = await boot(t, adapter, {
+    beforeUploadWrite: async () => { markWriteEntered(); await writeGate; },
+  });
+  const repo = await makeRepo();
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  t.after(() => releaseWrite());
+  const cwd = await createWorktree(repo, 'upload-owner');
+  const session = registry.create({
+    provider: 'claude', account: 'claude-main', repo, cwd, branch: 'upload-owner', title: 'upload-owner',
+  });
+  registry.apply(session.id, { type: 'stopped', reason: 'ready for upload' });
+
+  const upload = fetch(`${base}/upload?id=${session.id}&name=owned.txt`, {
+    method: 'POST', body: 'owned bytes',
+  });
+  await writeEntered;
+  try {
+    const handoff = await fetch(`${base}/command`, {
+      method: 'POST', body: JSON.stringify({
+        cmd: 'handoff', id: session.id, account: 'codex', branch: 'upload-owner-successor',
+      }),
+    });
+    assert.equal(handoff.status, 409);
+    assert.match((await handoff.json()).error, /upload.*in progress|worktree mutation.*in progress/i);
+    const merge = await fetch(`${base}/command`, {
+      method: 'POST', body: JSON.stringify({ cmd: 'merge', ids: [session.id] }),
+    });
+    assert.equal(merge.status, 409);
+    assert.match((await merge.json()).error, /upload.*in progress|worktree mutation.*in progress/i);
+    const deletion = await fetch(`${base}/command`, {
+      method: 'POST', body: JSON.stringify({ cmd: 'delete', id: session.id, removeWorktree: false }),
+    });
+    assert.equal(deletion.status, 409);
+    assert.match((await deletion.json()).error, /upload.*in progress|worktree mutation.*in progress/i);
+    assert.equal(registry.get(session.id), session, 'rejected delete retains the exact session identity');
+  } finally {
+    releaseWrite();
+  }
+
+  const uploadResponse = await upload;
+  assert.equal(uploadResponse.status, 200);
+  const stored = await uploadResponse.json() as { path: string };
+  assert.equal(await readFile(join(cwd, stored.path), 'utf8'), 'owned bytes');
+
+  const laterDelete = await fetch(`${base}/command`, {
+    method: 'POST', body: JSON.stringify({ cmd: 'delete', id: session.id, removeWorktree: false }),
+  });
+  assert.equal(laterDelete.status, 200, 'release permits a later delete');
 });
 
 test('POST /upload rejects a filename that escapes the worktree', async (t) => {
