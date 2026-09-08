@@ -502,7 +502,7 @@ export function createServer(opts: {
   const lineage = new Set<string>();
   const resumeReservations = new Map<string, symbol>();
   const handoffReservations = new Map<string, { token: symbol; phase: 'preparing' | 'committing' }>();
-  type WorktreeMutationKind = 'delete' | 'handoff' | 'merge' | 'upload';
+  type WorktreeMutationKind = 'delete' | 'handoff' | 'merge' | 'upload' | 'stop';
   type WorktreeMutationReservation = { token: symbol; sessionIds: string[]; kind: WorktreeMutationKind };
   const worktreeMutations = new Map<string, { token: symbol; kind: WorktreeMutationKind }>();
 
@@ -957,6 +957,10 @@ export function createServer(opts: {
         if (deletingSessions.has(source.id)) {
           return { status: 409, json: { error: 'session deletion is in progress' } };
         }
+        const sourceMutation = worktreeMutations.get(source.id);
+        if (sourceMutation) {
+          return { status: 409, json: { error: worktreeMutationError(sourceMutation.kind) } };
+        }
         // The same guard merge applies, for the same reason: a running agent's
         // half-written files must not be committed underneath it.
         if (source.status === 'working' || source.status === 'needs-you') {
@@ -1166,6 +1170,35 @@ export function createServer(opts: {
         if (handoff?.phase === 'committing') {
           return { status: 409, json: { error: 'session handoff is committing' } };
         }
+        const currentMutation = worktreeMutations.get(sessionId);
+        if (currentMutation) {
+          // A repeated stop is idempotent, but must leave the first stop's exact
+          // writer token in place. Every other owner is already mutating the
+          // worktree and cannot safely be cancelled or replaced here.
+          if (currentMutation.kind === 'stop') {
+            return { status: 200, json: { ok: true } };
+          }
+          return { status: 409, json: { error: worktreeMutationError(currentMutation.kind) } };
+        }
+        // Capture and reserve before any reservation, Registry, or handle
+        // mutation. App-server stop is terminal from the UI's perspective
+        // before setup/snapshot/interrupt work necessarily releases its writer.
+        const handle = handles.get(sessionId);
+        const quiescence = handle?.quiescence;
+        if (quiescence) {
+          const acquired = acquireWorktreeMutation([sessionId], 'stop');
+          if ('busy' in acquired) {
+            return { status: 409, json: { error: worktreeMutationError(acquired.busy.kind) } };
+          }
+          // Register both settlement branches before stop(): a defensive test
+          // handle may reject synchronously, despite AgentHandle's non-rejecting
+          // contract. Exact-token release prevents a stale completion from
+          // removing any later owner.
+          void quiescence.then(
+            () => releaseWorktreeMutation(acquired),
+            () => releaseWorktreeMutation(acquired),
+          );
+        }
         handoffReservations.delete(sessionId);
         resumeReservations.delete(sessionId);
         if (createReservations.delete(sessionId)) {
@@ -1177,9 +1210,14 @@ export function createServer(opts: {
           });
         }
         // Delete first, then stop — see the emit callback in launch().
-        const handle = handles.get(sessionId);
-        handles.delete(sessionId);
-        handle?.stop();
+        if (handles.get(sessionId) === handle) handles.delete(sessionId);
+        try {
+          handle?.stop();
+        } catch {
+          // The retained quiescence owns safety even when a provider violates
+          // stop()'s void/no-throw contract. Normal Stop remains idempotent and
+          // the settlement handler above cannot become an unhandled rejection.
+        }
         return { status: 200, json: { ok: true } };
       }
 
@@ -1187,6 +1225,10 @@ export function createServer(opts: {
         const sessionId = String(body.id);
         if (deletingSessions.has(sessionId)) {
           return { status: 409, json: { error: 'session deletion is in progress' } };
+        }
+        const mutation = worktreeMutations.get(sessionId);
+        if (mutation) {
+          return { status: 409, json: { error: worktreeMutationError(mutation.kind) } };
         }
         const session = registry.get(sessionId);
         if (!session) return { status: 404, json: { error: 'no such session' } };

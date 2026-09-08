@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
 import {
   access, chmod, mkdir, mkdtemp, writeFile, readdir, realpath, rename, rm, readFile, stat, symlink,
 } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
@@ -1942,6 +1944,363 @@ test('an unresolved app-server stop serializes immediate resume and releases a l
   }
 });
 
+test('stop retains production app-server setup ownership before deleting its worktree', async (t) => {
+  let markSetupEntered!: () => void;
+  const setupEntered = new Promise<void>((resolve) => { markSetupEntered = resolve; });
+  let releaseSetup!: () => void;
+  const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
+  let preparations = 0;
+  let turnStarts = 0;
+  let removals = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    verifyContract: async () => {},
+    clientFactory: () => ({
+      request: async <T>(method: string, params?: unknown): Promise<T> => {
+        if (method === 'initialize') return { initialized: true } as T;
+        if (method === 'account/read') {
+          return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+        }
+        if (method === 'account/rateLimits/read') {
+          return { rateLimits: { limitId: null, limitName: null,
+            primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+            credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+          rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+        }
+        if (method === 'thread/start') {
+          markSetupEntered();
+          await setupGate;
+          const { cwd } = params as { cwd: string };
+          return { thread: { id: 'stopped-setup-thread', cwd }, cwd, approvalPolicy: 'never',
+            sandbox: { type: 'workspaceWrite' } } as T;
+        }
+        if (method === 'turn/start') {
+          turnStarts += 1;
+          return { turn: { id: 'must-not-start', status: 'inProgress' } } as T;
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+      notify: () => {},
+      respondError: () => {},
+      close: async () => {},
+    }),
+  });
+  t.after(() => releaseSetup());
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare(_account, transport, sessionId) {
+      preparations += 1;
+      assert.equal(transport, 'app-server');
+      await supervisor.ensureTurnTransport();
+      return {
+        runtimeVersion: '0.145.0',
+        adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0'),
+      };
+    },
+    close: () => supervisor.close(),
+  };
+  const fixture = await bootCodex(t, {
+    codexTransport: 'app-server', codexPool: pool,
+    beforeWorktreeRemoval: async () => { removals += 1; },
+  });
+  const created = await fixture.create('stopped-setup-delete');
+  const session = fixture.registry.get(created.id)!;
+  await setupEntered;
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: session.id })).status, 200);
+  assert.equal((await fixture.command({ cmd: 'stop', id: session.id })).status, 200, 'duplicate stop is idempotent');
+  const blocked = await fixture.command({ cmd: 'delete', id: session.id, removeWorktree: true });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.error, /stop.*in progress/i);
+  assert.equal(fixture.registry.get(session.id), session);
+  assert.equal(await stat(session.cwd).then(() => true, () => false), true);
+  assert.equal(removals, 0);
+  assert.equal(preparations, 1);
+  assert.equal(turnStarts, 0);
+
+  releaseSetup();
+  await new Promise((resolve) => setImmediate(resolve));
+  const deleted = await fixture.command({ cmd: 'delete', id: session.id, removeWorktree: true });
+  assert.equal(deleted.status, 200, 'settled setup releases the stop owner');
+  assert.equal(fixture.registry.get(session.id), undefined);
+  assert.equal(await stat(session.cwd).then(() => true, () => false), false);
+  assert.equal(removals, 1);
+});
+
+test('stop retains production image-snapshot ownership before starting a handoff', async (t) => {
+  let releaseRead!: () => void;
+  const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+  const originalOpen = fs.promises.open;
+  let gated = false;
+  (fs.promises as any).open = async (...args: any[]) => {
+    if (!gated && String(args[0]).endsWith('/image.png') && typeof args[1] === 'number') {
+      gated = true;
+      await readGate;
+    }
+    return originalOpen(...args as Parameters<typeof originalOpen>);
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    releaseRead();
+    (fs.promises as any).open = originalOpen;
+    syncBuiltinESMExports();
+  });
+
+  let preparations = 0;
+  let turnStarts = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    verifyContract: async () => {},
+    clientFactory: () => ({
+      request: async <T>(method: string, params?: unknown): Promise<T> => {
+        if (method === 'initialize') return { initialized: true } as T;
+        if (method === 'account/read') {
+          return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true } as T;
+        }
+        if (method === 'account/rateLimits/read') {
+          return { rateLimits: { limitId: null, limitName: null,
+            primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 2_000_000_000 }, secondary: null,
+            credits: null, individualLimit: null, spendControlReached: false, planType: 'pro', rateLimitReachedType: null },
+          rateLimitsByLimitId: null, rateLimitResetCredits: null } as T;
+        }
+        if (method === 'thread/start') {
+          const { cwd } = params as { cwd: string };
+          return { thread: { id: `snapshot-thread-${preparations}`, cwd }, cwd, approvalPolicy: 'never',
+            sandbox: { type: 'workspaceWrite' } } as T;
+        }
+        if (method === 'turn/start') {
+          turnStarts += 1;
+          return { turn: { id: `snapshot-turn-${turnStarts}`, status: 'inProgress' } } as T;
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+      notify: () => {},
+      respondError: () => {},
+      close: async () => {},
+    }),
+  });
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare(_account, transport, sessionId) {
+      preparations += 1;
+      assert.equal(transport, 'app-server');
+      await supervisor.ensureTurnTransport();
+      const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0');
+      return {
+        runtimeVersion: '0.145.0',
+        adapter: {
+          start(opts, emit) {
+            return real.start({
+              ...opts,
+              prompt: { text: opts.prompt.text, attachments: [{
+                name: 'image.png', relativePath: 'image.png', absolutePath: join(opts.cwd, 'image.png'), kind: 'image',
+              }] },
+            }, emit);
+          },
+        },
+      };
+    },
+    close: () => supervisor.close(),
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+  await writeFile(join(fixture.repo, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  await run('git', ['add', 'image.png'], { cwd: fixture.repo });
+  await run('git', ['commit', '-m', 'add image fixture'], { cwd: fixture.repo });
+  const created = await fixture.create('snapshot-stop-source');
+  const source = fixture.registry.get(created.id)!;
+  await waitFor(() => gated, 5_000);
+  assert.equal(gated, true, 'the test pauses the production snapshot read before turn dispatch');
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200);
+  let handoffSettled = false;
+  const blockedRequest = fixture.command({
+    cmd: 'handoff', id: source.id, account: 'codex', branch: 'blocked-snapshot-handoff',
+  }).finally(() => { handoffSettled = true; });
+  try {
+    await waitFor(
+      () => handoffSettled || preparations > 1,
+      5_000,
+    );
+  } finally {
+    // Release before asserting so the committed RED implementation cannot leave
+    // teardown waiting behind the intentionally exposed writer race.
+    releaseRead();
+  }
+  const blocked = await blockedRequest;
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.error, /stop.*in progress/i);
+  assert.equal(preparations, 1, 'handoff is rejected before successor preparation');
+  assert.equal(turnStarts, 0, 'the stopped snapshot never reaches turn/start');
+  assert.equal((await run('git', ['branch', '--list', 'blocked-snapshot-handoff'], { cwd: fixture.repo })).stdout, '');
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const later = await fixture.command({
+    cmd: 'handoff', id: source.id, account: 'codex', branch: 'released-snapshot-handoff',
+  });
+  assert.equal(later.status, 200, 'snapshot settlement releases the retained stop owner');
+  assert.equal(preparations, 2);
+});
+
+test('stopped writer ownership blocks handoff, merge, upload, and resume before side effects', async (t) => {
+  for (const operation of ['handoff', 'merge-upload', 'resume'] as const) {
+    await t.test(operation, async (t) => {
+      let rejectQuiescence!: (error: Error) => void;
+      const quiescence = new Promise<void>((_resolve, reject) => { rejectQuiescence = reject; });
+      let starts = 0;
+      let stops = 0;
+      const adapter: Adapter = {
+        start(_opts, emit) {
+          starts += 1;
+          return {
+            send() {}, decide() {}, setAuto() {},
+            stop() {
+              stops += 1;
+              emit({ type: 'stopped', reason: 'stopped while writer drains' });
+              if (stops === 1) throw new Error('synthetic stop throw');
+            },
+            ...(starts === 1 ? { quiescence } : {}),
+          };
+        },
+      };
+      let preparations = 0;
+      const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+        async prepare() {
+          preparations += 1;
+          return { adapter, runtimeVersion: '0.145.0' };
+        },
+        async close() {},
+      };
+      const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+      const created = await fixture.create(`stopped-owner-${operation}`);
+      const source = fixture.registry.get(created.id)!;
+      await writeFile(join(source.cwd, 'still-owned.txt'), 'pending writer\n');
+
+      const stopped = await fixture.command({ cmd: 'stop', id: source.id });
+      assert.equal(stopped.status, 200, 'a defensive stop throw does not leak command failure');
+      assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200);
+      assert.equal(stops, 1, 'duplicate stop does not invoke the detached handle again');
+      assert.equal(fixture.registry.get(source.id)?.status, 'stopped');
+
+      if (operation === 'handoff') {
+        const blocked = await fixture.command({
+          cmd: 'handoff', id: source.id, account: 'codex', branch: 'blocked-stop-handoff',
+        });
+        assert.equal(blocked.status, 409);
+        assert.match(blocked.data.error, /stop.*in progress/i);
+        assert.equal(preparations, 1, 'handoff is rejected before successor preparation');
+        assert.equal(starts, 1);
+        assert.match((await run('git', ['status', '--porcelain'], { cwd: source.cwd })).stdout, /still-owned\.txt/);
+        assert.equal((await run('git', ['branch', '--list', 'blocked-stop-handoff'], { cwd: fixture.repo })).stdout, '');
+      } else if (operation === 'merge-upload') {
+        const merged = await fixture.command({ cmd: 'merge', ids: [source.id] });
+        assert.equal(merged.status, 409);
+        assert.match(merged.data.error, /stop.*in progress/i);
+        const uploaded = await fetch(`${fixture.base}/upload?id=${source.id}&name=blocked-stop-upload.txt`, {
+          method: 'POST', body: 'must not write',
+        });
+        assert.equal(uploaded.status, 409);
+        assert.match((await uploaded.json()).error, /stop.*in progress/i);
+        assert.match((await run('git', ['status', '--porcelain'], { cwd: source.cwd })).stdout, /still-owned\.txt/);
+        assert.deepEqual((await readdir(source.cwd)).filter((name) => name.includes('blocked-stop-upload')), []);
+      } else {
+        const resumed = await fixture.command({ cmd: 'resume', id: source.id, prompt: 'must not launch' });
+        assert.equal(resumed.status, 409);
+        assert.match(resumed.data.error, /stop.*in progress/i);
+        assert.equal(preparations, 1, 'resume fails before provider preparation');
+        assert.equal(starts, 1);
+      }
+
+      rejectQuiescence(new Error('synthetic quiescence rejection'));
+      await new Promise((resolve) => setImmediate(resolve));
+      if (operation === 'handoff') {
+        const later = await fixture.command({
+          cmd: 'handoff', id: source.id, account: 'codex', branch: 'released-stop-handoff',
+        });
+        assert.equal(later.status, 200);
+        assert.equal(preparations, 2);
+        assert.equal(starts, 2);
+      } else if (operation === 'merge-upload') {
+        const laterUpload = await fetch(`${fixture.base}/upload?id=${source.id}&name=released-stop-upload.txt`, {
+          method: 'POST', body: 'released',
+        });
+        assert.equal(laterUpload.status, 200);
+        const laterMerge = await fixture.command({ cmd: 'merge', ids: [source.id] });
+        assert.equal(laterMerge.status, 200);
+      } else {
+        const later = await fixture.command({ cmd: 'resume', id: source.id, prompt: 'released' });
+        assert.equal(later.status, 200);
+        assert.equal(preparations, 2);
+        assert.equal(starts, 2);
+      }
+    });
+  }
+});
+
+test('an already-settled stop owner preserves immediate stopped-session behavior', async (t) => {
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      return {
+        send() {}, decide() {}, setAuto() {},
+        stop() { emit({ type: 'stopped', reason: 'settled stop' }); },
+        quiescence: Promise.resolve(),
+      };
+    },
+  };
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+  const created = await fixture.create('settled-stop-owner');
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: created.id })).status, 200);
+  const handoff = await fixture.command({
+    cmd: 'handoff', id: created.id, account: 'codex', branch: 'settled-stop-successor',
+  });
+  assert.equal(handoff.status, 200, 'settled quiescence must not add a visible stop delay');
+});
+
+test('a stale stop settlement callback cannot release a newer worktree owner', async (t) => {
+  let settleStop!: () => void;
+  const replayableQuiescence = {
+    then(onFulfilled: () => void) {
+      settleStop = onFulfilled;
+      return Promise.resolve();
+    },
+  } as unknown as Promise<void>;
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      return {
+        send() {}, decide() {}, setAuto() {},
+        stop() { emit({ type: 'stopped', reason: 'stale settlement probe' }); },
+        quiescence: replayableQuiescence,
+      };
+    },
+  };
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
+  const created = await fixture.create('stale-stop-token');
+  const source = fixture.registry.get(created.id)!;
+  await writeFile(join(source.cwd, 'stale-owner.txt'), 'pending merge\n');
+  const gate = await installCommitGate(t, source.cwd);
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200);
+  settleStop();
+  const merging = fixture.command({ cmd: 'merge', ids: [source.id] });
+  await gate.entered;
+  try {
+    settleStop();
+    const blocked = await fixture.command({ cmd: 'delete', id: source.id, removeWorktree: true });
+    assert.equal(blocked.status, 409);
+    assert.match(blocked.data.error, /merge.*in progress|worktree mutation.*in progress/i);
+    assert.equal(await stat(source.cwd).then(() => true, () => false), true);
+  } finally {
+    await gate.release();
+  }
+  assert.equal((await merging).status, 200);
+});
+
 test('active app-server delete retains ownership and worktree until bounded quiescence', async (t) => {
   for (const interruptOutcome of ['success', 'failure'] as const) {
     for (const removeWorktree of [false, true] as const) {
@@ -2111,6 +2470,9 @@ test('pending app-server delete rejects handoff before preparation or Git mutati
 
   try {
     assert.equal(deletionSettled, false, 'delete remains pending while provider work drains');
+    const stop = await fixture.command({ cmd: 'stop', id: source.id });
+    assert.equal(stop.status, 409);
+    assert.match(stop.data.error, /deletion is in progress/i);
     const handoff = await fixture.command({
       cmd: 'handoff', id: source.id, account: 'codex', branch: 'pending-delete-successor',
     });
@@ -2273,6 +2635,9 @@ test('an in-flight merge owns every selected worktree until its exact reservatio
   await gate.entered;
   try {
     for (const [session, removeWorktree] of [[a, false], [b, true]] as const) {
+      const stop = await post({ cmd: 'stop', id: session.id });
+      assert.equal(stop.status, 409);
+      assert.match(stop.data.error, /merge.*in progress|worktree mutation.*in progress/i);
       const deletion = await post({ cmd: 'delete', id: session.id, removeWorktree });
       assert.equal(deletion.status, 409);
       assert.match(deletion.data.error, /merge.*in progress|worktree mutation.*in progress/i);
@@ -2441,6 +2806,9 @@ test('handoff commit owns its source worktree until the exact reservation is rel
 
   await sourceStopEntered;
   assert.equal(handoffSettled, false, 'handoff retains ownership through asynchronous source stop');
+  const stopWhileStopping = await post({ cmd: 'stop', id: source.id });
+  assert.equal(stopWhileStopping.status, 409);
+  assert.match(stopWhileStopping.data.error, /handoff.*committing|handoff.*in progress/i);
   const deleteWhileStopping = await post({ cmd: 'delete', id: source.id, removeWorktree: true });
   assert.equal(deleteWhileStopping.status, 409);
   assert.match(deleteWhileStopping.data.error, /handoff.*in progress/i);
@@ -2688,6 +3056,11 @@ test('an in-flight upload rejects delete until its exact worktree ownership is r
   });
   await writeEntered;
   try {
+    const stop = await fetch(`${base}/command`, {
+      method: 'POST', body: JSON.stringify({ cmd: 'stop', id: session.id }),
+    });
+    assert.equal(stop.status, 409);
+    assert.match((await stop.json()).error, /upload.*in progress|worktree mutation.*in progress/i);
     const handoff = await fetch(`${base}/command`, {
       method: 'POST', body: JSON.stringify({
         cmd: 'handoff', id: session.id, account: 'codex', branch: 'upload-owner-successor',
