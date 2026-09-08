@@ -2142,8 +2142,8 @@ test('stop retains production image-snapshot ownership before starting a handoff
 test('stopped writer ownership blocks handoff, merge, upload, and resume before side effects', async (t) => {
   for (const operation of ['handoff', 'merge-upload', 'resume'] as const) {
     await t.test(operation, async (t) => {
-      let rejectQuiescence!: (error: Error) => void;
-      const quiescence = new Promise<void>((_resolve, reject) => { rejectQuiescence = reject; });
+      let resolveQuiescence!: () => void;
+      const quiescence = new Promise<void>((resolve) => { resolveQuiescence = resolve; });
       let starts = 0;
       let stops = 0;
       const adapter: Adapter = {
@@ -2208,7 +2208,7 @@ test('stopped writer ownership blocks handoff, merge, upload, and resume before 
         assert.equal(starts, 1);
       }
 
-      rejectQuiescence(new Error('synthetic quiescence rejection'));
+      resolveQuiescence();
       await new Promise((resolve) => setImmediate(resolve));
       if (operation === 'handoff') {
         const later = await fixture.command({
@@ -2232,6 +2232,98 @@ test('stopped writer ownership blocks handoff, merge, upload, and resume before 
       }
     });
   }
+});
+
+test('rejected quiescence retains stopped writer ownership and its worktree', async (t) => {
+  let rejectQuiescence!: (error: Error) => void;
+  const quiescence = new Promise<void>((_resolve, reject) => { rejectQuiescence = reject; });
+  let writerActive = true;
+  let removals = 0;
+  const writerStateAtRemoval: boolean[] = [];
+  const adapter: Adapter = {
+    start(_opts, emit) {
+      return {
+        send() {}, decide() {}, setAuto() {},
+        stop() { emit({ type: 'stopped', reason: 'quiescence contract failed' }); },
+        quiescence,
+      };
+    },
+  };
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, {
+    codexTransport: 'app-server', codexPool: pool,
+    beforeWorktreeRemoval: async () => {
+      removals += 1;
+      writerStateAtRemoval.push(writerActive);
+    },
+  });
+  const created = await fixture.create('rejected-stop-quiescence');
+  const source = fixture.registry.get(created.id)!;
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200);
+  rejectQuiescence(new Error('synthetic quiescence contract failure'));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const blocked = await fixture.command({ cmd: 'delete', id: source.id, removeWorktree: true });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.error, /stop.*in progress/i);
+  assert.equal(writerActive, true, 'rejection is not evidence that the writer stopped');
+  assert.equal(removals, 0);
+  assert.deepEqual(writerStateAtRemoval, []);
+  assert.equal(fixture.registry.get(source.id), source);
+  assert.equal(await stat(source.cwd).then(() => true, () => false), true);
+
+  writerActive = false;
+});
+
+test('no-quiescence stop throw retains stopped writer ownership and its worktree', async (t) => {
+  let writerActive = true;
+  let stops = 0;
+  let removals = 0;
+  const writerStateAtRemoval: boolean[] = [];
+  const adapter: Adapter = {
+    start() {
+      return {
+        send() {}, decide() {}, setAuto() {},
+        stop() {
+          stops += 1;
+          throw new Error('synthetic stop contract failure');
+        },
+      };
+    },
+  };
+  const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
+    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async close() {},
+  };
+  const fixture = await bootCodex(t, {
+    codexTransport: 'app-server', codexPool: pool,
+    beforeWorktreeRemoval: async () => {
+      removals += 1;
+      writerStateAtRemoval.push(writerActive);
+    },
+  });
+  const created = await fixture.create('throwing-stop-without-quiescence');
+  const source = fixture.registry.get(created.id)!;
+
+  assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200);
+  assert.equal((await fixture.command({ cmd: 'stop', id: source.id })).status, 200,
+    'a repeated stop must preserve the original fail-closed owner');
+  assert.equal(stops, 1, 'the detached handle is not stopped a second time');
+
+  const blocked = await fixture.command({ cmd: 'delete', id: source.id, removeWorktree: true });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.data.error, /stop.*in progress/i);
+  assert.equal(writerActive, true, 'a thrown stop left the modeled writer active');
+  assert.equal(removals, 0);
+  assert.deepEqual(writerStateAtRemoval, []);
+  assert.equal(fixture.registry.get(source.id), source);
+  assert.equal(await stat(source.cwd).then(() => true, () => false), true);
+
+  writerActive = false;
 });
 
 test('an already-settled stop owner preserves immediate stopped-session behavior', async (t) => {

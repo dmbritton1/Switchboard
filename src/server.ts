@@ -1185,19 +1185,25 @@ export function createServer(opts: {
         // before setup/snapshot/interrupt work necessarily releases its writer.
         const handle = handles.get(sessionId);
         const quiescence = handle?.quiescence;
-        if (quiescence) {
+        let stopOwnership: WorktreeMutationReservation | undefined;
+        if (handle) {
           const acquired = acquireWorktreeMutation([sessionId], 'stop');
           if ('busy' in acquired) {
             return { status: 409, json: { error: worktreeMutationError(acquired.busy.kind) } };
           }
-          // Register both settlement branches before stop(): a defensive test
-          // handle may reject synchronously, despite AgentHandle's non-rejecting
-          // contract. Exact-token release prevents a stale completion from
-          // removing any later owner.
-          void quiescence.then(
-            () => releaseWorktreeMutation(acquired),
-            () => releaseWorktreeMutation(acquired),
-          );
+          stopOwnership = acquired;
+          if (quiescence) {
+            // Fulfillment is positive proof that the writer retired. Rejection
+            // violates AgentHandle's contract, so handle it without releasing
+            // the fail-closed owner. Exact-token release also prevents a stale
+            // fulfillment from removing any later owner.
+            void quiescence.then(
+              () => releaseWorktreeMutation(acquired),
+              () => {
+                // Retain ownership: rejection is not evidence of quiescence.
+              },
+            );
+          }
         }
         handoffReservations.delete(sessionId);
         resumeReservations.delete(sessionId);
@@ -1213,10 +1219,11 @@ export function createServer(opts: {
         if (handles.get(sessionId) === handle) handles.delete(sessionId);
         try {
           handle?.stop();
+          if (stopOwnership && !quiescence) releaseWorktreeMutation(stopOwnership);
         } catch {
-          // The retained quiescence owns safety even when a provider violates
-          // stop()'s void/no-throw contract. Normal Stop remains idempotent and
-          // the settlement handler above cannot become an unhandled rejection.
+          // A provider violated stop()'s void/no-throw contract. Keep the exact
+          // stop owner unless its quiescence later fulfills, so no worktree
+          // operation can race a writer whose retirement is unproven.
         }
         return { status: 200, json: { ok: true } };
       }
