@@ -1,6 +1,6 @@
 # Switchboard
 
-One window for coding-agent sessions across two Claude accounts and one Codex account.
+One window for coding-agent sessions across multiple Claude and Codex accounts
 
 ## Setup
 
