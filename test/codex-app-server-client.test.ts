@@ -498,3 +498,20 @@ function objectErrorCode(error: unknown): unknown {
     ? (error as { code?: unknown }).code
     : undefined;
 }
+
+test('RPC error classification recognizes only the exact no-active-turn response and discards detail', async (t) => {
+  for (const [code, message, expected] of [
+    [-32600, 'no active turn to interrupt', true],
+    [-32600, 'no active turn to interrupt private-canary', false],
+    [-32000, 'no active turn to interrupt', false],
+  ] as const) {
+    const client=clientFor({overrides:{FAKE_APP_SERVER_RATE_LIMITS_ERROR:JSON.stringify({code,message,data:'private-canary'})}});
+    t.after(()=>client.close());
+    await client.request('initialize', {clientInfo:{name:'test',title:'test',version:'1'},capabilities:null});client.notify('initialized');
+    await assert.rejects(client.request('account/rateLimits/read'), (error:any)=>{
+      assert.equal(error.noActiveTurn, expected);
+      assert.doesNotMatch(JSON.stringify(error)+error.message, /private-canary|no active turn/);
+      return true;
+    });
+  }
+});

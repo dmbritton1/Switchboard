@@ -46,7 +46,7 @@ async function makeProcessFixture(t: { after(fn: () => unknown): void }): Promis
       source: 'explicit',
       commandPath: bin,
       codexPathOverride: bin,
-      version: '0.145.0',
+      version: '0.153.4',
       env: {
         ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
         CODEX_HOME: codexHome,

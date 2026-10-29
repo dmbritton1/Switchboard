@@ -50,7 +50,7 @@ function account(): Account {
 function poolFactory(extraEnv: Record<string, string> = {}): () => CodexProviderPool {
   return () => new CodexProviderPool({
     prepareRuntime: async (configured) => ({
-      source: 'explicit', commandPath: fakeCommand, version: '0.145.0',
+      source: 'explicit', commandPath: fakeCommand, version: '0.153.4',
       env: { ...process.env, ...configured.env, ...extraEnv, FAKE_APP_SERVER_MODE: 'turn-multi-session' }, diagnostics: [],
     }),
   });
@@ -83,7 +83,7 @@ test('fake transport smoke drives the production pool and adapter without publis
   });
 
   assert.deepEqual(evidence, {
-    version: '0.145.0',
+    version: '0.153.4',
     initialized: true,
     telemetryContinuity: true,
     newThread: true,
@@ -128,7 +128,7 @@ test('fake transport smoke drives the production pool and adapter without publis
   for (const worktree of observedWorktrees) await assert.rejects(access(worktree));
 });
 
-test('real smoke evidence omits the unmeasured multi-session routing field', async () => {
+test('real smoke rejects a user-stopped event without an acknowledged interrupt', async () => {
   const createPool = (): CodexProviderPool => {
     let listener: { onSnapshot(snapshot: never): void; onStale(reason: string): void } | undefined;
     let promoted = false;
@@ -137,6 +137,7 @@ test('real smoke evidence omits the unmeasured multi-session routing field', asy
         listener = next;
         return {
           async start() { listener?.onSnapshot({} as never); },
+          async requestForSession() { return {}; },
         };
       },
       async prepare() {
@@ -146,7 +147,7 @@ test('real smoke evidence omits the unmeasured multi-session routing field', asy
           listener.onSnapshot({} as never);
         }
         return {
-          runtimeVersion: '0.145.0',
+          runtimeVersion: '0.153.4',
           adapter: {
             start(opts: { prompt: { text: string }; promptId?: string }, emit: (event: any) => void) {
               const held = opts.prompt.text.startsWith('Write a long neutral essay.');
@@ -178,7 +179,7 @@ test('real smoke evidence omits the unmeasured multi-session routing field', asy
     };
     return pool as unknown as CodexProviderPool;
   };
-  const evidence = await runCodexAppServerTransportSmoke({
+  await assert.rejects(runCodexAppServerTransportSmoke({
     mode: 'real',
     accountName: 'fixture-codex',
     accounts: [account()],
@@ -186,19 +187,16 @@ test('real smoke evidence omits the unmeasured multi-session routing field', asy
     createPool,
     createWorkspace: async () => ({
       repository: '/opaque/repository',
-      worktrees: ['/opaque/worktree'],
+      worktrees: ['/opaque/worktree', '/opaque/interrupt'],
       async cleanup() {},
     }),
-  });
-
-  assert.equal(Object.hasOwn(evidence, 'multiSessionRouting'), false);
-  assert.equal(JSON.stringify(evidence).includes('"multiSessionRouting":false'), false);
+  }), /graceful interrupt/);
 });
 
-test('real-mode workspace helper creates one temporary git worktree and cleans it', async () => {
+test('real-mode workspace helper gives each session a dedicated temporary git worktree and cleans it', async () => {
   const workspace = await createSmokeWorkspace('real');
   try {
-    assert.equal(workspace.worktrees.length, 1);
+    assert.equal(workspace.worktrees.length, 2);
     const worktree = workspace.worktrees[0]!;
     const commonDirectory = await realpath(resolve(
       worktree,
@@ -246,4 +244,11 @@ test('real transport smoke refuses before creating a provider when paid consent 
   );
   assert.equal(pools, 0);
   assert.equal(worktrees, 0);
+});
+
+test('smoke stops waiting immediately on terminal failure without exposing diagnostics', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const failure = assert.rejects(transportSmoke.waitForSmokeObservation('real', () => false, 'first turn', () => true), /failed before first turn/);
+  t.mock.timers.tick(120_000);
+  await failure;
 });

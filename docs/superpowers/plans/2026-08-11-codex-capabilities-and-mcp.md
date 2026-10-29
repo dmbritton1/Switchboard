@@ -1,12 +1,69 @@
 # Codex Capability Discovery and MCP Parity Implementation Plan
 
+## Execution baseline — revised 2026-09-10
+
+Screenshot support implemented 2026-09-10. Shared provider-neutral capture
+handlers feed Claude wrappers and pinned MCP 1.30.0 stdio sidecars. The installed
+0.153.4 runtime verified both screenshot tools available in a disposable thread
+without starting a model turn.
+
+Task 2's older launch-wide injection proposal is superseded: the supervisor
+reads effective configuration with `config/read` for the exact worktree, then
+adds dotted MCP keys to the existing thread start/resume config map. This keeps
+account-sharing safe across repositories and preserves configured server names.
+Explicit session network settings take precedence. Config read failure skips
+injection with a catalog warning. The launcher is `/usr/bin/env -i` followed by
+the absolute Node executable and sidecar paths, so account environment values
+cannot reach Node or capture children. Fixed PATH and local HOME are the only
+explicit sidecar environment. No configuration files are written.
+
+Capability discovery is implemented for live app-server sessions as of 2026-09-10:
+- Session-scoped skills, apps, and MCP tools with availability reasons, filtering,
+  manual refresh, bounded caching, and notification invalidation.
+- Server-resolved namespaced aliases; native skill/app inputs stay process-local.
+  Selection is checked before admission and again before turn dispatch.
+- Generated protocol checks cover the new read methods and native input shapes.
+
+Command/discovery extensions implemented 2026-09-10:
+- Slash autocomplete lists installed skills (including plugin-provided skills),
+  apps, MCP tools and supported built-ins, with descriptions and disabled reasons.
+- `/skills`, `/apps`, `/mcp` filter the catalog locally. `/compact` uses
+  `thread/compact/start`, waits for its asynchronous turn lifecycle, preserves
+  FIFO, and supports Stop; arguments and attachments are rejected before admission.
+- New-session preview validates the selected account and canonical Git directory,
+  then reads skills/apps without creating a thread. Threadless MCP discovery is
+  intentionally omitted because process-global servers may belong to another
+  repository; session discovery remains authoritative for MCP/screenshots.
+- Catalog refresh clears stale UI selections and account/session changes discard
+  in-flight results. Native paths remain server-only.
+
+Usage-limit recovery is now implemented. Next: remaining real-account validation
+and sustained reliability testing before the opt-in default changes. Interactive browser control
+and plugin marketplace management remain outside this phase. The older detailed
+checkboxes below are historical; this execution baseline is authoritative.
+
+Use the current account supervisor and persisted transport, rather than
+rebuilding the foundation. The installed runtime is SDK/CLI 0.153.4 and MCP 1.30.0 is now a pinned direct
+dependency. The original checklists below are historical implementation detail;
+the execution baseline above records the current behavior and remaining scope.
+
+App-server start/resume must continue forcing workspace-write, on-request, and
+the user reviewer. SDK sessions retain never. Keep the existing Codex FIFO and
+its question behavior; do not replace Claude's handle interface. Update the
+generated-contract checks for each newly admitted method while preserving
+telemetry-only restrictions. Work in this order: capability catalog and alias
+resolution (Tasks 3–4), then screenshot handlers/configuration (Tasks 1–2), then
+Task 5's bounded live gate. Screenshot tools remain read-only; interactive
+browser/simulator control is outside this plan.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give app-server Codex sessions Claude-shaped discovery of commands, skills, apps, and MCP tools, plus Switchboard's browser and simulator screenshot capabilities.
 
 **Architecture:** Build a lazy account/cwd-scoped capability catalog from stable app-server APIs and resolve every alias again on the server at send time. Refactor screenshot logic into provider-neutral handlers, expose those handlers through stable stdio MCP sidecars, and inject fixed sidecar configuration only in the app-server child argv.
 
-**Tech Stack:** Node.js 22.18+, TypeScript, Codex app-server 0.147.0, `@modelcontextprotocol/sdk` 1.30.0, browser JavaScript, HTTP/SSE, node:test.
+**Tech Stack:** Node.js 22.18+, TypeScript, Codex app-server 0.153.4, `@modelcontextprotocol/sdk` 1.30.0, browser JavaScript, HTTP/SSE, node:test.
 
 ## Global Constraints
 

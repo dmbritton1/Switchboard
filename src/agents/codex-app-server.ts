@@ -1,3 +1,9 @@
+import type { CapabilitySnapshot } from './codex-capabilities.ts';
+import { normalizeElicitation } from './codex-elicitation.ts';
+import { normalizeCodexQuestions, type CodexInteractionResult } from './codex-questions.ts';
+import { CodexApprovals } from './codex-approvals.ts';
+import { AppServerRequestError } from './codex-app-server-client.ts';
+import { realpath } from 'node:fs/promises';
 import { safeCodexDetail } from './codex-detail.ts';
 import { classifyCodexFailure } from './codex.ts';
 import { CodexRuntimeError, unsafeCodexProviderIdentifier, redactCodexText } from './codex-runtime.ts';
@@ -48,7 +54,7 @@ function safePublicText(value: string, env: Record<string, string>): string {
   return scrubAbsolutePaths(redactCodexText(value, env));
 }
 
-/** Internal recovery seam; this phase intentionally keeps both cases terminal. */
+/** Only the structured usage-limit variant is eligible for server recovery. */
 export type CodexAppServerTurnFailure =
   | { kind: 'UsageLimitExceeded'; reason: string }
   | { kind: 'Other'; reason: string };
@@ -155,14 +161,20 @@ export function normalizeCodexAppServerItem(
   }
 }
 
-function threadResponse(value: unknown, cwd: string): string | null {
+async function threadResponse(value: unknown, cwd: string): Promise<string | null> {
   const response = object(value);
   const thread = response && object(response.thread);
   const sandbox = response && object(response.sandbox);
   const id = thread && text(thread.id);
   if (!response || !thread || !sandbox || !id || unsafeCodexProviderIdentifier(id)
-    || response.cwd !== cwd || thread.cwd !== cwd
-    || response.approvalPolicy !== 'never' || sandbox.type !== 'workspaceWrite') return null;
+    || typeof response.cwd !== 'string' || typeof thread.cwd !== 'string'
+    || response.approvalPolicy !== 'on-request' || response.approvalsReviewer !== 'user' || sandbox.type !== 'workspaceWrite') return null;
+  if (response.cwd !== cwd || thread.cwd !== cwd) {
+    try {
+      const [expected, effective, stored] = await Promise.all([realpath(cwd), realpath(response.cwd), realpath(thread.cwd)]);
+      if (expected !== effective || expected !== stored) return null;
+    } catch { return null; }
+  }
   return id;
 }
 
@@ -202,6 +214,8 @@ export function createCodexAppServerAdapter(
       let activeUsage: unknown = null;
       let activeSnapshotCleanup: (() => Promise<void>) | null = null;
       let draining = false;
+      let compactPending = false;
+      let compactStartTimer: ReturnType<typeof setTimeout> | null = null;
       let completing = false;
       let stopped = false;
       let interrupted = false;
@@ -243,11 +257,54 @@ export function createCodexAppServerAdapter(
         await cleanup();
       };
 
+      const responses = new Map<string | number, (decision: CodexInteractionResult) => void>();
+      const approvals = new CodexApprovals(opts.auto ?? false, (pending) => {
+        emit(pending ? { type: 'approval', request: pending } : { type: 'approval-resolved' });
+      }, (id, decision) => {
+        const respond = responses.get(id);
+        respond?.(decision);
+      });
+      const cancelApprovals = (): void => {
+        try { approvals.cancel(); } finally { responses.clear(); }
+      };
+      const onServerRequest = (id: string | number, method: string, params: unknown,
+        respond: (decision: CodexInteractionResult) => void): void => {
+        if (method === 'mcpServer/elicitation/request') {
+          const elicitation = normalizeElicitation(params, value => safePublicText(value, opts.env));
+          if (stopped || interrupted || !elicitation) { respond({action:'cancel',content:null,_meta:null}); return; }
+          responses.set(id, respond); approvals.addElicitation(id, elicitation); return;
+        }
+        if (method === 'item/tool/requestUserInput') {
+          const questions = normalizeCodexQuestions(params, value => safePublicText(value, opts.env));
+          if (stopped || interrupted || !questions) { respond({ answers: {} }); return; }
+          responses.set(id, respond);
+          approvals.addQuestions(id, questions);
+          return;
+        }
+        if (stopped || interrupted) { respond('decline'); return; }
+        const value = object(params);
+        if (!value || (value.environmentId != null && value.environmentId !== 'local') || (value.grantRoot != null)
+          || (value.kind != null && value.kind !== 'command')) { respond('decline'); return; }
+        const command = method === 'item/commandExecution/requestApproval';
+        const description = command ? text(value.command) : 'File changes';
+        if (command && !description) { respond('decline'); return; }
+        const reason = text(value.reason);
+        const summary = safePublicText([description, reason].filter(Boolean).join(' — '), opts.env).slice(0, 2000);
+        responses.set(id, respond);
+        approvals.add(id, command ? 'command' : 'edit', summary);
+      };
+      const onServerResolved = (id: string | number): void => {
+        responses.delete(id); approvals.resolved(id);
+      };
+
       const finish = (
         reason: string, code: CodexFailureCode, detachNow = true, cleanupSnapshot = true,
       ): void => {
         if (stopped) return;
         stopped = true;
+        if (compactStartTimer) clearTimeout(compactStartTimer);
+        compactStartTimer = null;
+        try { cancelApprovals(); } catch { /* the retiring transport owns cancellation */ }
         for (const queued of queue.splice(0)) {
           if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'unsent' });
         }
@@ -283,9 +340,7 @@ export function createCodexAppServerAdapter(
         const failure = classifyCodexAppServerTurnFailure(error, opts.env);
         switch (failure.kind) {
           case 'UsageLimitExceeded':
-            // Later recovery may branch here. This phase keeps the existing
-            // terminal outcome and never schedules, retries, or replays work.
-            finish(failure.reason, 'codex_stream_failed');
+            finish(failure.reason, 'codex_usage_limited');
             return;
           case 'Other':
             finish(failure.reason, 'codex_stream_failed');
@@ -296,9 +351,22 @@ export function createCodexAppServerAdapter(
       const interruptActiveTurn = (): void => {
         if (interruptSent || !threadId || !activeTurnId) return;
         interruptSent = true;
-        void supervisor.requestForSession(sessionId, 'turn/interrupt', {
-          threadId, turnId: activeTurnId,
-        }).then(
+        const target = { threadId, turnId: activeTurnId };
+        const interrupt = async (): Promise<void> => {
+          // turn/start can acknowledge before the provider registers its active turn.
+          // Retry only that exact rejection, never an unknown or transport failure.
+          for (let attempt = 0; ; attempt += 1) {
+            if (stopped) return;
+            try {
+              await supervisor.requestForSession(sessionId, 'turn/interrupt', target);
+              return;
+            } catch (error) {
+              if (!(error instanceof AppServerRequestError) || !error.noActiveTurn || attempt === 5) throw error;
+              await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
+            }
+          }
+        };
+        void interrupt().then(
           () => {
             if (interrupted) finishUserStop();
           },
@@ -316,6 +384,7 @@ export function createCodexAppServerAdapter(
       const completeTurn = async (turnId: string): Promise<void> => {
         if (stopped || completing || turnId !== activeTurnId) return;
         completing = true;
+        cancelApprovals();
         const usage = lastUsage(activeUsage);
         activeTurnId = null;
         activeUsage = null;
@@ -341,6 +410,13 @@ export function createCodexAppServerAdapter(
           return;
         }
         const receivedTurn = text(value.turnId) ?? text(object(value.turn)?.id);
+        if (method === 'turn/started' && receivedTurn && compactPending) {
+          compactPending = false;
+          if (compactStartTimer) clearTimeout(compactStartTimer);
+          compactStartTimer = null;
+          activeTurnId = receivedTurn;
+          if (interrupted) interruptActiveTurn();
+        }
         if (receivedTurn && !activeTurnId && turnRequestInFlight) {
           bufferedNotifications.push({ method, params });
           return;
@@ -398,12 +474,30 @@ export function createCodexAppServerAdapter(
       };
 
       const drain = async (): Promise<void> => {
-        if (draining || completing || stopped || interrupted || protocolRetiring
+        if (draining || completing || compactPending || stopped || interrupted || protocolRetiring
           || !threadId || activeTurnId || queue.length === 0) return;
         const releaseWorktree = beginWorktreeOperation();
         draining = true;
         try {
           const queued = queue[0];
+          if (/^\/compact(?:\s|$)/.test(queued.prompt.text.trim())) {
+            if (queued.prompt.text.trim() !== '/compact' || queued.prompt.attachments.length) throw new Error('/compact does not accept arguments or attachments.');
+            compactPending = true;
+            compactStartTimer = setTimeout(() => {
+              compactStartTimer = null;
+              if (compactPending && !stopped) retireProtocolFailure('Codex compaction did not report a start notification.');
+            }, 10_000);
+            emit({type:'status',status:'working'});
+            await supervisor.requestForSession(sessionId,'thread/compact/start',{threadId},()=>{
+              const index = queue.indexOf(queued);
+              if(index !== -1) queue.splice(index,1);
+              if(queued.promptId) emit({type:'prompt-delivery',id:queued.promptId,delivery:'sent'});
+            });
+            return;
+          }
+          const selection = queued.prompt.capability ?? queued.prompt.text.match(/^\/(skill|app|mcp):[^\s]+/)?.[0].slice(1);
+          const native = selection ? await supervisor.capabilitiesForSession(sessionId, opts.cwd, true, selection) : [];
+          if (!Array.isArray(native)) throw new Error('Capability is no longer available; refresh and retry.');
           const prepared = await snapshotCodexPrompt(opts.cwd, queued.prompt);
           activeSnapshotCleanup = prepared.cleanup;
           let retainSnapshot = false;
@@ -422,7 +516,7 @@ export function createCodexAppServerAdapter(
             };
             try {
               response = await supervisor.requestForSession<{ turn?: unknown }>(sessionId, 'turn/start', {
-                threadId, input: codexAppServerPromptInput(prepared.prompt),
+                threadId, input: [...codexAppServerPromptInput(prepared.prompt), ...native],
                 ...(settings?.modelReasoningEffort !== undefined ? { effort: settings.modelReasoningEffort } : {}),
               }, acknowledgeDispatch);
             } finally {
@@ -456,11 +550,12 @@ export function createCodexAppServerAdapter(
         } finally {
           draining = false;
           releaseWorktree();
+          if (!stopped && !compactPending && !activeTurnId && queue.length) void drain();
         }
       };
 
       try {
-        detach = supervisor.registerSession(sessionId, { onNotification, onFatal });
+        detach = supervisor.registerSession(sessionId, { onNotification, onFatal, onServerRequest, onServerResolved });
       } catch (error) {
         finishRequest(error, 'codex_app_server_unavailable');
         return { send() {}, decide() {}, setAuto() {}, stop() {}, quiescence };
@@ -481,13 +576,13 @@ export function createCodexAppServerAdapter(
           const config = settingsConfig(settings);
           const params = {
             ...(opts.resumeId ? { threadId: opts.resumeId } : {}),
-            cwd: opts.cwd, approvalPolicy: 'never' as const, sandbox: 'workspace-write' as const,
+            cwd: opts.cwd, approvalPolicy: 'on-request' as const, approvalsReviewer: 'user' as const, sandbox: 'workspace-write' as const,
             ...(settings?.model !== undefined ? { model: settings.model } : {}),
             ...(config ? { config } : {}),
           };
           try {
             const response = await supervisor.requestForSession<unknown>(sessionId, opts.resumeId ? 'thread/resume' : 'thread/start', params);
-            const id = threadResponse(response, opts.cwd);
+            const id = await threadResponse(response, opts.cwd);
             if (!id || (opts.resumeId && id !== opts.resumeId)) {
               finish('Codex app-server thread response did not preserve the required sandbox.', 'codex_protocol_mismatch');
               return;
@@ -510,16 +605,46 @@ export function createCodexAppServerAdapter(
           queue.push({ prompt, promptId });
           void drain();
         },
-        decide() {},
-        setAuto() {},
+        decide(allow: boolean) {
+          if (stopped || interrupted) return;
+          try { approvals.decide(allow); } catch { retireProtocolFailure('Codex approval response failed.'); }
+        },
+        respondElicitation(requestId, response) {
+          if (stopped || interrupted || protocolRetiring) return false;
+          try { return approvals.respondElicitation(requestId, response); }
+          catch { retireProtocolFailure('Codex form response failed.'); return false; }
+        },
+        async capabilities(force = false) {
+          if (stopped || interrupted || protocolRetiring || !threadId) throw new Error('No live capability session.');
+          return await supervisor.capabilitiesForSession(sessionId, opts.cwd, force) as CapabilitySnapshot;
+        },
+        async resolveCapability(alias) {
+          if (stopped || interrupted || protocolRetiring || !threadId) return null;
+          const snapshot = await supervisor.capabilitiesForSession(sessionId, opts.cwd, true) as CapabilitySnapshot;
+          const entry = snapshot.capabilities.find(item => item.alias === alias && item.available);
+          return entry?.id ?? null;
+        },
+        elicitationUrl(requestId) {
+          return stopped || interrupted || protocolRetiring ? null : approvals.elicitationUrl(requestId);
+        },
+        answerQuestion(requestId, answer) {
+          if (stopped || interrupted || protocolRetiring) return false;
+          try { return approvals.answer(requestId, answer); }
+          catch { retireProtocolFailure('Codex question response failed.'); return false; }
+        },
+        setAuto(on: boolean) {
+          if (stopped || interrupted) return;
+          try { approvals.setAuto(on); } catch { retireProtocolFailure('Codex approval response failed.'); }
+        },
         stop() {
           if (stopped || interrupted || protocolRetiring) return;
           interrupted = true;
+          try { cancelApprovals(); } catch { void supervisor.retireSessionGeneration(sessionId); }
           for (const queued of queue.splice(0)) {
             if (queued.promptId) emit({ type: 'prompt-delivery', id: queued.promptId, delivery: 'unsent' });
           }
           interruptActiveTurn();
-          if (!turnRequestInFlight && !activeTurnId) finishUserStop();
+          if (!turnRequestInFlight && !compactPending && !activeTurnId) finishUserStop();
         },
         quiescence,
       };

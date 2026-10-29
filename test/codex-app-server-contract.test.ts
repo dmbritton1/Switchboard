@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { setTimeout as realDelay } from 'node:timers/promises';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,7 +37,7 @@ function runtime(overrides: Partial<PreparedCodexRuntime> = {}): PreparedCodexRu
   return {
     source: 'explicit',
     commandPath: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: env(),
     diagnostics: [],
     ...overrides,
@@ -75,7 +76,7 @@ function processIsGone(pid: number): boolean {
 }
 
 test('the phase-one telemetry allowlist remains exactly pinned', () => {
-  assert.equal(CODEX_TELEMETRY_VERSION, '0.145.0');
+  assert.equal(CODEX_TELEMETRY_VERSION, '0.153.4');
   assert.deepEqual(TELEMETRY_CLIENT_METHODS, [
     'initialize',
     'account/read',
@@ -110,6 +111,7 @@ test('the turn allowlist is pinned separately from telemetry', () => {
   assert.deepEqual(TURN_CLIENT_METHODS, [
     'thread/start',
     'thread/resume',
+    'thread/compact/start',
     'turn/start',
     'turn/interrupt',
   ]);
@@ -122,6 +124,7 @@ test('the turn allowlist is pinned separately from telemetry', () => {
     'item/started',
     'item/completed',
     'turn/completed',
+    'serverRequest/resolved',
   ]);
   assert.deepEqual(DENIED_SERVER_METHODS, [
     'item/commandExecution/requestApproval',
@@ -147,6 +150,7 @@ test('launch profiles isolate telemetry while preserving turn hooks and MCP conf
   ]);
   assert.deepEqual(appServerArgs('turns'), [
     '--strict-config',
+    '-c', 'features.default_mode_request_user_input=true',
     '-c', 'otel.exporter="none"',
     'app-server', '--listen', 'stdio://',
   ]);
@@ -163,7 +167,7 @@ test('turn launch leaves inherited hooks and MCP configuration enabled', async (
   })), 0);
   assert.deepEqual(JSON.parse(await readFile(recordPath, 'utf8')), {
     strict: true,
-    configs: ['otel.exporter="none"'],
+    configs: ['features.default_mode_request_user_input=true', 'otel.exporter="none"'],
     inheritedHooks: true,
     inheritedMcpServers: true,
   });
@@ -215,7 +219,7 @@ test('generated contract accepts the exact phase-one schema and reuses a verifie
   const directory = await mkdtemp(join(tmpdir(), 'switchboard-codex-contract-'));
   const calls = join(directory, 'calls.jsonl');
   t.after(() => rm(directory, { recursive: true, force: true }));
-  const prepared = runtime({ env: env({ FAKE_APP_SERVER_CALL_LOG: calls }), version: '0.145.0+cache' });
+  const prepared = runtime({ env: env({ FAKE_APP_SERVER_CALL_LOG: calls }), version: '0.153.4+cache' });
 
   await verifyTelemetryContract(prepared);
   await verifyTelemetryContract(prepared);
@@ -232,7 +236,7 @@ test('profiles share generated-schema evidence but verify their surfaces separat
   t.after(() => rm(directory, { recursive: true, force: true }));
   const prepared = runtime({
     env: env({ FAKE_APP_SERVER_CALL_LOG: calls }),
-    version: '0.145.0+profile-cache',
+    version: '0.153.4+profile-cache',
   });
 
   await verifyAppServerContract(prepared, 'telemetry');
@@ -250,7 +254,7 @@ test('turn profile rejects every missing method or notification while retaining 
   for (const [index, member] of required.entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-member-${index}`,
+        version: `0.153.4+turn-member-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_OMIT: member }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -262,7 +266,7 @@ test('turn profile rejects every missing method or notification while retaining 
   for (const mode of ['telemetry', 'turns'] as const satisfies readonly CodexAppServerMode[]) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+${mode}-server-request`,
+        version: `0.153.4+${mode}-server-request`,
         env: env({ FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST: 'item/future/requestApproval' }),
       }), mode),
     );
@@ -283,7 +287,7 @@ test('turn profile requires the pinned request, item, turn, usage, and routing s
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-shape-${index}`,
+        version: `0.153.4+turn-shape-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -303,7 +307,7 @@ for (const [shape, mismatch] of [
   test(`turn profile rejects the ${mismatch} for reasoning effort`, async () => {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+${shape}`,
+        version: `0.153.4+${shape}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -322,7 +326,7 @@ for (const [shape, location] of [
   test(`turn profile ignores an exact-looking effort field in a ${location}`, async () => {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+${shape}`,
+        version: `0.153.4+${shape}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -341,7 +345,7 @@ for (const [shape, mismatch] of [
   test(`turn profile rejects the ${mismatch} for reasoning effort`, async () => {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+${shape}`,
+        version: `0.153.4+${shape}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -353,7 +357,7 @@ for (const [shape, mismatch] of [
 test('telemetry profile remains isolated from turn effort and alias mismatches', async () => {
   for (const [index, shape] of ['turn-effort', 'reasoning-effort-alias'].entries()) {
     await verifyAppServerContract(runtime({
-      version: `0.145.0+telemetry-effort-isolation-${index}`,
+      version: `0.153.4+telemetry-effort-isolation-${index}`,
       env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
     }), 'telemetry');
   }
@@ -381,7 +385,7 @@ test('turn profile requires pinned thread safety aliases and config maps on star
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-safety-shape-${index}`,
+        version: `0.153.4+turn-safety-shape-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -401,7 +405,7 @@ test('turn profile keeps required input fields within their exact union members'
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-input-member-${index}`,
+        version: `0.153.4+turn-input-member-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -418,7 +422,7 @@ test('turn profile requires a typed token-usage notification payload', async () 
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-token-usage-payload-${index}`,
+        version: `0.153.4+turn-token-usage-payload-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -440,7 +444,7 @@ test('turn profile requires an exact required willRetry boolean field', async ()
   ].entries()) {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-will-retry-${index}`,
+        version: `0.153.4+turn-will-retry-${index}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -455,7 +459,7 @@ test('turn profile requires an exact required willRetry boolean field', async ()
 for (const shape of ['error-will-retry-multiline-nullable', 'error-will-retry-multiline-union']) {
   test(`willRetry rejects ${shape} across a newline before the outer delimiter`, async () => {
     await assert.rejects(verifyAppServerContract(runtime({
-      version: `0.145.0+${shape}`, env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
+      version: `0.153.4+${shape}`, env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
     }), 'turns'), { message: 'Codex app-server turn contract verification failed.' });
   });
 }
@@ -471,7 +475,7 @@ for (const [shape, location] of [
   test(`turn profile ignores a willRetry decoy in a ${location}`, async () => {
     await assert.rejects(
       verifyAppServerContract(runtime({
-        version: `0.145.0+turn-will-retry-${shape}`,
+        version: `0.153.4+turn-will-retry-${shape}`,
         env: env({ FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT: shape }),
       }), 'turns'),
       (error: unknown) => error instanceof Error
@@ -483,7 +487,7 @@ for (const [shape, location] of [
 test('generated contract rejects an omitted required member', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+omitted',
+      version: '0.153.4+omitted',
       env: env({ FAKE_APP_SERVER_SCHEMA_OMIT: 'account/rateLimits/updated' }),
     })),
     (error: unknown) => error instanceof Error
@@ -494,7 +498,7 @@ test('generated contract rejects an omitted required member', async () => {
 test('generated contract rejects a newly added server request', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+server-request',
+      version: '0.153.4+server-request',
       env: env({ FAKE_APP_SERVER_SCHEMA_ADD_SERVER_REQUEST: 'item/future/requestApproval' }),
     })),
     (error: unknown) => error instanceof Error
@@ -513,7 +517,7 @@ test('generated contract rejects an incompatible runtime version before generati
 test('generated contract bounds schema generation time', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+timeout',
+      version: '0.153.4+timeout',
       env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'hang' }),
     }), { timeoutMs: 30 }),
     (error: unknown) => error instanceof Error
@@ -531,9 +535,10 @@ test('generated contract reaps a generator that ignores SIGTERM after timeout', 
     await rm(directory, { recursive: true, force: true });
   });
 
-  await assert.rejects(
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const rejected = assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+ignore-term',
+      version: '0.153.4+ignore-term',
       env: env({
         FAKE_APP_SERVER_SCHEMA_MODE: 'ignore-term',
         FAKE_APP_SERVER_SCHEMA_EXIT_MARKER: marker,
@@ -544,7 +549,26 @@ test('generated contract reaps a generator that ignores SIGTERM after timeout', 
       && error.message === 'Codex telemetry contract verification failed.',
   );
 
-  await waitForFile(marker, 1_000);
+  // Start the deadline only after the fixture installed its SIGTERM handler.
+  // Under suite load the child may otherwise be killed before reaching that code.
+  const readyDeadline = Date.now() + 10_000;
+  while (true) {
+    try { await readFile(pidFile); break; } catch {
+      if (Date.now() >= readyDeadline) throw new Error('generator fixture did not start');
+      await realDelay(10);
+    }
+  }
+  pid = Number(await readFile(pidFile, 'utf8'));
+  t.mock.timers.tick(1_000);
+  const signalDeadline = Date.now() + 5_000;
+  while (true) {
+    try { await readFile(marker); break; } catch {
+      if (Date.now() >= signalDeadline) throw new Error('generator fixture did not receive SIGTERM');
+      await realDelay(10);
+    }
+  }
+  t.mock.timers.tick(250);
+  await rejected;
   pid = Number(await readFile(pidFile, 'utf8'));
   assert.ok(Number.isSafeInteger(pid) && pid > 0);
   assert.equal(await readFile(marker, 'utf8'), 'SIGTERM');
@@ -554,7 +578,7 @@ test('generated contract reaps a generator that ignores SIGTERM after timeout', 
 test('generated contract rejects malformed schema output', async () => {
   await assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+malformed',
+      version: '0.153.4+malformed',
       env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'malformed' }),
     })),
     (error: unknown) => error instanceof Error
@@ -566,7 +590,7 @@ test('generated contract never exposes account values or raw stderr', async () =
   const secret = 'contract-account-secret';
   await assert.rejects(
     verifyTelemetryContract(runtime({
-      version: '0.145.0+stderr',
+      version: '0.153.4+stderr',
       env: env({ FAKE_APP_SERVER_SCHEMA_MODE: 'error', CODEX_TOKEN: secret }),
     })),
     (error: unknown) => error instanceof Error
@@ -574,4 +598,24 @@ test('generated contract never exposes account values or raw stderr', async () =
       && !error.message.includes(secret)
       && !error.message.includes('fake schema failure'),
   );
+});
+
+test('turn approvals require a typed resolution notification', async () => {
+  await assert.rejects(verifyAppServerContract(runtime({version:'0.153.4+approval-resolution',env:env({FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT:'approval-resolution'})}),'turns'));
+});
+
+test('turn questions require the installed question and answer schema while telemetry stays isolated', async () => {
+  for (const shape of ['question-blocking','question-secret','question-answer','question-options','question-experimental']) {
+    const selected=runtime({version:`0.153.4+${shape}`,env:env({FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT:shape})});
+    await assert.rejects(verifyAppServerContract(selected,'turns'));
+    await verifyAppServerContract(selected,'telemetry');
+  }
+});
+
+test('MCP elicitation requires typed form URL and response contracts', async()=>{
+ for(const shape of ['mcp-request','mcp-action','mcp-schema']){
+  const selected=runtime({version:`0.153.4+${shape}`,env:env({FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT:shape})});
+  await assert.rejects(verifyAppServerContract(selected,'turns'));
+  await verifyAppServerContract(selected,'telemetry');
+ }
 });

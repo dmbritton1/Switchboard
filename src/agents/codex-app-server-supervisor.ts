@@ -1,3 +1,9 @@
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { CHROME } from './browser-capture.ts';
+import { screenshotConfig } from './codex-mcp-config.ts';
+import { CodexCapabilityCatalog, CAPABILITY_METHODS, CAPABILITY_NOTIFICATIONS } from './codex-capabilities.ts';
+import type { CodexInteractionResult } from './codex-questions.ts';
 import { AppServerClient, AppServerRequestError, type AppServerClientOptions } from './codex-app-server-client.ts';
 import {
   DENIED_SERVER_METHODS, PRIVATE_NOTIFICATIONS, TURN_CLIENT_METHODS, TURN_NOTIFICATIONS,
@@ -7,7 +13,7 @@ import {
   CODEX_TELEMETRY_REASONS, normalizeCodexAccountRead, normalizeCodexAuthUpdate,
   normalizeCodexRateLimits, type CodexTelemetryAuth,
 } from './codex-limits.ts';
-import { CodexRuntimeError, redactValues, unsafeCodexProviderIdentifier, type PreparedCodexRuntime } from './codex-runtime.ts';
+import { CodexRuntimeError, redactCodexText, redactValues, unsafeCodexProviderIdentifier, type PreparedCodexRuntime } from './codex-runtime.ts';
 import type { AccountLimitSnapshot, CodexFailureCode } from '../types.ts';
 
 const PUBLIC_UNAVAILABLE = 'Codex account telemetry is temporarily unavailable. Using the local estimate.';
@@ -17,7 +23,7 @@ const MAX_RESTART_DELAY_MS = 30_000;
 const TERMINAL_TURN_HISTORY = 32;
 
 type TimerHandle = unknown;
-type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError' | 'close'>;
+type SupervisorClient = Pick<AppServerClient, 'request' | 'notify' | 'respondError' | 'close'> & Partial<Pick<AppServerClient, 'respond'>>;
 type UnsupportedCodexTelemetryAuth = Extract<CodexTelemetryAuth, { supported: false }>;
 type ReadOutcome = { invalidated: true } | { invalidated: false; snapshot: AccountLimitSnapshot };
 type ActiveRead = { revision: number; promise: Promise<ReadOutcome> };
@@ -27,6 +33,7 @@ type SessionState = {
   threadId: string | null;
   generation: number | null;
   activeTurnId: string | null;
+  compactPending: boolean;
   pendingTurn: symbol | null;
   pendingStartTurnId: string | null;
   pendingTerminalTurnIds: Set<string>;
@@ -43,6 +50,8 @@ export type CodexLimitListener = {
 export type CodexSessionRoute = {
   onNotification(method: string, params: unknown): void;
   onFatal(reason: string, code: CodexFailureCode): void;
+  onServerRequest?(id: string | number, method: string, params: unknown, respond: (decision: CodexInteractionResult) => void): void;
+  onServerResolved?(id: string | number): void;
 };
 
 export type CodexAppServerSupervisorOptions = {
@@ -107,6 +116,9 @@ export class CodexAppServerSupervisor {
   readonly #sessions = new Map<string, SessionState>();
   readonly #threadOwners = new Map<string, string>();
   readonly #clientGenerations = new WeakMap<SupervisorClient, number>();
+  readonly #approvals = new Map<string | number, { client: SupervisorClient; state: SessionState; answered: boolean }>();
+  readonly #catalog: CodexCapabilityCatalog;
+  readonly #screenshotWarnings = new Map<string,string[]>();
   #mode: CodexAppServerMode = 'telemetry';
   #client: SupervisorClient | null = null;
   #readyClient: SupervisorClient | null = null;
@@ -114,6 +126,7 @@ export class CodexAppServerSupervisor {
   #promotion: Promise<void> | null = null;
   #retirement: ActiveRetirement | null = null;
   #read: ActiveRead | null = null;
+  #boundaryRead: Promise<AccountLimitSnapshot> | null = null;
   #limitRevision = 0;
   #auth: CodexTelemetryAuth | null = null;
   #unsupportedAuthLatch: UnsupportedCodexTelemetryAuth | null = null;
@@ -127,6 +140,18 @@ export class CodexAppServerSupervisor {
 
   constructor(options: CodexAppServerSupervisorOptions) {
     this.#options = options;
+    this.#catalog = new CodexCapabilityCatalog(async (method, params) => {
+      const client = this.#readyClient;
+      if (this.#closed || this.#mode !== 'turns' || !client || client !== this.#client
+          || !(CAPABILITY_METHODS as readonly string[]).includes(method)) throw unavailableError();
+      const result = await client.request(method, params);
+      if (this.#closed || client !== this.#readyClient || client !== this.#client) throw unavailableError();
+      return result;
+    }, value => redactCodexText(value, options.runtime.env)
+      .replace(/(^|[^\p{L}\p{N}_./\\-])\/(?!\/)[^\s"'`<>{}\[\](),;:]+/gu, '$1[path omitted]')
+      .replace(/(^|[^\p{L}\p{N}_./\\-])(?:[A-Za-z]:\\|\\\\)[^\s"'`<>{}\[\](),;:]+/gu, '$1[path omitted]'));
+
+
     this.#verifyContract = options.verifyContract ?? verifyAppServerContract;
     this.#clientFactory = options.clientFactory ?? ((clientOptions) => new AppServerClient(clientOptions));
     this.#setTimer = options.setTimer ?? defaultSetTimer;
@@ -164,7 +189,7 @@ export class CodexAppServerSupervisor {
     if (this.#promotion) return this.#promotion;
     if (this.#retirement) return Promise.reject(unavailableError());
     if (this.#mode === 'turns') return this.start();
-    if ([...this.#sessions.values()].some((session) => session.activeTurnId || session.pendingTurn)) {
+    if ([...this.#sessions.values()].some((session) => session.activeTurnId || session.pendingTurn || session.compactPending)) {
       return Promise.reject(new Error('Cannot promote Codex transport while a session turn is active.'));
     }
     const promotion = Promise.resolve().then(() => this.#promoteNow());
@@ -187,6 +212,7 @@ export class CodexAppServerSupervisor {
         ? this.#clientGenerations.get(ready) ?? null
         : null,
       activeTurnId: null,
+      compactPending: false,
       pendingTurn: null,
       pendingStartTurnId: null,
       pendingTerminalTurnIds: new Set(),
@@ -199,6 +225,8 @@ export class CodexAppServerSupervisor {
       active = false;
       if (this.#sessions.get(sessionId) !== state) return;
       this.#sessions.delete(sessionId);
+      this.#screenshotWarnings.delete(sessionId);
+      for (const [id, pending] of this.#approvals) if (pending.state === state) this.#approvals.delete(id);
       if (state.threadId !== null && this.#threadOwners.get(state.threadId) === sessionId) {
         this.#threadOwners.delete(state.threadId);
       }
@@ -216,9 +244,30 @@ export class CodexAppServerSupervisor {
     this.#threadOwners.set(threadId, sessionId);
   }
 
+  async previewCapabilities(cwd: string, force = false) {
+    await this.ensureTurnTransport();
+    const client = this.#readyClient;
+    if (!client || this.#closed) throw unavailableError();
+    const result = await this.#catalog.list(cwd, undefined, force);
+    if (this.#closed || client !== this.#readyClient) throw unavailableError();
+    return result;
+  }
+
+  async capabilitiesForSession(sessionId: string, cwd: string, force = false, selection?: string) {
+    const state = this.#sessions.get(sessionId);
+    const client = this.#readyClient;
+    if (!state?.threadId || !client || state.generation !== this.#clientGenerations.get(client)) throw unavailableError();
+    const result = selection === undefined
+      ? await this.#catalog.list(cwd, state.threadId, force)
+      : await this.#catalog.expand(selection, cwd, state.threadId, force);
+    if (this.#sessions.get(sessionId) !== state || client !== this.#readyClient) throw unavailableError();
+    if (result && !Array.isArray(result)) result.warnings.push(...(this.#screenshotWarnings.get(sessionId) ?? []));
+    return result;
+  }
+
   async requestForSession<T>(
     sessionId: string,
-    method: 'thread/start' | 'thread/resume' | 'turn/start' | 'turn/interrupt',
+    method: 'thread/start' | 'thread/resume' | 'turn/start' | 'turn/interrupt' | 'thread/compact/start',
     params: unknown,
     onDispatched?: () => void,
   ): Promise<T> {
@@ -237,8 +286,35 @@ export class CodexAppServerSupervisor {
     if (state.generation !== generation) {
       throw new Error('Codex session transport was retired; resume the session manually.');
     }
+    if (method === 'thread/start' || method === 'thread/resume') {
+      const value = params as {cwd?:unknown;config?:Record<string,unknown>};
+      let overrides:Record<string,unknown> = {};
+      try {
+        if (typeof value.cwd !== 'string') throw new Error();
+        const read = await client.request<{config?:unknown}>('config/read', {cwd:value.cwd,includeLayers:false});
+        if (!read.config || typeof read.config !== 'object' || Array.isArray(read.config)) throw new Error();
+        const injected = screenshotConfig({nodePath:process.execPath,
+          browserEntry:fileURLToPath(new URL('./mcp/browser-server.ts',import.meta.url)),
+          simulatorEntry:fileURLToPath(new URL('./mcp/simulator-server.ts',import.meta.url)),
+          platform:process.platform,chromePath:CHROME,home:homedir(),config:{...read.config as Record<string,unknown>,
+            ...(value.config?.sandbox_workspace_write ? {sandbox_workspace_write:value.config.sandbox_workspace_write} : {})}});
+        overrides = injected.overrides;
+        this.#screenshotWarnings.set(sessionId,injected.warnings);
+      } catch {
+        this.#screenshotWarnings.set(sessionId,['Screenshot tools unavailable: worktree configuration could not be checked.']);
+      }
+      if (this.#closed || this.#sessions.get(sessionId) !== state || this.#readyClient !== client) throw unavailableError();
+      params = {...value,config:{...value.config,...overrides}};
+    }
+    if (method === 'thread/compact/start') {
+      if ((params as {threadId?:unknown})?.threadId !== state.threadId || !state.threadId) throw unavailableError();
+      if (state.activeTurnId || state.pendingTurn || state.compactPending) throw new Error('Codex session already has an active turn.');
+      state.compactPending = true;
+      try { return await client.request<T>(method, params, onDispatched); }
+      catch (error) { state.compactPending = false; throw error; }
+    }
     if (method !== 'turn/start') return client.request<T>(method, params, onDispatched);
-    if (state.activeTurnId || state.pendingTurn) throw new Error('Codex session already has an active turn.');
+    if (state.activeTurnId || state.pendingTurn || state.compactPending) throw new Error('Codex session already has an active turn.');
     const pendingTurn = Symbol(sessionId);
     state.pendingTurn = pendingTurn;
     state.pendingStartTurnId = null;
@@ -308,10 +384,23 @@ export class CodexAppServerSupervisor {
     return this.#readCurrent(this.#now());
   }
 
-  async readAtResetBoundary(now = this.#now()): Promise<AccountLimitSnapshot> {
-    await this.start();
-    if (this.#promotion) await this.#promotion;
-    return this.#readCurrent(now);
+  readAtResetBoundary(now = this.#now()): Promise<AccountLimitSnapshot> {
+    if (this.#boundaryRead) return this.#boundaryRead;
+    // A reconciliation already dispatched before this call cannot establish
+    // post-failure/post-boundary capacity. Join it only to drain it; concurrent
+    // boundary callers share the subsequent authoritative read.
+    const older = this.#read;
+    const boundary = (async () => {
+      await this.start();
+      if (this.#promotion) await this.#promotion;
+      if (older) await older.promise.catch(() => {});
+      return this.#readCurrent(now);
+    })();
+    this.#boundaryRead = boundary;
+    void boundary.finally(() => {
+      if (this.#boundaryRead === boundary) this.#boundaryRead = null;
+    }).catch(() => {});
+    return boundary;
   }
 
   close(): Promise<void> {
@@ -379,7 +468,7 @@ export class CodexAppServerSupervisor {
       this.#client = client;
       await client.request('initialize', {
         clientInfo: { name: 'switchboard_telemetry', title: 'Switchboard telemetry', version: '0.1.0' },
-        capabilities: null,
+        capabilities: mode === 'turns' ? { experimentalApi: true, requestAttestation: false } : null,
       });
       this.#assertActive(client);
       client.notify('initialized');
@@ -427,9 +516,10 @@ export class CodexAppServerSupervisor {
       ...(this.#options.requestTimeoutMs === undefined ? {} : { requestTimeoutMs: this.#options.requestTimeoutMs }),
       redact: (text) => redactValues(text, Object.values(this.#options.runtime.env)),
       onNotification: (method, params) => this.#notification(client, method, params),
-      onServerRequest: (id, method, _params) => this.#serverRequest(client, id, method),
+      onServerRequest: (id, method, params) => this.#serverRequest(client, id, method, params),
       onExit: (error) => this.#clientExit(client, error),
     });
+    this.#catalog.invalidate();
     this.#clientGenerations.set(client, this.#nextGeneration++);
     return client;
   }
@@ -438,6 +528,20 @@ export class CodexAppServerSupervisor {
     if (client !== this.#client || this.#closed) return;
     if ((PRIVATE_NOTIFICATIONS as readonly string[]).includes(method)) return;
     if (client !== this.#readyClient) return;
+    if ((CAPABILITY_NOTIFICATIONS as readonly string[]).includes(method)) {
+      this.#catalog.invalidate();
+      return;
+    }
+    if (method === 'account/updated') this.#catalog.invalidate();
+    if (method === 'serverRequest/resolved') {
+      const value = params as {threadId?: unknown; requestId?: unknown} | null;
+      if (!value || (typeof value.requestId !== 'string' && typeof value.requestId !== 'number')) return;
+      const pending = this.#approvals.get(value.requestId);
+      if (!pending || pending.client !== client || pending.state.threadId !== value.threadId) return;
+      this.#approvals.delete(value.requestId);
+      pending.state.route.onServerResolved?.(value.requestId);
+      return;
+    }
     if (method === 'account/updated') {
       const auth = normalizeCodexAuthUpdate(params);
       this.#authRevision += 1;
@@ -471,6 +575,10 @@ export class CodexAppServerSupervisor {
       return;
     }
     if (method === 'turn/started' && turnId) {
+      if (state.compactPending && !state.terminalTurnIds.has(turnId)) {
+        state.compactPending = false;
+        state.activeTurnId = turnId;
+      }
       if (state.pendingTurn !== null) {
         if (state.terminalTurnIds.has(turnId)) return;
         if (state.pendingStartTurnId === null) {
@@ -498,8 +606,34 @@ export class CodexAppServerSupervisor {
     }
   }
 
-  #serverRequest(client: SupervisorClient, id: string | number, method: string): void {
+  #serverRequest(client: SupervisorClient, id: string | number, method: string, params: unknown): void {
     if (client !== this.#client || this.#closed) return;
+    if (this.#mode === 'turns' && client === this.#readyClient && client.respond
+      && (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval' || method === 'item/tool/requestUserInput' || method === 'mcpServer/elicitation/request')) {
+      const value = params as {threadId?: unknown; turnId?: unknown; itemId?: unknown} | null;
+      const sessionId = value && typeof value.threadId === 'string' ? this.#threadOwners.get(value.threadId) : undefined;
+      const state = sessionId ? this.#sessions.get(sessionId) : undefined;
+      const elicitation = method === 'mcpServer/elicitation/request';
+      const activeTurn = state && value && (state.activeTurnId === value.turnId
+        || (state.pendingTurn !== null && state.pendingStartTurnId === value.turnId));
+      const validTurn = value && (typeof value.turnId === 'string' && !unsafeCodexProviderIdentifier(value.turnId)
+        && activeTurn || elicitation && value.turnId === null && state?.activeTurnId != null);
+      if (state?.route.onServerRequest && value && validTurn
+        && (elicitation || typeof value.itemId === 'string' && !unsafeCodexProviderIdentifier(value.itemId))
+        && state.generation === this.#clientGenerations.get(client)
+        && !this.#approvals.has(id) && this.#approvals.size < 256) {
+        const pending = {client,state,answered:false};
+        this.#approvals.set(id,pending);
+        const respond = (decision: CodexInteractionResult) => {
+          if (this.#approvals.get(id) !== pending || pending.answered || client !== this.#readyClient) return;
+          pending.answered = true;
+          client.respond!(id, typeof decision === 'string' ? { decision } : decision);
+        };
+        try { state.route.onServerRequest(id,method,params,respond); }
+        catch { respond(elicitation ? {action:'cancel',content:null,_meta:null} : method === 'item/tool/requestUserInput' ? { answers: {} } : 'decline'); }
+        return;
+      }
+    }
     const pinnedDenied = (DENIED_SERVER_METHODS as readonly string[]).includes(method);
     client.respondError(
       id,
@@ -666,6 +800,8 @@ export class CodexAppServerSupervisor {
     for (const [sessionId, state] of [...this.#sessions]) {
       if (state.generation !== generation) continue;
       this.#sessions.delete(sessionId);
+      this.#screenshotWarnings.delete(sessionId);
+      for (const [id, pending] of this.#approvals) if (pending.state === state) this.#approvals.delete(id);
       if (state.threadId !== null && this.#threadOwners.get(state.threadId) === sessionId) {
         this.#threadOwners.delete(state.threadId);
       }
@@ -742,6 +878,7 @@ export class CodexAppServerSupervisor {
     this.#client = null;
     this.#readyClient = null;
     this.#sessions.clear();
+    this.#approvals.clear();
     this.#threadOwners.clear();
     this.#listeners.clear();
     if (client) {

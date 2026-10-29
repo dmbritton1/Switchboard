@@ -44,6 +44,17 @@ export class Scheduler {
     return item;
   }
 
+  findResetResume(sessionId: string): Queued | null {
+    return this.all().find(item => item.trigger.kind === 'reset'
+      && item.action.kind === 'resume' && item.action.sessionId === sessionId) ?? null;
+  }
+
+  addResetResume(account: string, sessionId: string, prompt: 'continue' = 'continue', now = Date.now()): Queued {
+    return this.findResetResume(sessionId) ?? this.add(
+      {kind:'reset',account}, {kind:'resume',sessionId,prompt}, now,
+    );
+  }
+
   remove(id: string): void {
     this.#items.delete(id);
     this.#notify();

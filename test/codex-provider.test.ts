@@ -84,7 +84,7 @@ async function harness(
       return {
         source: 'explicit' as const,
         commandPath: `/fixture/${configured.name}/codex`,
-        version: options.failContract ? '0.144.0' : '0.145.0',
+        version: options.failContract ? '0.144.0' : '0.153.4',
         env: {
           TEST_PROVIDER_ACCOUNT: configured.name,
           TEST_PROVIDER_GENERATION: generation,
@@ -211,7 +211,7 @@ test('telemetry followed by app-server preparation promotes the same supervisor'
   const prepared = await fixture.pool.prepare(configured, 'app-server', 'session-a');
 
   assert.equal(prepared.adapter, fixture.appAdapters[0]);
-  assert.equal(prepared.runtimeVersion, '0.145.0');
+  assert.equal(prepared.runtimeVersion, '0.153.4');
   assert.equal(fixture.appSupervisors[0], supervisor);
   assert.deepEqual(fixture.launches.get('promoted'), [
     appServerArgs('telemetry'),
@@ -231,8 +231,8 @@ test('two app-server sessions share one turn child and receive distinct adapters
   assert.notEqual(one.adapter, two.adapter);
   assert.equal(fixture.appSupervisors[0], fixture.appSupervisors[1]);
   assert.deepEqual(fixture.appAdapters.map((value) => value.label).sort(), [
-    'app-server:session-one:0.145.0',
-    'app-server:session-two:0.145.0',
+    'app-server:session-one:0.153.4',
+    'app-server:session-two:0.153.4',
   ]);
   assert.deepEqual(fixture.launches.get('turns'), [
     appServerArgs('turns'),
@@ -496,7 +496,7 @@ test('pool close joins failed supervisor preparation and closes its supervisor e
     prepareRuntime: async () => ({
       source: 'explicit',
       commandPath: '/fixture/codex',
-      version: '0.145.0',
+      version: '0.153.4',
       env: {},
       diagnostics: [],
     }),
@@ -534,7 +534,7 @@ test('pool close drains gated runtime preparation and concurrent identity retire
       return {
         source: 'explicit',
         commandPath: '/fixture/codex',
-        version: '0.145.0',
+        version: '0.153.4',
         env: {},
         diagnostics: [],
       };
@@ -581,7 +581,7 @@ test('retirement fails closed during SDK, app-server, and telemetry runtime prep
     const retired = pool.retire(old).then(() => { retirementResolved = true; });
     await nextTurn();
     assert.equal(retirementResolved, false, 'retirement must retain in-flight preparation ownership');
-    resolve({ source: 'explicit', commandPath: '/fixture/codex', version: '0.145.0', env: {}, diagnostics: [] });
+    resolve({ source: 'explicit', commandPath: '/fixture/codex', version: '0.153.4', env: {}, diagnostics: [] });
     await Promise.all([retired, rejected]);
     assert.equal(created, 0);
     await pool.close();
@@ -595,7 +595,7 @@ test('retirement during supervisor preparation prevents adapter creation', async
   const gate = new Promise<void>((r) => { release = r; });
   let adapters = 0;
   const pool = new CodexProviderPool({
-    prepareRuntime: async () => ({ source: 'explicit', commandPath: '/fixture/codex', version: '0.145.0', env: {}, diagnostics: [] }),
+    prepareRuntime: async () => ({ source: 'explicit', commandPath: '/fixture/codex', version: '0.153.4', env: {}, diagnostics: [] }),
     createSupervisor: (options) => new CodexAppServerSupervisor({
       ...options, verifyContract: async () => { entered(); await gate; },
       clientFactory: () => { throw new Error('retired preparation must not launch'); },
@@ -611,4 +611,33 @@ test('retirement during supervisor preparation prevents adapter creation', async
   await Promise.all([retired, rejected]);
   assert.equal(adapters, 0);
   await pool.close();
+});
+
+test('capability previews share account ownership and reject results from retired identities', async () => {
+  const gate = deferred();
+  const entered = deferred();
+  const calls: unknown[] = [];
+  const snapshot = {revision: 1, capabilities: [], warnings: []};
+  const pool = new CodexProviderPool({
+    prepareRuntime: async () => ({source:'explicit',commandPath:'/fixture/codex',version:'0.153.4',env:{},diagnostics:[]}),
+    createSupervisor: () => ({
+      async previewCapabilities(cwd: string, force: boolean) { calls.push([cwd,force]); entered.resolve(); await gate.promise; return snapshot; },
+      async close() {},
+    } as unknown as CodexAppServerSupervisor),
+  });
+  const old = account('preview');
+  const pending = pool.capabilities(old, '/repo', true);
+  const rejected = assert.rejects(pending, /retired/);
+  await entered.promise;
+  let settled = false;
+  const retiring = pool.retire(old).then(() => { settled = true; });
+  await nextTurn();
+  assert.equal(settled, false);
+  gate.resolve();
+  await Promise.all([rejected, retiring]);
+  const replacement = account('preview');
+  assert.deepEqual(await pool.capabilities(replacement, '/other', false), snapshot);
+  assert.deepEqual(calls, [['/repo',true],['/other',false]]);
+  await pool.close();
+  await assert.rejects(pool.capabilities(replacement, '/other'), /closed/);
 });

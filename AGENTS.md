@@ -34,18 +34,20 @@ Registry and git worktrees, then into a provider adapter.
 ## Safety boundaries
 
 - Each session has one dedicated git worktree.
-- Codex always uses the fixed `workspace-write` sandbox and `never` approval
-  policy. Do not broaden either policy or add an interactive approval path in
-  Phase 1 fixes.
+- Codex uses the fixed `workspace-write` sandbox. SDK sessions use `never`;
+  app-server sessions use fixed `on-request` and the `user` reviewer for the
+  approved interaction phase.
+  Mirror Claude's Allow/Deny and per-request Auto behavior, without switching
+  to blanket bypass or session-wide grants.
 - Settings must never expose the Codex sandbox mode or approval policy. The
   `settings` command rejects unknown keys for this reason; keep it strict.
 - Treat account environment values as launch-only secrets: never persist, log,
   return over SSE, or render them.
 - Preserve the target repository's Codex configuration and instructions.
-- Keep `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'` as
-  mandatory overrides. Per-session Codex settings may be explicit or omitted
+- Keep `sandboxMode: 'workspace-write'` and the transport's fixed approval
+  policy (`never` for SDK, `on-request` for app-server) as mandatory overrides. Per-session Codex settings may be explicit or omitted
   (omitted means inherit), may change only while a session is stopped, and must
-  never expose or weaken either policy.
+  never expose or weaken the sandbox or replace the fixed transport policy.
 - Codex lifecycle items occupy one stable row from `running` through terminal
   `ok` or `error`. Reasoning summaries and todo status are separate entries;
   do not persist or expose raw reasoning.

@@ -31,13 +31,13 @@ test('an explicit compatible executable is authoritative', async (t) => {
 
   const runtime = await prepareCodexRuntime(
     { bin, env: { CODEX_HOME: join(dir, 'codex-home') } },
-    { platform: 'darwin', sdkVersion: '0.145.0' },
+    { platform: 'darwin', sdkVersion: '0.153.4' },
   );
 
   assert.equal(runtime.source, 'explicit');
   assert.equal(runtime.commandPath, bin);
   assert.equal(runtime.codexPathOverride, bin);
-  assert.equal(runtime.version, '0.145.0');
+  assert.equal(runtime.version, '0.153.4');
   assert.equal(runtime.env.CODEX_HOME, join(dir, 'codex-home'));
 });
 
@@ -46,7 +46,7 @@ test('an explicit version mismatch fails closed', async (t) => {
   const bin = await writeFakeCodex(dir, { version: '0.146.0' });
 
   await assert.rejects(
-    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     expectCode('codex_version_mismatch'),
   );
 });
@@ -62,18 +62,18 @@ test('an incompatible ChatGPT.app candidate falls back to the SDK CLI', async (t
 
   const runtime = await prepareCodexRuntime(
     { env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0', chatgptPath, bundledPath },
+    { platform: 'darwin', sdkVersion: '0.153.4', chatgptPath, bundledPath },
   );
 
   assert.equal(runtime.source, 'sdk');
   assert.equal(runtime.commandPath, bundledPath);
   assert.equal(runtime.codexPathOverride, undefined);
-  assert.match(runtime.diagnostics.join('\n'), /ChatGPT.*0\.146\.0.*0\.145\.0/);
+  assert.match(runtime.diagnostics.join('\n'), /ChatGPT.*0\.146\.0.*0\.153\.4/);
 });
 
 test('a non-darwin host fails before resolving a binary', async () => {
   await assert.rejects(
-    prepareCodexRuntime({ env: {} }, { platform: 'linux', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ env: {} }, { platform: 'linux', sdkVersion: '0.153.4' }),
     expectCode('codex_platform_unsupported'),
   );
 });
@@ -82,7 +82,7 @@ test('a missing explicit binary fails closed', async (t) => {
   const dir = await fixture(t);
 
   await assert.rejects(
-    prepareCodexRuntime({ bin: join(dir, 'missing'), env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ bin: join(dir, 'missing'), env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     expectCode('codex_binary_missing'),
   );
 });
@@ -91,7 +91,7 @@ test('an explicit directory is not executable', async (t) => {
   const dir = await fixture(t);
 
   await assert.rejects(
-    prepareCodexRuntime({ bin: dir, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ bin: dir, env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     expectCode('codex_binary_not_executable'),
   );
 });
@@ -102,7 +102,7 @@ test('a non-executable explicit file fails closed', async (t) => {
   await chmod(bin, 0o644);
 
   await assert.rejects(
-    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     expectCode('codex_binary_not_executable'),
   );
 });
@@ -113,7 +113,7 @@ test('an explicit binary with an unreadable version fails closed', async (t) => 
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: {} }, {
-      platform: 'darwin', sdkVersion: '0.145.0',
+      platform: 'darwin', sdkVersion: '0.153.4',
       runFile: async () => ({ stdout: 'not a Codex version', stderr: '' }),
     }),
     expectCode('codex_version_unreadable'),
@@ -126,7 +126,7 @@ test('an unreadable version reports what the candidate said, redacted', async (t
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'version-secret' } }, {
-      platform: 'darwin', sdkVersion: '0.145.0',
+      platform: 'darwin', sdkVersion: '0.153.4',
       runFile: async () => {
         throw Object.assign(new Error('spawn EAGAIN'), {
           stdout: '', stderr: 'refusing to start for version-secret\n',
@@ -149,7 +149,7 @@ test('an unparseable version reports the output rather than a bare reinstall', a
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: {} }, {
-      platform: 'darwin', sdkVersion: '0.145.0',
+      platform: 'darwin', sdkVersion: '0.153.4',
       runFile: async () => ({ stdout: 'not a Codex version', stderr: '' }),
     }),
     (error: unknown) => {
@@ -166,7 +166,7 @@ test('a wedged version preflight times out with the version readiness code', asy
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'version-secret' } }, {
-      platform: 'darwin', sdkVersion: '0.145.0', preflightTimeoutMs: 25,
+      platform: 'darwin', sdkVersion: '0.153.4', preflightTimeoutMs: 25,
       runFile: async () => new Promise<never>(() => {}),
     }),
     (error: unknown) => error instanceof CodexRuntimeError
@@ -178,14 +178,14 @@ test('a wedged version preflight times out with the version readiness code', asy
 
 test('semver build metadata does not make a compatible explicit binary mismatch', async (t) => {
   const dir = await fixture(t);
-  const bin = await writeFakeCodex(dir, { version: '0.145.0+local.build' });
+  const bin = await writeFakeCodex(dir, { version: '0.153.4+local.build' });
 
   const runtime = await prepareCodexRuntime(
     { bin, env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0+sdk.build' },
+    { platform: 'darwin', sdkVersion: '0.153.4+sdk.build' },
   );
 
-  assert.equal(runtime.version, '0.145.0+local.build');
+  assert.equal(runtime.version, '0.153.4+local.build');
 });
 
 test('a logged-out explicit binary reports authentication unavailable', async (t) => {
@@ -193,7 +193,7 @@ test('a logged-out explicit binary reports authentication unavailable', async (t
   const bin = await writeFakeCodex(dir, { login: 'logged-out' });
 
   await assert.rejects(
-    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     expectCode('codex_auth_unavailable'),
   );
 });
@@ -204,9 +204,9 @@ test('a wedged login preflight times out with the authentication readiness code'
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 'login-secret' } }, {
-      platform: 'darwin', sdkVersion: '0.145.0', preflightTimeoutMs: 25,
+      platform: 'darwin', sdkVersion: '0.153.4', preflightTimeoutMs: 25,
       runFile: async (_file, args) => args.includes('--version')
-        ? { stdout: 'codex-cli 0.145.0\n', stderr: '' }
+        ? { stdout: 'codex-cli 0.153.4\n', stderr: '' }
         : new Promise<never>(() => {}),
     }),
     (error: unknown) => error instanceof CodexRuntimeError
@@ -222,7 +222,7 @@ test('an unsupported login-status command defers authentication validation', asy
 
   const runtime = await prepareCodexRuntime(
     { bin, env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0' },
+    { platform: 'darwin', sdkVersion: '0.153.4' },
   );
 
   assert.match(runtime.diagnostics.join('\n'), /login status.*unsupported/i);
@@ -238,7 +238,7 @@ test('a compatible ChatGPT.app binary is selected before the SDK fallback', asyn
 
   const runtime = await prepareCodexRuntime(
     { env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0', chatgptPath, bundledPath },
+    { platform: 'darwin', sdkVersion: '0.153.4', chatgptPath, bundledPath },
   );
 
   assert.equal(runtime.source, 'chatgpt');
@@ -254,7 +254,7 @@ test('the SDK CLI is selected when no ChatGPT.app candidate is available', async
 
   const runtime = await prepareCodexRuntime(
     { env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0', chatgptPath: join(dir, 'absent'), bundledPath },
+    { platform: 'darwin', sdkVersion: '0.153.4', chatgptPath: join(dir, 'absent'), bundledPath },
   );
 
   assert.equal(runtime.source, 'sdk');
@@ -273,7 +273,7 @@ test('the production default reads the installed SDK version', async (t) => {
     { platform: 'darwin', chatgptPath: join(dir, 'absent'), bundledPath },
   );
 
-  assert.equal(runtime.version, '0.145.0');
+  assert.equal(runtime.version, '0.153.4');
 });
 
 test('an invalid account environment shape fails without leaking its contents', async (t) => {
@@ -282,7 +282,7 @@ test('an invalid account environment shape fails without leaking its contents', 
 
   await assert.rejects(
     prepareCodexRuntime({ bin, env: { CODEX_TOKEN: 123 } as unknown as Record<string, string> }, {
-      platform: 'darwin', sdkVersion: '0.145.0',
+      platform: 'darwin', sdkVersion: '0.153.4',
     }),
     (error: unknown) =>
       error instanceof CodexRuntimeError
@@ -299,11 +299,11 @@ test('login status receives the same merged environment returned by the runtime'
   const runtime = await prepareCodexRuntime(
     { bin, env: { CODEX_HOME: join(dir, 'home'), SAFE_FLAG: 'yes' } },
     {
-      platform: 'darwin', sdkVersion: '0.145.0',
+      platform: 'darwin', sdkVersion: '0.153.4',
       runFile: async (_file, args, options) => {
         calls.push({ args, env: options.env });
         return args.includes('--version')
-          ? { stdout: 'codex-cli 0.145.0\n', stderr: '' }
+          ? { stdout: 'codex-cli 0.153.4\n', stderr: '' }
           : { stdout: 'Logged in using ChatGPT\n', stderr: '' };
       },
     },
@@ -433,7 +433,7 @@ test('requireAuth false resolves a logged-out binary instead of throwing', async
   const bin = await writeFakeCodex(dir, { login: 'logged-out' });
   const runtime = await prepareCodexRuntime(
     { bin, env: {} },
-    { platform: 'darwin', sdkVersion: '0.145.0', requireAuth: false },
+    { platform: 'darwin', sdkVersion: '0.153.4', requireAuth: false },
   );
   assert.equal(runtime.commandPath, bin);
   assert.equal(runtime.source, 'explicit');
@@ -445,7 +445,7 @@ test('requireAuth false still rejects a version-mismatched binary', async () => 
   await assert.rejects(
     () => prepareCodexRuntime(
       { bin, env: {} },
-      { platform: 'darwin', sdkVersion: '0.145.0', requireAuth: false },
+      { platform: 'darwin', sdkVersion: '0.153.4', requireAuth: false },
     ),
     (error: Error) => (error as CodexRuntimeError).code === 'codex_version_mismatch',
   );
@@ -455,7 +455,7 @@ test('requireAuth defaults to true, so a logged-out binary still fails', async (
   const dir = await mkdtemp(join(tmpdir(), 'codex-runtime-'));
   const bin = await writeFakeCodex(dir, { login: 'logged-out' });
   await assert.rejects(
-    () => prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.145.0' }),
+    () => prepareCodexRuntime({ bin, env: {} }, { platform: 'darwin', sdkVersion: '0.153.4' }),
     (error: Error) => (error as CodexRuntimeError).code === 'codex_auth_unavailable',
   );
 });

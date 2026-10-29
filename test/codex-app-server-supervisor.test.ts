@@ -294,7 +294,7 @@ function runtime(overrides: Record<string, string> = {}): PreparedCodexRuntime {
   return {
     source: 'explicit',
     commandPath: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: environment(overrides),
     diagnostics: [],
   };
@@ -443,6 +443,7 @@ function routedTurn(id: string, status: 'inProgress' | 'completed' = 'inProgress
 async function turnRoutingHarness(
   t: { after(fn: () => unknown): void },
   respondToStart: (number: number) => unknown | Promise<unknown>,
+  capabilityRead?: (method: string, params: unknown) => unknown | Promise<unknown>,
 ): Promise<{
   supervisor: CodexAppServerSupervisor;
   protocol: AppServerClientOptions;
@@ -470,6 +471,7 @@ async function turnRoutingHarness(
             return await respondToStart(starts) as T;
           }
           if (method === 'turn/interrupt') return {} as T;
+          if (capabilityRead) return await capabilityRead(method, _params) as T;
           throw new Error(`unexpected ${method}`);
         },
         notify: () => {},
@@ -1333,7 +1335,7 @@ test('promotes one telemetry child in place, keeps listeners, reconciles, and ma
   assert.deepEqual(modes, ['telemetry', 'turns']);
   assert.deepEqual(launches.map((entry) => entry.configs), [
     ['hooks={}', 'mcp_servers={}', 'otel.exporter="none"'],
-    ['otel.exporter="none"'],
+    ['features.default_mode_request_user_input=true', 'otel.exporter="none"'],
   ]);
   assert.equal((await calls(callLog)).filter((entry) => entry.operation === 'eof').length, 1);
   assert.equal(observed.stale.length, 1);
@@ -2029,4 +2031,122 @@ test('a failed replacement launch does not fatal the prior active route twice', 
   await waitFor(() => clients.length === 3 && scheduled.length === 2);
 
   assert.deepEqual(fatals, ['codex_transport_crashed']);
+});
+
+test('approval requests and resolutions stay with the active session and cannot be answered twice', async (t) => {
+  let callbacks!: AppServerClientOptions;
+  const responses: unknown[] = [], errors: unknown[] = [], received: any[] = [], resolved: unknown[] = [];
+  const supervisor = new ProductionCodexAppServerSupervisor({runtime:runtime(),verifyContract:async()=>{},
+    clientFactory: options => {
+      callbacks=options;
+      return { request:async <T>(method:string)=> (method==='initialize'?{}:method==='account/read'?managedAccountResult():method==='account/rateLimits/read'?rateLimitsResult():{turn:routedTurn('active')}) as T,
+        notify(){},respond:(id:unknown,result:unknown)=>responses.push({id,result}),respondError:(...args:unknown[])=>errors.push(args),async close(){} };
+    }});
+  t.after(()=>supervisor.close());await supervisor.ensureTurnTransport();
+  supervisor.registerSession('a',{onNotification(){},onFatal(){},onServerRequest:(...args:any[])=>received.push(args),onServerResolved:id=>resolved.push(id)});
+  supervisor.bindThread('a','thread-a');await supervisor.requestForSession('a','turn/start',{threadId:'thread-a'});
+  const method='item/commandExecution/requestApproval';
+  callbacks.onServerRequest('one',method,{threadId:'thread-a',turnId:'active',itemId:'item',command:'echo hello'});
+  assert.equal(received.length,1);
+  received[0][3]('accept');received[0][3]('decline');
+  assert.deepEqual(responses,[{id:'one',result:{decision:'accept'}}]);
+  callbacks.onNotification('serverRequest/resolved',{threadId:'wrong',requestId:'one'});
+  assert.deepEqual(resolved,[]);
+  callbacks.onNotification('serverRequest/resolved',{threadId:'thread-a',requestId:'one'});
+  assert.deepEqual(resolved,['one']);
+  callbacks.onServerRequest('two',method,{threadId:'thread-a',turnId:'old',itemId:'item'});
+  assert.equal(received.length,1);assert.equal(errors.length,1);
+});
+
+
+test('capability invalidation is account-local and detached sessions cannot read cached results',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-cap-routing-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+ let reads=0;
+ const {supervisor,protocol}=await turnRoutingHarness(t,()=>({turn:routedTurn('turn')}),async(method,p:any)=>{
+  reads++;
+  if(method==='skills/list'){assert.deepEqual(p.cwds,[cwd]);return {data:[]};}
+  assert.equal(p.threadId,'thread');
+  return method==='app/installed'?{apps:[]}:{data:[],nextCursor:null};
+ });
+ await supervisor.capabilitiesForSession('session',cwd);
+ assert.equal(reads,4);
+ await supervisor.capabilitiesForSession('session',cwd);assert.equal(reads,4);
+ protocol.onNotification?.('skills/changed',{});
+ await supervisor.capabilitiesForSession('session',cwd);assert.equal(reads,8);
+ await assert.rejects(supervisor.capabilitiesForSession('missing',cwd),/unavailable/);
+ await supervisor.close();
+ await assert.rejects(supervisor.capabilitiesForSession('session',cwd),/unavailable/);
+});
+
+test('thread screenshot injection reads its cwd, preserves user servers, and honors session network override',async t=>{
+ const calls:Array<{method:string;params:any}>=[];
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime(),verifyContract:async()=>{},clientFactory:()=>({
+  async request(method,params){calls.push({method,params});
+   if(method==='initialize')return {};
+   if(method==='account/read')return managedAccountResult();
+   if(method==='account/rateLimits/read')return rateLimitsResult();
+   if(method==='config/read')return {config:{mcp_servers:{switchboard_simulator:{command:'user-owned'},other:{command:'keep'}},sandbox_workspace_write:{network_access:true}}};
+   if(method==='thread/start')return {};
+   throw Error(method);
+  },notify(){},respondError(){},async close(){},
+ })});t.after(()=>supervisor.close());await supervisor.ensureTurnTransport();
+ supervisor.registerSession('shots',{onNotification(){},onFatal(){}});
+ await supervisor.requestForSession('shots','thread/start',{cwd:'/worktree',sandbox:'workspace-write',approvalPolicy:'on-request',config:{sandbox_workspace_write:{network_access:false},model_verbosity:'low'}});
+ assert.deepEqual(calls.find(c=>c.method==='config/read')?.params,{cwd:'/worktree',includeLayers:false});
+ const params=calls.find(c=>c.method==='thread/start')!.params;
+ assert.equal(params.config.model_verbosity,'low');assert.deepEqual(params.config.sandbox_workspace_write,{network_access:false});
+ assert.equal(params.config['mcp_servers.switchboard_simulator.command'],undefined);
+ assert.equal(params.config['mcp_servers.switchboard_browser.command'],undefined);
+ assert.equal(params.config.mcp_servers,undefined);assert.equal(params.sandbox,'workspace-write');assert.equal(params.approvalPolicy,'on-request');
+});
+
+test('preview discovers without a thread or process-wide MCP inventory and rejects after close',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-preview-route-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+ const calls:string[]=[];
+ const {supervisor}=await turnRoutingHarness(t,()=>{throw new Error('no turn permitted');},async(method,p:any)=>{
+  calls.push(method);assert.equal(p.threadId,undefined);
+  if(method==='skills/list'){assert.deepEqual(p.cwds,[cwd]);return {data:[]};}
+  return method==='app/installed'?{apps:[]}:{data:[],nextCursor:null};
+ });
+ const result=await supervisor.previewCapabilities(cwd);
+ assert.deepEqual(calls.sort(),['app/installed','app/list','skills/list']);
+ assert.ok(result.warnings.some(s=>s.includes('session')));
+ await supervisor.close();await assert.rejects(supervisor.previewCapabilities(cwd));
+});
+
+test('boundary recovery waits for older reconciliation then coalesces one new read', async (t) => {
+  const older = deferred<unknown>();
+  const fresh = deferred<unknown>();
+  let reads = 0;
+  const supervisor = new CodexAppServerSupervisor({
+    runtime: runtime(), onSnapshot() {}, onStale() {}, verifyContract: async () => {},
+    clientFactory: () => ({
+      request: async <T>(method: string): Promise<T> => {
+        if (method === 'initialize') return {} as T;
+        if (method === 'account/read') return managedAccountResult() as T;
+        if (method === 'account/rateLimits/read') {
+          reads++;
+          if (reads === 1) return rateLimitsResult(10) as T;
+          return (reads === 2 ? older.promise : fresh.promise) as Promise<T>;
+        }
+        throw new Error('unexpected request');
+      }, notify() {}, respondError() {}, close: async () => {},
+    }),
+  });
+  t.after(() => supervisor.close());
+  await supervisor.start();
+  const prior = supervisor.reconcile();
+  await waitFor(() => reads === 2);
+  const first = supervisor.readAtResetBoundary(2000);
+  const second = supervisor.readAtResetBoundary(2000);
+  older.resolve(rateLimitsResult(20));
+  await prior;
+  // Flush promise continuations without waiting indefinitely when the regression occurs.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(reads, 3, 'a pre-invocation read cannot satisfy the recovery read');
+  fresh.resolve(rateLimitsResult(90));
+  const results = await Promise.all([first, second]);
+  assert.equal(results[0], results[1]);
+  assert.equal(results[0].windows[0]?.usedPercent,90);
+  assert.equal(reads,3);
 });

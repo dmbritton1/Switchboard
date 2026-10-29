@@ -1,365 +1,96 @@
-# Codex Interactive Requests Implementation Plan
+# Codex interactions implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+Revised 2026-09-09 against the installed SDK/CLI 0.153.4 and the current shared
+account supervisor. This revision replaces the original 0.147.0 plan; do not
+recreate its proposed provider-neutral queue or replace Claude's handle API.
 
-**Goal:** Give app-server Codex sessions Claude-like approvals, `needs-you`, Auto behavior, sequential structured questions, and stable MCP elicitation.
+## Current implementation
 
-**Architecture:** Normalize every user-blocking server request into a provider-neutral FIFO interaction queue. Keep upstream app-server requests atomic, expose only the queue head through Registry state, and make `serverRequest/resolved` the authoritative state transition.
+- [x] Command/file Allow and Deny, FIFO, responding state, opaque browser IDs.
+- [x] Per-request Auto, needs-you, stop/crash cleanup, stale decision rejection.
+- [x] Start/resume force workspace-write, on-request, and the user reviewer.
+- [x] Structured questions use the same FIFO and resolution notification.
+- [x] Sequential question display, choices, optional typed input, masked secret
+  input, Skip, and atomic upstream submission of the complete answer map.
+- [x] Browser drafts survive unrelated snapshots and failed HTTP submissions;
+  successful submission, resolution, and Stop discard them.
+- [x] Auto never answers or skips a question.
+- [x] MCP form and URL elicitation with typed validation, stale-response guards,
+  draft retention, explicit URL opening, and Auto exclusion.
 
-**Tech Stack:** Node.js 22.18+, TypeScript, Codex app-server 0.147.0 protocol, browser JavaScript, HTTP/SSE, node:test.
+Implementation boundaries:
 
-## Global Constraints
+- `src/agents/codex-approvals.ts`: the shared Codex approval/question FIFO;
+  raw labels, question IDs, answers, and callbacks remain process-local.
+- `src/agents/codex-questions.ts`: bounded validation, public redaction, and
+  option-ID-to-provider-label mapping.
+- `src/agents/codex-app-server-supervisor.ts`: generation/thread/turn routing;
+  turn connections opt into experimental API fields, with attestation disabled.
+  Turn processes also set `features.default_mode_request_user_input=true` so
+  normal execution mode can expose the question tool. This is an argv override;
+  it does not write user or repository configuration.
+  Telemetry-only connections retain their original capabilities and deny policy.
+- `src/agents/codex-app-server.ts`: normalize and enqueue requests, submit typed
+  results, and clear state at lifecycle boundaries.
+- `src/server.ts`: `answer-question` validates the current visible question ID;
+  `decide` cannot answer a structured question. Answers bypass the transcript.
+- `web/questions.js`: in-memory drafts and shared question controls used by
+  the existing grid, session header, and interrupt strip.
 
-- Complete `2026-08-11-codex-app-server-foundation.md` first.
-- Execute in an isolated worktree created with `superpowers:using-git-worktrees`.
-- Keep Codex sandbox fixed to `workspaceWrite`.
-- Expose only Allow once, Deny, and the existing Auto toggle in the first release.
-- Auto responds `accept` per request; never send `acceptForSession` from Auto.
-- `tool/requestUserInput` is the only experimental server request accepted.
-- Never persist raw question answers or MCP elicitation values.
-- Keep `npm test` offline and run it before completion.
+The installed `ToolRequestUserInputQuestion` has `isOther`, `isSecret`, and
+nullable options. It has no multi-select field. Present one selection or one
+text answer per question. Do not infer multi-select from the response's array
+shape. `isBlocking` replaces the deprecated `autoResolutionMs` scheduling hint;
+Switchboard presents outstanding questions as needs-you and waits for the
+provider's `serverRequest/resolved` rather than running a competing timeout.
+A nonblocking question may be resolved by the provider while the user types.
 
----
+Each displayed question has a new public request ID. Earlier submissions cannot
+answer a later question in the same provider request. Partial answers are held
+only in memory until the last answer; Skip and Stop send `{ answers: {} }` and
+discard partial values. Resolution or transport failure discards the queue.
+SDK Codex and Claude retain their existing behavior.
 
-## File structure
+## MCP elicitation implementation
 
-- Create `src/agents/interactions.ts`: interaction queue and response types shared by adapters.
-- Create `test/interactions.test.ts`: FIFO, stale response, Auto, and drain behavior.
-- Modify `src/types.ts`, `src/sessions.ts`, `src/agents/claude.ts`, `src/agents/codex-app-server.ts`, `src/agents/codex-app-server-supervisor.ts`, `src/server.ts`.
-- Modify `web/lib.js`, `web/app.js`, `web/style.css` and their tests.
+`src/agents/codex-elicitation.ts` validates the stable `form` and `url` modes.
+Text, number/integer, boolean, and single/multiple enum fields are supported,
+including bounds and the generated email/URI/date/date-time formats. Fields and
+options have opaque browser IDs. Unknown constraints, nested structures, and
+`openai/form`/`openaiForm` extensions are cancelled rather than rendered loosely.
+Schema defaults are not prefilled; users explicitly provide the submitted data.
 
-### Task 1: Define provider-neutral interaction state
+The existing FIFO keeps each elicitation visible until upstream resolution.
+Auto never accepts, declines, or supplies values. Stop sends cancel; complete,
+crash, and resolution discard actionable state. A nullable turn ID is accepted
+only for an active owning thread; a supplied turn ID must match the active turn.
+Idle, stopped, unowned, and stale-generation requests remain unsupported.
 
-**Files:**
-- Create: `src/agents/interactions.ts`
-- Create: `test/interactions.test.ts`
-- Modify: `src/types.ts`
-- Modify: `src/sessions.ts`
-- Test: `test/sessions.test.ts`
+`respond-elicitation` sends validated values directly to the callback without
+appending them to the transcript or saved state. The browser shares the existing
+in-memory draft controller and restores values/focus across SSE updates.
 
-**Interfaces:**
-- Produces:
+URL requests show a redacted origin and a deliberate Open page link. The raw URL
+remains in the adapter queue. `/elicitation-url` checks the current public ID and
+responding state, then issues a no-store, no-referrer redirect. HTTPS is allowed;
+HTTP is allowed only for literal loopback hosts. Credentials in URLs and other
+schemes are rejected. The page is never opened automatically. Accept, Decline,
+and Cancel are explicit user actions and do not grant session-wide permissions.
 
-```ts
-export type InteractionOption = { label: string; description?: string; isOther?: boolean };
-export type InteractionQuestion = {
-  id: string;
-  header: string;
-  prompt: string;
-  options: InteractionOption[];
-  multiple: boolean;
-};
-export type PendingInteraction =
-  | { kind: 'approval'; id: string; tool: string; summary: string }
-  | { kind: 'questions'; id: string; questions: InteractionQuestion[]; expiresAt: number | null }
-  | { kind: 'mcp-form'; id: string; title: string; schema: Record<string, unknown> }
-  | { kind: 'mcp-url'; id: string; title: string; url: string };
-export type InteractionResponse =
-  | { id: string; kind: 'approval'; decision: 'allow' | 'deny' }
-  | { id: string; kind: 'questions'; answers: Record<string, string[]> }
-  | { id: string; kind: 'mcp-form'; action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> }
-  | { id: string; kind: 'mcp-url'; action: 'accept' | 'decline' | 'cancel' };
+Capability discovery is now the next roadmap milestone. Broader OpenAI form
+extensions and additional schema types require a separate design and verification.
+
+## Verification commands
+
+```sh
+node --test test/codex-questions.test.ts test/codex-approvals.test.ts test/question-drafts.test.ts
+node --test test/agents-codex-app-server.test.ts test/codex-app-server-supervisor.test.ts test/codex-app-server-contract.test.ts
+node --test test/server.test.ts test/ui.test.ts
+npm test
 ```
 
-- [ ] **Step 1: Write Registry interaction tests**
-
-Assert request sets `pending` and `needs-you`, a second request increments
-`pendingCount`, resolving the head keeps `needs-you` until the next head is
-resolved, stop clears everything, and restored sessions discard actionable
-pending requests.
-
-- [ ] **Step 2: Run tests and verify RED**
-
-Run: `node --test test/interactions.test.ts test/sessions.test.ts`
-
-Expected: FAIL on missing interaction types and events.
-
-- [ ] **Step 3: Replace approval-only adapter events**
-
-Add:
-
-```ts
-| { type: 'interaction-requested'; interaction: PendingInteraction; pendingCount: number }
-| { type: 'interaction-resolved'; id: string; next: PendingInteraction | null; pendingCount: number }
-```
-
-Replace `AgentHandle.decide()` with
-`respond(response: InteractionResponse): void`. Update Claude and server
-callers in the same compile unit so no adapter has a partial interface.
-
-- [ ] **Step 4: Implement Registry transitions**
-
-Store only the visible head and count on `Session`. On load, force
-`pending = null` and `pendingCount = 0`; a live connection is required before
-an interaction can be actionable. Preserve the current rule that pending state
-outranks ordinary `working` events.
-
-- [ ] **Step 5: Run focused tests**
-
-Run: `node --test test/interactions.test.ts test/sessions.test.ts test/agents-claude.test.ts`
-
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/types.ts src/sessions.ts src/agents/interactions.ts src/agents/claude.ts test/interactions.test.ts test/sessions.test.ts test/agents-claude.test.ts
-git commit -m "refactor: generalize pending interactions"
-```
-
-### Task 2: Implement Codex approval FIFO and Auto
-
-**Files:**
-- Modify: `src/agents/interactions.ts`
-- Modify: `src/agents/codex-app-server.ts`
-- Modify: `src/agents/codex-app-server-supervisor.ts`
-- Modify: `test/interactions.test.ts`
-- Modify: `test/agents-codex-app-server.test.ts`
-- Modify: `test/helpers/fake-app-server.ts`
-
-**Interfaces:**
-- Consumes: `PendingInteraction`, `InteractionResponse`.
-- Produces: `InteractionQueue.enqueue()`, `InteractionQueue.respond()`, `InteractionQueue.drain()`.
-
-- [ ] **Step 1: Write pure FIFO tests**
-
-Cover two concurrent requests, head-only response, wrong request ID, duplicate
-response, server auto-resolution, and drain-on-stop. Require every upstream
-promise to settle exactly once.
-
-- [ ] **Step 2: Write app-server approval tests**
-
-Have the fake emit command and file requests with interleaved lifecycle events.
-Assert Allow sends `{ decision: 'accept' }`, Deny sends
-`{ decision: 'decline' }`, and `serverRequest/resolved` advances the visible
-head.
-
-- [ ] **Step 3: Run tests and verify RED**
-
-Run: `node --test test/interactions.test.ts test/agents-codex-app-server.test.ts`
-
-Expected: FAIL because Codex server requests are not queued.
-
-- [ ] **Step 4: Implement the queue**
-
-Store each live server request as `{ publicInteraction, accept, decline,
-cancel }`. Emit only the head. Do not remove it on browser submission; mark it
-responding and remove it only after the matching resolution notification.
-
-- [ ] **Step 5: Implement approval mapping**
-
-Normalize command, file, and app-tool approval questions into
-`kind: 'approval'`. Never expose policy amendments, session-wide acceptance, or
-additional permissions. Decline unsupported permission-expansion requests.
-
-- [ ] **Step 6: Implement Auto behavior**
-
-When the session Auto flag is true, respond `{ decision: 'accept' }` immediately
-and do not emit `interaction-requested`. Turning Auto off affects the next
-request because no `acceptForSession` decision was sent.
-
-- [ ] **Step 7: Run focused tests**
-
-Run: `node --test test/interactions.test.ts test/agents-codex-app-server.test.ts test/agents-claude.test.ts`
-
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/agents/interactions.ts src/agents/codex-app-server.ts src/agents/codex-app-server-supervisor.ts test/interactions.test.ts test/agents-codex-app-server.test.ts test/helpers/fake-app-server.ts
-git commit -m "feat: add Codex interactive approvals"
-```
-
-### Task 3: Normalize questions and MCP elicitation
-
-**Files:**
-- Create: `src/agents/codex-interactions.ts`
-- Create: `test/codex-interactions.test.ts`
-- Modify: `src/agents/codex-app-server.ts`
-- Modify: `test/helpers/fake-app-server.ts`
-
-**Interfaces:**
-- Produces:
-
-```ts
-export function normalizeCodexServerRequest(
-  method: string,
-  id: string | number,
-  params: unknown,
-  now?: number,
-): PendingInteraction | { kind: 'unsupported'; reason: string };
-export function codexInteractionResult(
-  interaction: PendingInteraction,
-  response: InteractionResponse,
-): unknown;
-```
-
-- [ ] **Step 1: Write question normalization tests**
-
-Cover one and three questions, descriptions, multi-select, Other, malformed
-question arrays, `autoResolutionMs`, and an app approval disguised as
-`tool/requestUserInput`.
-
-- [ ] **Step 2: Write MCP elicitation tests**
-
-Cover form accept/decline/cancel, URL accept/decline/cancel, malformed schema,
-and rejection of an unknown server-request method.
-
-- [ ] **Step 3: Run tests and verify RED**
-
-Run: `node --test test/codex-interactions.test.ts`
-
-Expected: FAIL because the normalization module does not exist.
-
-- [ ] **Step 4: Implement strict normalization**
-
-Validate object/array/string/boolean fields without trusting vendor objects.
-Convert numeric request IDs to stable string IDs for the browser while keeping
-the original wire ID private in the queue. Compute
-`expiresAt = now + autoResolutionMs` only for a finite positive timeout.
-
-- [ ] **Step 5: Implement exact wire responses**
-
-Questions return the generated-schema answer map, MCP forms return
-`{ action, content, _meta: null }`, and MCP URL responses return the documented
-action shape. Mismatched interaction/response kinds throw before a wire write.
-
-- [ ] **Step 6: Add the experimental capability guard**
-
-Enable `experimentalApi` only for app-server accounts with the rollout flag.
-If the generated contract lacks `tool/requestUserInput`, initialize without the
-flag and reject any unexpected occurrence. Stable MCP elicitation remains on.
-
-- [ ] **Step 7: Run focused tests**
-
-Run: `node --test test/codex-interactions.test.ts test/agents-codex-app-server.test.ts`
-
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/agents/codex-interactions.ts src/agents/codex-app-server.ts test/codex-interactions.test.ts test/agents-codex-app-server.test.ts test/helpers/fake-app-server.ts
-git commit -m "feat: handle Codex structured requests"
-```
-
-### Task 4: Add response command and sequential UI
-
-**Files:**
-- Modify: `src/server.ts`
-- Modify: `web/lib.js`
-- Modify: `web/app.js`
-- Modify: `web/style.css`
-- Modify: `test/server.test.ts`
-- Modify: `test/ui-command.test.ts`
-- Modify: `test/ui.test.ts`
-
-**Interfaces:**
-- Produces: POST command `{ cmd: 'respond', id: sessionId, response: InteractionResponse }`.
-
-- [ ] **Step 1: Write server command tests**
-
-Assert request/session ID correlation, 400 for malformed response, 404 for no
-live handle, 409 for stale interaction ID, and successful forwarding without
-persisting raw response values.
-
-- [ ] **Step 2: Write sequential UI state tests**
-
-Define and test:
-
-```js
-questionDraft(pendingId, questions)
-answerQuestion(draft, questionId, values)
-moveQuestion(draft, delta)
-questionSubmission(draft)
-```
-
-Cover Back/Next bounds, final-submit completeness, browser-state reset on a new
-pending ID, and draft preservation across ordinary SSE renders.
-
-- [ ] **Step 3: Run tests and verify RED**
-
-Run: `node --test test/server.test.ts test/ui-command.test.ts test/ui.test.ts`
-
-Expected: FAIL on the new command and UI helpers.
-
-- [ ] **Step 4: Implement the server command**
-
-Validate the tagged response, require it to match `session.pending.id`, call
-`handle.respond()`, and return 202 without clearing Registry pending state.
-Return 409 after an upstream auto-resolution.
-
-- [ ] **Step 5: Implement approval rendering**
-
-Keep current card and interrupt placement. Render Allow and Deny from
-`kind: 'approval'`, disable buttons while the response POST is pending, and use
-`textContent` for every provider string.
-
-- [ ] **Step 6: Implement the question stepper**
-
-Store drafts in a module-level `Map` keyed by pending ID. Render one question,
-Back/Next, final Submit, multi-select controls when requested, Other input, and
-an expiry countdown. Browser refresh intentionally restarts at question one.
-
-- [ ] **Step 7: Implement MCP form and URL cards**
-
-Render supported primitive schema fields sequentially. Mark sensitive input as
-password, never place values into transcript state, and render URL mode as a
-safe HTTP/HTTPS link plus Accept/Decline.
-
-- [ ] **Step 8: Run focused tests**
-
-Run: `node --test test/server.test.ts test/ui-command.test.ts test/ui.test.ts test/sessions.test.ts`
-
-Expected: PASS.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add src/server.ts web/lib.js web/app.js web/style.css test/server.test.ts test/ui-command.test.ts test/ui.test.ts
-git commit -m "feat: render Codex pending interactions"
-```
-
-### Task 5: Verify interaction fallback and documentation
-
-**Files:**
-- Modify: `scripts/smoke-codex-app-server.ts`
-- Modify: `test/codex-app-server-smoke.test.ts`
-- Modify: `README.md`
-
-**Interfaces:**
-- Produces: opt-in approval/question smoke results and documented fallback behavior.
-
-- [ ] **Step 1: Extend fake smoke coverage**
-
-Prove command Allow, file Deny, Auto per-request acceptance, three sequential
-questions sent as one answer map, MCP form decline, and stale auto-resolution.
-
-- [ ] **Step 2: Add guarded live cases**
-
-Add `--interactions` to the smoke command. Require
-`SWITCHBOARD_ALLOW_PAID_CODEX_SMOKE=1`; print only boolean results.
-
-- [ ] **Step 3: Document user behavior**
-
-Update `README.md` for Codex `needs-you`, Auto, sequential questions, expiry,
-MCP forms, and text fallback when the experimental question capability is
-absent.
-
-- [ ] **Step 4: Run full verification**
-
-Run: `npm test`
-
-Expected: 0 failures.
-
-Run: `git diff --check`
-
-Expected: no output.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/smoke-codex-app-server.ts test/codex-app-server-smoke.test.ts README.md
-git commit -m "docs: document Codex interactions"
-```
+For current approval evidence see
+`../reports/2026-09-09-codex-approvals-validation.md`. Structured-question evidence
+is recorded separately so offline checks are not confused with live-provider
+coverage. Capability/MCP discovery follows this completed interaction layer;
+usage recovery and default cutover follow capabilities.

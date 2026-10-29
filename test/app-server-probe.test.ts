@@ -64,7 +64,7 @@ test('fake app-server proves the bounded stable lifecycle and approval surface',
   const evidence = await probeAppServer({ command: fakeCommand, env: env(), fixtureMode: true });
 
   assert.deepEqual(evidence, {
-    version: '0.145.0',
+    version: '0.153.4',
     schemaGenerated: false,
     initialized: true,
     authStateReadable: true,
@@ -154,7 +154,7 @@ test('non-fixture evaluation generates matching types and performs no turn', asy
   });
 
   assert.deepEqual(evidence, {
-    version: '0.145.0',
+    version: '0.153.4',
     schemaGenerated: true,
     initialized: true,
     authStateReadable: true,
@@ -194,13 +194,13 @@ test('telemetry smoke records only safe no-turn evidence for a supported account
 
   const evidence = await runCodexTelemetrySmoke({
     command: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: env({ FAKE_APP_SERVER_CALL_LOG: callLog }),
     observationMs: 20,
   });
 
   assert.deepEqual(evidence, {
-    version: '0.145.0',
+    version: '0.153.4',
     contractMatches: true,
     safeLaunchProfile: true,
     accountKind: 'chatgpt',
@@ -239,7 +239,7 @@ test('telemetry smoke fails closed for the pinned logged-out account/read and ra
   await assert.rejects(
     runCodexTelemetrySmoke({
       command: fakeCommand,
-      version: '0.145.0',
+      version: '0.153.4',
       env: env({
         FAKE_APP_SERVER_CALL_LOG: callLog,
         FAKE_APP_SERVER_ACCOUNT_RESPONSE: JSON.stringify({ account: null, requiresOpenaiAuth: true }),
@@ -280,7 +280,7 @@ test('telemetry smoke excludes private remote-control notification canaries', as
   const canaries = ['private-server-name', 'private-installation-id', 'private-environment-id'];
   const evidence = await runCodexTelemetrySmoke({
     command: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: env({ FAKE_APP_SERVER_MODE: 'telemetry-private-notification' }),
     observationMs: 25,
   });
@@ -295,7 +295,7 @@ test('telemetry smoke fails after a valid read when the child exits during obser
   await rejectsWithin(
     runCodexTelemetrySmoke({
       command: fakeCommand,
-      version: '0.145.0',
+      version: '0.153.4',
       env: env({
         FAKE_APP_SERVER_MODE: 'telemetry-exit-after-rate-read',
         PROBE_TOKEN: secret,
@@ -317,7 +317,7 @@ test('telemetry smoke fails after a valid read when malformed output arrives dur
   await rejectsWithin(
     runCodexTelemetrySmoke({
       command: fakeCommand,
-      version: '0.145.0',
+      version: '0.153.4',
       env: env({
         FAKE_APP_SERVER_MODE: 'telemetry-malformed-after-rate-read',
         PROBE_TOKEN: secret,
@@ -371,7 +371,7 @@ test('telemetry smoke follows normalizer precedence for empty and unusable keyed
 
       const evidence = await runCodexTelemetrySmoke({
         command: fakeCommand,
-        version: '0.145.0',
+        version: '0.153.4',
         env: env({ FAKE_APP_SERVER_RATE_LIMITS_RESPONSE: JSON.stringify(response) }),
         observationMs: 0,
       });
@@ -398,7 +398,7 @@ test('telemetry smoke denies the complete server-request fixture and emits only 
   await rejectsWithin(
     runCodexTelemetrySmoke({
       command: fakeCommand,
-      version: '0.145.0',
+      version: '0.153.4',
       env: env({
         FAKE_APP_SERVER_MODE: 'deny-server-requests',
         FAKE_APP_SERVER_CALL_LOG: callLog,
@@ -464,7 +464,7 @@ test('telemetry smoke success evidence excludes account, process, and response c
   ];
   const evidence = await runCodexTelemetrySmoke({
     command: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: env({
       FAKE_APP_SERVER_PRIVATE_NOTIFICATION: '1',
       FAKE_APP_SERVER_STDERR_AFTER_RATE: 'private-success-stderr',

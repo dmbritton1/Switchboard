@@ -913,3 +913,34 @@ body { margin: 0; padding: 2rem; background: var(--canvas); color: var(--ink);
 .settings-account button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid var(--hairline);
   background: var(--surface-2); color: var(--ink); font: inherit; cursor: pointer; }
 menu.inline { display: flex; gap: .5rem; padding: 0; }
+
+/* Structured input uses the same controls in cards and the interrupt strip. */
+.structured-question { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; min-width: 0; }
+.question-progress { width: 100%; font-size: 12px; opacity: .75; }
+.question-options { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+.question-options button { white-space: normal; text-align: left; overflow-wrap: anywhere; }
+.structured-question label { display: flex; flex-direction: column; gap: 4px; flex: 1 1 180px; min-width: 0; }
+.structured-question input { width: 100%; min-width: 0; box-sizing: border-box;
+  padding: .55rem .7rem; background: var(--well); color: var(--ink);
+  border: 1px solid var(--hairline); border-radius: 8px; font: inherit; }
+.structured-question input:focus-visible { outline: 2px solid var(--needs); outline-offset: 2px; }
+.structured-question button:disabled { opacity: .5; cursor: default; }
+.structured-question > button { align-self: end; }
+
+.mcp-form label { flex-basis: 100%; }
+.mcp-form select { width: 100%; padding: .55rem .7rem; background: var(--well);
+  color: var(--ink); border: 1px solid var(--hairline); border-radius: 8px; font: inherit; }
+.mcp-form small { color: var(--muted); }
+.mcp-form a { overflow-wrap: anywhere; text-decoration: none; }
+
+#capability-panel { padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+#capability-panel input { width: 100%; margin-bottom: 8px; }
+#capability-panel button { margin-right: 8px; }
+.capability-list { max-height: 280px; overflow-y: auto; }
+.capability-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.capability-row small { display: block; opacity: .75; margin-top: 5px; }
+.capability-row p { margin: 5px 0; overflow-wrap: anywhere; }
+
+.cmd-menu [aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
+.cmd-menu li small { display: block; font-size: .8em; opacity: .75; white-space: normal; }
+#new-capability-panel { max-height: 16rem; overflow: auto; }

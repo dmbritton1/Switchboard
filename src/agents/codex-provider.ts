@@ -6,6 +6,7 @@ import {
   type CodexLimitListener,
 } from './codex-app-server-supervisor.ts';
 import { prepareCodexRuntime, type PreparedCodexRuntime } from './codex-runtime.ts';
+import type { CapabilitySnapshot } from './codex-capabilities.ts';
 import type { Account } from '../accounts.ts';
 import type { Adapter } from '../types.ts';
 
@@ -57,6 +58,23 @@ export class CodexProviderPool {
     ));
     this.#createSdkAdapter = options.createSdkAdapter ?? createCodexAdapter;
     this.#createAppServerAdapter = options.createAppServerAdapter ?? createCodexAppServerAdapter;
+  }
+
+  capabilities(account: Account, cwd: string, force = false): Promise<CapabilitySnapshot> {
+    return this.#trackPreparation(this.#capabilitiesNow(account, cwd, force));
+  }
+
+  async #capabilitiesNow(account: Account, cwd: string, force: boolean): Promise<CapabilitySnapshot> {
+    this.#assertOpen();
+    this.#assertCodex(account);
+    const entry = await this.#entry(account);
+    return this.#trackEntryPreparation(entry, (async () => {
+      const supervisor = await this.#prepareSupervisor(entry);
+      this.#assertEntry(entry);
+      const snapshot = await supervisor.previewCapabilities(cwd, force);
+      this.#assertEntry(entry);
+      return snapshot;
+    })());
   }
 
   limits(account: Account, listener: CodexLimitListener): Promise<CodexAppServerSupervisor> {
@@ -158,7 +176,10 @@ export class CodexProviderPool {
     this.#assertAccount(account);
     while (true) {
       const existing = this.#entries.get(account.name);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.account !== account) throw new Error('Codex account identity changed.');
+        return existing;
+      }
       const retirement = this.#nameRetirements.get(account.name);
       if (retirement) {
         await retirement;

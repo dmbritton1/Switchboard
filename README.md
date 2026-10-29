@@ -85,12 +85,11 @@ vendor threads. It is not a browser setting.
 Opted-in app-server sessions use the same account-scoped process as telemetry,
 but every session retains immutable SDK or app-server ownership. App-server
 sessions support start, follow-up, resume, and interrupt with the fixed
-`workspace-write` sandbox and `never` approval policy. Rollback changes future
+`workspace-write` sandbox and `on-request` approvals routed to the user. Rollback changes future
 sessions by changing the account entry; it never transfers an existing vendor
-thread between transports. Approvals and other interactions, capability
-discovery, browser/simulator MCP sidecars, automatic Codex usage recovery, and
-an app-server default cutover remain deferred. Codex sessions never
-auto-requeue in this phase.
+thread between transports. Capability discovery, browser/simulator screenshots,
+and automatic usage-limit recovery are implemented. App-server remains opt-in;
+the new-session default has not changed. SDK sessions do not auto-requeue.
 
 An optional explicit binary is documentation for a local account, not a
 portable default:
@@ -104,8 +103,12 @@ Run `codex login status` to check the selected account. Account `env` may set
 `CODEX_HOME` (or another supported credential source); preflight runs login
 status with that same launch environment. Switchboard preserves user and target
 repository Codex configuration, applying only its fixed worktree safety
-overrides: `sandboxMode: 'workspace-write'` and `approvalPolicy: 'never'`.
-There are no interactive Codex approvals.
+overrides: `workspace-write`, with `never` approvals for SDK sessions and
+`on-request` plus the `user` reviewer for app-server sessions. App-server command
+and file-change approvals use Allow/Deny and Auto, like Claude. Auto accepts
+each request individually; it does not grant lasting permissions. An approved
+escalation may run outside the launch sandbox. Session-wide grants, policy
+amendments, and additional-permissions requests are unsupported.
 
 Unlinking (from the account's row in Settings → Accounts) refuses while a
 session on the account is `working` or `needs-you`, or while any queued item
@@ -191,8 +194,27 @@ The grid sorts blocked-first: `needs-you`, `working`, `done`, `stopped`. Claude
 permission prompts (Allow/Deny) are answered from the card, from the open
 session's own header (visible on whichever of its tabs you're on), or — for a
 *different* session while one is already open — from an interrupt band inside
-the session view. Codex runs sandboxed to its worktree with
-`approvalPolicy: 'never'` and never enters `needs-you` — see Limits below.
+the session view. App-server Codex approvals use these same surfaces and enter
+`needs-you`. Concurrent requests queue in order; a submitted decision remains
+disabled until Codex confirms resolution. Stop declines outstanding requests.
+SDK Codex sessions retain `never` and have no interactive approvals.
+
+App-server Codex supports structured questions in the same surfaces. Its turn
+process enables the runtime’s normal-mode question feature. Questions
+appear one at a time with choice buttons, typed input when supported, and masked
+input for secret answers. Auto never answers them. The final answer submits the
+whole request; Skip discards the request's partial answers. Drafts survive UI
+updates and failed submissions, but disappear after resolution or Stop. Answers
+are delivered to Codex without being appended to Switchboard's transcript or
+saved state.
+
+Connected MCP tools can request forms or a page visit. Forms support text,
+numbers, booleans, and selection lists with Submit, Decline, and Cancel controls.
+Auto never supplies these values. Drafts survive failed submissions and updates;
+submitted values bypass the Switchboard transcript and saved state. URL requests
+show the destination origin and open only when clicked; full URLs stay in the
+live adapter until that redirect. Unsupported schemas and extended OpenAI form
+modes are cancelled. MCP schema defaults are not automatically filled in.
 
 When Claude asks a question (`AskUserQuestion`), the same three places show the
 question text and one button per option instead of Allow/Deny; the pick is
@@ -272,10 +294,11 @@ released automatically.
 
 When a Claude session dies while its account is past its limit, a resume is
 queued automatically for when the window rolls; the card appends a line reading
-`⏱ waiting for reset` below the status. Codex sessions never auto-requeue,
-because automatic recovery of an SDK-owned Codex failure is deferred until a
-future app-server turn transport is approved. Stopping a session yourself never
-queues anything. Items waiting on one account fire one at a time, so a freshly
+`⏱ waiting for reset` below the status. With automatic recovery enabled,
+Codex app-server sessions queue one `continue` resume only after a structured
+usage-limit failure and a fresh read confirming a future reset. Multiple reached
+windows must all clear before release. Other failures and SDK sessions do not
+auto-requeue. Stopping a session yourself never queues anything. Items waiting on one account fire one at a time, so a freshly
 reset window is not spent all at once — items waiting on a clock fire at their
 time regardless of what else is running.
 
@@ -305,11 +328,9 @@ auto-resume behavior described under Scheduling above). Every default
 reproduces the behavior the app had before settings existed, so an empty or
 missing settings block changes nothing.
 
-`notifyOn` closes a real gap: Codex sessions never enter `needs-you` (they
-run with `approvalPolicy: 'never'` and no interactive approval — see Limits
-below), so before this setting existed a Codex session produced no browser
-notification, ever. `done` and `stopped` are the only transitions a Codex
-session has to notify on.
+`notifyOn` supports approval notifications for Claude and app-server Codex.
+SDK Codex sessions notify on `done` and `stopped`, since they have no
+interactive approval callback.
 
 Settings live in `state.json` alongside `sessions`, `usage`, and `queue`, and
 the file is meant to be hand-editable: on load, an invalid or unknown-typed
@@ -327,7 +348,7 @@ plus roughly forty more hardcoded colors past them, so a light theme means
 authoring a second palette, not wiring up a toggle. Sound was cut because
 macOS Notification Center already controls it, and better than this dialog
 could. Codex's sandbox mode (`workspace-write`) and approval policy
-(`never`) are also deliberately not settable, and must not become settable —
+(`never` for SDK, `on-request` for app-server) are deliberately not settable, and must not become settable —
 see Safety boundaries in `AGENTS.md`.
 
 ## Tests
@@ -392,10 +413,10 @@ without intentionally authorizing those paid turns.
   actually still running. The Resume button relaunches the agent (passing the
   vendor session id, so Claude/Codex can pick the conversation back up) and the
   card moves to `working` once the adapter starts producing events again.
-- Codex approvals are policy, not interactive — `@openai/codex-sdk` has no
-  approval callback, only a start-of-thread `approvalPolicy`. Codex sessions run
+- SDK Codex has no approval callback, only a start-of-thread `approvalPolicy`.
+  SDK Codex sessions run
   with `approvalPolicy: 'never'` and are sandboxed to their own worktree
-  (`sandboxMode: 'workspace-write'`) instead; `decide()` on a Codex session is a
+  (`sandboxMode: 'workspace-write'`) instead; `decide()` on an SDK Codex session is a
   no-op. Runtime preflight validates a selected macOS binary and compatibility.
   Create preflight runs after Switchboard owns the stopped session and worktree,
   retaining that pair on failure; handoff preflight is failure-atomic before
@@ -432,10 +453,10 @@ without intentionally authorizing those paid turns.
   scheduled item is not an OS-level cron job, and nothing fires with Switchboard
   closed. The auto-requeue heuristic applies only to Claude accounts: any Claude
   session that dies on its own while its account is past its limit gets a resume
-  queued, including one that died of something unrelated. Codex sessions never
-  auto-requeue, since the Codex SDK reports no rate-limit signal. The visible
-  queue row for an auto-requeue is one you can delete, which is the trade made to
-  avoid matching on provider error text.
+  queued, including one that died of something unrelated. Codex app-server
+  recovery instead requires the structured usage-limit error and fresh reset
+  eligibility. SDK sessions remain outside automatic recovery. The visible queue
+  row can be deleted; turning recovery on later does not replay old failures.
 
 ## Codex Phase 2 behavior
 
@@ -460,18 +481,25 @@ Codex thread settings are optional. Omitted settings inherit the selected
 Codex/user/repository configuration; only explicit settings are saved and used
 again on resume. Settings cannot be changed during an active turn, but a
 stopped session can update them for its next resume. The worktree directory,
-`sandboxMode: 'workspace-write'`, and `approvalPolicy: 'never'` are mandatory
-overrides and are not settings users can weaken.
+`workspace-write` sandbox, and transport-specific approval policy are mandatory
+overrides and are not browser settings. App-server sessions also force the
+`user` reviewer so inherited automatic review cannot bypass Switchboard's cards.
 
 The session shows the SDK's last-turn usage fields when available. Account pace
 remains an estimate from observed input/output spend against the local account
 budget, not a provider rate-limit or plan-limit reading.
 
-The no-turn app-server evaluators remain limited to real, installed-`0.145.0`
+The no-turn app-server evaluators remain limited to real, installed-`0.153.4`
 schema-generation, initialization, authentication-state, and clean shutdown;
 they never create a thread or spend a turn. The deterministic transport fake
-proves the opt-in app-server path separately, while the paid transport gate is
-currently not run. SDK remains the default and the hybrid path remains rejected.
+proves the opt-in app-server path separately. The September 9 live validation
+initially found runtime compatibility, canonical-path resume, and immediate-stop
+issues. The fixes upgrade the pinned runtime to `0.153.4`, preserve canonical
+worktree identity on resume, and retry only a bounded transient interrupt
+rejection. Live telemetry and the strengthened lifecycle gate subsequently
+passed with inherited `gpt-6-astra` settings, including sibling continuity after Stop. See the
+[live validation report](docs/superpowers/reports/2026-09-09-codex-app-server-live-validation.md).
+SDK remains the default and the hybrid path remains rejected.
 See
 [`docs/superpowers/reports/2026-08-01-codex-app-server-decision.md`](docs/superpowers/reports/2026-08-01-codex-app-server-decision.md).
 Fake evidence does not establish live parity and does not cover deferred
@@ -491,3 +519,40 @@ thread or spend a model turn:
 ```bash
 npm run evaluate:codex-app-server
 ```
+
+### Codex capability discovery
+
+Live Codex app-server sessions expose a **Capabilities** button in the composer.
+Search skills, apps, and MCP tools, inspect availability, refresh the inventory,
+and select an entry to insert a `/skill:…`, `/app:…`, or `/mcp:…` alias.
+The server resolves the selection in that session's account and worktree and
+checks it again before dispatch. Skills and apps use native Codex inputs;
+MCP selections add an explicit tool request to the prompt. Unavailable selections
+are rejected without sending. Native paths and app identifiers are not included
+in the public catalog. Type `/` to search skills (including plugin-provided
+skills), apps, MCP tools, and built-in commands in the composer. `/skills`,
+`/apps`, and `/mcp` open filtered lists. `/compact` compacts context through the
+app-server and holds subsequent prompts until it finishes; it accepts no
+arguments or attachments.
+
+The new-session dialog offers **Preview capabilities** for an app-server account
+and an existing Git repository. Preview reads skills and account apps without
+creating a session. MCP and screenshot availability is discovered after session
+creation, when the worktree's servers are known. Refresh clears stale selections;
+unavailable entries explain why they cannot be selected.
+
+### Codex screenshot tools
+
+App-server sessions can discover `switchboard_browser.screenshot` and
+`switchboard_simulator.screenshot` through **Capabilities**. Browser screenshots
+accept HTTP/HTTPS URLs and optional viewport dimensions. They use an installed
+Chromium-family browser with a temporary profile and require network access in
+the effective worktree/session settings. Simulator screenshots require macOS
+and a booted iOS Simulator; an optional device name or UDID selects the device.
+
+The tools capture images only. They do not click, type, boot devices, or install
+apps. Configuration is added to thread start/resume in memory, preserving user
+MCP servers and repository files. A conflicting server name is left untouched,
+and the catalog shows a warning. Sidecars run with a clean environment and do
+not receive account launch secrets. Existing sessions need to be stopped and
+resumed after the Switchboard server loads this update.

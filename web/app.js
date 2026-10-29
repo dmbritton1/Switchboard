@@ -15,6 +15,9 @@ import {
   attributeBranches, branchHues,
   readTheme, ACCENTS, CANVASES, pastedName, composeMessage, diffSummary, patchLineClass,
 } from './lib.js';
+import { codexCommands, searchCommands, capabilityFilter } from './codex-commands.js';
+import { QuestionDrafts, questionControls, elicitationControls } from './questions.js';
+const questionDrafts = new QuestionDrafts();
 
 let state = { sessions: [], accounts: [], commands: [] };
 let openId = null;
@@ -400,6 +403,10 @@ function renderTheme() {
 }
 
 function render() {
+  const active = document.activeElement;
+  const questionFocus = active?.dataset?.questionId
+    ? { id: active.dataset.questionId, field: active.dataset.fieldId, start: active.selectionStart, end: active.selectionEnd } : null;
+  questionDrafts.prune(state.sessions);
   updateResetScheduleAvailability();
   renderHeader();
   renderCommandError();
@@ -412,6 +419,14 @@ function render() {
   $('#welcome').hidden = !(noAccounts && !openId);
   if (!openId) $('#grid').hidden = noAccounts;
   renderLink();
+  if (questionFocus) {
+    const input = [...document.querySelectorAll('[data-question-id]')]
+      .find(node => node.dataset.questionId === questionFocus.id && node.dataset.fieldId === questionFocus.field);
+    if (input && !input.disabled) {
+      input.focus({ preventScroll: true });
+      if (questionFocus.start !== null && typeof input.setSelectionRange === 'function') input.setSelectionRange(questionFocus.start, questionFocus.end);
+    }
+  }
 }
 
 function renderCommandError() {
@@ -693,14 +708,14 @@ function overflowMenu(s) {
   menu.className = 'menu';
   menu.onclick = (e) => e.stopPropagation();
 
-  // Codex sessions never prompt (approvalPolicy 'never'), so the toggle would
-  // be a lie there — shown disabled with the reason, not hidden.
+  // SDK Codex has no interactive approval callback.
+  const sdkCodex = s.provider === 'codex' && s.codexTransport !== 'app-server';
   const auto = document.createElement('label');
   const box = document.createElement('input');
   box.type = 'checkbox';
   box.checked = s.auto;
-  box.disabled = s.provider === 'codex';
-  auto.title = s.provider === 'codex'
+  box.disabled = sdkCodex;
+  auto.title = sdkCodex
     ? 'Codex uses a fixed worktree sandbox with non-interactive permissions.'
     : 'Approve every tool call automatically, without asking';
   box.onchange = async () => {
@@ -973,10 +988,27 @@ function stopButton(s) {
  * summary here.
  */
 function decideButtons(id, pending, compact = false) {
+  if (pending.elicitation) return [elicitationControls(pending, id, questionDrafts, async response => {
+    if (!questionDrafts.begin(pending.id)) return;
+    render();
+    const result=await postCommand({cmd:'respond-elicitation',id,requestId:pending.id,response});
+    questionDrafts.settle(pending.id,result.ok);
+    sessionCommandError=retainedSessionError(id,result);
+    render();
+  })];
+  if (pending.question) return [questionControls(pending, questionDrafts, async answer => {
+    if (!questionDrafts.begin(pending.id)) return;
+    render();
+    const result = await postCommand({ cmd: 'answer-question', id, requestId: pending.id, answer });
+    questionDrafts.settle(pending.id, result.ok);
+    sessionCommandError = retainedSessionError(id, result);
+    render();
+  })];
   return decideSpecs(pending).map(({ label, description, command }) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.textContent = label;
+    b.disabled = Boolean(pending.responding);
     // The interrupt strip is a one-line nudge about a session you are not
     // reading, so its captions stay in the tooltip; the card is where a choice
     // is actually weighed, so there they are on the button.
@@ -989,7 +1021,9 @@ function decideButtons(id, pending, compact = false) {
     }
     b.onclick = async (e) => {
       e.stopPropagation();
-      await runSessionCommand({ cmd: 'decide', id, ...command });
+      b.disabled = true;
+      try { await runSessionCommand({ cmd: 'decide', id, requestId: pending.id, ...command }); }
+      finally { b.disabled = Boolean(pending.responding); }
     };
     return b;
   });
@@ -1044,7 +1078,7 @@ function approval(s) {
   // are not ours to trust with innerHTML either.
   const line = document.createElement('div');
   line.className = 'wt';
-  line.textContent = `${s.pending.tool}: ${s.pending.summary}`;
+  line.textContent = `${s.pending.tool}: ${s.pending.summary}${s.pending.responding ? " — Waiting for Codex…" : ""}${s.pending.pendingCount > 1 ? ` (${s.pending.pendingCount - 1} more queued)` : ""}`;
   box.append(line);
 
   box.append(...decideButtons(s.id, s.pending));
@@ -1778,7 +1812,7 @@ function triggerFor(when, at) {
  * repaint, which callers need after they clear the field programmatically
  * (nothing fires `input` for that).
  */
-function wireCommandMenu({ field, box, mirror, menu, ids }) {
+function wireCommandMenu({ field, box, mirror, menu, ids, commands = () => null }) {
   // Matches currently offered, and which one is highlighted. Empty means closed,
   // so every handler below can test one thing.
   let matches = [];
@@ -1827,7 +1861,7 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
 
   /** Repaint the coloured copy of the command that sits behind the field. */
   function paint() {
-    const cmd = commandToken(field.value, state.commands ?? []);
+    const cmd = commandToken(field.value, commands()?.filter(x => x.available).map(x => x.name) ?? state.commands ?? []);
     // The class is what makes the field's own text transparent, so it goes on
     // only while there is something underneath worth seeing.
     box.classList.toggle('mirroring', Boolean(cmd));
@@ -1848,6 +1882,8 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   }
 
   function apply(name) {
+    const entries = commands();
+    if (entries && !entries.find(x => x.name === name)?.available) { render(); return; }
     // Whitespace, not just a space: in the textarea the command can be its own
     // line, and the rest of the prompt has to survive selecting one.
     const ws = field.value.search(/\s/);
@@ -1861,7 +1897,8 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
   }
 
   function render() {
-    const found = commandMenu(field.value, field.selectionStart ?? 0, state.commands ?? []);
+    const entries = commands();
+    const found = entries ? searchCommands(field.value, field.selectionStart ?? 0, entries) : commandMenu(field.value, field.selectionStart ?? 0, state.commands ?? []);
     if (!found) { close(); return; }
     // Only reset the highlight when the list itself changed; re-rendering for a
     // caret move must not throw away an arrow-key selection.
@@ -1879,6 +1916,13 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
         ns.className = 'ns';
         ns.textContent = `/${name.slice(0, colon + 1)}`;
         li.append(ns, name.slice(colon + 1));
+      }
+      const entry = entries?.find(x => x.name === name);
+      if (entry) {
+        li.setAttribute('aria-disabled', String(!entry.available));
+        const detail = document.createElement('small');
+        detail.textContent = entry.available ? entry.description : entry.unavailableReason;
+        li.append(detail);
       }
       // mousedown, not click: preventDefault here keeps focus in the field, so
       // the menu never has to race its own blur handler.
@@ -1922,7 +1966,11 @@ function wireCommandMenu({ field, box, mirror, menu, ids }) {
     }
   });
 
-  return paint;
+  return () => {
+    paint();
+    if (document.activeElement === field) render();
+    else close();
+  };
 }
 
 /**
@@ -2019,11 +2067,13 @@ function wireMentionMenu({ field, menu, ids, sessions }) {
 const paintMirror = wireCommandMenu({
   field: $('#prompt'), box: $('#prompt-box'), mirror: $('#prompt-mirror'),
   menu: $('#cmd-menu'), ids: 'cmd-opt',
+  commands: () => capabilitySession ? codexCommands(capabilitySnapshot) : (state.sessions.find(x => x.id === openId)?.provider === 'codex' ? [] : null),
 });
 
 const paintNewMirror = wireCommandMenu({
   field: $('#prompt-input'), box: $('#new-prompt-box'), mirror: $('#new-prompt-mirror'),
   menu: $('#new-cmd-menu'), ids: 'new-cmd-opt',
+  commands: () => state.accounts.find(x => x.name === $('#account-select').value)?.provider === 'codex' ? codexCommands(previewSnapshot, true) : null,
 });
 
 // Only the chat composer gets this: the new-session prompt has no open
@@ -2101,7 +2151,82 @@ const STOP_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="current
  * field still calls requestSubmit() either way, so a message typed mid-turn
  * still sends (the server queues it) even though the button itself reads Stop.
  */
+let capabilitySession = null;
+let capabilityRequest = 0;
+let capabilitySnapshot = null;
+function hideCapabilities() {
+  capabilityRequest++;
+  $('#capability-panel').hidden = true;
+  $('#capabilities-btn').setAttribute('aria-expanded', 'false');
+}
+async function loadCapabilities(refresh = false, show = true, selection = null) {
+  const session = capabilitySession;
+  const request = ++capabilityRequest;
+  capabilitySnapshot = null;
+  paintMirror();
+  const panel = $('#capability-panel');
+  if (show) {
+    panel.hidden = false;
+    panel.textContent = 'Loading capabilities…';
+    $('#capabilities-btn').setAttribute('aria-expanded', 'true');
+  }
+  try {
+    const response = await fetch(`/capabilities?session=${encodeURIComponent(session)}${refresh ? '&refresh=1' : ''}`, {cache:'no-store'});
+    const data = await response.json();
+    if (request !== capabilityRequest || session !== capabilitySession || session !== openId) return;
+    if (!response.ok) throw new Error(data.error || 'Capabilities unavailable.');
+    capabilitySnapshot = data;
+    if (show) renderCapabilities(selection);
+    paintMirror();
+  } catch (error) {
+    if (request !== capabilityRequest || session !== capabilitySession) return;
+    if (!show) return;
+    panel.textContent = error.message || 'Capabilities unavailable.';
+    const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = 'Retry';
+    retry.onclick = () => loadCapabilities(true); panel.append(retry);
+  }
+}
+function renderCapabilities(selection = null) {
+  const panel = $('#capability-panel');
+  panel.replaceChildren();
+  const filter = document.createElement('input'); filter.type = 'search'; filter.placeholder = 'Find skills, apps, or MCP tools';
+  filter.setAttribute('aria-label', 'Filter capabilities');
+  filter.value = selection?.query ?? '';
+  const refresh = document.createElement('button'); refresh.type = 'button'; refresh.textContent = 'Refresh'; refresh.onclick = () => loadCapabilities(true, true, selection);
+  const close = document.createElement('button'); close.type = 'button'; close.textContent = 'Close'; close.onclick = hideCapabilities;
+  const list = document.createElement('div'); list.className = 'capability-list';
+  const warnings = document.createElement('p'); warnings.textContent = capabilitySnapshot.warnings.join(' ');
+  panel.append(filter, refresh, close, warnings, list);
+  const paint = () => {
+    list.replaceChildren();
+    const entries = capabilitySnapshot.capabilities.filter(item => (!selection || item.kind === selection.kind) && `${item.kind} ${item.displayName} ${item.description}`.toLowerCase().includes(filter.value.toLowerCase()));
+    if (!entries.length) {list.textContent = 'No matching capabilities.'; return;}
+    for (const entry of entries) {
+      const row = document.createElement('div'); row.className = 'capability-row';
+      const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = `/${entry.alias}`; choose.disabled = !entry.available;
+      choose.onclick = () => {
+        if (capabilitySession !== openId) return;
+        const prompt = $('#prompt');
+        prompt.value = `/${entry.alias} ` + prompt.value.replace(/^\/(?:(?:skill|app|mcp):[^\s]+|skills|apps|mcp)(?:\s+|$)/, '');
+        prompt.dispatchEvent(new Event('input', {bubbles:true}));
+        hideCapabilities(); prompt.focus();
+      };
+      const description = document.createElement('p'); description.textContent = entry.description;
+      const status = document.createElement('small'); status.textContent = entry.available ? `${entry.kind} · Available` : `${entry.kind} · ${entry.unavailableReason}`;
+      row.append(choose, status, description); list.append(row);
+    }
+  };
+  filter.oninput = paint; paint(); filter.focus();
+}
+$('#capabilities-btn').onclick = () => $('#capability-panel').hidden ? loadCapabilities() : hideCapabilities();
+
 function updateComposerButton(s) {
+  const supportsCapabilities = s.provider === 'codex' && s.codexTransport === 'app-server' && s.status !== 'stopped';
+  if (capabilitySession !== s.id || !supportsCapabilities) { hideCapabilities(); capabilitySnapshot = null; }
+  const changed = capabilitySession !== s.id;
+  capabilitySession = supportsCapabilities ? s.id : null;
+  if (supportsCapabilities && changed) loadCapabilities(false, false);
+  $('#capabilities-btn').hidden = !supportsCapabilities;
   const btn = $('#send-btn');
   const working = s.status === 'working';
   btn.innerHTML = working ? STOP_ICON : SEND_ICON;
@@ -2116,6 +2241,8 @@ $('#composer').onsubmit = async (e) => {
   e.preventDefault();
   const draft = $('#prompt').value;
   const text = draft.trim();
+  const browse = capabilitySession && capabilityFilter(text);
+  if (browse) { await loadCapabilities(false, true, browse); return; }
   if (!composerText()) return;
   const operation = beginAttachmentSend(attachmentController, draft);
   if (!operation) return;
@@ -2412,6 +2539,7 @@ const repoCombo = (() => {
 
   function choose(path) {
     input.value = path;
+    input.dispatchEvent(new Event('change', {bubbles:true}));
     close();
     input.focus();
   }
@@ -2650,6 +2778,60 @@ $('#settings').addEventListener('close', async (e) => {
   }
 });
 
+let previewSnapshot = null;
+let previewRequest = 0;
+function clearCapabilityPreview() {
+  previewRequest++;
+  previewSnapshot = null;
+  $('#new-capability-panel').replaceChildren();
+  $('#new-capabilities-btn').hidden = state.accounts.find(x => x.name === $('#account-select').value)?.provider !== 'codex';
+  paintNewMirror();
+}
+async function loadCapabilityPreview() {
+  const request = ++previewRequest;
+  previewSnapshot = null;
+  paintNewMirror();
+  const account = $('#account-select').value;
+  const cwd = $('#repo-input').value;
+  const panel = $('#new-capability-panel');
+  panel.textContent = 'Loading capabilities…';
+  try {
+    const response = await fetch(`/capabilities?account=${encodeURIComponent(account)}&cwd=${encodeURIComponent(cwd)}&refresh=1`, {cache:'no-store'});
+    const data = await response.json();
+    if (request !== previewRequest) return;
+    if (!response.ok) throw new Error(data.error || 'Capabilities unavailable.');
+    previewSnapshot = data;
+    panel.replaceChildren();
+    const filter = document.createElement('input'); filter.type = 'search'; filter.placeholder = 'Find skills, apps, or MCP tools'; filter.setAttribute('aria-label', 'Filter preview capabilities');
+    const list = document.createElement('div'); list.className = 'capability-list';
+    const warnings = document.createElement('p'); warnings.textContent = data.warnings.join(' ');
+    panel.append(filter, warnings, list);
+    const paint = () => {
+      list.replaceChildren();
+      const entries = data.capabilities.filter(item => `${item.alias} ${item.displayName} ${item.description}`.toLowerCase().includes(filter.value.toLowerCase()));
+      if (!entries.length) list.textContent = 'No matching capabilities.';
+      for (const entry of entries) {
+        const row = document.createElement('div'); row.className = 'capability-row';
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = `/${entry.alias}`; button.disabled = !entry.available;
+        button.onclick = () => {
+          if (request !== previewRequest) return;
+          const field = $('#prompt-input');
+          field.value = `/${entry.alias} ` + field.value.replace(/^\/(?:skill|app|mcp):[^\s]+\s*/, '');
+          field.dispatchEvent(new Event('input', {bubbles:true})); field.focus();
+        };
+        const detail = document.createElement('p'); detail.textContent = entry.available ? entry.description : entry.unavailableReason;
+        row.append(button, detail); list.append(row);
+      }
+    };
+    filter.oninput = paint; paint(); paintNewMirror();
+  } catch (error) { if (request === previewRequest) panel.textContent = error.message || 'Capabilities unavailable.'; }
+}
+$('#new-capabilities-btn').onclick = loadCapabilityPreview;
+$('#repo-input').addEventListener('input', clearCapabilityPreview);
+$('#repo-input').addEventListener('change', clearCapabilityPreview);
+$('#account-select').addEventListener('change', clearCapabilityPreview);
+$('#new').addEventListener('close', () => { previewRequest++; });
+
 async function openNew() {
   // reset() before the option lists are rebuilt below, so it can't clobber them:
   // a re-opened dialog otherwise still holds the previous session's repo, branch
@@ -2681,6 +2863,7 @@ async function openNew() {
   }));
   updateNewCodexSettings();
   updateResetScheduleAvailability();
+  clearCapabilityPreview();
 
   $('#new-error').textContent = '';
   dialog.showModal();

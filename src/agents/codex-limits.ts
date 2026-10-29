@@ -100,6 +100,7 @@ export function normalizeCodexAuthUpdate(input: unknown): CodexTelemetryAuth {
     case 'personalAccessToken':
       return { supported: false, plan: null, reason: CODEX_TELEMETRY_REASONS.personalAccessToken };
     case 'bedrockApiKey':
+    case 'bedrockAccessKeys':
       return { supported: false, plan: null, reason: CODEX_TELEMETRY_REASONS.bedrock };
     default:
       return invalid(AUTH_UPDATE_ERROR);

@@ -1,5 +1,17 @@
 # Codex Phase 2 Main Integration Plan
 
+## Status update — 2026-09-09
+
+Historical SDK integration plan, not the remaining app-server roadmap. Do not
+repeat these branch merges or use its SDK-only transport decision to undo the
+implemented opt-in app-server path. The runtime is now 0.153.4. SDK sessions
+retain never approvals; app-server sessions force workspace-write, on-request,
+and the user reviewer. Approvals and structured questions are implemented;
+MCP elicitation, capability discovery, screenshot tools, usage recovery, and
+default rollout remain. Follow the revised interactions/capabilities/recovery
+plans. The original integration details below are retained as history.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Integrate the completed Codex Phase 2 implementation with current `main` while preserving every newer Switchboard and Claude feature, then merge the verified result into `main` without losing the user's uncommitted work.

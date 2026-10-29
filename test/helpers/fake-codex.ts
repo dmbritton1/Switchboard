@@ -9,7 +9,7 @@ export async function writeFakeCodex(
   } = {},
 ): Promise<string> {
   const path = join(dir, 'fake-codex');
-  const version = options.version ?? '0.145.0';
+  const version = options.version ?? '0.153.4';
   const login = options.login ?? 'ready';
   const source = `#!/usr/bin/env node
 const { appendFileSync, existsSync } = require('node:fs');

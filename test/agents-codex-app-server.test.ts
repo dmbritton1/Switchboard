@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { AppServerClient, type AppServerClientOptions } from '../src/agents/codex-app-server-client.ts';
+import { AppServerRequestError, AppServerClient, type AppServerClientOptions } from '../src/agents/codex-app-server-client.ts';
 import * as appServerAdapter from '../src/agents/codex-app-server.ts';
 import { fileURLToPath } from 'node:url';
 import {
@@ -55,8 +55,7 @@ function safeThreadResponse(threadId: string, cwd: string): Record<string, unkno
     serviceTier: null,
     cwd,
     instructionSources: ['/private/provider/AGENTS.md'],
-    approvalPolicy: 'never',
-    approvalsReviewer: 'user',
+    approvalPolicy: 'on-request', approvalsReviewer: 'user',
     sandbox: {
       type: 'workspaceWrite',
       writableRoots: [cwd],
@@ -227,7 +226,7 @@ test('absolute-path-shaped identifiers fail before item, thread, resume, turn, R
           if (method === 'turn/start') return { turn: turn(location === 'turn' ? unsafeId : 'turn-1', 'inProgress') };
           return {};
         });
-        const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+        const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.153.4')
           .start({ cwd, prompt: prompt('inspect'), env: {}, ...(location === 'resume' ? { resumeId: unsafeId } : {}) },
             (event) => registry.apply(session.id, event));
         await waitFor(() => session.status === 'stopped' || supervisor.requests.some(({ method }) => method === 'turn/start'));
@@ -259,7 +258,7 @@ test('opaque provider identifiers survive binding, resume and public persistence
     const session = registry.create({ provider: 'codex', account: 'codex', repo: cwd, cwd,
       branch: 'test', title: 'test', codexTransport: 'app-server' });
     const supervisor = new ScriptedSupervisor();
-    const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+    const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.153.4')
       .start({ cwd, prompt: prompt('inspect'), env: {}, resumeId: id }, (event) => registry.apply(session.id, event));
     await waitFor(() => session.status === 'stopped' || supervisor.requests.some(({ method }) => method === 'turn/start'));
     assert.notEqual(session.status, 'stopped', id);
@@ -456,7 +455,7 @@ test('an absolute file URI in a provider thread id fails closed before binding o
   });
   const events: AdapterEvent[] = [];
 
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-thread', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-thread', '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-thread-prompt', env: {} }, (event) => events.push(event));
 
   await waitFor(
@@ -480,7 +479,7 @@ test('an unsafe stored thread id is rejected before resume without rewriting it'
   const supervisor = new ScriptedSupervisor();
   const events: AdapterEvent[] = [];
 
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-resume', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-resume', '0.153.4')
     .start({
       cwd, prompt: prompt('continue'), promptId: 'unsafe-resume-prompt', env: {}, resumeId: unsafeId,
     }, (event) => events.push(event));
@@ -509,7 +508,7 @@ test('an absolute file URI in a provider turn id fails closed before public id d
   });
   const events: AdapterEvent[] = [];
 
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-turn', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-turn', '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-turn-prompt', env: {} }, (event) => events.push(event));
 
   await waitFor(
@@ -538,7 +537,7 @@ test('an absolute file URI in a provider item id fails closed before Registry ad
   const supervisor = new ScriptedSupervisor();
   const events: AdapterEvent[] = [];
 
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-item', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'unsafe-item', '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-item-prompt', env: {} }, (event) => events.push(event));
   await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
 
@@ -569,7 +568,7 @@ test('a non-absolute file prefix cannot hide an unsafe provider id from Registry
   const unsafeId = 'item:file:notes,file:///private/provider,public;(secret).json';
   const supervisor = new ScriptedSupervisor();
 
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'unsafe-public-prompt', env: {} },
       (event) => registry.apply(session.id, event));
   await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
@@ -599,7 +598,7 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
     throw new Error(`unexpected ${method}`);
   });
   const events: AdapterEvent[] = [];
-  const adapter = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'session-fifo', '0.145.0');
+  const adapter = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'session-fifo', '0.153.4');
   const handle = adapter.start({
     cwd,
     prompt: prompt('first'),
@@ -627,7 +626,7 @@ test('thread setup binds before one-at-a-time FIFO turns and preserves delivery,
     method: 'thread/start',
     params: {
       cwd,
-      approvalPolicy: 'never',
+      approvalPolicy: 'on-request', approvalsReviewer: 'user',
       sandbox: 'workspace-write',
       model: 'gpt-5.4',
       config: {
@@ -699,7 +698,7 @@ test('dispatch acknowledgement distinguishes a pre-write failure from a lost res
     createCodexAppServerAdapter(
       supervisor as unknown as CodexAppServerSupervisor,
       `dispatch-${acknowledged}`,
-      '0.145.0',
+      '0.153.4',
     ).start({ cwd, prompt: prompt('dispatch me'), promptId: 'dispatch-prompt', env: {} }, (event) => events.push(event));
 
     await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'pending turn/start write');
@@ -753,7 +752,7 @@ test('delayed stdin callbacks after stop correct only the accepted prompt throug
         return true;
       }) as typeof stdin.write;
       const supervisor = new CodexAppServerSupervisor({
-        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
         verifyContract: async () => {},
         clientFactory: (options) => new AppServerClient({ ...options, childFactory: () => child }),
       });
@@ -764,7 +763,7 @@ test('delayed stdin callbacks after stop correct only the accepted prompt throug
       await supervisor.ensureTurnTransport();
       const events: AdapterEvent[] = [];
       const emit = (event: AdapterEvent) => { events.push(event); registry.apply(session.id, event); };
-      const handle = createCodexAppServerAdapter(supervisor, session.id, '0.145.0')
+      const handle = createCodexAppServerAdapter(supervisor, session.id, '0.153.4')
         .start({ cwd, prompt: prompt('first'), promptId: firstId, env: {} }, emit);
       await waitFor(() => callbacks.length === 1);
       const otherId = registry.appendPrompt(session.id, 'queued second', 'queued');
@@ -801,7 +800,7 @@ test('delayed stdin callbacks after stop correct only the accepted prompt throug
       if (accepted) {
         registry.revive(session.id);
         const resumeId = registry.appendPrompt(session.id, 'resume only', 'queued');
-        const resumed = createCodexAppServerAdapter(supervisor, session.id, '0.145.0')
+        const resumed = createCodexAppServerAdapter(supervisor, session.id, '0.153.4')
           .start({ cwd, prompt: prompt('resume only'), promptId: resumeId, resumeId: 'delivery-thread', env: {} }, emit);
         await waitFor(() => callbacks.length === 2);
         callbacks[1](null);
@@ -824,7 +823,7 @@ test('retryable error notifications retain the active turn, route, and image sna
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'retryable-error',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: await imagePrompt(cwd), promptId: 'retryable-image', env: {} }, (event) => events.push(event));
   handle.send(prompt('queued after retry'), 'after-retry');
 
@@ -863,7 +862,7 @@ test('adapter plan and terminal error events scrub embedded absolute paths', asy
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const supervisor = new ScriptedSupervisor();
   const events: AdapterEvent[] = [];
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'event-paths', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'event-paths', '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'event-paths', env: {} }, (event) => events.push(event));
   await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
 
@@ -887,7 +886,7 @@ test('adapter plan and terminal error events scrub embedded absolute paths', asy
   assert.match(serialized, /Inspect|carefully|permission denied/);
 });
 
-test('typed UsageLimitExceeded failures are classified internally on both terminal paths without recovery or details', async (t) => {
+test('typed usage-limit failures have a distinct stopped code on both terminal paths without leaking details', async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), 'sb-typed-turn-failure-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   for (const path of ['notification', 'failed-turn'] as const) {
@@ -920,7 +919,7 @@ test('typed UsageLimitExceeded failures are classified internally on both termin
       const firstId = registry.appendPrompt(session.id, 'first', 'queued');
       const supervisor = new ScriptedSupervisor();
       const events: AdapterEvent[] = [];
-      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.145.0')
+      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, session.id, '0.153.4')
         .start({ cwd, prompt: prompt('first'), promptId: firstId, env: {} }, (event) => {
           events.push(event); registry.apply(session.id, event);
         });
@@ -933,7 +932,7 @@ test('typed UsageLimitExceeded failures are classified internally on both termin
       else supervisor.notify('turn/completed', { threadId: 'thread-new', turn: turn('turn-1', 'failed', terminal.value) });
       await waitFor(() => session.status === 'stopped');
       assert.equal(terminal.typedReads(), 1, `${path} must retain the typed discriminator`);
-      assert.equal(session.stoppedCode, 'codex_stream_failed');
+      assert.equal(session.stoppedCode, kind === 'UsageLimitExceeded' ? 'codex_usage_limited' : 'codex_stream_failed');
       assert.equal(session.stoppedReason, 'Failure at [path omitted]');
       assert.equal(supervisor.detached, 1);
       assert.equal(supervisor.requests.filter(({ method }) => method === 'turn/start').length, 1);
@@ -941,7 +940,7 @@ test('typed UsageLimitExceeded failures are classified internally on both termin
       assert.equal(events.filter((event) => event.type === 'stopped').length, 1);
       await registry.save();
       for (const serialized of [JSON.stringify(events), JSON.stringify(registry.publicSessions()), await readFile(join(cwd, 'state.json'), 'utf8')]) {
-        assert.doesNotMatch(serialized, /codex_usage_limited|UsageLimitExceeded|usageLimitExceeded|codexErrorInfo|additionalDetails|\/private\/provider/);
+        assert.doesNotMatch(serialized, /UsageLimitExceeded|usageLimitExceeded|codexErrorInfo|additionalDetails|\/private\/provider/);
       }
     }
   }
@@ -953,7 +952,8 @@ test('thread safety mismatches fail closed before turn/start', async (t) => {
   const mismatches: Array<[string, (response: Record<string, unknown>) => void]> = [
     ['cwd', (response) => { response.cwd = `${cwd}-other`; }],
     ['thread cwd', (response) => { (response.thread as Record<string, unknown>).cwd = `${cwd}-other`; }],
-    ['approval policy', (response) => { response.approvalPolicy = 'on-request'; }],
+    ['approval reviewer', (response) => { response.approvalsReviewer = 'auto_review'; }],
+    ['approval policy', (response) => { response.approvalPolicy = 'never'; }],
     ['sandbox', (response) => { response.sandbox = { type: 'dangerFullAccess' }; }],
   ];
 
@@ -968,7 +968,7 @@ test('thread safety mismatches fail closed before turn/start', async (t) => {
     createCodexAppServerAdapter(
       supervisor as unknown as CodexAppServerSupervisor,
       `session-${label}`,
-      '0.145.0',
+      '0.153.4',
     ).start({ cwd, prompt: prompt('inspect'), promptId: `prompt-${label}`, env: {} }, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'stopped'), `${label} safety stop`);
     assert.equal(supervisor.requests.some(({ method }) => method === 'turn/start'), false);
@@ -982,14 +982,14 @@ test('resume uses only the stored thread ID', async (t) => {
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const supervisor = new ScriptedSupervisor();
   const events: AdapterEvent[] = [];
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'session-resume', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'session-resume', '0.153.4')
     .start({ cwd, prompt: prompt('continue'), promptId: 'resume-prompt', env: {}, resumeId: 'stored-thread' },
       (event) => events.push(event));
 
   await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'resumed turn');
   assert.deepEqual(supervisor.requests.filter(({ method }) => method.startsWith('thread/')).map(({ method, params }) => ({ method, params })), [
     { method: 'thread/resume', params: {
-      threadId: 'stored-thread', cwd, approvalPolicy: 'never', sandbox: 'workspace-write',
+      threadId: 'stored-thread', cwd, approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: 'workspace-write',
     } },
   ]);
   assert.deepEqual(supervisor.bound, { sessionId: 'session-resume', threadId: 'stored-thread' });
@@ -1002,7 +1002,7 @@ test('reasoning effort is top-level per turn for start and resume, and omitted w
   for (const resumeId of [undefined, 'stored-thread']) {
     for (const effort of [undefined, 'high'] as const) {
       const supervisor = new ScriptedSupervisor();
-      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'effort', '0.145.0')
+      const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'effort', '0.153.4')
         .start({ cwd, prompt: prompt('effort'), env: {}, resumeId,
           ...(effort ? { codexSettings: { modelReasoningEffort: effort } } : {}) }, () => {});
       await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'));
@@ -1025,7 +1025,7 @@ test('stop interrupts once, marks queued prompts unsent, and settles once despit
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-stop',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: prompt('hold'), promptId: 'active', env: {} }, (event) => events.push(event));
 
   await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.id === 'active'), 'active delivery');
@@ -1066,7 +1066,7 @@ test('handle quiescence waits for writer settlement and resolves once across a c
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-quiescence',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: prompt('hold'), promptId: 'active', env: {} }, (event) => events.push(event));
 
   await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'active turn');
@@ -1110,7 +1110,7 @@ test('handle quiescence joins an in-flight thread setup that may still access th
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-setup-quiescence',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: prompt('hold'), promptId: 'setup-prompt', env: {} }, (event) => events.push(event));
 
   await waitFor(() => supervisor.requests.some(({ method }) => method === 'thread/start'), 'gated thread setup');
@@ -1138,7 +1138,7 @@ test('handle quiescence releases setup ownership when validation fails before a 
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-validation-quiescence',
-    '0.145.0',
+    '0.153.4',
   ).start({
     cwd,
     prompt: prompt('hold'),
@@ -1184,7 +1184,7 @@ test('handle quiescence joins an in-flight image snapshot read before worktree r
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-snapshot-quiescence',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: queuedPrompt, promptId: 'snapshot-prompt', env: {} }, (event) => events.push(event));
 
   await waitFor(
@@ -1220,7 +1220,7 @@ test('a rejected established interrupt retires the shared generation and every s
   const turnInputs: string[] = [];
   let turnNumber = 0;
   const supervisor = new CodexAppServerSupervisor({
-    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
     verifyContract: async () => {},
     clientFactory: (options) => {
       const generation = protocols.push(options) - 1;
@@ -1269,9 +1269,9 @@ test('a rejected established interrupt retires the shared generation and every s
 
   const eventsA: AdapterEvent[] = [];
   const eventsB: AdapterEvent[] = [];
-  const handleA = createCodexAppServerAdapter(supervisor, 'rejected-a', '0.145.0')
+  const handleA = createCodexAppServerAdapter(supervisor, 'rejected-a', '0.153.4')
     .start({ cwd: cwdA, prompt: prompt('first-a'), promptId: 'first-a', env: {} }, (event) => eventsA.push(event));
-  createCodexAppServerAdapter(supervisor, 'rejected-b', '0.145.0')
+  createCodexAppServerAdapter(supervisor, 'rejected-b', '0.153.4')
     .start({ cwd: cwdB, prompt: prompt('first-b'), promptId: 'first-b', env: {} }, (event) => eventsB.push(event));
   await waitFor(() => turnInputs.length === 2, 'two established turns');
 
@@ -1295,7 +1295,7 @@ test('a rejected established interrupt retires the shared generation and every s
   scheduled[0]();
   await waitFor(() => protocols.length === 2, 'replacement generation');
   const resumedEvents: AdapterEvent[] = [];
-  createCodexAppServerAdapter(supervisor, 'rejected-a', '0.145.0')
+  createCodexAppServerAdapter(supervisor, 'rejected-a', '0.153.4')
     .start({ cwd: cwdA, prompt: prompt('later-a'), promptId: 'later-a', env: {}, resumeId: 'thread-a' },
       (event) => resumedEvents.push(event));
   await waitFor(() => resumedEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
@@ -1319,7 +1319,7 @@ test('post-dispatch protocol failures retire the exact generation before termina
       let closeStarts = 0;
       let turnStarts = 0;
       const supervisor = new CodexAppServerSupervisor({
-        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
         verifyContract: async () => {},
         clientFactory: (options) => {
           protocol = options;
@@ -1369,12 +1369,12 @@ test('post-dispatch protocol failures retire the exact generation before termina
 
       const eventsA: AdapterEvent[] = [];
       const eventsB: AdapterEvent[] = [];
-      createCodexAppServerAdapter(supervisor, `protocol-a-${scenario}`, '0.145.0')
+      createCodexAppServerAdapter(supervisor, `protocol-a-${scenario}`, '0.153.4')
         .start({ cwd: cwdA, prompt: prompt('first-a'), promptId: 'first-a', env: {} }, (event) => {
           eventsA.push(event);
           if (event.type === 'stopped') trace.push(`a:stopped:${event.code}`);
         });
-      createCodexAppServerAdapter(supervisor, `protocol-b-${scenario}`, '0.145.0')
+      createCodexAppServerAdapter(supervisor, `protocol-b-${scenario}`, '0.153.4')
         .start({ cwd: cwdB, prompt: prompt('first-b'), promptId: 'first-b', env: {} }, (event) => {
           eventsB.push(event);
           if (event.type === 'stopped') trace.push(`b:stopped:${event.code}`);
@@ -1447,7 +1447,7 @@ test('a typed supervisor protocol mismatch stays typed and sanitized through the
   const cwd = await mkdtemp(join(tmpdir(), 'switchboard-app-adapter-typed-protocol-'));
   let closes = 0;
   const supervisor = new CodexAppServerSupervisor({
-    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
     verifyContract: async () => {},
     clientFactory: () => ({
       request: async <T>(method: string, params?: unknown, onDispatched?: () => void): Promise<T> => {
@@ -1482,7 +1482,7 @@ test('a typed supervisor protocol mismatch stays typed and sanitized through the
   await supervisor.ensureTurnTransport();
   const events: AdapterEvent[] = [];
 
-  createCodexAppServerAdapter(supervisor, 'typed-protocol', '0.145.0')
+  createCodexAppServerAdapter(supervisor, 'typed-protocol', '0.153.4')
     .start({ cwd, prompt: prompt('inspect'), promptId: 'typed-prompt', env: {} }, (event) => events.push(event));
   await waitFor(() => events.some((event) => event.type === 'stopped'), 'typed protocol stop');
 
@@ -1507,7 +1507,7 @@ test('stop interrupts a turn accepted just before its response returns', async (
   const handle = createCodexAppServerAdapter(
     supervisor as unknown as CodexAppServerSupervisor,
     'session-pending-stop',
-    '0.145.0',
+    '0.153.4',
   ).start({ cwd, prompt: prompt('hold'), promptId: 'active', env: {} }, (event) => events.push(event));
 
   await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'), 'pending turn delivery');
@@ -1542,7 +1542,7 @@ test('a stopped pending turn detaches after rejected or invalid responses so res
     });
     const firstEvents: AdapterEvent[] = [];
     const first = createCodexAppServerAdapter(
-      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.145.0',
+      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.153.4',
     ).start({ cwd, prompt: prompt('first'), promptId: `first-${outcome}`, env: {} }, (event) => firstEvents.push(event));
 
     await waitFor(() => firstEvents.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'));
@@ -1553,7 +1553,7 @@ test('a stopped pending turn detaches after rejected or invalid responses so res
 
     const resumedEvents: AdapterEvent[] = [];
     createCodexAppServerAdapter(
-      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.145.0',
+      supervisor as unknown as CodexAppServerSupervisor, `session-${outcome}`, '0.153.4',
     ).start({
       cwd, prompt: prompt('resume'), promptId: `resume-${outcome}`, env: {}, resumeId: `thread-${outcome}`,
     }, (event) => resumedEvents.push(event));
@@ -1567,7 +1567,7 @@ test('image snapshots remain readable for the active turn and clean after comple
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const supervisor = new ScriptedSupervisor();
   const events: AdapterEvent[] = [];
-  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'image-complete', '0.145.0')
+  createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'image-complete', '0.153.4')
     .start({ cwd, prompt: await imagePrompt(cwd), promptId: 'image-complete', env: {} }, (event) => events.push(event));
 
   await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), 'image turn/start');
@@ -1593,7 +1593,7 @@ test('image snapshots clean on stop, crash, and turn/start rejection while queue
     });
     const events: AdapterEvent[] = [];
     const handle = createCodexAppServerAdapter(
-      supervisor as unknown as CodexAppServerSupervisor, `image-${terminal}`, '0.145.0',
+      supervisor as unknown as CodexAppServerSupervisor, `image-${terminal}`, '0.153.4',
     ).start({ cwd, prompt: await imagePrompt(cwd), promptId: `active-${terminal}`, env: {} }, (event) => events.push(event));
     await waitFor(() => supervisor.requests.some(({ method }) => method === 'turn/start'), `${terminal} image turn/start`);
     const input = (supervisor.requests.find(({ method }) => method === 'turn/start')?.params as { input: unknown[] }).input;
@@ -1628,7 +1628,7 @@ test('crash and timeout are terminal without replaying active or queued work', a
     const handle = createCodexAppServerAdapter(
       supervisor as unknown as CodexAppServerSupervisor,
       'session-crash',
-      '0.145.0',
+      '0.153.4',
     ).start({ cwd, prompt: prompt('active'), promptId: 'active', env: {} }, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'prompt-delivery' && event.delivery === 'sent'), 'active turn');
     handle.send(prompt('queued'), 'queued');
@@ -1659,7 +1659,7 @@ test('crash and timeout are terminal without replaying active or queued work', a
     createCodexAppServerAdapter(
       supervisor as unknown as CodexAppServerSupervisor,
       'session-timeout',
-      '0.145.0',
+      '0.153.4',
     ).start({ cwd, prompt: prompt('time out'), promptId: 'timeout', env: {} }, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'stopped'), 'timeout stop');
     assert.ok(events.some((event) => event.type === 'stopped' && event.code === 'codex_request_timed_out'));
@@ -1679,7 +1679,7 @@ function runtime(overrides: Record<string, string> = {}): PreparedCodexRuntime {
   return {
     source: 'explicit',
     commandPath: fakeCommand,
-    version: '0.145.0',
+    version: '0.153.4',
     env: environment(overrides),
     diagnostics: [],
   };
@@ -1697,7 +1697,7 @@ test('real app-server request timeout reaches the active route as codex_request_
   });
   await supervisor.ensureTurnTransport();
   const events: AdapterEvent[] = [];
-  createCodexAppServerAdapter(supervisor, 'real-timeout', '0.145.0')
+  createCodexAppServerAdapter(supervisor, 'real-timeout', '0.153.4')
     .start({ cwd, prompt: prompt('time out'), promptId: 'real-timeout', env: {} }, (event) => events.push(event));
 
   await waitFor(() => events.some((event) => event.type === 'stopped'), 'real request timeout', 7_000);
@@ -1724,9 +1724,9 @@ test('two adapters share the real fake child without cross-routing turns or stop
 
   const eventsA: AdapterEvent[] = [];
   const eventsB: AdapterEvent[] = [];
-  const handleA = createCodexAppServerAdapter(supervisor, 'multi-a', '0.145.0')
+  const handleA = createCodexAppServerAdapter(supervisor, 'multi-a', '0.153.4')
     .start({ cwd: cwdA, prompt: prompt('session-a'), promptId: 'a-1', env: {} }, (event) => eventsA.push(event));
-  createCodexAppServerAdapter(supervisor, 'multi-b', '0.145.0')
+  createCodexAppServerAdapter(supervisor, 'multi-b', '0.153.4')
     .start({ cwd: cwdB, prompt: prompt('session-b'), promptId: 'b-1', env: {} }, (event) => eventsB.push(event));
 
   await waitFor(() => eventsA.some((event) => event.type === 'status' && event.status === 'done')
@@ -1747,4 +1747,214 @@ test('two adapters share the real fake child without cross-routing turns or stop
   const snapshot = await supervisor.reconcile();
   assert.equal(snapshot.fresh, true, 'account telemetry remains available after one session stops');
   assert.equal(eventsB.filter((event) => event.type === 'stopped').length, 0);
+});
+
+test('resume accepts a canonical alias of its worktree but rejects a different existing directory', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'sb-canonical-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'worktree');
+  const alias = join(root, 'alias');
+  const other = join(root, 'other');
+  await mkdir(cwd); await mkdir(other); await symlink(cwd, alias);
+  for (const [returned, accepted] of [[alias, true], [other, false]] as const) {
+    const response = safeThreadResponse('stored-thread', cwd);
+    (response.thread as Record<string, unknown>).cwd = returned;
+    const supervisor = new ScriptedSupervisor(async ({method}) => method === 'thread/resume'
+      ? response : {turn: turn('turn-1', 'inProgress')});
+    const events: AdapterEvent[] = [];
+    const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'alias', '0.153.4')
+      .start({cwd, resumeId:'stored-thread', prompt:prompt('continue'), env:{}}, e => events.push(e));
+    await waitFor(() => supervisor.requests.some(r => r.method === 'turn/start') || events.some(e => e.type === 'stopped'));
+    assert.equal(supervisor.requests.some(r => r.method === 'turn/start'), accepted);
+    handle.stop(); await handle.quiescence;
+  }
+});
+
+test('immediate stop retries no-active-turn rejection with bounded fail-closed fallback', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-stop-starting-'));
+  t.after(() => rm(cwd, {recursive:true, force:true}));
+  for (const persistent of [false, true]) {
+  const supervisor = new ScriptedSupervisor();
+  const request = supervisor.request;
+  let retirements = 0;
+  const retire = supervisor.retireSessionGeneration.bind(supervisor);
+  supervisor.retireSessionGeneration = async (...args) => { retirements++; await retire(...args); };
+  let interrupts = 0;
+  supervisor.request = async (r) => {
+    if (r.method === 'turn/interrupt' && (++interrupts === 1 || persistent)) throw new AppServerRequestError(true);
+    return request(r);
+  };
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor, 'starting', '0.153.4')
+    .start({cwd, prompt:prompt('hold'), env:{}}, e=>events.push(e));
+  await waitFor(() => supervisor.requests.some(r=>r.method==='turn/start'));
+  handle.stop(); await handle.quiescence;
+  assert.equal(interrupts, persistent ? 6 : 2);
+  assert.equal(retirements, persistent ? 1 : 0);
+  assert.ok(events.some(e=>e.type==='stopped' && e.code==='codex_user_stopped'));
+  }
+});
+
+test('Codex approvals mirror Allow Deny and Auto with redacted FIFO and stop cleanup', async (t) => {
+  const cwd=await mkdtemp(join(tmpdir(),'sb-approvals-'));t.after(()=>rm(cwd,{recursive:true,force:true}));
+  const supervisor=new ScriptedSupervisor();const events:AdapterEvent[]=[];const sent:unknown[]=[];
+  const handle=createCodexAppServerAdapter(supervisor as unknown as CodexAppServerSupervisor,'approvals','0.153.4')
+    .start({cwd,prompt:prompt('hold'),env:{TOKEN:'private-canary-token'}},e=>events.push(e));
+  await waitFor(()=>supervisor.requests.some(r=>r.method==='turn/start'));
+  const request=(id:string,method:string,params:unknown)=>supervisor.route!.onServerRequest!(id,method,params,d=>sent.push({id,d}));
+  request('a','item/commandExecution/requestApproval',{command:'echo private-canary-token',reason:'reason',environmentId:'local'});
+  request('b','item/fileChange/requestApproval',{});
+  assert.ok(events.some(e=>e.type==='approval'));
+  assert.ok(!JSON.stringify(events).includes('private-canary-token'));
+  handle.decide(true); assert.deepEqual(sent,[{id:'a',d:'accept'}]);
+  supervisor.route!.onServerResolved!('a');handle.decide(false);
+  assert.deepEqual(sent.at(-1),{id:'b',d:'decline'});supervisor.route!.onServerResolved!('b');
+  request('c','item/commandExecution/requestApproval',{command:'echo hello'});
+  handle.setAuto(true);assert.deepEqual(sent.at(-1),{id:'c',d:'accept'});
+  handle.setAuto(false);supervisor.route!.onServerResolved!('c');
+  request('remote','item/commandExecution/requestApproval',{command:'echo hello',environmentId:'remote'});
+  assert.deepEqual(sent.at(-1),{id:'remote',d:'decline'});
+  request('grant','item/fileChange/requestApproval',{grantRoot:'/outside'});
+  assert.deepEqual(sent.at(-1),{id:'grant',d:'decline'});
+  request('d','item/fileChange/requestApproval',{});handle.stop();await handle.quiescence;
+  assert.deepEqual(sent.at(-1),{id:'d',d:'decline'});
+});
+
+test('real stdio approval round trips preserve FIFO and Auto without leaking request payloads', async (t) => {
+  const cwd=await mkdtemp(join(tmpdir(),'sb-approval-wire-'));
+  const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session'})});
+  t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+  await supervisor.ensureTurnTransport();
+  const registry=new Registry(join(cwd,'state.json'));
+  const session=registry.create({provider:'codex',account:'fixture',repo:cwd,cwd,branch:'fixture',title:'fixture',codexTransport:'app-server'});
+  const events:AdapterEvent[]=[];
+  const handle=createCodexAppServerAdapter(supervisor,session.id,'0.153.4')
+    .start({cwd,prompt:prompt('approval-fixture'),env:{TOKEN:'approval-private-token'}},e=>{events.push(e);registry.apply(session.id,e);});
+  await waitFor(()=>session.pending?.pendingCount===2,'two approval requests');
+  assert.equal(session.status,'needs-you');assert.equal(session.pending?.tool,'command');
+  handle.decide(true);await waitFor(()=>session.pending?.tool==='edit','file approval');handle.decide(false);
+  await waitFor(()=>session.status==='done','approved turn');assert.equal(session.pending,null);
+  const prior=events.length;handle.setAuto(true);handle.send(prompt('approval-fixture-auto'));
+  await waitFor(()=>events.slice(prior).filter(e=>e.type==='status'&&e.status==='done').length===1,'auto turn');
+  assert.equal(events.slice(prior).some(e=>e.type==='approval'),false);
+  assert.ok(!JSON.stringify(registry.publicSessions()).includes('approval-private-token'));
+  handle.stop();await handle.quiescence;
+});
+
+
+test('real stdio structured questions submit atomically under Auto without persisting answers', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'sb-question-wire-'));
+  const supervisor = new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session'})});
+  t.after(async () => { await supervisor.close(); await rm(cwd,{recursive:true,force:true}); });
+  await supervisor.ensureTurnTransport();
+  const registry = new Registry(join(cwd,'state.json'));
+  const session = registry.create({provider:'codex',account:'fixture',repo:cwd,cwd,branch:'fixture',title:'fixture',codexTransport:'app-server'});
+  const events: AdapterEvent[] = [];
+  const handle = createCodexAppServerAdapter(supervisor,session.id,'0.153.4')
+    .start({cwd,prompt:prompt('question-fixture'),auto:true,env:{TOKEN:'wire-secret-label'}},event => {
+      events.push(event); registry.apply(session.id,event);
+    });
+  await waitFor(() => !!session.pending?.question, 'first question');
+  assert.equal(session.status,'needs-you');
+  const first = session.pending!;
+  assert.equal(handle.answerQuestion!(first.id,{optionId:first.question!.options[0].id}),true);
+  assert.equal(session.pending?.question?.index,2);
+  await registry.save();
+  assert.ok(!(await readFile(join(cwd,'state.json'),'utf8')).includes('wire-secret-label'));
+  assert.equal(handle.answerQuestion!(first.id,{text:'stale'}),false);
+  assert.equal(handle.answerQuestion!(session.pending!.id,{text:'private-answer'}),true);
+  await waitFor(() => session.status === 'done','question turn completed');
+  await registry.save();
+  assert.equal(session.pending,null);
+  assert.ok(!JSON.stringify(events).includes('private-answer'));
+  assert.ok(!(await readFile(join(cwd,'state.json'),'utf8')).includes('private-answer'));
+  handle.stop(); await handle.quiescence;
+});
+
+
+test('MCP form and URL requests route through the real stdio boundary without leaking values', async (t) => {
+  const cwd=await mkdtemp(join(tmpdir(),'sb-mcp-wire-'));
+  const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session'})});
+  t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+  await supervisor.ensureTurnTransport();
+  const events:AdapterEvent[]=[];let pending:any;
+  const handle=createCodexAppServerAdapter(supervisor,'mcp','0.153.4').start({cwd,auto:true,prompt:prompt('mcp-fixture'),env:{}},e=>{
+    events.push(e);if(e.type==='approval')pending=e.request;if(e.type==='approval-resolved')pending=null;
+  });
+  await waitFor(()=>pending?.elicitation?.mode==='form','MCP form');
+  assert.equal(handle.respondElicitation!(pending.id,{action:'accept',values:{[pending.elicitation.fields[0].id]:'private-form-value'}}),true);
+  await waitFor(()=>pending?.elicitation?.mode==='url','MCP URL');
+  assert.equal(handle.elicitationUrl!(pending.id),'https://example.com/auth?token=private-url-value');
+  assert.equal(handle.elicitationUrl!('stale'),null);
+  assert.equal(handle.respondElicitation!(pending.id,{action:'decline'}),true);
+  await waitFor(()=>events.some(e=>e.type==='status'&&e.status==='done'),'MCP complete');
+  assert.ok(!JSON.stringify(events).includes('private-form-value'));
+  assert.ok(!JSON.stringify(events).includes('private-url-value'));
+  handle.stop();await handle.quiescence;
+});
+
+test('capability discovery crosses real stdio and selected skills become native turn input',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-cap-wire-'));
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session'})});
+ t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+ await supervisor.ensureTurnTransport();
+ const events:AdapterEvent[]=[];
+ const handle=createCodexAppServerAdapter(supervisor,'capabilities','0.153.4').start({cwd,auto:false,prompt:prompt('/skill:fixture inspect'),env:{}},e=>events.push(e));
+ await waitFor(()=>events.some(e=>e.type==='status'&&e.status==='done'),'capability turn');
+ const catalog=await handle.capabilities!();
+ assert.equal(catalog.capabilities.length,3);
+ assert.ok(!JSON.stringify(catalog).includes(cwd));
+ assert.ok(await handle.resolveCapability!('skill:fixture'));
+ assert.equal(await handle.resolveCapability!('skill:unknown'),null);
+ handle.stop();await handle.quiescence;
+ await assert.rejects(handle.capabilities!(),/live/);
+});
+
+for (const timing of ['early','late']) test(`compact uses its own RPC and holds FIFO until completion (${timing})`,async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-compact-'));
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session',FAKE_COMPACT_TIMING:timing})});
+ t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+ await supervisor.ensureTurnTransport();const events:AdapterEvent[]=[];
+ const handle=createCodexAppServerAdapter(supervisor,'compact','0.153.4').start({cwd,auto:false,prompt:prompt(timing==='early'?'  /compact  ':'/compact'),promptId:'compact-prompt',env:{}},e=>events.push(e));
+ handle.send(prompt('after-compact'),'after-prompt');
+ await waitFor(()=>events.filter(e=>e.type==='status'&&e.status==='done').length===2,'compact and next prompt');
+ assert.ok(events.some(e=>e.type==='upsert-msg'&&e.msg.kind==='tool'&&e.msg.summary==='Context compacted'&&e.msg.status==='ok'));
+ assert.deepEqual(events.filter(e=>e.type==='prompt-delivery'&&e.delivery==='sent').map(e=>e.id),['compact-prompt','after-prompt']);
+ handle.stop();await handle.quiescence;
+});
+
+test('Stop while compaction awaits its start notification interrupts it and never sends queued work',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-compact-stop-'));
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session',FAKE_COMPACT_TIMING:'late'})});
+ t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+ await supervisor.ensureTurnTransport();const events:AdapterEvent[]=[];let handle:any;
+ handle=createCodexAppServerAdapter(supervisor,'compact-stop','0.153.4').start({cwd,auto:false,prompt:prompt('/compact'),promptId:'compact',env:{}},e=>{
+  events.push(e);if(e.type==='prompt-delivery'&&e.id==='compact'&&e.delivery==='sent')handle.stop();
+ });
+ handle.send(prompt('must-not-send'),'queued');
+ await waitFor(()=>events.some(e=>e.type==='stopped'),'compact stop');await handle.quiescence;
+ assert.ok(!events.some(e=>e.type==='prompt-delivery'&&e.id==='queued'&&e.delivery==='sent'));
+});
+
+test('missing compaction start notification is bounded and Stop resolves quiescence',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-compact-missing-'));
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session',FAKE_COMPACT_TIMING:'missing'})});
+ t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+ await supervisor.ensureTurnTransport();const events:AdapterEvent[]=[];
+ const handle=createCodexAppServerAdapter(supervisor,'compact-missing','0.153.4').start({cwd,auto:false,prompt:prompt('/compact'),promptId:'compact',env:{}},e=>events.push(e));
+ await waitFor(()=>events.some(e=>e.type==='prompt-delivery'&&e.delivery==='sent'),'compact dispatched');
+ handle.stop();
+ await waitFor(()=>events.some(e=>e.type==='stopped'),'missing notification timeout',13000);
+ await handle.quiescence;
+});
+
+test('usage limit failure crosses stdio and duplicate terminal events stop only once',async t=>{
+ const cwd=await mkdtemp(join(tmpdir(),'sb-limit-wire-'));
+ const supervisor=new CodexAppServerSupervisor({runtime:runtime({FAKE_APP_SERVER_MODE:'turn-multi-session'})});
+ t.after(async()=>{await supervisor.close();await rm(cwd,{recursive:true,force:true});});
+ await supervisor.ensureTurnTransport();const events:AdapterEvent[]=[];
+ const handle=createCodexAppServerAdapter(supervisor,'limited','0.153.4').start({cwd,auto:false,prompt:prompt('usage-limit-fixture'),env:{}},e=>events.push(e));
+ await waitFor(()=>events.some(e=>e.type==='stopped'),'usage limit');
+ await handle.quiescence;
+ assert.deepEqual(events.filter(e=>e.type==='stopped').map(e=>e.code),['codex_usage_limited']);
 });

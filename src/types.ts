@@ -15,6 +15,7 @@ export type CodexFailureCode =
   | 'codex_transport_crashed'
   | 'codex_request_timed_out'
   | 'codex_stream_failed'
+  | 'codex_usage_limited'
   | 'codex_sandbox_denied'
   | 'codex_user_stopped';
 
@@ -35,6 +36,8 @@ export type PromptAttachment = {
 };
 
 export type AgentPrompt = {
+  /** Server-resolved capability identity; never a browser-supplied native path. */
+  capability?: string;
   text: string;
   attachments: PromptAttachment[];
 };
@@ -108,8 +111,23 @@ export type QuestionOption = { label: string; description?: string };
  *  which the UI renders as answer buttons. Answering resolves the request with a
  *  deny whose message carries the label — deny's `message` is the SDK's only
  *  channel back into the tool result, since the CLI has no terminal to ask on. */
+export type StructuredQuestion = {
+  header: string; prompt: string;
+  options: { id: string; label: string; description: string }[];
+  allowText: boolean; secret: boolean; index: number; total: number;
+};
+
+export type ElicitationField = {
+  id: string; label: string; description: string; type: 'string' | 'number' | 'integer' | 'boolean' | 'array'; required: boolean;
+  options?: {id:string;label:string}[]; minLength?:number; maxLength?:number;
+  minimum?:number; maximum?:number; minItems?:number; maxItems?:number; format?:string;
+};
+export type PublicElicitation = {
+  mode: 'form' | 'url'; server: string; message: string; fields?: ElicitationField[]; destination?: string;
+};
 export type ApprovalRequest = {
   id: string; tool: string; summary: string; options?: QuestionOption[];
+  responding?: boolean; pendingCount?: number; question?: StructuredQuestion; elicitation?: PublicElicitation;
 };
 
 export type TurnUsage = {
@@ -130,8 +148,7 @@ export type Session = {
   branch: string;
   title: string;
   status: Status;
-  /** Auto-approve every tool call instead of asking. Codex sessions ignore it —
-   *  their SDK has no interactive approval to skip (see codex.ts approvalPolicy). */
+  /** Accept individual approval requests automatically. SDK Codex has no callback. */
   auto: boolean;
   /** Immutable owner of this Codex vendor thread. Claude sessions omit both fields. */
   codexTransport?: 'sdk' | 'app-server';
@@ -288,6 +305,12 @@ export type AgentHandle = {
   /** `answer` is the AskUserQuestion option label the user picked; it overrides
    *  `allow` and is handed back to the agent as the tool result. */
   decide(allow: boolean, answer?: string): void;
+  /** App-server structured input; false means stale or invalid submission. */
+  respondElicitation?(requestId: string, response: unknown): boolean;
+  capabilities?(force?: boolean): Promise<import('./agents/codex-capabilities.ts').CapabilitySnapshot>;
+  resolveCapability?(alias: string): Promise<string | null>;
+  elicitationUrl?(requestId: string): string | null;
+  answerQuestion?(requestId: string, answer: unknown): boolean;
   setAuto(on: boolean): void;
   stop(): void;
   /** Present when stop has asynchronous writer ownership to settle. The promise

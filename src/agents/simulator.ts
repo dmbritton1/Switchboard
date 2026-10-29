@@ -1,27 +1,7 @@
 import { z } from 'zod';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
-import { capture, run, type Capture } from './capture.ts';
-
-/**
- * Devices are named by the agent, so this is a trust boundary. execFile takes an
- * argv array (no shell), which rules out injection but not argument smuggling —
- * a name starting with `-` would be read by simctl as a flag. Requiring the
- * first character to be alphanumeric costs nothing: real names are `booted`, a
- * UUID, or something like "iPhone 16 Pro".
- */
-const DEVICE = /^[A-Za-z0-9][A-Za-z0-9 _.-]*$/;
-
-/**
- * One PNG of the simulator's screen, base64-encoded.
- *
- * `xcrun` is a parameter so tests can point at a fake the same way the Codex
- * tests point at a fake codex binary — the real boundary stays in play, no
- * simulator required.
- */
-export async function captureScreenshot(device = 'booted', xcrun = 'xcrun'): Promise<Capture> {
-  if (!DEVICE.test(device)) return { ok: false, error: `invalid device name: ${device}` };
-  return capture((file) => run(xcrun, ['simctl', 'io', device, 'screenshot', file]));
-}
+import { captureScreenshot, simulatorScreenshot } from './simulator-capture.ts';
+export { captureScreenshot, simulatorScreenshot } from './simulator-capture.ts';
 
 /**
  * The one simulator capability the agent cannot get from Bash.
@@ -50,11 +30,7 @@ export const simulatorServer = createSdkMcpServer({
         device: z.string().optional()
           .describe('Device UDID or name. Defaults to the currently booted device.'),
       },
-      async ({ device }) => {
-        const shot = await captureScreenshot(device);
-        if (!shot.ok) return { content: [{ type: 'text', text: shot.error }], isError: true };
-        return { content: [{ type: 'image', data: shot.base64, mimeType: 'image/png' }] };
-      },
+      (args) => simulatorScreenshot(args),
     ),
   ],
 });

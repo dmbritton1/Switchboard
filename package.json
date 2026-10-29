@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "evaluate:codex-app-server": "node scripts/codex-app-server-probe.ts",
     "evaluate:codex-telemetry": "node scripts/codex-telemetry-smoke.ts",
@@ -13,6 +15,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.220",
-    "@openai/codex-sdk": "0.145.0"
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@openai/codex-sdk": "0.153.4"
   }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, realpathSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import readline from 'node:readline';
 import { DENIED_SERVER_METHODS } from '../../src/agents/codex-app-server-contract.ts';
@@ -19,6 +19,7 @@ const threadId = 'fixture-thread';
 let turnNumber = 0;
 let multiThreadNumber = 0;
 let multiTurnNumber = 0;
+const compactingThreads = new Set<string>();
 const multiThreads = new Map<string, string>();
 const multiTurns = new Map<string, string>();
 let initialized = false;
@@ -68,11 +69,11 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   if (schemaMode === 'hang') setInterval(() => {}, 1_000);
   if (schemaMode === 'ignore-term') {
     const pidFile = process.env.FAKE_APP_SERVER_SCHEMA_PID_FILE;
-    if (pidFile) writeFileSync(pidFile, String(process.pid));
     process.on('SIGTERM', () => {
       const marker = process.env.FAKE_APP_SERVER_SCHEMA_EXIT_MARKER;
       if (marker) appendFileSync(marker, 'SIGTERM');
     });
+    if (pidFile) writeFileSync(pidFile, String(process.pid));
     setInterval(() => {}, 1_000);
     await new Promise<void>(() => {});
   }
@@ -83,9 +84,27 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   }
   mkdirSync(join(out, 'v2'), { recursive: true });
   mkdirSync(join(out, 'serde_json'), { recursive: true });
+  writeFileSync(join(out, 'v2', 'SkillsListParams.ts'), 'export type SkillsListParams = { cwds?: Array<string>, forceReload?: boolean, };');
+  writeFileSync(join(out, 'v2', 'SkillsListResponse.ts'), 'export type SkillsListResponse = { data: Array<SkillsListEntry>, };');
+  writeFileSync(join(out, 'v2', 'SkillsListEntry.ts'), 'export type SkillsListEntry = { cwd: string, skills: Array<SkillMetadata>, errors: Array<SkillErrorInfo>, };');
+  writeFileSync(join(out, 'v2', 'SkillMetadata.ts'), 'export type SkillMetadata = { name: string, description: string, path: AbsolutePathBuf, enabled: boolean, };');
+  writeFileSync(join(out, 'v2', 'AppsListParams.ts'), 'export type AppsListParams = { cursor?: string | null, limit?: number | null, threadId?: string | null, forceRefetch?: boolean, };');
+  writeFileSync(join(out, 'v2', 'AppsListResponse.ts'), 'export type AppsListResponse = { data: Array<AppInfo>, nextCursor: string | null, };');
+  writeFileSync(join(out, 'v2', 'AppInfo.ts'), 'export type AppInfo = { id: string, name: string, isAccessible: boolean, isEnabled: boolean, };');
+  writeFileSync(join(out, 'v2', 'AppsInstalledParams.ts'), 'export type AppsInstalledParams = { threadId?: string | null, forceRefresh?: boolean, };');
+  writeFileSync(join(out, 'v2', 'AppsInstalledResponse.ts'), 'export type AppsInstalledResponse = { apps: Array<InstalledApp>, };');
+  writeFileSync(join(out, 'v2', 'InstalledApp.ts'), 'export type InstalledApp = { id: string, enabled: boolean, callable: boolean, };');
+  writeFileSync(join(out, 'v2', 'ListMcpServerStatusParams.ts'), 'export type ListMcpServerStatusParams = { threadId?: string | null, cursor?: string | null, limit?: number | null, detail?: McpServerStatusDetail | null, };');
+  writeFileSync(join(out, 'v2', 'ListMcpServerStatusResponse.ts'), 'export type ListMcpServerStatusResponse = { data: Array<McpServerStatus>, nextCursor: string | null, };');
+  writeFileSync(join(out, 'v2', 'McpServerStatus.ts'), 'export type McpServerStatus = { name: string, runtimeStatus: McpServerConnectionStatus | null, tools: { [key in string]?: Tool }, };');
+  writeFileSync(join(out,'v2','ConfigReadParams.ts'),'export type ConfigReadParams = {cwd?:string|null,includeLayers?:boolean};');
+  writeFileSync(join(out,'v2','ConfigReadResponse.ts'),'export type ConfigReadResponse = {config:Config};');
+  writeFileSync(join(out,'v2','ThreadCompactStartParams.ts'),'export type ThreadCompactStartParams = {threadId:string};');
+  writeFileSync(join(out,'v2','ThreadCompactStartResponse.ts'),'export type ThreadCompactStartResponse = Record<string, never>;');
   const omit = process.env.FAKE_APP_SERVER_SCHEMA_OMIT;
   const include = (value: string): boolean => value !== omit;
   writeFileSync(join(out, 'ClientRequest.ts'), [
+    'thread/compact/start', 'config/read', 'skills/list', 'app/list', 'app/installed', 'mcpServerStatus/list',
     'initialize',
     'account/read',
     'account/rateLimits/read',
@@ -104,6 +123,7 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     `export type ServerRequest = ${serverRequests.map((method) => `{ "method": "${method}" }`).join(' | ')};`,
   ].join('\n'));
   const notifications = [
+    'skills/changed', 'app/list/updated', 'mcpServer/startupStatus/updated',
     'error',
     'account/updated',
     'account/rateLimits/updated',
@@ -116,18 +136,38 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     'item/completed',
     'turn/completed',
     'serverRequest/resolved',
+    'serverRequest/resolved',
   ].filter(include);
   writeFileSync(
     join(out, 'ServerNotification.ts'),
     `${notifications.map((method) => `{ "method": "${method}" }`).join('\n')}\n`,
   );
   writeFileSync(join(out, 'ServerNotificationEnvelope.ts'), 'export type ServerNotificationEnvelope = { emittedAtMs?: number };\n');
-  writeFileSync(join(out, 'AuthMode.ts'), 'export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey";\n');
+  writeFileSync(join(out, 'AuthMode.ts'), 'export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey" | "bedrockAccessKeys";\n');
   writeFileSync(join(out, 'v2', 'Account.ts'), 'export type Account = { "type": "apiKey" } | { "type": "chatgpt" } | { "type": "amazonBedrock" };\n');
   writeFileSync(join(out, 'v2', 'RateLimitSnapshot.ts'), 'export type RateLimitSnapshot = { limitId: string | null, limitName: string | null, primary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, secondary: { usedPercent: number, windowDurationMins: number | null, resetsAt: number | null } | null, spendControlReached: boolean | null, rateLimitReachedType: string | null };\n');
   writeFileSync(join(out, 'v2', 'GetAccountRateLimitsResponse.ts'), 'export type GetAccountRateLimitsResponse = { rateLimits: RateLimitSnapshot, rateLimitsByLimitId: Record<string, RateLimitSnapshot> | null };\n');
   writeFileSync(join(out, 'v2', 'AccountRateLimitsUpdatedNotification.ts'), '/** Sparse rolling rate-limit update. */\nexport type AccountRateLimitsUpdatedNotification = { rateLimits: RateLimitSnapshot };\n');
   const shapeOmit = process.env.FAKE_APP_SERVER_SCHEMA_SHAPE_OMIT;
+  for (const kind of ['CommandExecution', 'FileChange']) {
+    const decision = `${kind}ApprovalDecision`;
+    writeFileSync(join(out,'v2',decision+'.ts'), `export type ${decision} = "accept" | "acceptForSession" | "decline" | "cancel";`);
+    writeFileSync(join(out,'v2',kind+'RequestApprovalResponse.ts'), `export type Response = { decision: ${decision} };`);
+    writeFileSync(join(out,'v2',kind+'RequestApprovalParams.ts'), 'export type Params = { threadId: string, turnId: string, itemId: string };');
+  }
+  writeFileSync(join(out,'RequestId.ts'),'export type RequestId = string | number;');
+  writeFileSync(join(out,'v2','McpServerElicitationRequestParams.ts'), shapeOmit==='mcp-request'?'': 'export type Params = {threadId: string, turnId: string | null, serverName: string} & ({mode: "form", requestedSchema: McpElicitationSchema} | {mode: "url", url: string, elicitationId: string});');
+  writeFileSync(join(out,'v2','McpServerElicitationRequestResponse.ts'),'export type Response = {action: McpServerElicitationAction, content: JsonValue | null, _meta: JsonValue | null};');
+  writeFileSync(join(out,'v2','McpServerElicitationAction.ts'),shapeOmit==='mcp-action'?'': 'export type Action = "accept" | "decline" | "cancel";');
+  writeFileSync(join(out,'v2','McpElicitationSchema.ts'),shapeOmit==='mcp-schema'?'': 'export type Schema = {type: McpElicitationObjectType, properties: { [key in string]?: McpElicitationPrimitiveSchema }, required?: Array<string>};');
+  writeFileSync(join(out, 'InitializeCapabilities.ts'), `export type InitializeCapabilities = { experimentalApi: ${shapeOmit === 'question-experimental' ? 'string' : 'boolean'}, requestAttestation: boolean, };`);
+  writeFileSync(join(out, 'v2', 'ToolRequestUserInputParams.ts'), `export type ToolRequestUserInputParams = { threadId: string, turnId: string, itemId: string, questions: Array<ToolRequestUserInputQuestion>, isBlocking: ${shapeOmit === 'question-blocking' ? 'string' : 'boolean'}, autoResolutionMs: number | null, };`);
+  writeFileSync(join(out, 'v2', 'ToolRequestUserInputQuestion.ts'), `export type ToolRequestUserInputQuestion = { id: string, header: string, question: string, isOther: boolean, isSecret: ${shapeOmit === 'question-secret' ? 'string' : 'boolean'}, options: Array<ToolRequestUserInputOption>${shapeOmit === 'question-options' ? '' : ' | null'}, };`);
+  writeFileSync(join(out, 'v2', 'ToolRequestUserInputOption.ts'), 'export type ToolRequestUserInputOption = { label: string, description: string, };');
+  writeFileSync(join(out, 'v2', 'ToolRequestUserInputResponse.ts'), 'export type ToolRequestUserInputResponse = { answers: { [key in string]?: ToolRequestUserInputAnswer }, };');
+  writeFileSync(join(out, 'v2', 'ToolRequestUserInputAnswer.ts'), `export type ToolRequestUserInputAnswer = { answers: Array<${shapeOmit === 'question-answer' ? 'number' : 'string'}>, };`);
+  writeFileSync(join(out,'v2','ServerRequestResolvedNotification.ts'), shapeOmit === 'approval-resolution' ? '' : 'export type Resolved = { threadId: string, requestId: RequestId };');
+
   const shape = (name: string, value: string): string => shapeOmit === name ? '' : value;
   const changedShape = (name: string, value: string, changed: string): string =>
     shapeOmit === name ? changed : value;
@@ -158,10 +198,11 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
     ),
     'export type ReasoningEffort = number;\n',
   )));
+  writeFileSync(join(out, 'v2', 'ApprovalsReviewer.ts'), 'export type ApprovalsReviewer = "user" | "auto_review" | "guardian_subagent";');
   writeFileSync(join(out, 'v2', 'ThreadStartParams.ts'), [
     'export type ThreadStartParams = {',
     shape('thread-params', [
-      'model?: string | null, cwd?: string | null, ',
+      'model?: string | null, cwd?: string | null, approvalsReviewer?: ApprovalsReviewer | null, ',
       changedShape('thread-start-approval-type', changedShape(
         'thread-start-approval-union',
         'approvalPolicy?: AskForApproval | null, ',
@@ -183,7 +224,7 @@ if (appServerIndex !== -1 && process.argv[appServerIndex + 1] === 'generate-ts')
   writeFileSync(join(out, 'v2', 'ThreadResumeParams.ts'), [
     'export type ThreadResumeParams = { threadId: string,',
     shape('thread-params', [
-      'model?: string | null, cwd?: string | null, ',
+      'model?: string | null, cwd?: string | null, approvalsReviewer?: ApprovalsReviewer | null, ',
       changedShape('thread-resume-approval-type', changedShape(
         'thread-resume-approval-union',
         'approvalPolicy?: AskForApproval | null, ',
@@ -386,7 +427,7 @@ if (appServerIndex !== -1) {
   const rootArgs = process.argv.slice(2, appServerIndex);
   const configs = rootArgs.flatMap((value, index) => value === '-c' ? [rootArgs[index + 1]] : []);
   const strict = rootArgs.includes('--strict-config');
-  const knownConfigs = new Set(['hooks={}', 'mcp_servers={}', 'otel.exporter="none"']);
+  const knownConfigs = new Set(['features.default_mode_request_user_input=true', 'hooks={}', 'mcp_servers={}', 'otel.exporter="none"']);
   if (strict && configs.some((value) => !knownConfigs.has(value))) fail('strict config rejected unknown key');
   if (!strict && process.env.FAKE_APP_SERVER_STRICT_CONFIG_MARKER) {
     writeFileSync(process.env.FAKE_APP_SERVER_STRICT_CONFIG_MARKER, 'strict config missing');
@@ -469,7 +510,7 @@ function thread(): Record<string, unknown> {
     status: { type: 'idle' },
     path: null,
     cwd: '/fixture',
-    cliVersion: '0.145.0',
+    cliVersion: '0.153.4',
     source: 'appServer',
     threadSource: null,
     agentNickname: null,
@@ -509,7 +550,7 @@ function multiThreadResponse(id: string, cwd: string): Record<string, unknown> {
     serviceTier: null,
     cwd,
     instructionSources: [],
-    approvalPolicy: 'never',
+    approvalPolicy: 'on-request',
     approvalsReviewer: 'user',
     sandbox: {
       type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false,
@@ -726,7 +767,7 @@ async function handleDeniedServerRequests(message: Message): Promise<boolean> {
   send({
     id: message.id,
     result: {
-      userAgent: 'codex-app-server/0.145.0',
+      userAgent: 'codex-app-server/0.153.4',
       codexHome: '/fixture/codex-home',
       platformFamily: 'unix',
       platformOs: 'macos',
@@ -837,13 +878,13 @@ async function handle(message: Message): Promise<void> {
     case 'initialize': {
       if (initialized) fail('initialize called twice');
       const capabilities = message.params?.capabilities;
-      if (capabilities !== null) fail('fixture requires installed-schema capabilities: null');
+      if (capabilities !== null && JSON.stringify(capabilities) !== JSON.stringify({experimentalApi:true,requestAttestation:false})) fail('unexpected initialize capabilities');
       if (message.params && 'experimentalApi' in message.params) fail('experimentalApi must be omitted');
       send({ method: 'account/updated', params: { authMode: 'chatgpt', planType: null } });
       send({
         id: message.id,
         result: {
-          userAgent: 'codex-app-server/0.145.0',
+          userAgent: 'codex-app-server/0.153.4',
           codexHome: '/fixture/codex-home',
           platformFamily: 'unix',
           platformOs: 'macos',
@@ -889,6 +930,16 @@ async function handle(message: Message): Promise<void> {
       });
       notifyAfterRateLimitRead();
       return;
+    case 'config/read':
+      send({id:message.id,result:{config:{sandbox_workspace_write:{network_access:false},mcp_servers:{}}}});return;
+    case 'skills/list':
+      send({id:message.id,result:{data:[{cwd:message.params.cwds[0],skills:[{name:'fixture',description:'Fixture skill',path:message.params.cwds[0]+'/SKILL.md',enabled:true}],errors:[]}]}});return;
+    case 'app/list':
+      send({id:message.id,result:{data:[{id:'fixture-app',name:'Fixture App',description:'Fixture',isAccessible:true,isEnabled:true}],nextCursor:null}});return;
+    case 'app/installed':
+      send({id:message.id,result:{apps:[{id:'fixture-app',enabled:true,callable:true}]}});return;
+    case 'mcpServerStatus/list':
+      send({id:message.id,result:{data:[{name:'fixture',runtimeStatus:'connected',tools:{inspect:{description:'Inspect'}}}],nextCursor:null}});return;
     case 'thread/start': {
       if (!initialized) fail('thread/start before initialized');
       if (mode === 'turn-request-timeout') {
@@ -914,12 +965,30 @@ async function handle(message: Message): Promise<void> {
       }
       return;
     }
+    case 'thread/compact/start': {
+      const requestedThread = message.params.threadId;
+      const compactId = `compact-${++multiTurnNumber}`;
+      compactingThreads.add(requestedThread);
+      multiTurns.set(compactId,requestedThread);
+      const start = () => send({method:'turn/started',params:{threadId:requestedThread,turn:turn(compactId,'inProgress')}});
+      if(process.env.FAKE_COMPACT_TIMING === 'early') start();
+      send({id:message.id,result:{}});
+      if(process.env.FAKE_COMPACT_TIMING === 'missing') return;
+      if(process.env.FAKE_COMPACT_TIMING !== 'early') setTimeout(start,10);
+      setTimeout(()=>{
+        compactingThreads.delete(requestedThread);
+        send({method:'item/completed',params:{threadId:requestedThread,turnId:compactId,item:{id:compactId+'-item',type:'contextCompaction',status:'completed'}}});
+        send({method:'turn/completed',params:{threadId:requestedThread,turn:turn(compactId,'completed')}});
+      },30);
+      return;
+    }
     case 'turn/start': {
       if (mode === 'turn-multi-session') {
         const requestedThread = message.params?.threadId;
         if (typeof requestedThread !== 'string' || ![...multiThreads.values()].includes(requestedThread)) {
           fail('turn/start used an unknown multi-session thread');
         }
+        if(compactingThreads.has(requestedThread)) fail('prompt dispatched before compaction completed');
         const turnId = `multi-turn-${++multiTurnNumber}`;
         multiTurns.set(turnId, requestedThread);
         send({ id: message.id, result: { turn: turn(turnId, 'inProgress') } });
@@ -929,6 +998,64 @@ async function handle(message: Message): Promise<void> {
         }
         send({ method: 'turn/started', params: { threadId: requestedThread, turn: turn(turnId, 'inProgress') } });
         const promptText = multiInputText(message);
+        if (promptText.startsWith('/skill:fixture')) {
+          const selected = message.params.input.find((item:any) => item.type === 'skill');
+          const cwd = [...multiThreads.entries()].find(([,id]) => id === requestedThread)?.[0];
+          if (!selected || selected.name !== 'fixture' || selected.path !== realpathSync(cwd!) + '/SKILL.md') fail('missing native skill selection');
+        }
+        if (promptText === 'usage-limit-fixture') {
+          const error={message:'Account capacity exhausted',codexErrorInfo:'usageLimitExceeded',additionalDetails:null};
+          send({method:'error',params:{threadId:requestedThread,turnId,willRetry:false,error}});
+          send({method:'turn/completed',params:{threadId:requestedThread,turn:{...turn(turnId,'failed'),error}}});
+          return;
+        }
+        if (promptText === 'mcp-fixture') {
+          void (async()=>{
+            const base={threadId:requestedThread,turnId:null,serverName:'fixture',_meta:null,message:'Fixture input'};
+            const form=await serverRequest(`form-${turnId}`,'mcpServer/elicitation/request',{...base,mode:'form',requestedSchema:{type:'object',properties:{field:{type:'string'}},required:['field']}});
+            if(JSON.stringify(form.result)!==JSON.stringify({action:'accept',content:{field:'private-form-value'},_meta:null}))fail('form result differs');
+            send({method:'serverRequest/resolved',params:{threadId:requestedThread,requestId:`form-${turnId}`}});
+            const url=await serverRequest(`url-${turnId}`,'mcpServer/elicitation/request',{...base,turnId,mode:'url',url:'https://example.com/auth?token=private-url-value',elicitationId:'private-url-id'});
+            if(JSON.stringify(url.result)!==JSON.stringify({action:'decline',content:null,_meta:null}))fail('URL result differs');
+            send({method:'serverRequest/resolved',params:{threadId:requestedThread,requestId:`url-${turnId}`}});
+            send({method:'turn/completed',params:{threadId:requestedThread,turn:turn(turnId,'completed')}});
+          })();return;
+        }
+        if (promptText === 'question-fixture') {
+          const requestId = `question-${turnId}`;
+          void (async () => {
+            const response = await serverRequest(requestId, 'item/tool/requestUserInput', {
+              threadId: requestedThread, turnId, itemId: `item-${turnId}`,
+              isBlocking: true, autoResolutionMs: null, questions: [
+                { id: 'wire-choice', header: 'Choose', question: 'Which?', isOther: false, isSecret: false,
+                  options: [{ label: 'wire-secret-label', description: 'First' }, { label: 'B', description: 'Second' }] },
+                { id: 'wire-text', header: 'Details', question: 'Details?', isOther: false, isSecret: true, options: null },
+              ],
+            });
+            const expected = { answers: { 'wire-choice': { answers: ['wire-secret-label'] }, 'wire-text': { answers: ['private-answer'] } } };
+            if (JSON.stringify(response.result) !== JSON.stringify(expected)) fail('question response differs');
+            send({method:'serverRequest/resolved',params:{threadId:requestedThread,requestId}});
+            send({method:'turn/completed',params:{threadId:requestedThread,turn:turn(turnId,'completed')}});
+          })();
+          return;
+        }
+        if (promptText.startsWith('approval-fixture')) {
+          const commandId = `command-${turnId}`;
+          const fileId = `file-${turnId}`;
+          const base = {threadId:requestedThread,turnId,itemId:`item-${turnId}`,startedAtMs:1};
+          const command = serverRequest(commandId,'item/commandExecution/requestApproval',{...base,kind:'command',environmentId:null,command:'echo approval-private-token'});
+          const file = serverRequest(fileId,'item/fileChange/requestApproval',base);
+          void (async()=>{
+            const a = await command;
+            if ((a.result as {decision?: string})?.decision !== 'accept') fail('command approval did not accept once');
+            send({method:'serverRequest/resolved',params:{threadId:requestedThread,requestId:commandId}});
+            const b = await file;
+            if ((b.result as {decision?: string})?.decision !== (promptText.endsWith('-auto')?'accept':'decline')) fail('file approval decision differs');
+            send({method:'serverRequest/resolved',params:{threadId:requestedThread,requestId:fileId}});
+            send({method:'turn/completed',params:{threadId:requestedThread,turn:turn(turnId,'completed')}});
+          })();
+          return;
+        }
         if (!promptText.startsWith('hold-')) {
           const reply = promptText.includes('session-a') ? 'reply:session-a' : 'reply:session-b';
           send({ method: 'turn/plan/updated', params: {

@@ -1,12 +1,47 @@
 # Codex Limits, Requeue, and Cutover Implementation Plan
 
+## Execution baseline — revised 2026-09-10
+
+Tasks 1–4 are implemented. Authoritative limits, usage display, reset scheduling,
+and typed automatic usage-limit recovery are available for app-server sessions.
+SDK sessions remain outside automatic recovery; Claude retains its existing
+heuristic. App-server remains opt-in: no account migration or default flip occurred.
+
+Recovery uses only the structured `usageLimitExceeded` variant, captured while
+Auto-requeue is enabled. It forces a bounded fresh account read and queues one
+visible `continue` resume only for future resettable reached windows. Multiple
+reached windows must all clear; release still requires a fresh authoritative read.
+Pre-existing account reads are drained before boundary/recovery reads, and
+concurrent boundary calls coalesce. No provider snapshots are persisted.
+
+Stop, deletion, manual resume, changed account/session identity, disabled recovery,
+and existing queue items prevent a late enqueue. Failed resume attempts retain
+queue entries so the scheduler can show their errors. User-deleted items are not
+recreated by duplicate terminal events. Fixed workspace-write/on-request/user
+reviewer policy remains mandatory, with SDK never approvals unchanged.
+
+The 2026-09-11 rollout report records live lifecycle, model screenshot,
+compaction, file approval, and current-runtime SDK resume evidence. The soak has
+one dated day (four lifecycle completions and one resume); multi-day testing is
+tabled at user request with no automation scheduled. Cross-version SDK resume
+from 0.145.0 to 0.153.4 passed with retained thread identity and history. No iOS
+simulator device is installed, so its conditional live capture gate is unavailable.
+See `../reports/2026-09-11-codex-rollout-gate.md` for current evidence.
+
+Next execute Task 5's remaining live compatibility and sustained-reliability
+validation before considering the new-session default change. Do not intentionally
+exhaust a real account; deterministic failure fixtures validate recovery. The
+older detailed checklists below are historical implementation guidance; this
+baseline describes current scope.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Render authoritative Codex plan and rate-limit windows, recover exactly once from `UsageLimitExceeded`, and make app-server the new-session default only after a recorded compatibility gate and soak period.
 
 **Architecture:** Replace Claude-specific limit fields with a provider-neutral in-memory snapshot, normalize Codex account RPCs and notifications at the supervisor, and require fresh authoritative capacity before the scheduler releases reset work. Keep transport ownership immutable, and put the final default flip behind measurable live evidence rather than runtime fallback.
 
-**Tech Stack:** Node.js 22.18+, TypeScript, Codex app-server 0.147.0, HTTP/SSE, browser JavaScript, node:test.
+**Tech Stack:** Node.js 22.18+, TypeScript, Codex app-server 0.153.4, HTTP/SSE, browser JavaScript, node:test.
 
 ## Global Constraints
 
@@ -30,7 +65,7 @@
 - Modify `src/types.ts`, `src/usage.ts`, `src/schedule.ts`, `src/sessions.ts`, and `src/server.ts`.
 - Modify `src/agents/codex-app-server-supervisor.ts`, `src/agents/codex-app-server.ts`, and their fake/tests.
 - Modify `web/lib.js`, `web/app.js`, `web/style.css`, `web/index.html`, and UI tests.
-- Modify `scripts/smoke-codex-app-server.ts`, `test/codex-app-server-smoke.test.ts`, `accounts.example.json`, `README.md`, and the compatibility report.
+- Modify `scripts/codex-app-server-transport-smoke.ts`, `test/codex-app-server-transport-smoke.test.ts`, `accounts.example.json`, `README.md`, and the compatibility report.
 
 ### Task 1: Generalize the in-memory account limit model
 
@@ -363,8 +398,8 @@ git commit -m "feat: show Codex plan windows"
 ### Task 5: Pass the live gate and flip only the new-session default
 
 **Files:**
-- Modify: `scripts/smoke-codex-app-server.ts`
-- Modify: `test/codex-app-server-smoke.test.ts`
+- Modify: `scripts/codex-app-server-transport-smoke.ts`
+- Modify: `test/codex-app-server-transport-smoke.test.ts`
 - Modify: `docs/superpowers/reports/2026-08-01-codex-phase-2-compatibility.md`
 - Modify: `accounts.example.json`
 - Modify: `src/server.ts`
@@ -436,7 +471,7 @@ Expected: PASS.
 - [ ] **Step 10: Commit the evidence and default together**
 
 ```bash
-git add scripts/smoke-codex-app-server.ts test/codex-app-server-smoke.test.ts docs/superpowers/reports/2026-08-01-codex-phase-2-compatibility.md accounts.example.json src/server.ts test/server.test.ts test/sessions.test.ts README.md
+git add scripts/codex-app-server-transport-smoke.ts test/codex-app-server-transport-smoke.test.ts docs/superpowers/reports/2026-08-01-codex-phase-2-compatibility.md accounts.example.json src/server.ts test/server.test.ts test/sessions.test.ts README.md
 git commit -m "feat: default new Codex sessions to app-server"
 ```
 
@@ -447,7 +482,7 @@ git commit -m "feat: default new Codex sessions to app-server"
 
 - [ ] **Step 1: Run protocol and fake-boundary coverage**
 
-Run: `node --test test/codex-app-server-contract.test.ts test/codex-app-server-client.test.ts test/agents-codex-app-server.test.ts test/codex-interactions.test.ts test/codex-capabilities.test.ts test/mcp-sidecars.test.ts test/codex-limits.test.ts test/codex-app-server-smoke.test.ts`
+Run: `node --test test/codex-app-server-contract.test.ts test/codex-app-server-client.test.ts test/agents-codex-app-server.test.ts test/codex-approvals.test.ts test/codex-questions.test.ts test/codex-elicitation.test.ts test/codex-capabilities.test.ts test/mcp-sidecars.test.ts test/codex-limits.test.ts test/codex-app-server-transport-smoke.test.ts`
 
 Expected: PASS.
 

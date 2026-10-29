@@ -109,7 +109,7 @@ test('rejects malformed account/read results', () => {
   }
 });
 
-test('normalizes all seven account/updated AuthMode values with distinct external-auth reasons', () => {
+test('normalizes all eight account/updated AuthMode values with distinct external-auth reasons', () => {
   const cases: Array<{ authMode: string; expected: unknown }> = [
     ['apikey', { supported: false, plan: null, reason: reasons.apiKey }],
     ['chatgpt', { supported: true, plan: 'plus' }],
@@ -118,6 +118,7 @@ test('normalizes all seven account/updated AuthMode values with distinct externa
     ['agentIdentity', { supported: false, plan: null, reason: reasons.identity }],
     ['personalAccessToken', { supported: false, plan: null, reason: reasons.personalAccessToken }],
     ['bedrockApiKey', { supported: false, plan: null, reason: reasons.bedrock }],
+    ['bedrockAccessKeys', { supported: false, plan: null, reason: reasons.bedrock }],
   ].map(([authMode, expected]) => ({ authMode: authMode as string, expected }));
 
   for (const { authMode, expected } of cases) {

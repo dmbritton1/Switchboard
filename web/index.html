@@ -105,6 +105,7 @@
         <div id="composer-shell">
           <!-- Thumbnails of images attached to the message being composed. Empty
                (and display:none) until an upload lands; cleared once it is sent. -->
+          <section id="capability-panel" aria-label="Session capabilities" hidden></section>
           <div id="thumbs" aria-live="polite"></div>
           <div id="prompt-box" class="cmd-box">
             <!-- Paints the command in colour underneath the real input, which cannot
@@ -122,6 +123,7 @@
             <ul id="mention-menu" class="cmd-menu" role="listbox" aria-label="Sessions" hidden></ul>
           </div>
           <div id="composer-tools">
+            <button id="capabilities-btn" type="button" hidden aria-expanded="false" aria-controls="capability-panel">Capabilities</button>
             <!-- The file input is hidden in CSS rather than with [hidden]: a
                  display:none input cannot take focus, which left the attach
                  control out of the tab order entirely. -->
@@ -212,6 +214,8 @@
     </div>
     <div class="field">
       <label for="prompt-input">First prompt</label>
+      <button id="new-capabilities-btn" type="button" hidden>Preview capabilities</button>
+      <div id="new-capability-panel" aria-live="polite"></div>
       <div id="new-prompt-box" class="cmd-box">
         <div id="new-prompt-mirror" class="cmd-mirror" aria-hidden="true"></div>
         <textarea id="prompt-input" class="cmd-field" name="prompt" required rows="3"
@@ -381,7 +385,7 @@
       <input type="checkbox" name="autoRequeue">
       Resume rate-limited sessions when the window resets
     </label>
-    <p class="hint">Claude accounts only — Codex reports no rate-limit signal.</p>
+    <p class="hint">Claude and Codex app-server sessions. Codex resumes only after fresh account data confirms capacity.</p>
 
     <h3>Accounts</h3>
     <div id="settings-accounts"></div>

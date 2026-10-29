@@ -6,11 +6,12 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { loadAccounts, type Account } from '../src/accounts.ts';
 import { CodexProviderPool } from '../src/agents/codex-provider.ts';
+import type { CodexAppServerSupervisor } from '../src/agents/codex-app-server-supervisor.ts';
 import type { AdapterEvent } from '../src/types.ts';
 import { createWorktree } from '../src/worktree.ts';
 
 export type CodexAppServerTransportSmokeEvidence = {
-  version: '0.145.0';
+  version: '0.153.4';
   initialized: boolean;
   telemetryContinuity: boolean;
   newThread: boolean;
@@ -69,12 +70,26 @@ async function accountFor(options: CodexAppServerTransportSmokeOptions): Promise
   return account;
 }
 
-export async function waitForSmokeObservation(mode: 'fake' | 'real', predicate: () => boolean, description: string): Promise<void> {
+export async function waitForSmokeObservation(mode: 'fake' | 'real', predicate: () => boolean, description: string, failed: () => boolean = () => false): Promise<void> {
   const deadline = Date.now() + (mode === 'fake' ? FAKE_OBSERVATION_DEADLINE_MS : LIVE_OBSERVATION_DEADLINE_MS);
-  while (!predicate()) {
+  while (true) {
+    if (failed()) throw fail(`Codex transport smoke failed before ${description}.`);
+    if (predicate()) return;
     if (Date.now() >= deadline) throw fail(`Codex transport smoke did not observe ${description}.`);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+// Observe the real RPC boundary: user-stopped can also mean forced retirement.
+function observeInterrupt(supervisor: CodexAppServerSupervisor): () => boolean {
+  const request = supervisor.requestForSession.bind(supervisor);
+  let acknowledged = false;
+  supervisor.requestForSession = async <T>(...args: Parameters<CodexAppServerSupervisor['requestForSession']>): Promise<T> => {
+    const response = await request<T>(...args);
+    if (args[1] === 'turn/interrupt') acknowledged = true;
+    return response;
+  };
+  return () => acknowledged;
 }
 
 function message(text: string) {
@@ -137,7 +152,7 @@ export async function createSmokeWorkspace(mode: 'fake' | 'real'): Promise<Codex
       '-c', 'user.email=smoke@switchboard.invalid',
       'commit', '-m', 'Initialize smoke fixture',
     ], { cwd: repository });
-    const labels = mode === 'fake' ? ['a', 'b', 'crash', 'resume'] : ['real'];
+    const labels = mode === 'fake' ? ['a', 'b', 'crash', 'resume'] : ['real', 'interrupt'];
     for (const label of labels) {
       worktrees.push(await createWorktree(repository, `switchboard-smoke-${label}`));
     }
@@ -194,6 +209,8 @@ async function fakeSmoke(
     if (!originalThread) throw fail('Codex transport smoke did not receive a fixture thread id.');
     await pool.close();
     restarted = createPool();
+    const restartedSupervisor = await restarted.limits(account, { onSnapshot() {}, onStale() {} });
+    const interruptAcknowledged = observeInterrupt(restartedSupervisor);
     const resumed = await restarted.prepare(account, 'app-server', 'fixture-resume');
     const resumedEvents: EventLog = [];
     const resumedHandle = resumed.adapter.start({
@@ -204,10 +221,11 @@ async function fakeSmoke(
     await waitFor(() => hasDelivery(resumedEvents, 'interrupt-a', 'sent'), 'interruptible turn');
     resumedHandle.stop();
     await waitFor(() => stopped(resumedEvents, 'codex_user_stopped'), 'interrupt');
+    if (!interruptAcknowledged()) throw fail('Codex transport smoke did not observe a graceful interrupt.');
     await restarted.close();
 
     return {
-      version: '0.145.0', initialized: telemetry.includes('snapshot'), telemetryContinuity: telemetryContinuous(telemetry),
+      version: '0.153.4', initialized: telemetry.includes('snapshot'), telemetryContinuity: telemetryContinuous(telemetry),
       newThread: vendorThread(eventsA) !== null && vendorThread(eventsB) !== null,
       firstTurn: hasDelivery(eventsA, 'first-a', 'sent') && hasDelivery(eventsB, 'first-b', 'sent'),
       followUp: hasDelivery(eventsA, 'follow-a', 'sent'), cleanProcessRestart: true,
@@ -223,10 +241,14 @@ async function fakeSmoke(
 async function realSmoke(
   account: Account,
   createPool: () => CodexProviderPool,
-  worktree: string,
+  worktrees: string[],
   onTelemetryEvent?: (event: TelemetryEvent) => void,
 ): Promise<CodexAppServerTransportSmokeEvidence> {
-  const waitFor = (predicate: () => boolean, description: string) => waitForSmokeObservation('real', predicate, description);
+  const [worktree, interruptWorktree] = worktrees;
+  if (!worktree || !interruptWorktree) throw fail('Real Codex transport smoke requires two worktrees.');
+  const logs: EventLog[] = [];
+  const waitFor = (predicate: () => boolean, description: string) => waitForSmokeObservation('real', predicate, description,
+    () => logs.some((events) => events.some((event) => event.type === 'stopped' && event.code !== 'codex_user_stopped')));
   const pool = createPool();
   let restarted: CodexProviderPool | null = null;
   try {
@@ -242,6 +264,7 @@ async function realSmoke(
     await supervisor.start();
     const first = await pool.prepare(account, 'app-server', 'fixture-a');
     const events: EventLog = [];
+    logs.push(events);
     const handle = first.adapter.start({ cwd: worktree, prompt: message('Reply only READY. Do not use files or tools.'), promptId: 'first-a', env: account.env }, (event) => { events.push(event); });
     await waitFor(() => countDone(events) === 1, 'first turn');
     handle.send(message('Reply only READY. Do not use files or tools.'), 'follow-a');
@@ -250,14 +273,18 @@ async function realSmoke(
     if (!thread) throw fail('Codex transport smoke did not receive a thread id.');
     await pool.close();
     restarted = createPool();
+    const restartedSupervisor = await restarted.limits(account, { onSnapshot() {}, onStale() {} });
+    const interruptAcknowledged = observeInterrupt(restartedSupervisor);
     const resumed = await restarted.prepare(account, 'app-server', 'fixture-resume');
     const resumedEvents: EventLog = [];
-    resumed.adapter.start({ cwd: worktree, prompt: message('Reply only READY. Do not use files or tools.'), promptId: 'resume-a', env: account.env, resumeId: thread }, (event) => { resumedEvents.push(event); });
+    logs.push(resumedEvents);
+    const resumedHandle = resumed.adapter.start({ cwd: worktree, prompt: message('Reply only READY. Do not use files or tools.'), promptId: 'resume-a', env: account.env, resumeId: thread }, (event) => { resumedEvents.push(event); });
     await waitFor(() => countDone(resumedEvents) === 1, 'resumed turn');
     const interruptible = await restarted.prepare(account, 'app-server', 'fixture-interrupt');
     const interruptEvents: EventLog = [];
+    logs.push(interruptEvents);
     const interruptHandle = interruptible.adapter.start({
-      cwd: worktree,
+      cwd: interruptWorktree,
       prompt: message('Write a long neutral essay. Do not use files or tools.'),
       promptId: 'interrupt-a', env: account.env,
     }, (event) => { interruptEvents.push(event); });
@@ -265,9 +292,12 @@ async function realSmoke(
     await waitFor(() => hasDelivery(interruptEvents, 'interrupt-a', 'sent'), 'interruptible turn');
     interruptHandle.stop();
     await waitFor(() => stopped(interruptEvents, 'codex_user_stopped'), 'interrupt');
+    if (!interruptAcknowledged()) throw fail('Codex transport smoke did not observe a graceful interrupt.');
+    resumedHandle.send(message('Reply only READY. Do not use files or tools.'), 'after-interrupt');
+    await waitFor(() => countDone(resumedEvents) === 2, 'sibling continuity after interrupt');
     await restarted.close();
     return {
-      version: '0.145.0', initialized: telemetry.includes('snapshot'), telemetryContinuity: telemetryContinuous(telemetry),
+      version: '0.153.4', initialized: telemetry.includes('snapshot'), telemetryContinuity: telemetryContinuous(telemetry),
       newThread: vendorThread(events) !== null, firstTurn: hasDelivery(events, 'first-a', 'sent'), followUp: hasDelivery(events, 'follow-a', 'sent'),
       cleanProcessRestart: true, resume: hasDelivery(resumedEvents, 'resume-a', 'sent'), interrupt: stopped(interruptEvents, 'codex_user_stopped'),
       noReplay: hasDelivery(interruptEvents, 'interrupt-a', 'sent') && hasDelivery(interruptEvents, 'queued-a', 'unsent'),
@@ -286,7 +316,7 @@ export async function runCodexAppServerTransportSmoke(options: CodexAppServerTra
     const createPool = options.createPool ?? (() => new CodexProviderPool());
     return options.mode === 'fake'
       ? await fakeSmoke(account, createPool, workspace.worktrees, options.onTelemetryEvent)
-      : await realSmoke(account, createPool, workspace.worktrees[0], options.onTelemetryEvent);
+      : await realSmoke(account, createPool, workspace.worktrees, options.onTelemetryEvent);
   } finally {
     await workspace.cleanup();
   }

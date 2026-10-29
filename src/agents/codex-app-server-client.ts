@@ -54,9 +54,11 @@ function delay(milliseconds: number): Promise<void> {
 
 /** Valid RPC rejection, with all provider diagnostics discarded. */
 export class AppServerRequestError extends Error {
-  constructor() {
+  readonly noActiveTurn: boolean;
+  constructor(noActiveTurn = false) {
     super('Codex app-server request failed.');
     this.name = 'AppServerRequestError';
+    this.noActiveTurn = noActiveTurn;
   }
 }
 
@@ -120,6 +122,11 @@ export class AppServerClient {
   notify(method: string, params?: unknown): void {
     if (this.#terminalError) throw this.#terminalError;
     this.#send(params === undefined ? { method } : { method, params });
+  }
+
+  respond(id: string | number, result: unknown): void {
+    if (this.#terminalError) throw this.#terminalError;
+    this.#send({ id, result });
   }
 
   respondError(id: string | number, code: number, message: string): void {
@@ -219,7 +226,9 @@ export class AppServerClient {
       this.#ackDispatch(pending);
       this.#pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error !== undefined) pending.reject(new AppServerRequestError());
+      if (message.error !== undefined) pending.reject(new AppServerRequestError(
+        message.error.code === -32600 && message.error.message === 'no active turn to interrupt',
+      ));
       else pending.resolve(message.result);
       return;
     }

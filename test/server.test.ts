@@ -325,11 +325,11 @@ function gatedHandoffPool(adapter: Adapter, outcome: 'ok' | 'error' = 'ok'): {
     pool: {
       async prepare() {
         preparations += 1;
-        if (preparations === 1) return { adapter, runtimeVersion: '0.145.0' };
+        if (preparations === 1) return { adapter, runtimeVersion: '0.153.4' };
         markEntered();
         await gate;
         if (outcome === 'error') throw new Error('handoff transport unavailable');
-        return { adapter, runtimeVersion: '0.145.0' };
+        return { adapter, runtimeVersion: '0.153.4' };
       },
       async close() {},
     },
@@ -494,10 +494,13 @@ test('in-process preflight gate bounds a never-entered arm and disarms it on tim
 async function bootCodex(
   t: { after: (fn: () => void) => void },
   options: {
+    usage?: Usage;
+    scheduler?: Scheduler;
+    limitCoordinator?: AccountLimitCoordinator;
     bin?: string;
     env?: Record<string, string>;
     codexTransport?: CodexTransport;
-    codexPool?: Pick<CodexProviderPool, 'prepare' | 'close'>;
+    codexPool?: Pick<CodexProviderPool, 'prepare' | 'close'> & Partial<Pick<CodexProviderPool, 'capabilities'>>;
     resolvePrompt?: typeof resolveAgentPrompt;
     gatedPreflight?: boolean;
     beforeWorktreeRemoval?: (cwd: string) => Promise<void>;
@@ -534,7 +537,7 @@ process.exit(result.status ?? 1);
   const registry = options.initialRegistry
     ? await options.initialRegistry(statePath, repo)
     : new Registry(statePath);
-  const usage = new Usage();
+  const usage = options.usage ?? new Usage();
   const account = {
     name: 'codex', provider: 'codex' as const, budget: 1000,
     ...(options.codexTransport ? { codexTransport: options.codexTransport } : {}),
@@ -554,7 +557,8 @@ process.exit(result.status ?? 1);
     async close() {},
   } satisfies Pick<CodexProviderPool, 'prepare' | 'close'> : undefined;
   const server = createServer({
-    registry, usage, scheduler: new Scheduler(), accounts: [account],
+    registry, usage, scheduler: options.scheduler ?? new Scheduler(), accounts: [account],
+    ...(options.limitCoordinator ? {limitCoordinator:options.limitCoordinator} : {}),
     ...(options.codexPool ? { codexPool: options.codexPool } : gatedCodexPool ? { codexPool: gatedCodexPool } : {}),
     ...(options.resolvePrompt ? { resolvePrompt: options.resolvePrompt } : {}),
     ...(options.beforeWorktreeRemoval ? { beforeWorktreeRemoval: options.beforeWorktreeRemoval } : {}),
@@ -604,7 +608,7 @@ test('Codex create, scheduled create, and resume route exclusively through the p
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
     async prepare(_account, transport, sessionId) {
       routes.push({ transport, sessionId });
-      return { adapter: transport === 'sdk' ? sdkAdapter : appAdapter, runtimeVersion: '0.145.0' };
+      return { adapter: transport === 'sdk' ? sdkAdapter : appAdapter, runtimeVersion: '0.153.4' };
     },
     async close() { closes += 1; },
   };
@@ -616,7 +620,7 @@ test('Codex create, scheduled create, and resume route exclusively through the p
   assert.equal(created.status, 200);
   const appSession = fixture.registry.get(created.data.id)!;
   assert.equal(appSession.codexTransport, 'app-server');
-  assert.equal(appSession.codexRuntimeVersion, '0.145.0');
+  assert.equal(appSession.codexRuntimeVersion, '0.153.4');
   assert.deepEqual(routes.map((route) => route.transport), ['app-server']);
 
   await fixture.command({ cmd: 'stop', id: appSession.id });
@@ -631,7 +635,7 @@ test('Codex create, scheduled create, and resume route exclusively through the p
     'handoff admits exactly one successor',
   );
   assert.equal(handoffSession.codexTransport, 'app-server');
-  assert.equal(handoffSession.codexRuntimeVersion, '0.145.0');
+  assert.equal(handoffSession.codexRuntimeVersion, '0.153.4');
   assert.equal(routes[1].sessionId, handoffSession.id, 'preparation is bound to the admitted successor identity');
   assert.deepEqual(routes.map((route) => route.transport), ['app-server', 'app-server']);
 
@@ -1087,7 +1091,7 @@ test('a failed active Codex turn leaves queued follow-ups unsent and resume does
   await writeFile(bin, `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
-if (args.includes('--version')) { process.stdout.write('codex-cli 0.145.0\\n'); process.exit(0); }
+if (args.includes('--version')) { process.stdout.write('codex-cli 0.153.4\\n'); process.exit(0); }
 if (args[0] === 'login' && args[1] === 'status') { process.stdout.write('Logged in using ChatGPT\\n'); process.exit(0); }
 let prompt = '';
 process.stdin.setEncoding('utf8');
@@ -1845,7 +1849,7 @@ test('an unresolved app-server stop serializes immediate resume and releases a l
       let turnStarts = 0;
       let interrupts = 0;
       const supervisor = new CodexAppServerSupervisor({
-        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+        runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
         verifyContract: async () => {},
         clientFactory: (options) => {
           protocols.push(options);
@@ -1864,7 +1868,7 @@ test('an unresolved app-server stop serializes immediate resume and releases a l
               if (method === 'thread/start' || method === 'thread/resume') {
                 const value = params as { cwd: string; threadId?: string };
                 const id = value.threadId ?? 'server-stop-thread';
-                return { thread: { id, cwd: value.cwd }, cwd: value.cwd, approvalPolicy: 'never',
+                return { thread: { id, cwd: value.cwd }, cwd: value.cwd, approvalPolicy: 'on-request', approvalsReviewer: 'user',
                   sandbox: { type: 'workspaceWrite' } } as T;
               }
               if (method === 'turn/start') {
@@ -1899,8 +1903,8 @@ test('an unresolved app-server stop serializes immediate resume and releases a l
           assert.ok(sessionId);
           await supervisor.ensureTurnTransport();
           const startNumber = adapterEvents.filter(({ event }) => event.type === 'vendor-session-id').length + 1;
-          const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0');
-          return { runtimeVersion: '0.145.0', adapter: {
+          const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.153.4');
+          return { runtimeVersion: '0.153.4', adapter: {
             start(opts, emit) {
               return real.start(opts, (event) => {
                 adapterEvents.push({ start: startNumber, event });
@@ -1953,7 +1957,7 @@ test('stop retains production app-server setup ownership before deleting its wor
   let turnStarts = 0;
   let removals = 0;
   const supervisor = new CodexAppServerSupervisor({
-    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
     verifyContract: async () => {},
     clientFactory: () => ({
       request: async <T>(method: string, params?: unknown): Promise<T> => {
@@ -1971,7 +1975,7 @@ test('stop retains production app-server setup ownership before deleting its wor
           markSetupEntered();
           await setupGate;
           const { cwd } = params as { cwd: string };
-          return { thread: { id: 'stopped-setup-thread', cwd }, cwd, approvalPolicy: 'never',
+          return { thread: { id: 'stopped-setup-thread', cwd }, cwd, approvalPolicy: 'on-request', approvalsReviewer: 'user',
             sandbox: { type: 'workspaceWrite' } } as T;
         }
         if (method === 'turn/start') {
@@ -1992,8 +1996,8 @@ test('stop retains production app-server setup ownership before deleting its wor
       assert.equal(transport, 'app-server');
       await supervisor.ensureTurnTransport();
       return {
-        runtimeVersion: '0.145.0',
-        adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0'),
+        runtimeVersion: '0.153.4',
+        adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.153.4'),
       };
     },
     close: () => supervisor.close(),
@@ -2048,7 +2052,7 @@ test('stop retains production image-snapshot ownership before starting a handoff
   let preparations = 0;
   let turnStarts = 0;
   const supervisor = new CodexAppServerSupervisor({
-    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+    runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
     verifyContract: async () => {},
     clientFactory: () => ({
       request: async <T>(method: string, params?: unknown): Promise<T> => {
@@ -2064,7 +2068,7 @@ test('stop retains production image-snapshot ownership before starting a handoff
         }
         if (method === 'thread/start') {
           const { cwd } = params as { cwd: string };
-          return { thread: { id: `snapshot-thread-${preparations}`, cwd }, cwd, approvalPolicy: 'never',
+          return { thread: { id: `snapshot-thread-${preparations}`, cwd }, cwd, approvalPolicy: 'on-request', approvalsReviewer: 'user',
             sandbox: { type: 'workspaceWrite' } } as T;
         }
         if (method === 'turn/start') {
@@ -2083,9 +2087,9 @@ test('stop retains production image-snapshot ownership before starting a handoff
       preparations += 1;
       assert.equal(transport, 'app-server');
       await supervisor.ensureTurnTransport();
-      const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0');
+      const real = createCodexAppServerAdapter(supervisor, sessionId!, '0.153.4');
       return {
-        runtimeVersion: '0.145.0',
+        runtimeVersion: '0.153.4',
         adapter: {
           start(opts, emit) {
             return real.start({
@@ -2164,7 +2168,7 @@ test('stopped writer ownership blocks handoff, merge, upload, and resume before 
       const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
         async prepare() {
           preparations += 1;
-          return { adapter, runtimeVersion: '0.145.0' };
+          return { adapter, runtimeVersion: '0.153.4' };
         },
         async close() {},
       };
@@ -2250,7 +2254,7 @@ test('rejected quiescence retains stopped writer ownership and its worktree', as
     },
   };
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
-    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async prepare() { return { adapter, runtimeVersion: '0.153.4' }; },
     async close() {},
   };
   const fixture = await bootCodex(t, {
@@ -2296,7 +2300,7 @@ test('no-quiescence stop throw retains stopped writer ownership and its worktree
     },
   };
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
-    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async prepare() { return { adapter, runtimeVersion: '0.153.4' }; },
     async close() {},
   };
   const fixture = await bootCodex(t, {
@@ -2337,7 +2341,7 @@ test('an already-settled stop owner preserves immediate stopped-session behavior
     },
   };
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
-    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async prepare() { return { adapter, runtimeVersion: '0.153.4' }; },
     async close() {},
   };
   const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
@@ -2368,7 +2372,7 @@ test('a stale stop settlement callback cannot release a newer worktree owner', a
     },
   };
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
-    async prepare() { return { adapter, runtimeVersion: '0.145.0' }; },
+    async prepare() { return { adapter, runtimeVersion: '0.153.4' }; },
     async close() {},
   };
   const fixture = await bootCodex(t, { codexTransport: 'app-server', codexPool: pool });
@@ -2414,7 +2418,7 @@ test('active app-server delete retains ownership and worktree until bounded quie
         const scheduled: Array<() => void> = [];
         let protocol!: AppServerClientOptions;
         const supervisor = new CodexAppServerSupervisor({
-          runtime: { source: 'explicit', commandPath: 'fixture', version: '0.145.0', env: {}, diagnostics: [] },
+          runtime: { source: 'explicit', commandPath: 'fixture', version: '0.153.4', env: {}, diagnostics: [] },
           verifyContract: async () => {},
           clientFactory: (options) => {
             protocol = options;
@@ -2433,7 +2437,7 @@ test('active app-server delete retains ownership and worktree until bounded quie
                 if (method === 'thread/start') {
                   const value = params as { cwd: string };
                   return { thread: { id: 'delete-thread', cwd: value.cwd }, cwd: value.cwd,
-                    approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' } } as T;
+                    approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite' } } as T;
                 }
                 if (method === 'turn/start') {
                   onDispatched?.();
@@ -2471,8 +2475,8 @@ test('active app-server delete retains ownership and worktree until bounded quie
             assert.equal(transport, 'app-server');
             await supervisor.ensureTurnTransport();
             return {
-              runtimeVersion: '0.145.0',
-              adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.145.0'),
+              runtimeVersion: '0.153.4',
+              adapter: createCodexAppServerAdapter(supervisor, sessionId!, '0.153.4'),
             };
           },
           close: () => supervisor.close(),
@@ -2545,7 +2549,7 @@ test('pending app-server delete rejects handoff before preparation or Git mutati
   const pool: Pick<CodexProviderPool, 'prepare' | 'close'> = {
     async prepare() {
       preparations += 1;
-      return { adapter, runtimeVersion: '0.145.0' };
+      return { adapter, runtimeVersion: '0.153.4' };
     },
     async close() {},
   };
@@ -4619,7 +4623,7 @@ test('HTTP unlink and same-name relink retire runtime and telemetry identity aft
   const pool = new CodexProviderPool({
     prepareRuntime: async (account) => {
       prepared.push(account);
-      return { source: 'explicit', version: '0.145.0', diagnostics: [],
+      return { source: 'explicit', version: '0.153.4', diagnostics: [],
         commandPath: join(process.cwd(), 'test/helpers/fake-app-server.ts'), env: { ...process.env, ...account.env } as Record<string, string> };
     },
     createSupervisor: (options) => new CodexAppServerSupervisor({ ...options, verifyContract: async () => {} }),
@@ -5155,4 +5159,269 @@ test('removing a worktree clears its phantom overlap once its own /status is pol
     (await status(a.id)).overlapping, [],
     'the sibling must stop reporting overlap with a worktree that no longer exists',
   );
+});
+
+test('Codex approval decisions require the current public request id and reject duplicate submissions', async (t) => {
+  let emit!: (event: AdapterEvent) => void; let decisions=0;
+  const fixture=await bootCodex(t,{codexTransport:'app-server',codexPool:{
+    async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(_opts,e){emit=e;return {send(){},decide(){decisions++;emit({type:'approval',request:{id:'current',tool:'command',summary:'echo',responding:true}});},setAuto(){},stop(){}};}}};},async close(){}
+  }});
+  const session=await fixture.create('approval');
+  emit({type:'approval',request:{id:'current',tool:'command',summary:'echo'}});
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,requestId:'old',allow:true})).status,409);
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,allow:true})).status,409);
+  assert.equal(decisions,0);
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,requestId:'current',allow:true})).status,200);
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,requestId:'current',allow:true})).status,409);
+  assert.equal(decisions,1);
+});
+
+test('structured answers require the current question and never enter transcript', async (t) => {
+  const { CodexApprovals } = await import('../src/agents/codex-approvals.ts');
+  const { normalizeCodexQuestions } = await import('../src/agents/codex-questions.ts');
+  let emit!: (event: AdapterEvent) => void;
+  let queue!: InstanceType<typeof CodexApprovals>;
+  const results: unknown[] = [];
+  const fixture = await bootCodex(t,{codexTransport:'app-server',codexPool:{
+    async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(_opts,e){emit=e;
+      queue=new CodexApprovals(false,p=>emit(p?{type:'approval',request:p}:{type:'approval-resolved'}),(_id,result)=>results.push(result));
+      return {send(){},decide(){},answerQuestion:(id,answer)=>queue.answer(id,answer),setAuto(){},stop(){queue.cancel();}};
+    }}};},async close(){}
+  }});
+  const session=await fixture.create('questions');
+  queue.addQuestions('wire',normalizeCodexQuestions({isBlocking:true,questions:[
+    {id:'wire-q',header:'Input',question:'Enter text',isOther:false,isSecret:true,options:null},
+  ]},s=>s)!);
+  const pending=fixture.registry.get(session.id)!.pending!;
+  assert.equal((await fixture.command({cmd:'answer-question',id:session.id,requestId:'stale',answer:{text:'private-http-answer'}})).status,409);
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,requestId:pending.id,allow:true})).status,400);
+  assert.equal((await fixture.command({cmd:'answer-question',id:session.id,requestId:pending.id,answer:{text:''}})).status,400);
+  assert.equal((await fixture.command({cmd:'answer-question',id:session.id,requestId:pending.id,answer:{text:'private-http-answer'}})).status,200);
+  assert.equal((await fixture.command({cmd:'answer-question',id:session.id,requestId:pending.id,answer:{text:'duplicate'}})).status,409);
+  assert.deepEqual(results,[{answers:{'wire-q':{answers:['private-http-answer']}}}]);
+  assert.ok(!JSON.stringify(fixture.registry.publicSessions()).includes('private-http-answer'));
+});
+
+test('MCP responses and URL redirects require a current request and keep values out of saved state', async (t) => {
+  const {CodexApprovals}=await import('../src/agents/codex-approvals.ts');
+  const {normalizeElicitation}=await import('../src/agents/codex-elicitation.ts');
+  let queue!:InstanceType<typeof CodexApprovals>;const results:unknown[]=[];
+  const fixture=await bootCodex(t,{codexTransport:'app-server',codexPool:{async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(_opts,emit){
+    queue=new CodexApprovals(false,p=>emit(p?{type:'approval',request:p}:{type:'approval-resolved'}),(_id,result)=>results.push(result));
+    return {send(){},decide(){},setAuto(){},stop(){queue.cancel();},respondElicitation:(id,response)=>queue.respondElicitation(id,response),elicitationUrl:id=>queue.elicitationUrl(id)};
+  }}};},async close(){}}});
+  const session=await fixture.create('mcp');
+  queue.addElicitation('form',normalizeElicitation({mode:'form',serverName:'fixture',message:'Name',requestedSchema:{type:'object',properties:{name:{type:'string'}},required:['name']}},s=>s)!);
+  const pending=fixture.registry.get(session.id)!.pending!;
+  assert.equal((await fixture.command({cmd:'respond-elicitation',id:session.id,requestId:'stale',response:{action:'cancel'}})).status,409);
+  assert.equal((await fixture.command({cmd:'decide',id:session.id,requestId:pending.id,allow:true})).status,400);
+  assert.equal((await fixture.command({cmd:'respond-elicitation',id:session.id,requestId:pending.id,response:{action:'accept',values:{}}})).status,400);
+  assert.equal((await fixture.command({cmd:'respond-elicitation',id:session.id,requestId:pending.id,response:{action:'accept',values:{[pending.elicitation!.fields![0].id]:'private-form-value'}}})).status,200);
+  assert.equal((await fixture.command({cmd:'respond-elicitation',id:session.id,requestId:pending.id,response:{action:'cancel'}})).status,409);
+  assert.ok(!(await readFile(fixture.statePath,'utf8')).includes('private-form-value'));
+  queue.resolved('form');
+  queue.addElicitation('url',normalizeElicitation({mode:'url',serverName:'fixture',message:'Continue',url:'https://example.com/auth?token=private-url-value',elicitationId:'wire-id'},s=>s)!);
+  const id=fixture.registry.get(session.id)!.pending!.id;
+  const endpoint=`${fixture.base}/elicitation-url?session=${session.id}&request=${id}`;
+  const redirect=await fetch(endpoint,{redirect:'manual'});
+  assert.equal(redirect.status,302);assert.equal(redirect.headers.get('location'),'https://example.com/auth?token=private-url-value');
+  assert.equal(redirect.headers.get('cache-control'),'no-store');
+  await fixture.registry.save();assert.ok(!(await readFile(fixture.statePath,'utf8')).includes('private-url-value'));
+  queue.resolved('url');assert.equal((await fetch(endpoint,{redirect:'manual'})).status,409);
+  assert.deepEqual(results,[{action:'accept',content:{name:'private-form-value'},_meta:null}]);
+});
+
+test('capabilities are live-session scoped and send resolves aliases without trusting native browser input', async t=>{
+ const sent:any[]=[];const refreshes:boolean[]=[];let available=true;
+ const fixture=await bootCodex(t,{codexTransport:'app-server',codexPool:{async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(){return {
+  send(prompt){sent.push(prompt);},decide(){},setAuto(){},stop(){},
+  async capabilities(force){refreshes.push(!!force);return {revision:1,warnings:[],capabilities:[]};},
+  async resolveCapability(alias){return available&&alias==='skill:build'?'opaque-skill-id':null;},
+ };}}};},async close(){}}});
+ const session=await fixture.create('capabilities');
+ let response=await fetch(`${fixture.base}/capabilities?session=${session.id}&refresh=1`);
+ assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');assert.deepEqual(refreshes,[true]);
+ assert.equal((await fetch(`${fixture.base}/capabilities?session=${session.id}&cwd=/private`)).status,400);
+ assert.equal((await fetch(`${fixture.base}/capabilities?session=missing`)).status,404);
+ assert.equal((await fixture.command({cmd:'send',id:session.id,text:'/skill:build check',capability:'browser-forged',path:'/private'})).status,200);
+ assert.equal(sent[0].capability,'opaque-skill-id');assert.equal(sent[0].path,undefined);
+ available=false;
+ assert.equal((await fixture.command({cmd:'send',id:session.id,text:'/skill:build stale'})).status,409);
+ assert.equal(sent.length,1);
+ assert.equal((await fixture.command({cmd:'send',id:session.id,text:'normal prompt'})).status,200);
+ assert.equal(sent[1].capability,undefined);
+});
+
+test('capability preview validates its account and canonical repository without creating sessions', async t => {
+  const calls: unknown[] = [];
+  const f = await bootCodex(t, {codexTransport:'app-server',codexPool:{
+    async prepare(){throw new Error('preview must not prepare a session');}, async close(){},
+    async capabilities(account,cwd,force){calls.push([account.name,cwd,force]);return {revision:1,capabilities:[],warnings:[]};},
+  }});
+  const query = new URLSearchParams({account:'codex',cwd:f.repo,refresh:'1'});
+  assert.equal((await fetch(`${f.base}/capabilities?${query}`)).status,200);
+  const {realpath} = await import('node:fs/promises');
+  assert.deepEqual(calls,[['codex',await realpath(f.repo),true]]);
+  assert.equal(f.registry.publicSessions().length,0);
+  for (const suffix of ['&session=other','&account=codex','&extra=1','&refresh=0']) {
+    assert.equal((await fetch(`${f.base}/capabilities?${query}${suffix}`)).status,400);
+  }
+  for (const cwd of [join(f.repo,'missing'),join(f.repo,'a.txt'),dirname(f.repo)]) {
+    assert.equal((await fetch(`${f.base}/capabilities?${new URLSearchParams({account:'codex',cwd})}`)).status,400);
+  }
+  assert.equal((await fetch(`${f.base}/capabilities?account=missing&cwd=${encodeURIComponent(f.repo)}`)).status,404);
+  f.account.codexTransport='sdk';
+  assert.equal((await fetch(`${f.base}/capabilities?${query}`)).status,404);
+  assert.equal(calls.length,1);
+});
+
+test('app-server built-in commands reject arguments and attachments before transcript admission', async t => {
+  const sent: unknown[]=[];
+  const f=await bootCodex(t,{codexTransport:'app-server',codexPool:{async close(){},async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(){return {send(p){sent.push(p);},stop(){},decide(){},setAuto(){}};}}};}}});
+  const session=await f.create('commands');
+  const before=JSON.stringify(f.registry.publicSessions());
+  for (const text of ['/compact extra',' /compact extra','/skills','/apps','/mcp']) {
+    assert.equal((await f.command({cmd:'send',id:session.id,text})).status,400);
+  }
+  assert.equal((await f.command({cmd:'send',id:session.id,text:'/compact',attachments:['x']})).status,400);
+  assert.equal(JSON.stringify(f.registry.publicSessions()),before);
+  assert.equal((await f.command({cmd:'send',id:session.id,text:'/compact'})).status,200);
+  assert.equal(sent.length,1);
+});
+
+test('capability preview suppresses stale account results and private failures', async t => {
+  let complete!: (value: any) => void;
+  let entered!: () => void;
+  const ready = new Promise<void>(resolve => {entered=resolve;});
+  const f=await bootCodex(t,{codexTransport:'app-server',codexPool:{
+    async close(){},async prepare(){throw new Error('no session');},
+    async capabilities(){entered();return new Promise(resolve=>{complete=resolve;});},
+  }});
+  const query=new URLSearchParams({account:'codex',cwd:f.repo});
+  const pending=fetch(`${f.base}/capabilities?${query}`);
+  await ready;
+  f.account.codexTransport='sdk';
+  complete({revision:1,capabilities:[{description:'private stale result'}],warnings:[]});
+  const response=await pending;
+  assert.equal(response.status,409);
+  assert.ok(!(await response.text()).includes('private stale result'));
+});
+
+for(const mode of ['eligible','stop','disabled','failed-read','duplicate','manual-resume']) test(`Codex automatic recovery: ${mode}`,async t=>{
+ const scheduler=new Scheduler();let emit:any;let resolveRead!: (v:any)=>void;let reads=0;
+ const gate=new Promise<any>(r=>resolveRead=r);
+ const coordinator={...fakeLimitCoordinator({eligibility:{eligible:true,resetsAt:Date.now()+60000}}),
+  async refreshCodexForRecovery(){reads++;return gate;}};
+ const f=await bootCodex(t,{codexTransport:'app-server',scheduler,limitCoordinator:coordinator,codexPool:{
+  async prepare(){return {runtimeVersion:'0.153.4',adapter:{start(_opts:any,callback:any){emit=callback;return {send(){},stop(){},decide(){},setAuto(){}};}}};},async close(){}}});
+ f.registry.setSettings({autoRequeue:mode!=='disabled'});
+ const session=await f.create('recovery-'+mode);const oldEmit=emit;
+ oldEmit({type:'stopped',reason:'limited',code:'codex_usage_limited'});
+ if(mode==='duplicate')oldEmit({type:'stopped',reason:'limited',code:'codex_usage_limited'});
+ if(mode==='stop')await f.command({cmd:'stop',id:session.id});
+ if(mode==='manual-resume')await f.command({cmd:'resume',id:session.id});
+ if(mode==='disabled')f.registry.setSettings({autoRequeue:true});
+ resolveRead(mode==='failed-read'?{eligible:false,reason:'unavailable'}:{eligible:true,resetsAt:Date.now()+60000});
+ await new Promise(r=>setTimeout(r,30));
+ assert.equal(reads,mode==='disabled'?0:1);
+ assert.equal(scheduler.all().length,['eligible','duplicate'].includes(mode)?1:0);
+ if(scheduler.all().length){assert.equal(scheduler.all()[0].action.kind,'resume');
+  await f.command({cmd:'stop',id:session.id});assert.equal(scheduler.all().length,0);}
+});
+
+test('automatic Codex recovery waits for fresh capacity then resumes exactly once', async (t) => {
+  const usage = new Usage();
+  const scheduler = new Scheduler();
+  let now = Date.now();
+  let resetAt = now + 60_000;
+  let available = false;
+  let boundaryReads = 0;
+  const snapshot = () => ({
+    plan: 'pro', authoritative: true, fresh: true, fetchedAt: now, blocks: [],
+    windows: [{ id: '5h', label: '5h', usedPercent: available ? 10 : 100,
+      windowDurationMins: 300, resetsAt: resetAt, reached: !available }],
+  });
+  const coordinator = createAccountLimitCoordinator({
+    accounts: [accounts[1]], usage, now: () => now, onChange() {},
+    prepareCodex: async () => ({
+      source: 'explicit', commandPath: '/unused-offline-fixture', version: '0.153.4', env: {}, diagnostics: [],
+    }),
+    supervisorFactory: () => ({
+      async reconcile() { return snapshot(); },
+      async readAtResetBoundary() { boundaryReads++; return snapshot(); },
+      async close() {},
+    }),
+  });
+  const starts: StartOpts[] = [];
+  let emit!: (event: AdapterEvent) => void;
+  const f = await bootCodex(t, {
+    usage, scheduler, limitCoordinator: coordinator, codexTransport: 'app-server',
+    codexPool: {
+      async prepare() {
+        return { runtimeVersion: '0.153.4', adapter: {
+          start(opts: StartOpts, callback: (event: AdapterEvent) => void) {
+            starts.push(opts);
+            emit = callback;
+            callback({ type: 'vendor-session-id', id: 'offline-recovery-thread' });
+            if (opts.promptId) callback({ type: 'prompt-delivery', id: opts.promptId, delivery: 'sent' });
+            if (opts.resumeId) queueMicrotask(() => callback({ type: 'status', status: 'done' }));
+            return { send() {}, stop() {}, decide() {}, setAuto() {} };
+          },
+        } };
+      },
+      async close() {},
+    },
+  });
+  t.mock.method(Date, 'now', () => now);
+  f.registry.setSettings({ autoRequeue: true });
+  const session = await f.create('fresh-recovery');
+  const originalEmit = emit;
+  originalEmit({ type: 'stopped', reason: 'limited', code: 'codex_usage_limited' });
+  await waitFor(() => scheduler.all().length === 1);
+  const queued = scheduler.all()[0];
+  assert.deepEqual(queued.action, { kind: 'resume', sessionId: session.id, prompt: 'continue' });
+  assert.equal(boundaryReads, 1, 'typed failure performs a recovery limit read');
+
+  await f.server.tick();
+  assert.equal(boundaryReads, 1, 'known future reset does not release or poll early');
+  assert.equal(starts.length, 1);
+
+  now = resetAt;
+  resetAt = now + 60_000;
+  await f.server.tick();
+  assert.equal(boundaryReads, 2, 'reset boundary requires a new provider read');
+  assert.equal(scheduler.all()[0], queued);
+  assert.equal(queued.state, 'waiting');
+  assert.equal(starts.length, 1, 'a fresh reached window remains blocked');
+
+  now = resetAt;
+  resetAt = now + 60_000;
+  available = true;
+  await f.server.tick();
+  assert.equal(boundaryReads, 3);
+  assert.equal(starts.length, 2);
+  assert.equal(starts[1].resumeId, 'offline-recovery-thread');
+  assert.equal(starts[1].prompt.text, 'continue');
+  assert.equal(f.registry.get(session.id)?.status, 'done');
+  assert.deepEqual(scheduler.all(), []);
+
+  originalEmit({ type: 'stopped', reason: 'late duplicate', code: 'codex_usage_limited' });
+  await f.server.tick();
+  await f.server.tick();
+  assert.equal(starts.length, 2, 'completed recovery and stale terminal events cannot replay it');
+  assert.equal(boundaryReads, 3);
+  assert.deepEqual(scheduler.all(), []);
+});
+
+test('a failed recovery resume keeps its queue item available for failure reporting',async t=>{
+ const scheduler=new Scheduler();let emit:any;let preparations=0;
+ const coordinator={...fakeLimitCoordinator({eligibility:{eligible:true,resetsAt:Date.now()+60000}}),
+  async refreshCodexForRecovery(){return {eligible:true as const,resetsAt:Date.now()+60000};}};
+ const f=await bootCodex(t,{codexTransport:'app-server',scheduler,limitCoordinator:coordinator,codexPool:{
+  async prepare(){if(++preparations>1)throw new Error('preflight unavailable');return {runtimeVersion:'0.153.4',adapter:{start(_opts:any,callback:any){emit=callback;return {send(){},stop(){},decide(){},setAuto(){}};}}};},async close(){}}});
+ f.registry.setSettings({autoRequeue:true});const session=await f.create('failed-recovery');
+ emit({type:'stopped',reason:'limited',code:'codex_usage_limited'});
+ await waitFor(()=>scheduler.all().length===1);
+ const result=await f.command({cmd:'resume',id:session.id});assert.notEqual(result.status,200);
+ assert.equal(scheduler.all().length,1);
 });

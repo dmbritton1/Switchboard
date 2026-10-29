@@ -1,5 +1,17 @@
 # Codex App-Server Foundation Implementation Plan
 
+## Status update — 2026-09-09
+
+Historical implementation proposal, superseded by the implemented telemetry
+foundation and `2026-08-29-codex-app-server-turn-transport.md`. Do not execute
+its original extraction/version-pin steps again. The runtime is now 0.153.4,
+with one account-scoped supervisor and immutable per-session transport.
+Start/resume/interrupt and live lifecycle checks are complete. App-server
+approvals and structured questions extend that implementation; SDK is still
+the default. See `2026-08-11-codex-interactions.md` for the current boundaries.
+The remaining text preserves the original proposal, including historical pins.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a production-quality, opt-in Codex app-server transport while preserving SDK ownership and resume behavior for every legacy Codex session.

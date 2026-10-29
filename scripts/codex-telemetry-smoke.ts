@@ -23,6 +23,7 @@ const KNOWN_AUTH_MODES = new Set([
   'agentIdentity',
   'personalAccessToken',
   'bedrockApiKey',
+  'bedrockAccessKeys',
 ]);
 
 class SmokeFailure extends Error {

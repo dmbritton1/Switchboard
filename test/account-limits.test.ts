@@ -36,7 +36,7 @@ function availableSnapshot(overrides: Partial<AccountLimitSnapshot> = {}): Accou
 
 function runtime(): PreparedCodexRuntime {
   return {
-    source: 'explicit', commandPath: '/fake/codex', version: '0.145.0', env: {}, diagnostics: [],
+    source: 'explicit', commandPath: '/fake/codex', version: '0.153.4', env: {}, diagnostics: [],
   };
 }
 
@@ -592,4 +592,33 @@ test('coordinators share an external Codex pool, unsubscribe independently, and 
   await coordinatorB.close();
   assert.equal(listeners.size, 0);
   assert.equal(poolCloses, 0);
+});
+
+test('recovery refresh reads immediately despite a future boundary and rejects a failed refresh',async()=>{
+ const usage=new Usage();usage.setLimitSnapshot('codex-one',snapshot());let fail=false;let reads=0;
+ const coordinator=createAccountLimitCoordinator({accounts:[accounts[1]],usage,onChange(){},now:()=>1000,
+  prepareCodex:async()=>runtime(),supervisorFactory:supervisorFactory([],[],[],async()=>{
+   reads++;if(fail)throw new Error('secret provider diagnostic');
+   return snapshot({windows:[...snapshot().windows,{id:'week',label:'week',usedPercent:100,windowDurationMins:10080,resetsAt:5000,reached:true}]});
+  })});
+ assert.deepEqual(await coordinator.refreshCodexForRecovery('codex-one'),{eligible:true,resetsAt:5000});
+ assert.equal(reads,1);fail=true;
+ assert.equal((await coordinator.refreshCodexForRecovery('codex-one')).eligible,false);
+ assert.equal(reads,2);assert.equal(usage.getLimitSnapshot('codex-one').snapshot?.fresh,false);
+ await coordinator.close();
+});
+
+test('recovery refresh rejects clean capacity, unsupported blocks, expired reset and timeout without using cached eligibility',async()=>{
+ for(const mode of ['available','unsupported','expired','timeout']){
+  const usage=new Usage();usage.setLimitSnapshot('codex-one',snapshot());
+  const coordinator=createAccountLimitCoordinator({accounts:[accounts[1]],usage,onChange(){},now:()=>1000,boundaryTimeoutMs:5,
+   prepareCodex:async()=>runtime(),supervisorFactory:supervisorFactory([],[],[],async()=>{
+    if(mode==='timeout')return new Promise(()=>{});
+    if(mode==='available')return availableSnapshot();
+    if(mode==='unsupported')return snapshot({blocks:[{id:'credits',reason:'credits_depleted',resettable:false}]});
+    return snapshot({windows:[{...snapshot().windows[0],resetsAt:500}]});
+   })});
+  assert.equal((await coordinator.refreshCodexForRecovery('codex-one')).eligible,false,mode);
+  await coordinator.close();
+ }
 });

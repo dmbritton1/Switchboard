@@ -52,10 +52,11 @@ stderr, raw-response, hostname, and installation canaries.
 
 ## Live-account result
 
-**Not run.** The optional `npm run evaluate:codex-telemetry` probe has not been
-separately authorized against a real configured account. No conclusion about
-live plan visibility, live windows, notification timing, or reset timestamp
-units is drawn from the fake evidence.
+Originally not run at the time of this report. The authorized September 9 live
+probe passed with visible plan data, usable windows, seconds-band reset
+timestamps, and clean shutdown. No notifications were observed in its bounded
+interval. See [the live validation report](2026-09-09-codex-app-server-live-validation.md)
+for evidence and the separate turn-transport limitations.
 
 ## Rollback
 

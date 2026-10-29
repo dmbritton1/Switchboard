@@ -1,10 +1,11 @@
+import { CAPABILITY_METHODS, CAPABILITY_NOTIFICATIONS } from './codex-capabilities.ts';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redactValues, type PreparedCodexRuntime } from './codex-runtime.ts';
 
-export const CODEX_TELEMETRY_VERSION = '0.145.0';
+export const CODEX_TELEMETRY_VERSION = '0.153.4';
 export const TELEMETRY_CLIENT_METHODS = [
   'initialize',
   'account/read',
@@ -17,6 +18,7 @@ export const TELEMETRY_NOTIFICATIONS = [
 export const TURN_CLIENT_METHODS = [
   'thread/start',
   'thread/resume',
+  'thread/compact/start',
   'turn/start',
   'turn/interrupt',
 ] as const;
@@ -29,6 +31,7 @@ export const TURN_NOTIFICATIONS = [
   'item/started',
   'item/completed',
   'turn/completed',
+  'serverRequest/resolved',
 ] as const;
 export const DENIED_SERVER_METHODS = [
   'item/commandExecution/requestApproval',
@@ -58,6 +61,7 @@ const AUTH_MODES = [
   'agentIdentity',
   'personalAccessToken',
   'bedrockApiKey',
+  'bedrockAccessKeys',
 ];
 const ACCOUNT_TYPES = ['apiKey', 'chatgpt', 'amazonBedrock'];
 
@@ -70,7 +74,7 @@ export type CodexAppServerMode = 'telemetry' | 'turns';
 export function appServerArgs(mode: CodexAppServerMode): string[] {
   const config = mode === 'telemetry'
     ? ['-c', 'hooks={}', '-c', 'mcp_servers={}']
-    : [];
+    : ['-c', 'features.default_mode_request_user_input=true'];
   return [
     '--strict-config',
     ...config,
@@ -279,7 +283,76 @@ function assertContract(files: Map<string, string>, mode: CodexAppServerMode): v
 }
 
 function assertTurnContract(files: Map<string, string>, client: string, notifications: string): void {
+  if (!methods(client).includes('config/read') || !/cwd\s*\?\s*:\s*string/.test(files.get(join('v2','ConfigReadParams.ts')) ?? '')
+      || !/config\s*:\s*Config/.test(files.get(join('v2','ConfigReadResponse.ts')) ?? '')) throw new Error('Screenshot config contract differs');
+  if (!/threadId\s*:\s*string/.test(files.get(join('v2','ThreadCompactStartParams.ts')) ?? '')
+      || !/Record<string, never>/.test(files.get(join('v2','ThreadCompactStartResponse.ts')) ?? '')) throw new Error('Compaction contract differs');
+  const capabilitySchemas: [string, RegExp[]][] = [
+    ['SkillsListParams', [/cwds\?:\s*Array<string>/, /forceReload\?:\s*boolean/]],
+    ['SkillsListResponse', [/data:\s*Array<SkillsListEntry>/]],
+    ['SkillsListEntry', [/cwd:\s*string/, /skills:\s*Array<SkillMetadata>/, /errors:\s*Array<SkillErrorInfo>/]],
+    ['SkillMetadata', [/name:\s*string/, /description:\s*string/, /path:\s*AbsolutePathBuf/, /enabled:\s*boolean/]],
+    ['AppsListParams', [/cursor\?:\s*string\s*\|\s*null/, /limit\?:\s*number\s*\|\s*null/, /threadId\?:\s*string\s*\|\s*null/, /forceRefetch\?:\s*boolean/]],
+    ['AppsListResponse', [/data:\s*Array<AppInfo>/, /nextCursor:\s*string\s*\|\s*null/]],
+    ['AppInfo', [/id:\s*string/, /name:\s*string/, /isAccessible:\s*boolean/, /isEnabled:\s*boolean/]],
+    ['AppsInstalledParams', [/threadId\?:\s*string\s*\|\s*null/, /forceRefresh\?:\s*boolean/]],
+    ['AppsInstalledResponse', [/apps:\s*Array<InstalledApp>/]],
+    ['InstalledApp', [/id:\s*string/, /enabled:\s*boolean/, /callable:\s*boolean/]],
+    ['ListMcpServerStatusParams', [/threadId\?:\s*string\s*\|\s*null/, /cursor\?:\s*string\s*\|\s*null/, /limit\?:\s*number\s*\|\s*null/, /detail\?:\s*McpServerStatusDetail\s*\|\s*null/]],
+    ['ListMcpServerStatusResponse', [/data:\s*Array<McpServerStatus>/, /nextCursor:\s*string\s*\|\s*null/]],
+    ['McpServerStatus', [/name:\s*string/, /runtimeStatus:\s*McpServerConnectionStatus\s*\|\s*null/, /tools:\s*\{\s*\[key\s*in\s*string\]\?:\s*Tool\s*\}/]],
+  ];
+  if (!CAPABILITY_METHODS.every(method => methods(client).includes(method))
+      || !CAPABILITY_NOTIFICATIONS.every(method => methods(notifications).includes(method))
+      || capabilitySchemas.some(([name, patterns]) => !patterns.every(pattern => pattern.test(files.get(join('v2', name + '.ts')) ?? '')))
+      || !['skill', 'mention'].every(kind => new RegExp('"type"\\s*:\\s*"' + kind + '"\\s*,\\s*name\\s*:\\s*string\\s*,\\s*path\\s*:\\s*string').test(files.get(join('v2','UserInput.ts')) ?? ''))) {
+    throw new Error('Capability discovery contract differs');
+  }
+  const elicitationParams=files.get(join('v2','McpServerElicitationRequestParams.ts'))??'';
+  const elicitationResponse=files.get(join('v2','McpServerElicitationRequestResponse.ts'))??'';
+  const elicitationAction=files.get(join('v2','McpServerElicitationAction.ts'))??'';
+  const elicitationSchema=files.get(join('v2','McpElicitationSchema.ts'))??'';
+  if(!/threadId\s*:\s*string/.test(elicitationParams)||!/turnId\s*:\s*string\s*\|\s*null/.test(elicitationParams)
+    ||!['form','url'].every(mode=>quoted(elicitationParams).includes(mode))
+    ||!/requestedSchema\s*:\s*McpElicitationSchema/.test(elicitationParams)||!/url\s*:\s*string/.test(elicitationParams)
+    ||!/elicitationId\s*:\s*string/.test(elicitationParams)||!/action\s*:\s*McpServerElicitationAction/.test(elicitationResponse)
+    ||!/content\s*:\s*JsonValue\s*\|\s*null/.test(elicitationResponse)||!/_meta\s*:\s*JsonValue\s*\|\s*null/.test(elicitationResponse)
+    ||!sameMembers(quoted(elicitationAction),['accept','decline','cancel'])
+    ||!/type\s*:\s*McpElicitationObjectType/.test(elicitationSchema)||!/properties\s*:\s*\{\s*\[key in string\]\?\s*:\s*McpElicitationPrimitiveSchema/.test(elicitationSchema)) {
+    throw new Error('MCP elicitation contract differs');
+  }
+  const questionSchemas: [string, RegExp[]][] = [
+    ['InitializeCapabilities.ts', [/experimentalApi\s*:\s*boolean\s*,/, /requestAttestation\s*:\s*boolean\s*,/]],
+    [join('v2', 'ToolRequestUserInputParams.ts'), [
+      /threadId\s*:\s*string\s*,/, /turnId\s*:\s*string\s*,/, /itemId\s*:\s*string\s*,/,
+      /questions\s*:\s*Array<ToolRequestUserInputQuestion>\s*,/, /isBlocking\s*:\s*boolean\s*,/]],
+    [join('v2', 'ToolRequestUserInputQuestion.ts'), [
+      /id\s*:\s*string\s*,/, /header\s*:\s*string\s*,/, /question\s*:\s*string\s*,/,
+      /isOther\s*:\s*boolean\s*,/, /isSecret\s*:\s*boolean\s*,/,
+      /options\s*:\s*Array<ToolRequestUserInputOption>\s*\|\s*null\s*,/]],
+    [join('v2', 'ToolRequestUserInputOption.ts'), [/label\s*:\s*string\s*,/, /description\s*:\s*string\s*,/]],
+    [join('v2', 'ToolRequestUserInputResponse.ts'), [/answers\s*:\s*\{\s*\[key in string\]\?\s*:\s*ToolRequestUserInputAnswer\s*\}/]],
+    [join('v2', 'ToolRequestUserInputAnswer.ts'), [/answers\s*:\s*Array<string>\s*,/]],
+  ];
+  for (const [file, patterns] of questionSchemas) {
+    const source = (files.get(file) ?? '').replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+    if (!patterns.every(pattern => pattern.test(source))) throw new Error('structured question contract differs');
+  }
+  const resolved = files.get(join('v2','ServerRequestResolvedNotification.ts')) ?? '';
+  const requestId = files.get('RequestId.ts') ?? '';
+  if (!/threadId\s*:\s*string/.test(resolved) || !/requestId\s*:\s*RequestId/.test(resolved)
+    || !/export type RequestId = string \| number;/.test(requestId)) throw new Error('approval resolution contract differs');
+  for (const kind of ['CommandExecution', 'FileChange']) {
+    const params = files.get(join('v2',kind+'RequestApprovalParams.ts')) ?? '';
+    const response = files.get(join('v2',kind+'RequestApprovalResponse.ts')) ?? '';
+    const decision = files.get(join('v2',kind+'ApprovalDecision.ts')) ?? '';
+    if (!/threadId\s*:\s*string/.test(params) || !/turnId\s*:\s*string/.test(params)
+      || !/itemId\s*:\s*string/.test(params)
+      || !response.includes(`decision: ${kind}ApprovalDecision`)
+      || !quoted(decision).includes('accept') || !quoted(decision).includes('decline')) throw new Error('approval contract differs');
+  }
   const approvalPolicy = files.get(join('v2', 'AskForApproval.ts'));
+  const reviewer = files.get(join('v2', 'ApprovalsReviewer.ts'));
   const sandboxMode = files.get(join('v2', 'SandboxMode.ts'));
   const jsonValue = files.get(join('serde_json', 'JsonValue.ts'));
   const reasoningEffort = files.get('ReasoningEffort.ts');
@@ -320,7 +393,10 @@ function assertTurnContract(files: Map<string, string>, client: string, notifica
   const requiredWillRetry = /(?:^|[,;])\s*willRetry\s*:\s*boolean\s*(?=[,;]|(?![\s\S]))/;
   const textInput = userInput ? taggedUnionMember(userInput, 'text') : undefined;
   const localImageInput = userInput ? taggedUnionMember(userInput, 'localImage') : undefined;
-  if (!approvalPolicy || !sandboxMode || !jsonValue || !reasoningEffort || !threadStart || !threadResume
+  if (!reviewer || !quoted(reviewer).includes('user')
+    || !/approvalsReviewer\s*\?\s*:\s*ApprovalsReviewer\s*\|\s*null\s*,/.test(threadStart ?? '')
+    || !/approvalsReviewer\s*\?\s*:\s*ApprovalsReviewer\s*\|\s*null\s*,/.test(threadResume ?? '')
+    || !approvalPolicy || !sandboxMode || !jsonValue || !reasoningEffort || !threadStart || !threadResume
     || !turnStart || !turnInterrupt || !userInput || !threadItem
     || !turn || !turnStatus || !turnError || !tokenUsage || !tokenBreakdown || !thread
     || !threadStarted || !usageUpdated || !turnStarted || !planUpdated || !itemStarted

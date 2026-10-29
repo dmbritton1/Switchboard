@@ -46,6 +46,7 @@ export interface AccountLimitCoordinator {
     account: string,
     now?: number,
   ): ReturnType<Usage['authoritativeResetEligibility']>;
+  refreshCodexForRecovery(account: string, now?: number): Promise<ReturnType<Usage['authoritativeResetEligibility']>>;
   releaseCodexAfterFreshRead(account: string, now?: number): Promise<ResetRelease>;
   close(): Promise<void>;
 }
@@ -291,6 +292,22 @@ class Coordinator implements AccountLimitCoordinator {
   codexResetEligibility(account: string, now = this.#now()): ReturnType<Usage['authoritativeResetEligibility']> {
     this.#codexAccount(account);
     return this.#usage.authoritativeResetEligibility(account, now);
+  }
+
+  /** A failed turn needs a new read even when the previous reset is in the future. */
+  async refreshCodexForRecovery(accountName: string, now = this.#now()): Promise<ReturnType<Usage['authoritativeResetEligibility']>> {
+    const account = this.#codexAccount(accountName);
+    try {
+      const supervisor = await this.#supervisor(account);
+      const result = await this.#withBoundaryTimeout(supervisor.readAtResetBoundary(now));
+      if (!this.#current(account)) return {eligible:false,reason:CODEX_FAILURE};
+      if (result.timedOut || !isCleanSnapshot(result.snapshot)) throw new Error(CODEX_FAILURE);
+      this.#storeSnapshot(account.name,result.snapshot);
+      return this.#usage.authoritativeResetEligibility(account.name,now);
+    } catch (error) {
+      this.#fail(account,error,CODEX_FAILURE);
+      return {eligible:false,reason:CODEX_FAILURE};
+    }
   }
 
   async releaseCodexAfterFreshRead(account: string, now = this.#now()): Promise<ResetRelease> {

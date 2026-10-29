@@ -69,13 +69,13 @@ test('Codex transport is explicit at creation and immutable while runtime metada
     provider: 'codex', account: 'codex', repo: '/r', cwd: '/r/wt', branch: 'app', title: 'app',
     codexTransport: 'app-server',
   });
-  registry.recordCodexRuntimeVersion(session.id, '0.145.0');
+  registry.recordCodexRuntimeVersion(session.id, '0.153.4');
   registry.recordCodexRuntimeVersion(session.id, 'changed');
   registry.apply(session.id, { type: 'vendor-session-id', id: 'app-thread' });
   registry.recordCodexRuntimeVersion(session.id, 'after-thread');
 
   assert.equal(session.codexTransport, 'app-server');
-  assert.equal(session.codexRuntimeVersion, '0.145.0');
+  assert.equal(session.codexRuntimeVersion, '0.153.4');
 });
 
 test('load migrates genuinely absent Codex transport but stops invalid stored transport without coercion', async (t) => {
@@ -90,7 +90,7 @@ test('load migrates genuinely absent Codex transport but stops invalid stored tr
     },
     {
       id: 'app-server', provider: 'codex', account: 'codex', vendorSessionId: 'app-thread',
-      codexTransport: 'app-server', codexRuntimeVersion: '0.145.0',
+      codexTransport: 'app-server', codexRuntimeVersion: '0.153.4',
       repo: '/r', cwd: '/r/app', branch: 'app', title: 'app', status: 'done', auto: false,
       transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
     },
@@ -102,7 +102,7 @@ test('load migrates genuinely absent Codex transport but stops invalid stored tr
     },
     {
       id: 'claude', provider: 'claude', account: 'claude', vendorSessionId: null,
-      codexTransport: 'sdk', codexRuntimeVersion: '0.145.0',
+      codexTransport: 'sdk', codexRuntimeVersion: '0.153.4',
       repo: '/r', cwd: '/r/claude', branch: 'claude', title: 'claude', status: 'done', auto: false,
       transcript: [], pending: null, stoppedReason: null, stoppedCode: null, startedAt: 1, statusSince: 1,
     },
@@ -111,7 +111,7 @@ test('load migrates genuinely absent Codex transport but stops invalid stored tr
   const loaded = await Registry.load(path);
   assert.equal(loaded.get('legacy-sdk')!.codexTransport, 'sdk');
   assert.equal(loaded.get('app-server')!.codexTransport, 'app-server');
-  assert.equal(loaded.get('app-server')!.codexRuntimeVersion, '0.145.0');
+  assert.equal(loaded.get('app-server')!.codexRuntimeVersion, '0.153.4');
   assert.equal(loaded.get('invalid')!.codexTransport, undefined);
   assert.equal(loaded.get('invalid')!.status, 'stopped');
   assert.match(loaded.get('invalid')!.stoppedReason ?? '', /invalid stored transport.*delete.*create a new session/i);

@@ -343,6 +343,7 @@ export const CODEX_FAILURE_LABEL = Object.freeze({
   codex_transport_crashed: 'Codex app-server transport crashed',
   codex_request_timed_out: 'Codex app-server request timed out',
   codex_stream_failed: 'Codex stream failed',
+  codex_usage_limited: 'Codex usage limit reached',
   codex_sandbox_denied: 'Blocked by worktree sandbox',
   codex_user_stopped: 'Stopped by you',
 });

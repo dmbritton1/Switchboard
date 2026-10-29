@@ -26,7 +26,7 @@ test('every stable Codex failure has a user-facing label', () => {
     'codex_binary_not_executable', 'codex_platform_unsupported',
     'codex_protocol_mismatch', 'codex_request_timed_out',
     'codex_resume_failed', 'codex_sandbox_denied', 'codex_start_failed',
-    'codex_stream_failed', 'codex_transport_crashed', 'codex_user_stopped',
+    'codex_stream_failed', 'codex_transport_crashed', 'codex_usage_limited', 'codex_user_stopped',
     'codex_version_mismatch', 'codex_version_unreadable',
   ]);
   assert.deepEqual({

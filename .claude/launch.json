@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "switchboard",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start"],
+      "port": 4711,
+      "url": "http://127.0.0.1:4711"
+    }
+  ]
+}

@@ -1,3 +1,7 @@
+> Historical SDK integration report. Current app-server rollout evidence and
+> default decision are in [the 2026-09-11 rollout gate](2026-09-11-codex-rollout-gate.md).
+> Do not use this older version baseline to assess current app-server readiness.
+
 # Codex Phase 2 compatibility report
 
 ## Phase 1 gate

@@ -1,7 +1,7 @@
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { Server } from 'node:http';
-import { mkdir, readFile, readdir, rm, stat, lstat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rm, stat, lstat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
@@ -115,7 +115,7 @@ type PreparedProvider = {
 
 type SessionPreparation = { sessionId: string; transport?: CodexTransport };
 type SessionOwnership = Pick<Session, 'id' | 'provider' | 'codexTransport'>;
-type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare' | 'retire'>>;
+type ServerCodexPool = Pick<CodexProviderPool, 'close'> & Partial<Pick<CodexProviderPool, 'prepare' | 'retire' | 'capabilities'>>;
 
 async function prepareProvider(account: Account, _session?: SessionPreparation): Promise<PreparedProvider> {
   if (account.provider === 'claude') return { adapter: claudeAdapter };
@@ -477,6 +477,17 @@ export function createServer(opts: {
   const prepare = injectedPrepare ?? prepareProvider;
   const handles = new Map<string, AgentHandle>();
   const launchOwners = new Map<string, symbol>();
+  const recoveryCandidates = new Map<string, symbol>();
+  function cancelRecovery(sessionId: string, removeQueued = true): void {
+    recoveryCandidates.delete(sessionId);
+    if (!removeQueued) return;
+    const session = registry.get(sessionId);
+    if (session?.provider !== 'codex' || session.codexTransport !== 'app-server') return;
+    for (const item of scheduler.all()) {
+      if (item.state === 'waiting' && item.trigger.kind === 'reset'
+        && item.action.kind === 'resume' && item.action.sessionId === sessionId) scheduler.remove(item.id);
+    }
+  }
   const createReservations = new Map<string, symbol>();
   const deletingSessions = new Set<string>();
   // Process-local like the handle map, and for the same reason: a channel names
@@ -718,8 +729,8 @@ export function createServer(opts: {
           const { inputTokens, outputTokens } = safeEvent;
           usage.record(account.name, inputTokens, outputTokens);
         }
-        // Claude only — the Codex SDK reports no rate-limit signal at all, which
-        // is why a Codex session never auto-requeues below.
+        // Claude rate events maintain its existing reset heuristic; app-server
+        // recovery below uses a structured failure and authoritative read.
         if (safeEvent.type === 'rate-limit') {
           usage.noteLimit(account.name, safeEvent.status, safeEvent.resetsAt);
         }
@@ -756,6 +767,26 @@ export function createServer(opts: {
             { kind: 'reset', account: account.name },
             { kind: 'resume', sessionId, prompt: 'continue' },
           );
+        }
+        if (dead && account.provider === 'codex' && session?.codexTransport === 'app-server'
+          && safeEvent.code === 'codex_usage_limited' && registry.settings().autoRequeue
+          && limitCoordinator && !scheduler.findResetResume(sessionId)) {
+          const candidate = Symbol(sessionId);
+          recoveryCandidates.set(sessionId,candidate);
+          void (async () => {
+            try {
+              const eligibility = await limitCoordinator.refreshCodexForRecovery(account.name);
+              await dead.quiescence;
+              if (!eligibility.eligible || eligibility.resetsAt <= Date.now()
+                || recoveryCandidates.get(sessionId) !== candidate
+                || !registry.settings().autoRequeue || registry.get(sessionId) !== session
+                || session.status !== 'stopped' || session.stoppedCode !== 'codex_usage_limited'
+                || accounts.find(a=>a.name===account.name) !== account || handles.has(sessionId)
+                || launchOwners.has(sessionId) || scheduler.findResetResume(sessionId)) return;
+              scheduler.addResetResume(account.name,sessionId);
+            } catch { /* A failed refresh leaves the stopped session manually resumable. */ }
+            finally { if(recoveryCandidates.get(sessionId)===candidate) recoveryCandidates.delete(sessionId); }
+          })();
         }
         dead?.stop();
       });
@@ -952,6 +983,7 @@ export function createServer(opts: {
       }
 
       case 'handoff': {
+        cancelRecovery(String(body.id));
         const source = registry.get(String(body.id));
         if (!source) return { status: 404, json: { error: 'no such session' } };
         if (deletingSessions.has(source.id)) {
@@ -1106,11 +1138,26 @@ export function createServer(opts: {
         const handle = handles.get(sessionId);
         if (!session || !handle) return { status: 404, json: { error: 'no live session' } };
         const text = String(body.text);
+        if (session.provider === 'codex' && session.codexTransport === 'app-server') {
+          const command = text.trim().match(/^\/(compact|skills|apps|mcp)(?=\s|$)/)?.[1];
+          if (command && command !== 'compact') {
+            return {status:400,json:{error:`/${command} opens the capability picker. Select a capability to send.`}};
+          }
+          if (command === 'compact' && (text.trim() !== '/compact'
+            || (body.attachments !== undefined && (!Array.isArray(body.attachments) || body.attachments.length > 0)))) {
+            return {status:400,json:{error:'/compact does not accept arguments or attachments.'}};
+          }
+        }
         let prompt: AgentPrompt;
         try {
           prompt = await resolvePrompt(session.cwd, text, body.attachments);
         } catch (error) {
           return { status: 400, json: { error: String((error as Error).message ?? error) } };
+        }
+        const alias = text.match(/^\/(?:skill|app|mcp):[^\s]+/)?.[0].slice(1);
+        if (alias && session.provider === 'codex' && session.codexTransport === 'app-server') {
+          try { prompt.capability = await handle.resolveCapability?.(alias) ?? undefined; } catch {}
+          if (!prompt.capability) return {status:409,json:{error:'Capability is unavailable. Refresh capabilities and retry.'}};
         }
         const currentSession = registry.get(sessionId);
         const currentHandle = handles.get(sessionId);
@@ -1125,9 +1172,47 @@ export function createServer(opts: {
         return { status: 200, json: { ok: true } };
       }
 
+      case 'respond-elicitation': {
+        const id = String(body.id);
+        const session = registry.get(id);
+        const handle = handles.get(id);
+        if (!handle?.respondElicitation || session?.provider !== 'codex' || session.codexTransport !== 'app-server') {
+          return {status:404,json:{error:'no live form session'}};
+        }
+        if (!session.pending?.elicitation || session.pending.responding || body.requestId !== session.pending.id) {
+          return {status:409,json:{error:'request is no longer awaiting a response'}};
+        }
+        return handle.respondElicitation(session.pending.id,body.response)
+          ? {status:200,json:{ok:true}} : {status:400,json:{error:'invalid form response'}};
+      }
+
+      case 'answer-question': {
+        const id = String(body.id);
+        const session = registry.get(id);
+        const handle = handles.get(id);
+        if (!handle || session?.provider !== 'codex' || session.codexTransport !== 'app-server'
+          || !handle.answerQuestion) return { status: 404, json: { error: 'no live question session' } };
+        if (!session.pending?.question || session.pending.responding || body.requestId !== session.pending.id) {
+          return { status: 409, json: { error: 'question is no longer awaiting an answer' } };
+        }
+        // Answers go directly to the provider callback, never into the transcript.
+        if (!handle.answerQuestion(session.pending.id, body.answer)) {
+          return { status: 400, json: { error: 'invalid question answer' } };
+        }
+        return { status: 200, json: { ok: true } };
+      }
+
       case 'decide': {
         const handle = handles.get(String(body.id));
         if (!handle) return { status: 404, json: { error: 'no live session' } };
+        const session = registry.get(String(body.id));
+        if (session?.provider === 'codex' && session.codexTransport === 'app-server') {
+          if (!session.pending || body.requestId !== session.pending.id || session.pending.responding) {
+            return { status: 409, json: { error: 'approval is no longer awaiting a decision' } };
+          }
+          if (session.pending.question || session.pending.elicitation) return { status: 400, json: { error: 'use question answer controls' } };
+          if (typeof body.allow !== 'boolean' || body.answer !== undefined) return { status: 400, json: { error: 'invalid approval decision' } };
+        }
         const answer = typeof body.answer === 'string' && body.answer ? body.answer : undefined;
         // Recorded as a prompt so the scrollback shows what was chosen; clicking
         // an option is the user speaking, and it is delivered as the tool result.
@@ -1166,6 +1251,7 @@ export function createServer(opts: {
 
       case 'stop': {
         const sessionId = String(body.id);
+        cancelRecovery(sessionId);
         const handoff = handoffReservations.get(sessionId);
         if (handoff?.phase === 'committing') {
           return { status: 409, json: { error: 'session handoff is committing' } };
@@ -1230,6 +1316,7 @@ export function createServer(opts: {
 
       case 'resume': {
         const sessionId = String(body.id);
+        cancelRecovery(sessionId, false);
         if (deletingSessions.has(sessionId)) {
           return { status: 409, json: { error: 'session deletion is in progress' } };
         }
@@ -1316,6 +1403,7 @@ export function createServer(opts: {
             session.vendorSessionId ?? undefined, promptId,
           );
           if (launchError) return { status: 500, json: launchError };
+          cancelRecovery(sessionId);
           return { status: 200, json: { ok: true } };
         } finally {
           if (resumeReservations.get(sessionId) === reservation) resumeReservations.delete(sessionId);
@@ -1359,6 +1447,7 @@ export function createServer(opts: {
       }
 
       case 'delete': {
+        cancelRecovery(String(body.id));
         const sessionId = String(body.id);
         if (deletingSessions.has(sessionId)) {
           return { status: 409, json: { error: 'session deletion is already in progress' } };
@@ -1413,6 +1502,7 @@ export function createServer(opts: {
       case 'settings': {
         const parsed = parseSettingsPatch(body.patch);
         if ('error' in parsed) return { status: 400, json: { error: parsed.error } };
+        if (parsed.patch.autoRequeue === false) recoveryCandidates.clear();
         registry.setSettings(parsed.patch);
         return { status: 200, json: { ok: true } };
       }
@@ -1590,6 +1680,7 @@ export function createServer(opts: {
 
       const dispatch = async (items: ReturnType<Scheduler['due']>): Promise<void> => {
         for (const item of items) {
+          if (!scheduler.all().includes(item) || item.state !== 'waiting') continue;
           let action = item.action;
           // A queued `send` can only be decided against the session's status at
           // schedule time — but the headline use of this feature is scheduling a
@@ -1689,6 +1780,68 @@ export function createServer(opts: {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(await recentRepos()));
         return;
+      }
+
+      if (url.pathname === '/capabilities' && req.method === 'GET') {
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('content-type', 'application/json');
+        const params = url.searchParams;
+        const keys = [...params.keys()];
+        const live = params.has('session');
+        const allowed = live ? ['session','refresh'] : ['account','cwd','refresh'];
+        if (keys.some(key => !allowed.includes(key) || params.getAll(key).length !== 1)
+          || (params.has('refresh') && params.get('refresh') !== '1')
+          || (!live && (!params.get('account') || !params.get('cwd')))) {
+          res.writeHead(400); res.end(JSON.stringify({error:'Unsupported capability query.'})); return;
+        }
+        if (!live) {
+          const account = accounts.find(a => a.name === params.get('account'));
+          if (account?.provider !== 'codex' || account.codexTransport !== 'app-server' || !codexPool?.capabilities) {
+            res.writeHead(404); res.end(JSON.stringify({error:'No app-server capability account.'})); return;
+          }
+          let cwd: string;
+          try {
+            cwd = await realpath(params.get('cwd')!);
+            if (!(await stat(cwd)).isDirectory()) throw new Error();
+            const result = await run('git', ['-C',cwd,'rev-parse','--is-inside-work-tree'], {timeout:5000});
+            if (result.stdout.trim() !== 'true') throw new Error();
+          } catch {
+            res.writeHead(400); res.end(JSON.stringify({error:'Choose an existing Git repository directory.'})); return;
+          }
+          try {
+            if (accounts.find(a => a.name === account.name) !== account || account.codexTransport !== 'app-server') throw new Error();
+            const snapshot = await codexPool.capabilities(account,cwd,params.get('refresh') === '1');
+            if (accounts.find(a => a.name === account.name) !== account || account.codexTransport !== 'app-server') throw new Error();
+            res.writeHead(200); res.end(JSON.stringify(snapshot));
+          } catch {
+            res.writeHead(409); res.end(JSON.stringify({error:'Capabilities changed or are unavailable. Refresh and retry.'}));
+          }
+          return;
+        }
+        const id = params.get('session') ?? '';
+        const session = registry.get(id);
+        const handle = handles.get(id);
+        if (session?.provider !== 'codex' || session.codexTransport !== 'app-server' || !handle?.capabilities) {
+          res.writeHead(404); res.end(JSON.stringify({error:'No live capability session.'})); return;
+        }
+        try {
+          const snapshot = await handle.capabilities(url.searchParams.get('refresh') === '1');
+          if (handles.get(id) !== handle || registry.get(id) !== session || session.status === 'stopped') throw new Error();
+          res.writeHead(200); res.end(JSON.stringify(snapshot));
+        } catch { res.writeHead(409); res.end(JSON.stringify({error:'Capabilities changed or are unavailable. Refresh and retry.'})); }
+        return;
+      }
+
+      if (url.pathname === '/elicitation-url' && req.method === 'GET') {
+        const id=url.searchParams.get('session')??'';
+        const requestId=url.searchParams.get('request')??'';
+        const pending=registry.get(id)?.pending;
+        const destination=pending?.id===requestId && pending.elicitation?.mode==='url' && !pending.responding
+          ? handles.get(id)?.elicitationUrl?.(requestId) : null;
+        res.setHeader('cache-control','no-store');
+        res.setHeader('referrer-policy','no-referrer');
+        if(!destination){res.writeHead(409);res.end('This request is no longer available.');return;}
+        res.writeHead(302,{location:destination});res.end();return;
       }
 
       if (url.pathname === '/detail' && req.method === 'GET') {
@@ -1898,7 +2051,7 @@ export function createServer(opts: {
       // Serve only the known assets; never join user-controlled path segments.
       // The fonts sit flat in web/ rather than web/fonts/ for exactly that
       // reason — a subdirectory would mean building a path from the URL.
-      if (!['index.html', 'app.js', 'lib.js', 'style.css', 'inter.woff2', 'garamond.woff2'].includes(file)) {
+      if (!['index.html', 'app.js', 'lib.js', 'questions.js', 'codex-commands.js', 'style.css', 'inter.woff2', 'garamond.woff2'].includes(file)) {
         res.writeHead(404).end('not found');
         return;
       }

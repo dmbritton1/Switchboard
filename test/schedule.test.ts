@@ -186,3 +186,15 @@ test('restore drops items with corrupted state, invalid at.time, and unrecognize
   assert.equal(s.all()[0].id, 'ok1');
   assert.equal(s.all()[1].id, 'ok2');
 });
+
+test('reset resume helpers deduplicate existing session work and preserve its prompt',()=>{
+ const s=new Scheduler();const first=s.addResetResume('codex','session','continue',100);
+ assert.equal(s.addResetResume('codex','session','continue',200),first);
+ assert.equal(s.findResetResume('session'),first);
+ assert.equal(s.all().length,1);
+ assert.deepEqual(first.action,{kind:'resume',sessionId:'session',prompt:'continue'});
+ s.fail(first.id,'failed');assert.equal(s.findResetResume('session'),first);
+ s.remove(first.id);assert.equal(s.findResetResume('session'),null);
+ const manual=s.add({kind:'reset',account:'codex'},{kind:'resume',sessionId:'session',prompt:'my prompt'});
+ assert.equal(s.addResetResume('codex','session'),manual);
+});
